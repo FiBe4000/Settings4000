@@ -10,3 +10,13 @@
 //! Hard layering rule: like [`crate::core`], nothing here may import `gtk` or
 //! `relm4` — parsers are pure, display-free, and independently testable
 //! (enforced by `tests/module_boundaries.rs`).
+
+// The palette parser (task 3.1) will be consumed by the SettingsStore (task 4.2,
+// which reads and stages `colors/<scheme>` for the theme page) and the theme
+// palette page (task 6.3) — neither of which exists yet. Until they wire it in,
+// its public surface is exercised only by its own tests, so a non-test build
+// would flag every item as dead code. Scope the allowance to `not(test)` so the
+// `dead_code` lint stays fully active in test builds (where the surface is used);
+// remove it once 4.2/6.3 consume the parser.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod palette;
