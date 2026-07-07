@@ -7,9 +7,15 @@ Complexity: 1 = simple/repetitive … 5 = highly complex.
 
 - [x] **1.1 Cargo project scaffold** — Complexity: 1
   Init binary crate (2024 edition) with `gtk4`, `relm4`, `tracing`, `tracing-subscriber`, `tracing-journald`, `serde_json` (preserve_order), `tempfile` (dev), `nix` deps; module tree `ui/ core/ parsers/ system/` as in architecture §2. *Accept:* `cargo build` and `cargo test` pass on empty modules; a module-boundary check (grep-based test for `gtk` imports, or workspace crate split) fails if `core/` or `parsers/` import `gtk`.
+  *Done:* scaffolded in `Cargo.toml` + `src/` with a `tests/` guard:
+  - 2024-edition binary crate `settings4000` with the required dependencies (`gtk4`/`relm4`, the `tracing` stack, `serde_json` with `preserve_order`, `nix`; `tempfile` as a dev-dependency) and the `ui/ core/ parsers/ system/` module tree from architecture §2.
+  - `tests/module_boundaries.rs` is a grep-based guard that fails if any file under `src/core` or `src/parsers` imports `gtk`/`gtk4`/`relm4`, enforcing the GTK-free layering rule (R6.2); confirmed to catch real violations.
 
 - [x] **1.2 CLI & logging init** — Complexity: 2
   `--log-level` flag; `EnvFilter` from `SETTINGS4000_LOG`/`RUST_LOG` (flag wins); journald layer with stderr fmt fallback when journald is unavailable (R7.1–R7.2). *Accept:* messages visible in `journalctl --user -t settings4000`; fallback exercised by unit test with journald socket absent.
+  *Done:* implemented in `src/system/logging.rs`, wired from `main.rs`:
+  - A `--log-level` flag plus an `EnvFilter` resolved from `SETTINGS4000_LOG`/`RUST_LOG` with the flag taking precedence; a blank or malformed directive degrades to `info`. `--log-level debug` raises only the `settings4000` target so dependency chatter doesn't bury the app's own logs.
+  - Tracing init attaches a journald layer (syslog identifier `settings4000`) and falls back to a stderr `fmt` layer when journald is unavailable; the backend selection is injectable and unit-tested (fallback exercised without a live journald).
 
 - [x] **1.3 GtkApplication bootstrap + single instance** — Complexity: 2
   Fixed app ID, `Application::register`; second launch activates the existing window and exits (R8.4). Empty `ApplicationWindow` shown. *Accept:* relaunching focuses the running window; process exits 0.
