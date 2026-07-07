@@ -46,8 +46,11 @@ Complexity: 1 = simple/repetitive … 5 = highly complex.
   - The content step is a closure seam (`atomic_write_with`), so a test can inject a failure before the rename and prove the original is untouched with no stray temp file (the `NamedTempFile` deletes on drop). `write_atomic` returns a `FileSnapshot` capturing the original bytes *and* permission mode, whose `restore()` puts both back through the same atomic path — the per-file rollback the Apply pipeline (task 4.5) will use. Each write logs its resolved path + byte count at `info`, never contents (R7.3).
   - `tempfile` moved from a dev-dependency to a regular dependency because `NamedTempFile` is now used in production code (still available to tests).
 
-- [ ] **2.3 File freshness tracking** — Complexity: 2
+- [x] **2.3 File freshness tracking** — Complexity: 2
   Per-file content-hash + mtime record on read; `check_conflicts()` re-reads and reports changed files (R5.6). *Accept:* external modification between read and check is detected; unchanged files aren't flagged.
+  *Done:* implemented in `src/core/freshness.rs` (domain logic, GTK-free — architecture §3 "Write safety" and §6 step 2):
+  - `FreshnessTracker::record(path)` reads a file and stores a per-file baseline of a content hash (`std`'s SipHash `DefaultHasher`, so no new dependency) plus its mtime; `record_bytes(path, bytes)` records the same baseline from bytes the caller already read (the store's read-time entry point, task 4.2) — avoiding a second read and closing the TOCTOU gap where an external edit between the store's read and a tracker re-read would baseline the edited bytes; `check_conflicts()` re-reads every tracked file and returns a path-sorted `Vec<Conflict>` (each a tracked path + reason) of those that changed since it was recorded (R5.6). It lives in `core/` — not `system/` — because it is store/apply-pipeline domain logic (tasks 4.2/4.5) and reading files to compare them needs no side-effect abstraction.
+  - Conflict rule: the content hash is authoritative — a file conflicts iff its bytes no longer hash to the recorded value (`ContentChanged`) or it can no longer be re-read (`Unreadable`, e.g. deleted or permission-revoked, carrying the OS error); the recorded mtime is diagnostic only and never gates the decision, so a content edit made under an unchanged mtime is still caught and a pure mtime touch (or a rewrite to identical bytes) is not a false positive.
 
 ## 3. Parsers (each: lossless representation, targeted value edits, round-trip tests — R5.3 item 1, R6.1)
 

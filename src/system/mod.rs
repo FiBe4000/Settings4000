@@ -9,9 +9,11 @@
 //!
 //! The concrete abstractions live here: [`command`]'s `CommandRunner` for
 //! shell-free process execution and the atomic file [`writer`] for
-//! symlink-following writes; freshness tracking (task 2.3) is still to come.
-//! Logging initialization ([`logging`]) also lives here, since directing output
-//! to the systemd journal is itself a side effect (architecture §2).
+//! symlink-following writes. Logging initialization ([`logging`]) also lives
+//! here, since directing output to the systemd journal is itself a side effect
+//! (architecture §2). File *freshness*/conflict tracking (task 2.3) is domain
+//! logic and lives in [`crate::core::freshness`], not here — it only reads files
+//! to compare them, which needs no side-effect abstraction.
 
 // The command-execution boundary and the atomic file writer are foundational
 // infrastructure: they are consumed by the reload command table (task 4.4) and
