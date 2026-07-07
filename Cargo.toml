@@ -40,6 +40,16 @@ serde_json = { version = "1.0.150", features = ["preserve_order"] }
 # `signal` feature also enables the `process` module it depends on.
 nix = { version = "0.31.3", features = ["signal"] }
 
+# Waiting on a child process with a deadline for the `CommandRunner` real
+# implementation (architecture §6: every command runs with a 5 s timeout and is
+# killed if it exceeds it — task 2.1). This crate wraps the OS primitives
+# (`waitid`/self-pipe + `select` on Unix) to block efficiently until the child
+# exits *or* the deadline elapses, which is race-free and avoids the CPU cost
+# and added latency of a hand-rolled `try_wait` poll loop. It is a tiny,
+# long-stable, single-purpose crate with no transitive dependencies beyond
+# `libc`.
+wait-timeout = "0.2.1"
+
 [dev-dependencies]
 # Temporary directories/files for tests that install a fixture dotfiles tree
 # and exercise the atomic writer (architecture §9).

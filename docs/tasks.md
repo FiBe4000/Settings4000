@@ -32,8 +32,12 @@ Complexity: 1 = simple/repetitive … 5 = highly complex.
 
 ## 2. System boundary
 
-- [ ] **2.1 `CommandRunner` trait + real impl** — Complexity: 2
+- [x] **2.1 `CommandRunner` trait + real impl** — Complexity: 2
   Shell-free `Command` spawning (arg vectors), 5 s timeout, captured exit status/stderr; every invocation logged (cmd + exit, R7.3). Mock recorder impl for tests. *Accept:* unit tests via mock; real impl runs `true`/`false` correctly with timeout kill verified.
+  *Done:* implemented in `src/system/command.rs`:
+  - A `CommandRunner` trait over a shell-free `Command` (program + arg-vector builder — no `sh`, no string interpolation) and a real `SystemCommandRunner`. `run` returns `Ok(CommandOutput)` (captured exit code + full stdout/stderr; `success()` == exit 0) for a completed process, and a `CommandError` distinguishing spawn failure, timeout, and wait failure. Both pipes are drained on per-stream reader threads concurrently with the timed wait, so a large-output command (e.g. `pw-dump` JSON, well over the 64 KiB pipe buffer) cannot block on write and deadlock. Each invocation and its exit status is logged at `info` (R7.3) with a truncated stderr excerpt only at `debug`.
+  - The 5 s deadline is the named `DEFAULT_TIMEOUT` constant (architecture §6); a child that overruns it is killed and surfaces `CommandError::Timeout`. The wait-with-deadline uses the new `wait-timeout` = "0.2.1" dependency (race-free OS wait, no busy-poll). Tests inject a shorter timeout to verify the kill quickly while production stays at 5 s.
+  - A `#[cfg(test)]` `MockCommandRunner` records the exact program+args sequence and returns queued canned outcomes (defaulting to success), so callers can be tested without spawning processes (R6.1).
 
 - [ ] **2.2 Atomic file writer** — Complexity: 3
   Files are addressed by their XDG runtime path (`~/.config/…`), never a hardcoded `~/.dotfiles` path (R8.5). `fs::canonicalize` the target (a symlink into a dotfiles repo resolves to the repo file; a plain file resolves to itself) → `NamedTempFile` in the resolved target's dir → fsync → rename over the target (R5.4). Symlink preserved when present; plain files rewritten in place. Pre-write snapshot capture for rollback; write logged with resolved path (byte-level — changed-key logging lives in the apply orchestrator, R7.3). *Accept:* tests prove symlink target rewritten + link preserved, a plain (non-symlink) file rewritten in place, no partial file on injected failure, snapshot restore works.
