@@ -11,8 +11,11 @@ Complexity: 1 = simple/repetitive … 5 = highly complex.
 - [x] **1.2 CLI & logging init** — Complexity: 2
   `--log-level` flag; `EnvFilter` from `SETTINGS4000_LOG`/`RUST_LOG` (flag wins); journald layer with stderr fmt fallback when journald is unavailable (R7.1–R7.2). *Accept:* messages visible in `journalctl --user -t settings4000`; fallback exercised by unit test with journald socket absent.
 
-- [ ] **1.3 GtkApplication bootstrap + single instance** — Complexity: 2
+- [x] **1.3 GtkApplication bootstrap + single instance** — Complexity: 2
   Fixed app ID, `Application::register`; second launch activates the existing window and exits (R8.4). Empty `ApplicationWindow` shown. *Accept:* relaunching focuses the running window; process exits 0.
+  *Done:* implemented in `src/ui/app.rs`, wired from `main.rs`:
+  - Fixed ID `org.settings4000.Settings4000` with default (unique) flags; an explicit `register()` selects the primary/remote role, then `run_with_args` drives it — the primary shows an empty window on `activate`, while a relaunch (`is_remote()`) forwards `activate` to present the running window and exits 0.
+  - `main` parses the CLI with clap and forwards only `argv[0]` to GTK, so `--log-level` is never re-parsed by GApplication. The app-ID validity is unit-tested; relaunch-focus and exit-0 were verified live on the target session.
 
 - [ ] **1.4 CI / pre-commit gate** — Complexity: 1
   Wire `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` into CI and/or pre-commit (R6.1). *Accept:* pipeline fails on any of the three.

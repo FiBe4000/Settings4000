@@ -6,3 +6,9 @@
 //! dirty-tracking, or conflict logic ever lives in a widget. The main window
 //! (`GtkStackSidebar` + `GtkStack`) and the category pages are built here in
 //! later tasks (§5 of `docs/tasks.md`).
+//!
+//! Today the layer holds only the process bootstrap in [`app`]: the
+//! `gtk4::Application`, its single-instance registration (R8.4), and a
+//! placeholder empty window.
+
+pub(crate) mod app;

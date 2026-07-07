@@ -31,13 +31,16 @@ mod system;
 mod ui;
 
 use clap::Parser;
+use gtk4::glib;
 
 use crate::system::logging::LogLevel;
 
 /// Command-line interface for Settings4000 (R7.2).
 ///
-/// Only logging configuration is exposed today; the `gtk::Application`
-/// bootstrap and any further flags arrive in later tasks.
+/// Only logging configuration is exposed today. `clap` owns the command line in
+/// full: `main` parses it here before starting GTK, and the application then
+/// forwards only the program name (`argv[0]`) to GTK's own option handling (see
+/// [`ui::app::run`]), so GTK never sees or re-parses these flags.
 #[derive(Debug, Parser)]
 #[command(name = "settings4000", version, about)]
 struct Cli {
@@ -52,11 +55,11 @@ struct Cli {
 
 /// Program entry point.
 ///
-/// Parses the command line and initializes logging (task 1.2). The
-/// `gtk::Application` bootstrap with single-instance activation (task 1.3) is
-/// implemented in a subsequent task; for now the process starts up, records the
-/// selected logging backend, and exits.
-fn main() {
+/// Parses the command line, initializes logging (task 1.2), then builds and runs
+/// the single-instance `gtk4::Application` (task 1.3). The returned
+/// [`glib::ExitCode`] becomes the process exit status: on a relaunch that
+/// activates an already-running instance it is success (0), per R8.4.
+fn main() -> glib::ExitCode {
     let cli = Cli::parse();
 
     let backend = system::logging::init(cli.log_level);
@@ -66,6 +69,8 @@ fn main() {
         backend = ?backend,
         "settings4000 starting"
     );
+
+    ui::app::run()
 }
 
 #[cfg(test)]
