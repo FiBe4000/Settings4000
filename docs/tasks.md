@@ -5,7 +5,7 @@ Complexity: 1 = simple/repetitive … 5 = highly complex.
 
 ## 1. Project foundation
 
-- [ ] **1.1 Cargo project scaffold** — Complexity: 1
+- [x] **1.1 Cargo project scaffold** — Complexity: 1
   Init binary crate (2024 edition) with `gtk4`, `relm4`, `tracing`, `tracing-subscriber`, `tracing-journald`, `serde_json` (preserve_order), `tempfile` (dev), `nix` deps; module tree `ui/ core/ parsers/ system/` as in architecture §2. *Accept:* `cargo build` and `cargo test` pass on empty modules; a module-boundary check (grep-based test for `gtk` imports, or workspace crate split) fails if `core/` or `parsers/` import `gtk`.
 
 - [ ] **1.2 CLI & logging init** — Complexity: 2

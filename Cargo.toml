@@ -1,0 +1,39 @@
+[package]
+name = "settings4000"
+version = "0.1.0"
+edition = "2024"
+# Minimum supported Rust version. The 2024 edition was stabilized in Rust 1.85,
+# and all dependencies below are pinned to versions that build on 1.85.
+rust-version = "1.85"
+description = "Native GTK4 settings GUI for a dotfiles-managed Hyprland desktop"
+
+[dependencies]
+# GUI toolkit. Relm4 provides the declarative, message-driven component
+# framework; `gtk4` is the underlying binding. Both are pinned to the same 0.10
+# series so only a single `gtk4` version is present in the tree (architecture
+# §1). Only the `ui/` layer may use these — `core/` and `parsers/` must not
+# (enforced by tests/module_boundaries.rs).
+gtk4 = "0.10.3"
+relm4 = "0.10.0"
+
+# Structured logging to the systemd journal, with a stderr formatting layer as
+# fallback when journald is unavailable (R7.1). `EnvFilter`-based level control
+# (R7.2) is wired up in a later task.
+tracing = "0.1.44"
+tracing-journald = "0.3.2"
+tracing-subscriber = "0.3.23"
+
+# JSON editing for `swaync/config.json`. `preserve_order` keeps object key
+# order stable across a parse-modify-reserialize cycle so edits stay surgical
+# (architecture §3, task 3.4).
+serde_json = { version = "1.0.150", features = ["preserve_order"] }
+
+# Direct signal delivery without a shell: the reload path sends SIGUSR1 to
+# kitty PIDs via `nix::sys::signal::kill` (architecture §6, task 4.4). The
+# `signal` feature also enables the `process` module it depends on.
+nix = { version = "0.31.3", features = ["signal"] }
+
+[dev-dependencies]
+# Temporary directories/files for tests that install a fixture dotfiles tree
+# and exercise the atomic writer (architecture §9).
+tempfile = "3.27.0"
