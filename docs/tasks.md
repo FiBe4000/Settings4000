@@ -17,8 +17,12 @@ Complexity: 1 = simple/repetitive … 5 = highly complex.
   - Fixed ID `org.settings4000.Settings4000` with default (unique) flags; an explicit `register()` selects the primary/remote role, then `run_with_args` drives it — the primary shows an empty window on `activate`, while a relaunch (`is_remote()`) forwards `activate` to present the running window and exits 0.
   - `main` parses the CLI with clap and forwards only `argv[0]` to GTK, so `--log-level` is never re-parsed by GApplication. The app-ID validity is unit-tested; relaunch-focus and exit-0 were verified live on the target session.
 
-- [ ] **1.4 CI / pre-commit gate** — Complexity: 1
+- [x] **1.4 CI / pre-commit gate** — Complexity: 1
   Wire `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` into CI and/or pre-commit (R6.1). *Accept:* pipeline fails on any of the three.
+  *Done:* the gate runs as GitHub Actions and, optionally, as a local hook:
+  - `.github/workflows/ci.yml` runs the three checks as separate steps on push to `main` and on every pull request; a job fails as soon as any step exits non-zero, so the run fails on any one gate. It installs `libgtk-4-dev` (the `gtk4` crate needs system GTK to compile) and uses the version-pinned `actions/checkout@v4` and `Swatinem/rust-cache@v2` actions, plus `dtolnay/rust-toolchain@stable` which tracks the current stable Rust channel (rustfmt + clippy).
+  - `.githooks/pre-commit` mirrors the same three checks for local use; it is opt-in and version-controlled — enable it per clone with `git config core.hooksPath .githooks`.
+  - Decision: clippy runs with `--all-targets` so test code is linted too; each gate was verified to fail on an injected violation and pass on the clean tree.
 
 ## 2. System boundary
 

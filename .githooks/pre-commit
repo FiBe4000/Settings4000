@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Local pre-commit gate for Settings4000 (task 1.4, requirement R6.1).
+#
+# Runs the same three checks as the CI workflow (.github/workflows/ci.yml) so a
+# commit that would fail CI is caught before it is pushed. The commit is aborted
+# as soon as any check fails.
+#
+# This hook is opt-in and version-controlled — enable it once per clone with:
+#
+#     git config core.hooksPath .githooks
+#
+# and disable it again with `git config --unset core.hooksPath`. It is kept out
+# of the default hooks path on purpose: cloning the repository must never
+# silently change a contributor's git behaviour.
+#
+# Note: these checks run against the on-disk working tree, not the staged index,
+# so a partially staged commit is validated including its unstaged changes. This
+# matches how CI sees the tree and keeps the hook simple; run the gate manually
+# if you need to validate the staged content in isolation.
+set -euo pipefail
+
+echo "pre-commit: cargo fmt --all --check"
+cargo fmt --all --check
+
+echo "pre-commit: cargo clippy --all-targets -- -D warnings"
+cargo clippy --all-targets -- -D warnings
+
+echo "pre-commit: cargo test"
+cargo test
+
+echo "pre-commit: all gates passed"

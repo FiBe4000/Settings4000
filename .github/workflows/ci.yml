@@ -1,0 +1,74 @@
+# Continuous-integration gate for Settings4000 (task 1.4, requirement R6.1).
+#
+# Runs the project's three mandatory checks — formatting, lints-as-errors, and
+# the test suite — as separate steps in one job. GitHub Actions fails a job as
+# soon as any step exits non-zero, so the run fails if *any* of the three gates
+# fails, which is exactly the acceptance criterion for this task.
+name: CI
+
+# Gate every push to the default branch and every pull request. This is the
+# authoritative pre-merge check; the optional local hook in `.githooks/`
+# mirrors it for faster feedback before pushing.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least-privilege token: this job only reads the repository to build and test
+# it, so drop the default broader `GITHUB_TOKEN` scope to read-only. This limits
+# the blast radius if a step (or a third-party action) were ever compromised.
+permissions:
+  contents: read
+
+# A newer commit on the same branch/PR makes an in-flight run obsolete, so
+# cancel it to save CI minutes and return the latest result faster.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install GTK 4 development libraries
+        # The `gtk4` crate links against the system GTK 4 through pkg-config, so
+        # the headers and `.pc` files must be present before any cargo step can
+        # compile the crate. `libgtk-4-dev` pulls in the glib/cairo/pango/gdk
+        # dev packages transitively, so it is the only package we need to name.
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libgtk-4-dev
+
+      - name: Install the Rust toolchain with rustfmt and clippy
+        # `dtolnay/rust-toolchain` is the de-facto standard action for this; the
+        # `@stable` ref selects the current stable channel and the components are
+        # required by the fmt and clippy gates below.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry, index, and build outputs
+        # Keyed on the toolchain and Cargo.lock, so a green run only reuses
+        # artifacts that are still valid. Purely a speed optimisation — it never
+        # affects whether a gate passes or fails.
+        uses: Swatinem/rust-cache@v2
+
+      # The three gates, one step each. Kept as three distinct steps (rather
+      # than one combined script) so the failing gate is obvious at a glance in
+      # the run summary. Per CLAUDE.md the canonical gate is
+      # `cargo fmt --check` / `cargo clippy -D warnings` / `cargo test`.
+      - name: Formatting gate — cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: Lint gate — cargo clippy -D warnings
+        # `--all-targets` extends the documented gate to lint tests and any
+        # future examples/benches as well, so lints in test code are caught too;
+        # `-D warnings` promotes every warning to an error (R6.1).
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test gate — cargo test
+        run: cargo test
