@@ -9,3 +9,7 @@
 //!
 //! The concrete abstractions (`CommandRunner`, the atomic writer, freshness
 //! tracking) are added in the System-boundary tasks (§2 of `docs/tasks.md`).
+//! Logging initialization ([`logging`]) also lives here, since directing output
+//! to the systemd journal is itself a side effect (architecture §2).
+
+pub mod logging;

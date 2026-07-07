@@ -30,10 +30,66 @@ mod parsers;
 mod system;
 mod ui;
 
+use clap::Parser;
+
+use crate::system::logging::LogLevel;
+
+/// Command-line interface for Settings4000 (R7.2).
+///
+/// Only logging configuration is exposed today; the `gtk::Application`
+/// bootstrap and any further flags arrive in later tasks.
+#[derive(Debug, Parser)]
+#[command(name = "settings4000", version, about)]
+struct Cli {
+    /// Minimum log level (`debug`, `info`, `warn`, `error`).
+    ///
+    /// When set, this overrides the `SETTINGS4000_LOG` and `RUST_LOG`
+    /// environment variables; when unset, those are consulted, defaulting to
+    /// `info` (R7.2).
+    #[arg(long, value_name = "LEVEL")]
+    log_level: Option<LogLevel>,
+}
+
 /// Program entry point.
 ///
-/// This is a scaffold placeholder: CLI parsing and logging init (task 1.2) and
-/// the `gtk::Application` bootstrap with single-instance activation (task 1.3)
-/// are implemented in subsequent tasks. It exists so the crate builds and the
-/// module tree is wired up.
-fn main() {}
+/// Parses the command line and initializes logging (task 1.2). The
+/// `gtk::Application` bootstrap with single-instance activation (task 1.3) is
+/// implemented in a subsequent task; for now the process starts up, records the
+/// selected logging backend, and exits.
+fn main() {
+    let cli = Cli::parse();
+
+    let backend = system::logging::init(cli.log_level);
+
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        backend = ?backend,
+        "settings4000 starting"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_level_flag_parses_to_the_matching_level() {
+        let cli = Cli::try_parse_from(["settings4000", "--log-level", "debug"])
+            .expect("`--log-level debug` should parse");
+        assert_eq!(cli.log_level, Some(LogLevel::Debug));
+    }
+
+    #[test]
+    fn log_level_defaults_to_none_when_flag_is_absent() {
+        let cli = Cli::try_parse_from(["settings4000"]).expect("no flags should parse");
+        assert_eq!(cli.log_level, None);
+    }
+
+    #[test]
+    fn an_invalid_log_level_is_rejected() {
+        // clap validates against the `LogLevel` value set, so a typo is an error
+        // rather than being silently ignored.
+        let result = Cli::try_parse_from(["settings4000", "--log-level", "verbose"]);
+        assert!(result.is_err());
+    }
+}

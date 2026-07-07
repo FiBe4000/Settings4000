@@ -16,12 +16,19 @@ description = "Native GTK4 settings GUI for a dotfiles-managed Hyprland desktop"
 gtk4 = "0.10.3"
 relm4 = "0.10.0"
 
+# Command-line argument parsing (R7.2). Only the `--log-level` flag exists
+# today, but clap's derive API gives typed parsing, value validation, and a
+# generated `--help` for free, and scales cleanly as more flags appear. Used by
+# `main.rs` and `system/` only — never by the GTK-free `core/`/`parsers/` layers.
+clap = { version = "4.6.1", features = ["derive"] }
+
 # Structured logging to the systemd journal, with a stderr formatting layer as
-# fallback when journald is unavailable (R7.1). `EnvFilter`-based level control
-# (R7.2) is wired up in a later task.
+# fallback when journald is unavailable (R7.1). The `env-filter` feature enables
+# `EnvFilter`, which drives the configurable log levels sourced from
+# `SETTINGS4000_LOG`/`RUST_LOG` and the `--log-level` flag (R7.2).
 tracing = "0.1.44"
 tracing-journald = "0.3.2"
-tracing-subscriber = "0.3.23"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # JSON editing for `swaync/config.json`. `preserve_order` keeps object key
 # order stable across a parse-modify-reserialize cycle so edits stay surgical

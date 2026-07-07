@@ -8,7 +8,7 @@ Complexity: 1 = simple/repetitive … 5 = highly complex.
 - [x] **1.1 Cargo project scaffold** — Complexity: 1
   Init binary crate (2024 edition) with `gtk4`, `relm4`, `tracing`, `tracing-subscriber`, `tracing-journald`, `serde_json` (preserve_order), `tempfile` (dev), `nix` deps; module tree `ui/ core/ parsers/ system/` as in architecture §2. *Accept:* `cargo build` and `cargo test` pass on empty modules; a module-boundary check (grep-based test for `gtk` imports, or workspace crate split) fails if `core/` or `parsers/` import `gtk`.
 
-- [ ] **1.2 CLI & logging init** — Complexity: 2
+- [x] **1.2 CLI & logging init** — Complexity: 2
   `--log-level` flag; `EnvFilter` from `SETTINGS4000_LOG`/`RUST_LOG` (flag wins); journald layer with stderr fmt fallback when journald is unavailable (R7.1–R7.2). *Accept:* messages visible in `journalctl --user -t settings4000`; fallback exercised by unit test with journald socket absent.
 
 - [ ] **1.3 GtkApplication bootstrap + single instance** — Complexity: 2
