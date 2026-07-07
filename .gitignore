@@ -1,0 +1,6 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Claude Code per-user settings (shared config under .claude/ stays tracked)
+.claude/settings.local.json
