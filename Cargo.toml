@@ -50,7 +50,11 @@ nix = { version = "0.31.3", features = ["signal"] }
 # `libc`.
 wait-timeout = "0.2.1"
 
-[dev-dependencies]
-# Temporary directories/files for tests that install a fixture dotfiles tree
-# and exercise the atomic writer (architecture §9).
+# Atomic file writes (task 2.2). The file writer stages new content in a
+# `NamedTempFile` created in the resolved target's own directory, fsyncs it, then
+# atomically renames it over the target so a write is transactional and never
+# leaves a partial config (R5.4). This was a dev-dependency while only tests used
+# temporary directories, but `NamedTempFile` is now used in production code, so
+# it must be a regular dependency (which also keeps it available to the tests
+# that build fixture dotfiles trees, architecture §9).
 tempfile = "3.27.0"
