@@ -30,6 +30,12 @@
 //!    re-reads the tracked files; any that changed externally have their originals
 //!    reloaded from disk so a later Apply does not silently clobber those edits
 //!    (R5.6).
+//! 5. **Commit.** After the Apply pipeline ([`crate::core::apply`]) reports a
+//!    successful apply, [`SettingsStore::commit_apply`] promotes the staged values to
+//!    originals and re-baselines the written files' freshness — the pipeline is a
+//!    pure orchestrator and never touches the store, so this is what reconciles the
+//!    store with what was just written (and stops the app's own write from looking
+//!    like an external edit on the next Apply).
 //!
 //! # Why the freshness baseline is taken from the store's own bytes
 //!
@@ -347,6 +353,46 @@ impl SettingsStore {
         tracing::debug!("discarded all staged edits");
     }
 
+    /// Commits a successful Apply: promotes every pending staged edit to its
+    /// `original` and re-baselines the written files' freshness (architecture §6;
+    /// task 4.5).
+    ///
+    /// The Apply pipeline ([`crate::core::apply`]) is a pure orchestrator and never
+    /// touches the store, so after it returns [`ApplyOutcome::Applied`](crate::core::apply::ApplyOutcome::Applied)
+    /// the UI (task 5.3) calls this to reconcile the store with what was just
+    /// written. It does two things:
+    ///
+    /// 1. **Promote staged → original.** An `Applied` outcome means every staged
+    ///    value reached disk, so each becomes the new baseline and the store is clean
+    ///    again (dirty is `false`). Every pending edit is promoted, since the caller
+    ///    must have included every dirty setting in the applied plan (the apply
+    ///    contract); a staged value equal to its original is harmlessly promoted too.
+    /// 2. **Re-baseline the written files.** `written` pairs each written file's
+    ///    **live** path (the same key the store tracked it under — freshness is keyed
+    ///    by the live XDG path, not the symlink-resolved target) with the exact bytes
+    ///    written. Fingerprinting those bytes with [`FreshnessTracker::record_bytes`]
+    ///    — rather than re-reading the file — is what stops the app's own write from
+    ///    being mistaken for an external edit on the next Apply's conflict check, and
+    ///    it avoids the read→baseline TOCTOU window `record_bytes` exists for (an edit
+    ///    landing between the write and a re-read would otherwise be silently
+    ///    baselined as ours). A file absent from `written` keeps its prior baseline.
+    ///
+    /// This never fails: it only mutates in-memory state.
+    pub(crate) fn commit_apply(&mut self, written: &[(PathBuf, Vec<u8>)]) {
+        for entry in self.settings.values_mut() {
+            if let Some(staged) = entry.staged.take() {
+                entry.original = staged;
+            }
+        }
+        for (path, bytes) in written {
+            self.freshness.record_bytes(path, bytes);
+        }
+        tracing::debug!(
+            files = written.len(),
+            "committed applied edits: promoted staged values and re-baselined written files"
+        );
+    }
+
     /// Whether any file-backed setting has a pending edit differing from its original.
     ///
     /// Drives the suggested-action Apply button (R5.1).
@@ -550,6 +596,43 @@ mod tests {
             store.value(SettingId::NotificationTimeout),
             Some(&Value::Integer(300)),
             "after reset the effective value is the original again"
+        );
+    }
+
+    #[test]
+    fn commit_apply_promotes_staged_and_rebaselines_written_files() {
+        // The task-4.5 commit contract: after a successful apply the store must
+        // become clean with the staged values as the new originals, AND treat the
+        // just-written on-disk bytes as the freshness baseline — so the app's own
+        // write is not a spurious conflict on the next refresh/apply.
+        let dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let mut store = SettingsStore::new();
+        let path = load_timeout(&mut store, dir.path(), 300);
+
+        store
+            .stage(SettingId::NotificationTimeout, Value::Integer(120))
+            .expect("stage a pending edit");
+        assert!(store.is_dirty());
+
+        // The Apply pipeline would have written the new value to disk; mimic that,
+        // then commit with the exact bytes written (as the pipeline reports them).
+        fs::write(&path, "120").expect("apply writes the new value to disk");
+        store.commit_apply(&[(path.clone(), b"120".to_vec())]);
+
+        assert!(!store.is_dirty(), "commit clears dirty");
+        assert!(store.dirty_ids().is_empty());
+        assert_eq!(
+            store.original(SettingId::NotificationTimeout),
+            Some(&Value::Integer(120)),
+            "the staged value is promoted to the original"
+        );
+
+        // The re-baseline is load-bearing: a refresh now finds no conflict even
+        // though the file differs from the pre-apply baseline (300). Without the
+        // re-baseline this would report the app's own write as an external change.
+        assert!(
+            store.refresh().is_empty(),
+            "the written bytes are the new baseline, so refresh finds no self-conflict"
         );
     }
 

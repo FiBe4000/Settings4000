@@ -60,10 +60,19 @@ pub mod store;
 // backing file to the ordered, capability-gated reload actions its change requires
 // and runs each action through the `CommandRunner`/`ProcessSignaller` seams. It is
 // consumed by the Apply pipeline (task 4.5), which orders it after the file writes
-// and decides how to surface reload failures — and which does not exist yet. Until
-// it wires the table in, the public surface is exercised only by this module's own
-// tests, so a non-test build would flag every item as dead code. Scope the
-// allowance to `not(test)` so the lint stays active in test builds (where the
-// surface is used); remove it once 4.5 consumes the table.
+// and decides how to surface reload failures.
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod reload;
+
+// The Apply pipeline orchestrator (task 4.5; architecture §6; R5.3–R5.6, R8.3). It
+// runs the fixed order — validate all, conflict-check, atomic writes with per-file
+// rollback, the palette `generate-colors` step last, then the changed+running
+// reloads — over an `ApplyPlan` a page assembles from staged edits and the parsers,
+// returning a structured `ApplyOutcome`. It ties together the writer (2.2),
+// freshness (2.3), model (4.1), store (4.2), detection (4.3), and reload table
+// (4.4). It is consumed by the UI Apply chrome (task 5.3), which is not wired in
+// yet, so in a non-test build its public surface is exercised only by its own
+// tests. Scope the `dead_code` allowance to `not(test)` so the lint stays active in
+// test builds (where the surface is used); remove it once 5.3 consumes the pipeline.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod apply;
