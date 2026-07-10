@@ -21,6 +21,19 @@
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod freshness;
 
+// Installed-app / capabilities detection (task 4.3; R4.1–R4.4, R2.2, R3.2, R8.5).
+// It runs the binary/daemon/portal/palette-source/config probes once at startup
+// and is re-run on manual refresh, producing a plain `Capabilities` struct. That
+// struct is consumed by the UI (tasks 5.x/6.x) to hide unsupported rows/pages, by
+// the reload table (task 4.4) to skip reloads for stopped components, and by the
+// Apply pipeline (task 4.5) for the palette source's repo root — none of which
+// exist yet. Until they wire it in, its public surface is exercised only by its own
+// tests, so a non-test build would flag every item as dead code. Scope the
+// allowance to `not(test)` so the `dead_code` lint stays active in test builds
+// (where the surface is used); remove it once 4.4/4.5/5.x consume detection.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod detect;
+
 // The typed settings model + validators (task 4.1; R8.3). It is consumed by the
 // SettingsStore (task 4.2), which stores an `original`/`staged` `Value` per
 // `SettingId`, and by the Apply pipeline (task 4.5), which validates every staged
