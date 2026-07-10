@@ -475,6 +475,34 @@ impl Capabilities {
     }
 }
 
+#[cfg(test)]
+impl Capabilities {
+    /// Builds a [`Capabilities`] directly from explicit sets, for tests in other
+    /// modules that need a precise capability combination without constructing a
+    /// full [`DetectionInputs`] filesystem fixture.
+    ///
+    /// This is the seam the reload-table tests (task 4.4) use to drive
+    /// capability-gating: they pass exactly the binaries and live daemons a
+    /// scenario requires. `settings_portal`, `palette_source`, and
+    /// `unreadable_configs` are irrelevant to the reload table, so they are fixed to
+    /// their "absent"/empty forms; a test that needs them exercises the real
+    /// [`Capabilities::detect`] path instead.
+    pub(crate) fn for_tests(
+        binaries: &[Binary],
+        live_daemons: &[Daemon],
+        hyprland_ipc: bool,
+    ) -> Capabilities {
+        Capabilities {
+            present_binaries: binaries.iter().copied().collect(),
+            live_daemons: live_daemons.iter().copied().collect(),
+            hyprland_ipc,
+            settings_portal: false,
+            palette_source: None,
+            unreadable_configs: BTreeSet::new(),
+        }
+    }
+}
+
 /// Scans `path` for each [`Binary`], returning those found (a `which`-equivalent,
 /// architecture §4).
 ///

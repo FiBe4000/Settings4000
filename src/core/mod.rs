@@ -55,3 +55,15 @@ pub mod model;
 // remove it once the UI/apply pipeline wire the store in.
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod store;
+
+// The reload command table (task 4.4; architecture §6). It maps each changed
+// backing file to the ordered, capability-gated reload actions its change requires
+// and runs each action through the `CommandRunner`/`ProcessSignaller` seams. It is
+// consumed by the Apply pipeline (task 4.5), which orders it after the file writes
+// and decides how to surface reload failures — and which does not exist yet. Until
+// it wires the table in, the public surface is exercised only by this module's own
+// tests, so a non-test build would flag every item as dead code. Scope the
+// allowance to `not(test)` so the lint stays active in test builds (where the
+// surface is used); remove it once 4.5 consumes the table.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod reload;
