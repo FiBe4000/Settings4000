@@ -31,3 +31,14 @@ pub mod freshness;
 // surface is used); remove it once 4.2/4.5 consume the model.
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod model;
+
+// The staging state machine (task 4.2; R5.1, R5.2, R5.6). It holds an
+// `original`/`staged` `Value` per `SettingId`, tracks dirty state, and reloads
+// originals on external-edit conflict. It builds on `model` and `freshness`, and is
+// itself consumed by the UI (task 5.x) and the Apply pipeline (task 4.5) — neither
+// of which exists yet — so in a non-test build its surface is exercised only by its
+// own tests and would otherwise trip the `dead_code` lint. Scope the allowance to
+// `not(test)` so the lint stays active in test builds (where the surface is used);
+// remove it once the UI/apply pipeline wire the store in.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod store;

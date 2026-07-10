@@ -34,6 +34,9 @@
 //!   UI know which widget to build and how to coerce input);
 //! - [`SettingId::category`] — which [`Category`] it belongs to (so the store can
 //!   roll dirty state up per page);
+//! - [`SettingId::backing`] — whether the setting is staged to a file until Apply
+//!   (R5.1) or applied to the live session immediately, bypassing staging (R5.2),
+//!   so the store and the UI dispatcher route the edit correctly;
 //! - the match in [`SettingId::validate`] — which validator (if any) guards it.
 //!
 //! Keeping this in one enum, rather than scattering ad-hoc string keys across
@@ -64,11 +67,17 @@ use crate::parsers::palette::is_bare_hex;
 /// [`SettingId::category`] maps each setting to its page so the store (task 4.2)
 /// can compute a per-page "modified" indicator by grouping dirty settings.
 ///
-/// Only the file-backed pages that own staged, validated settings appear here.
-/// Sound and Network are deliberately absent: they are runtime-only (R3.1, R5.2) —
-/// their controls apply immediately via system commands and hold no staged
-/// [`Value`], so there is nothing for this model to represent. A page adds its
-/// variant here when it introduces its first staged [`SettingId`].
+/// Only pages that own at least one staged, validated setting appear here. Sound
+/// and Network are deliberately absent: they are runtime-only (R3.1, R5.2) — their
+/// controls apply immediately via system commands and hold no staged [`Value`], so
+/// there is no whole page for this model to represent. A page adds its variant here
+/// when it introduces its first staged [`SettingId`].
+///
+/// A page can still be file-backed *and* carry an individual runtime-only control:
+/// the laptop-display toggle lives on the file-backed [`Display`](Self::Display)
+/// page yet is itself runtime-only (see [`SettingId::backing`]), so it is modelled
+/// as a [`SettingId`] for routing but never contributes a staged value or dirty
+/// state to its category.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Category {
     /// Per-monitor display settings backed by `monitors.conf` (task 6.1).
@@ -82,6 +91,29 @@ pub(crate) enum Category {
     Notifications,
     /// Idle timeouts and the lock command backed by `hypridle.conf` (task 6.8).
     PowerAndIdle,
+}
+
+/// Whether a setting's value is staged to a config file or applied to the live
+/// session immediately.
+///
+/// This is the routing marker that the [`SettingsStore`](crate::core) (task 4.2)
+/// and the UI dispatcher use to decide, for a given edit, between *staging* it until
+/// the user clicks Apply (R5.1) and *applying it immediately*, bypassing staging
+/// entirely (R5.2). Because it is an intrinsic, unchanging property of the setting
+/// (audio volume is always live; a monitor mode is always file-backed), it is
+/// declared once on [`SettingId`] via [`SettingId::backing`] rather than being
+/// decided per edit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Backing {
+    /// The value is written to a config file and only takes effect on Apply. The
+    /// store keeps it as an `original`/`staged` pair, and it contributes to dirty
+    /// state and the per-page rollup (R5.1).
+    FileBacked,
+    /// The value is pushed to the running session immediately via a system command
+    /// and touches no config file, so it is never staged and never dirty (R5.2) —
+    /// e.g. audio volume/mute or the laptop-display toggle. The store holds no
+    /// value for such a setting.
+    RuntimeOnly,
 }
 
 /// A stable identifier for a single editable setting.
@@ -104,6 +136,13 @@ pub(crate) enum SettingId {
     MonitorMode,
     /// A monitor's fractional scale factor (e.g. `1.333333`).
     MonitorScale,
+    /// Whether the laptop's internal display is enabled. Runtime-only (R5.2): the
+    /// toggle drives the existing hotplug mechanism (the
+    /// `/tmp/hypr-laptop-display-forced` state file, task 6.1) and applies
+    /// immediately, so it is never staged and never dirty. It is modelled as a
+    /// [`SettingId`] purely so the UI can route it by [`SettingId::backing`]; the
+    /// store (task 4.2) never holds an `original`/`staged` value for it.
+    LaptopDisplayEnabled,
 
     // --- Theme (tasks 6.3–6.5) ---
     /// A single palette color as bare hex. Not surfaced by the v1 UI — palette
@@ -157,7 +196,9 @@ impl SettingId {
             | SettingId::DimTimeout
             | SettingId::LockTimeout
             | SettingId::DpmsTimeout => ValueKind::Integer,
-            SettingId::TouchpadNaturalScroll | SettingId::TouchpadTapToClick => ValueKind::Bool,
+            SettingId::TouchpadNaturalScroll
+            | SettingId::TouchpadTapToClick
+            | SettingId::LaptopDisplayEnabled => ValueKind::Bool,
             SettingId::PaletteColor
             | SettingId::WallpaperPath
             | SettingId::LockBackgroundPath
@@ -171,7 +212,9 @@ impl SettingId {
     /// per-page "modified" marker.
     pub(crate) fn category(&self) -> Category {
         match self {
-            SettingId::MonitorMode | SettingId::MonitorScale => Category::Display,
+            SettingId::MonitorMode | SettingId::MonitorScale | SettingId::LaptopDisplayEnabled => {
+                Category::Display
+            }
             SettingId::PaletteColor | SettingId::WallpaperPath | SettingId::LockBackgroundPath => {
                 Category::Theme
             }
@@ -185,6 +228,38 @@ impl SettingId {
             | SettingId::LockTimeout
             | SettingId::DpmsTimeout
             | SettingId::LockCommand => Category::PowerAndIdle,
+        }
+    }
+
+    /// Whether this setting is staged to a file or applied to the live session
+    /// immediately (R5.1/R5.2).
+    ///
+    /// See [`Backing`]. The store (task 4.2) calls this at the point an edit is
+    /// staged: a [`Backing::RuntimeOnly`] setting bypasses staging and is applied
+    /// at once, so it never becomes dirty. The match is exhaustive on purpose —
+    /// adding a [`SettingId`] variant without classifying it fails to compile, which
+    /// forces every new setting to declare how it reaches the system.
+    pub(crate) fn backing(&self) -> Backing {
+        match self {
+            // Runtime-only: applied to the live session immediately, never staged
+            // (R5.2). The laptop-display toggle drives the hotplug state file
+            // directly rather than editing a config.
+            SettingId::LaptopDisplayEnabled => Backing::RuntimeOnly,
+            // Everything else is written to a config file and staged until Apply.
+            SettingId::MonitorMode
+            | SettingId::MonitorScale
+            | SettingId::PaletteColor
+            | SettingId::WallpaperPath
+            | SettingId::LockBackgroundPath
+            | SettingId::MouseSensitivity
+            | SettingId::TouchpadNaturalScroll
+            | SettingId::TouchpadTapToClick
+            | SettingId::NotificationPosition
+            | SettingId::NotificationTimeout
+            | SettingId::DimTimeout
+            | SettingId::LockTimeout
+            | SettingId::DpmsTimeout
+            | SettingId::LockCommand => Backing::FileBacked,
         }
     }
 
@@ -227,10 +302,15 @@ impl SettingId {
             ) => validate_int_range(*seconds, &TIMEOUT_SECONDS_RANGE),
             // No value-format rule: a boolean switch, a free-text command, or a
             // drop-down whose every option is valid. The kind match above is the
-            // only constraint.
-            (SettingId::TouchpadNaturalScroll | SettingId::TouchpadTapToClick, Value::Bool(_)) => {
-                Ok(())
-            }
+            // only constraint. `LaptopDisplayEnabled` is runtime-only (R5.2) and
+            // never reaches the Apply pipeline, but is validated for its kind here
+            // so the whole enum has uniform, guarded validation.
+            (
+                SettingId::TouchpadNaturalScroll
+                | SettingId::TouchpadTapToClick
+                | SettingId::LaptopDisplayEnabled,
+                Value::Bool(_),
+            ) => Ok(()),
             (SettingId::NotificationPosition, Value::Enum(_)) => Ok(()),
             (SettingId::LockCommand, Value::String(_)) => Ok(()),
             // Anything left over is a value whose kind does not match the setting.
@@ -738,6 +818,7 @@ mod tests {
     const ALL_SETTING_IDS: &[SettingId] = &[
         SettingId::MonitorMode,
         SettingId::MonitorScale,
+        SettingId::LaptopDisplayEnabled,
         SettingId::PaletteColor,
         SettingId::WallpaperPath,
         SettingId::LockBackgroundPath,
@@ -759,6 +840,7 @@ mod tests {
         match id {
             SettingId::MonitorMode
             | SettingId::MonitorScale
+            | SettingId::LaptopDisplayEnabled
             | SettingId::PaletteColor
             | SettingId::WallpaperPath
             | SettingId::LockBackgroundPath
@@ -780,6 +862,7 @@ mod tests {
         match id {
             SettingId::MonitorMode => Value::Enum("2880x1800@120".to_string()),
             SettingId::MonitorScale => Value::Float(1.333_333),
+            SettingId::LaptopDisplayEnabled => Value::Bool(true),
             SettingId::PaletteColor => Value::String("83c092".to_string()),
             // A path validity test needs a real file, so these two are exercised
             // separately in the image-path tests; here just use a plausible-kind
@@ -869,6 +952,26 @@ mod tests {
             Category::Notifications
         );
         assert_eq!(SettingId::LockCommand.category(), Category::PowerAndIdle);
+    }
+
+    #[test]
+    fn backing_marks_only_the_laptop_toggle_runtime_only() {
+        // The routing marker the store's bypass depends on (R5.2): the
+        // laptop-display toggle is the sole runtime-only setting today; every other
+        // setting is file-backed and staged (R5.1). Iterating the exhaustive list
+        // keeps this honest as the enum grows.
+        assert_eq!(
+            SettingId::LaptopDisplayEnabled.backing(),
+            Backing::RuntimeOnly
+        );
+        for &id in ALL_SETTING_IDS {
+            let expected = if id == SettingId::LaptopDisplayEnabled {
+                Backing::RuntimeOnly
+            } else {
+                Backing::FileBacked
+            };
+            assert_eq!(id.backing(), expected, "unexpected backing for {id:?}");
+        }
     }
 
     #[test]
