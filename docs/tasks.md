@@ -106,8 +106,12 @@ Complexity: 1 = simple/repetitive … 5 = highly complex.
 
 ## 4. Core domain (GTK-free — R6.2)
 
-- [ ] **4.1 Typed settings model + validators** — Complexity: 3
+- [x] **4.1 Typed settings model + validators** — Complexity: 3
   `SettingId`, typed values (enum/bool/float/string), per-setting validation: hex colors, `WxH@Hz` mode strings, timeout/sensitivity/scale ranges, file paths (exists + readable + image extension for wallpaper/lock background) (R8.3). *Accept:* unit tests per validator, valid + invalid cases.
+  *Done:* implemented in `src/core/model.rs` (GTK-free domain logic — R6.2):
+  - `SettingId` is a fieldless enum — the central registry of every editable setting, used as the store's key (task 4.2) and validated by the Apply pipeline (task 4.5). Each variant declares its `kind()` (a `ValueKind`) and `category()` (its sidebar page, for the store's per-page dirty rollup); a page adds a setting by adding a variant and extending those mappings plus the `validate` match. `Value` is a typed union — `Enum`/`Bool`/`Float`/`Integer`/`String` with typed accessors — where `Integer` is kept distinct from `Float` so whole-number settings (timeouts) never gain a fractional part or emit `300.0` into a config expecting `300`.
+  - `SettingId::validate(&Value)` first requires the value's kind to match (`WrongKind`), then dispatches to the value-format validator; the returned `ValidationError` renders a UI-ready message via `Display` (R8.3). Validators: bare six-hex-digit color (reuses the task-3.1 `is_bare_hex`); monitor mode accepting a bare `WxH`, a full `WxH@Hz`, or the `preferred`/`highres`/`highrr` tokens (dimensions 1–16384 px, and when present a 1–1000 Hz refresh); numeric ranges `SENSITIVITY_RANGE` (-1.0..=1.0), `SCALE_RANGE` (0.5..=3.0), `TIMEOUT_SECONDS_RANGE` (1..=86400 s); and an image-path check (exists + regular file + png/jpg/jpeg/webp extension + readable, following symlinks, no panic on an IO error).
+  - Unit-tested per validator with valid and invalid cases (hex length/chars/`#`-prefix; malformed and out-of-range modes; range boundaries and just-outside; image path missing/directory/non-image/unreadable via a `tempfile` fixture), plus dispatch, wrong-kind, and `Display`-message coverage; the module-boundary guard confirms `core/` stays GTK-free.
 
 - [ ] **4.2 SettingsStore (staging state machine)** — Complexity: 3
   `original`/`staged` per setting; dirty computation, per-page dirty rollup, `stage()`, `reset()`, conflict-triggered reload of originals (R5.1, R5.6). Runtime-only settings bypass staging (R5.2). *Accept:* headless tests cover stage→dirty→reset→clean, conflict reload, and bypass paths.

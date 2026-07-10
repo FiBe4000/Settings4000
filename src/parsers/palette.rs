@@ -537,7 +537,12 @@ fn is_key_char(c: char) -> bool {
 ///
 /// Case-insensitive, matching how hex is read downstream; the dotfiles write
 /// lowercase but either case is a valid color.
-fn is_bare_hex(value: &str) -> bool {
+///
+/// Exposed at crate scope because it is the single definition of "a palette
+/// color": the typed settings model's hex validator ([`crate::core::model`], task
+/// 4.1, R8.3) reuses it so the parser's write guard and the pipeline's pre-write
+/// validation cannot disagree about what a valid color is.
+pub(crate) fn is_bare_hex(value: &str) -> bool {
     value.len() == 6 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
