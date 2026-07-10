@@ -68,3 +68,14 @@ pub mod ini;
 // active in test builds; remove it once 4.2/6.4 consume the editor.
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod env;
+
+// The generated-file readers (task 3.7) will be consumed by capabilities
+// detection (task 4.3, active-scheme detection) and the palette theme page
+// (task 6.3, active-scheme preselect + per-scheme swatches) — neither of which
+// exists yet. Until they wire it in, its public surface is exercised only by its
+// own tests, so a non-test build would flag every item as dead code. Scope the
+// allowance to `not(test)` so the `dead_code` lint stays active in test builds;
+// remove it once 4.3/6.3 consume the readers. Unlike the sibling modules this one
+// is read-only — the generated files must never be written by the app.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod generated;
