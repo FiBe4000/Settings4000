@@ -29,3 +29,12 @@ pub mod palette;
 // lint stays active in test builds; remove it once those tasks consume it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod hyprlang;
+
+// The monitors.conf record parser (task 3.3) will be consumed by the
+// SettingsStore (task 4.2) and the Display page (task 6.1) — neither of which
+// exists yet. Until they wire it in, its public surface is exercised only by its
+// own tests, so a non-test build would flag every item as dead code. Scope the
+// allowance to `not(test)` so the `dead_code` lint stays active in test builds;
+// remove it once 4.2/6.1 consume the parser.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod monitors;
