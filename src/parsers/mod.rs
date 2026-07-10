@@ -20,3 +20,12 @@
 // remove it once 4.2/6.3 consume the parser.
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod palette;
+
+// The hyprlang parser (task 3.2) will be consumed by the SettingsStore (task 4.2)
+// and the input (6.6), power/idle (6.8), wallpaper/lock (6.5), and cursor-env
+// (6.4) pages — none of which exist yet. Until they wire it in, its public
+// surface is exercised only by its own tests, so a non-test build would flag
+// every item as dead code. Scope the allowance to `not(test)` so the `dead_code`
+// lint stays active in test builds; remove it once those tasks consume it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod hyprlang;
