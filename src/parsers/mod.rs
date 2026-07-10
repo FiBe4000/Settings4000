@@ -38,3 +38,13 @@ pub mod hyprlang;
 // remove it once 4.2/6.1 consume the parser.
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod monitors;
+
+// The swaync JSON adapter (task 3.4) will be consumed by the SettingsStore
+// (task 4.2) and the Notifications page (task 6.7, which edits position,
+// timeouts, and a do-not-disturb toggle) — neither of which exists yet. Until
+// they wire it in, its public surface is exercised only by its own tests, so a
+// non-test build would flag every item as dead code. Scope the allowance to
+// `not(test)` so the `dead_code` lint stays active in test builds; remove it
+// once 4.2/6.7 consume the adapter.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod swaync;
