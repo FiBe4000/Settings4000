@@ -58,3 +58,13 @@ pub mod swaync;
 // remove it once 4.2/6.4 consume the editor.
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod ini;
+
+// The uwsm/env editor (task 3.6) will be consumed by the SettingsStore (task 4.2)
+// and the Theme page (task 6.4): it writes the `uwsm/env` copy of the cursor
+// theme/size and reads the `GTK_THEME` override that gates the GTK-theme drop-down
+// (R3.3) — neither of which exists yet. Until they wire it in, its public surface
+// is exercised only by its own tests, so a non-test build would flag every item
+// as dead code. Scope the allowance to `not(test)` so the `dead_code` lint stays
+// active in test builds; remove it once 4.2/6.4 consume the editor.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod env;
