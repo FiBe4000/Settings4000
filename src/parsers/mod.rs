@@ -48,3 +48,13 @@ pub mod monitors;
 // once 4.2/6.7 consume the adapter.
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod swaync;
+
+// The GTK settings.ini editor (task 3.5) will be consumed by the SettingsStore
+// (task 4.2) and the Theme page (task 6.4, which writes the same theme/icon/
+// cursor values into both gtk-3.0 and gtk-4.0 settings.ini) — neither of which
+// exists yet. Until they wire it in, its public surface is exercised only by its
+// own tests, so a non-test build would flag every item as dead code. Scope the
+// allowance to `not(test)` so the `dead_code` lint stays active in test builds;
+// remove it once 4.2/6.4 consume the editor.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod ini;
