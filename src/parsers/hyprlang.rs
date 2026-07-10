@@ -1025,7 +1025,14 @@ fn collect_brace_warnings(lines: &[Line], warnings: &mut Vec<ParseWarning>) {
         match &line.kind {
             LineKind::SectionOpen { name } => open.push((index + 1, name.clone())),
             LineKind::SectionClose => {
-                if open.pop().is_none() {
+                // A `}` always closes a section, so the pop is unconditional; a
+                // `None` result means there was no matching `section {` open,
+                // i.e. this is a stray closing brace. The result is bound to a
+                // local first (rather than testing `open.pop().is_none()`
+                // directly) so the pop's side effect stays unconditional and
+                // the `if` is not folded into a side-effecting `match` guard.
+                let closed_section = open.pop();
+                if closed_section.is_none() {
                     warnings.push(ParseWarning {
                         line: index + 1,
                         kind: ParseWarningKind::StrayClosingBrace,
