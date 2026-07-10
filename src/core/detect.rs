@@ -501,6 +501,23 @@ impl Capabilities {
             unreadable_configs: BTreeSet::new(),
         }
     }
+
+    /// Returns `self` with the dotfiles palette source marked present, for tests that
+    /// need the palette-gated path — such as the Theme category's `palette_source`
+    /// arm (task 5.1) — without building a real symlinked-repo filesystem fixture.
+    ///
+    /// The paths are placeholders: a test that needs the *real* discovery logic
+    /// exercises [`Capabilities::detect`] against a temp-dir fixture instead. It is
+    /// builder-style so it chains onto [`Self::for_tests`], keeping that constructor's
+    /// signature (and its "absent" defaults) unchanged.
+    pub(crate) fn with_palette_source_for_tests(mut self) -> Capabilities {
+        self.palette_source = Some(PaletteSource {
+            repo_root: PathBuf::from("/test/dotfiles"),
+            colors_dir: PathBuf::from("/test/dotfiles/colors"),
+            generate_colors: PathBuf::from("/test/dotfiles/scripts/generate-colors"),
+        });
+        self
+    }
 }
 
 /// Scans `path` for each [`Binary`], returning those found (a `which`-equivalent,
