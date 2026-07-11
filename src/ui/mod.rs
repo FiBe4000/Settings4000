@@ -31,6 +31,11 @@
 //!   rendered from the runtime-discovered [`crate::core::display`] model, plus the
 //!   runtime-only laptop-display toggle. It is bespoke rather than declarative because
 //!   monitors are dynamic and the laptop toggle bypasses staging (R5.2).
+//! - [`sound`] — the Sound page's bespoke glue (task 6.2): output/input device
+//!   drop-downs, volume sliders, and mute switches rendered from the runtime-enumerated
+//!   [`crate::core::sound`] state. It is bespoke rather than declarative because every
+//!   control is runtime-only — it applies a `wpctl` command immediately and bypasses
+//!   staging entirely (R3.1/R5.2).
 //!
 //! The real per-category page content (§6) plugs into this shell in later tasks.
 
@@ -40,5 +45,6 @@ mod chrome;
 mod display;
 mod page;
 mod row;
+mod sound;
 mod startup;
 mod window;

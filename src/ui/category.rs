@@ -125,9 +125,13 @@ impl SidebarCategory {
             // Display edits `monitors.conf` and applies via `hyprctl reload`; with no
             // `hyprctl` there is nothing to drive it (§6.1).
             SidebarCategory::Display => capabilities.has_binary(Binary::Hyprctl),
-            // Sound is runtime-only and needs an audio control client — either
-            // WirePlumber's `wpctl` or PulseAudio's `pactl` (§6.2, R3.1).
-            SidebarCategory::Sound => capabilities.audio_available(),
+            // Sound is runtime-only. Its enumeration (`pw-dump`, falling back to
+            // `wpctl status`) and all its controls speak only `wpctl`/`pw-dump`, so it
+            // is gated on `wpctl` specifically — not the broader `audio_available`
+            // (wpctl OR pactl). A `pactl`-only host would render a dead, inert page
+            // (no devices, a dead rescan button), which R4.2 forbids; `pactl`-only
+            // support is out of v1 scope (§6.2, R3.1).
+            SidebarCategory::Sound => capabilities.has_binary(Binary::Wpctl),
             // Theme aggregates four independent features: palette switching (the
             // dotfiles palette source), GTK/icon/cursor themes (`gsettings`), the
             // wallpaper (`hyprpaper`) and the lock background (`hyprlock`). It is
@@ -259,12 +263,16 @@ mod tests {
     }
 
     #[test]
-    fn audio_client_gates_the_sound_category() {
-        // Either audio client satisfies Sound; neither hides it (§6.2, R3.1).
+    fn wpctl_gates_the_sound_category() {
+        // The Sound page speaks only wpctl/pw-dump, so it is gated on `wpctl`
+        // specifically (§6.2, R3.1).
         let with_wpctl = Capabilities::for_tests(&[Binary::Wpctl], &[], false);
         assert!(SidebarCategory::Sound.is_visible(&with_wpctl));
-        let with_pactl = Capabilities::for_tests(&[Binary::Pactl], &[], false);
-        assert!(SidebarCategory::Sound.is_visible(&with_pactl));
+
+        // pactl present but no wpctl -> hidden: a pactl-only host must not render a
+        // dead, inert Sound page (R4.2). This is the S1 review fix.
+        let pactl_only = Capabilities::for_tests(&[Binary::Pactl], &[], false);
+        assert!(!SidebarCategory::Sound.is_visible(&pactl_only));
 
         let without = Capabilities::for_tests(&[], &[], false);
         assert!(!SidebarCategory::Sound.is_visible(&without));

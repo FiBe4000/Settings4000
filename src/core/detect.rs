@@ -418,12 +418,15 @@ impl Capabilities {
         self.present_binaries.contains(&binary)
     }
 
-    /// Whether an audio control client is available — WirePlumber's `wpctl` or
+    /// Whether any audio control client is on `$PATH` — WirePlumber's `wpctl` or
     /// PulseAudio's `pactl` (R3.1).
     ///
-    /// The Sound page (task 6.2) needs *either*; it prefers `wpctl` and falls back
-    /// to `pactl`, so it uses this composite for visibility and
-    /// [`has_binary`](Self::has_binary) to choose the command.
+    /// This is the general "is there some audio client at all" query. Note the v1
+    /// Sound page (task 6.2) does **not** gate on this: its enumeration (`pw-dump`,
+    /// falling back to `wpctl status`) and its controls speak only `wpctl`/`pw-dump`,
+    /// so it is gated on [`Binary::Wpctl`] specifically — a `pactl`-only host would
+    /// otherwise render a dead, inert page, which R4.2 forbids. `pactl`-only support is
+    /// out of v1 scope.
     pub(crate) fn audio_available(&self) -> bool {
         self.has_binary(Binary::Wpctl) || self.has_binary(Binary::Pactl)
     }
@@ -584,15 +587,14 @@ fn log_binary_results(present: &BTreeSet<Binary>) {
                 binary = name,
                 "dconf not on PATH; relying on the portal-process signal for live restyle"
             );
-        } else if matches!(binary, Binary::Wpctl | Binary::Pactl) {
-            // Audio needs either wpctl or pactl (see `audio_available`), so an absent
-            // one does not by itself hide the Sound page. Log it without claiming the
-            // settings are hidden, so the log is not misleading when the other client
-            // is present.
-            tracing::info!(
+        } else if binary == Binary::Pactl {
+            // pactl gates no page in v1: the Sound page speaks only wpctl/pw-dump, so an
+            // absent pactl hides nothing. Log at debug rather than as a hidden item.
+            // (wpctl, which *does* gate the Sound page, falls through to the generic
+            // hidden-item branch below.)
+            tracing::debug!(
                 binary = name,
-                "audio client not found on PATH; the Sound page still works if the other \
-                 client (wpctl/pactl) is present"
+                "pactl not on PATH; it gates no settings in v1 (the Sound page uses wpctl)"
             );
         } else {
             tracing::info!(

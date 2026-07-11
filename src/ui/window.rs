@@ -106,6 +106,7 @@ use crate::ui::category::{SidebarCategory, visible_categories};
 use crate::ui::chrome::{self, ApplyResponse, Toast};
 use crate::ui::display::{self, DisplayPage};
 use crate::ui::page::{self, PageMsg, PagePlan, SettingsPage};
+use crate::ui::sound::{self, SoundPage};
 use crate::ui::startup::{self, LoadedFile, StartupLoad};
 
 /// Title shown in the window's title bar and to the compositor.
@@ -163,6 +164,11 @@ struct Shell {
     /// or a committed Apply. Rebuilt by [`Shell::populate`]; `None` while the Display
     /// category shows a placeholder (no live monitor data).
     display_page: Rc<RefCell<Option<DisplayPage>>>,
+    /// The mounted Sound page (task 6.2), retained so the window can re-enumerate it when
+    /// the page is re-shown. Rebuilt by [`Shell::populate`]; `None` when the Sound
+    /// category is not visible. It is runtime-only, so — unlike the store and the Display
+    /// model — it feeds neither the Apply/Reset chrome nor a dirty marker (R5.2).
+    sound_page: Rc<RefCell<Option<SoundPage>>>,
     /// The most recent detection result, replaced on a manual refresh (R4.3).
     capabilities: Rc<RefCell<Capabilities>>,
     /// The retained page controllers, so the window can send them [`PageMsg::Rerender`]
@@ -212,6 +218,8 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     // the model and `populate` builds the page.
     let display: Rc<RefCell<Option<DisplayModel>>> = Rc::new(RefCell::new(None));
     let display_page: Rc<RefCell<Option<DisplayPage>>> = Rc::new(RefCell::new(None));
+    // The Sound page (task 6.2) — a runtime-only bespoke page rebuilt by `populate`.
+    let sound_page: Rc<RefCell<Option<SoundPage>>> = Rc::new(RefCell::new(None));
 
     // The persistent content stack + sidebar. Pages are added to this same stack on
     // every populate; the stack itself is never rebuilt.
@@ -295,6 +303,7 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
         store,
         display,
         display_page,
+        sound_page,
         capabilities,
         controllers,
         stack,
@@ -306,6 +315,7 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     shell.wire_apply(&apply_button);
     shell.wire_reset(&reset_button);
     shell.wire_refresh(&refresh_button);
+    shell.wire_sound_page_entry();
 
     // Initial (disabled) chrome state, then kick off the worker.
     (shell.update_chrome)();
@@ -426,9 +436,10 @@ impl Shell {
             self.stack.remove(&child);
         }
         self.marked.borrow_mut().clear();
-        // Drop any retained Display page from a previous populate; `populate_display`
-        // re-sets it when the Display category is (re)built below.
+        // Drop any retained Display/Sound pages from a previous populate; their
+        // `populate_*` helpers re-set them when the categories are (re)built below.
         *self.display_page.borrow_mut() = None;
+        *self.sound_page.borrow_mut() = None;
 
         // Build one page per visible category, in sidebar order (R4.2).
         let mut controllers = Vec::new();
@@ -438,6 +449,13 @@ impl Shell {
             // framework. Build it directly from the runtime-discovered model.
             if category == SidebarCategory::Display {
                 self.populate_display(category);
+                continue;
+            }
+            // Sound is bespoke too (task 6.2): every control is runtime-only (R5.2), so
+            // it does not use the declarative store-backed framework. Build it directly
+            // from the runtime-enumerated PipeWire state.
+            if category == SidebarCategory::Sound {
+                self.populate_sound(category);
                 continue;
             }
             match page::plan_category(category, &caps) {
@@ -497,6 +515,38 @@ impl Shell {
             self.stack
                 .add_titled(&placeholder, Some(category.stack_name()), category.title());
         }
+    }
+
+    /// Builds the Sound category's page (task 6.2).
+    ///
+    /// Mounts the bespoke [`sound`] page, which enumerates the live PipeWire devices on
+    /// entry and renders the runtime-only output/input controls. No dirty marker is
+    /// registered: the page stages nothing and never feeds the Apply/Reset chrome
+    /// (R5.2). The category is only reached here when the Sound gate found `wpctl`
+    /// present (task 5.1), so the enumeration and controls have their client.
+    fn populate_sound(&self, category: SidebarCategory) {
+        let page = sound::build();
+        self.stack
+            .add_titled(page.root(), Some(category.stack_name()), category.title());
+        *self.sound_page.borrow_mut() = Some(page);
+    }
+
+    /// Re-enumerates the Sound page whenever it becomes the visible stack child (task
+    /// 6.2), so the controls reflect the live audio state on page entry (R3.1) — picking
+    /// up volume/device changes made elsewhere while the app was on another page.
+    ///
+    /// The handler is connected once to the persistent stack (never rebuilt) and reads
+    /// the current [`Self::sound_page`] on each change, so it survives every repopulate
+    /// without accumulating handlers.
+    fn wire_sound_page_entry(&self) {
+        let sound_page = self.sound_page.clone();
+        self.stack.connect_visible_child_name_notify(move |stack| {
+            if stack.visible_child_name().as_deref() == Some(SidebarCategory::Sound.stack_name()) {
+                if let Some(page) = sound_page.borrow().as_ref() {
+                    page.refresh();
+                }
+            }
+        });
     }
 
     /// Wires the Apply button to run the pipeline and handle its outcome (R5.3–R5.6).
