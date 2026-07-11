@@ -38,7 +38,10 @@
 //!   the hyprlang parser → the Input page's keyboard layouts, keyboard options, mouse
 //!   sensitivity, and touchpad toggles (task 6.6);
 //! - `~/.config/swaync/config.json` via the swaync JSON adapter → the Notifications
-//!   page's position and auto-dismiss timeout.
+//!   page's position and auto-dismiss timeout;
+//! - `~/.config/hypr/hypridle.conf` via the hyprlang parser → the Power & Idle page's
+//!   dim/lock/DPMS timeouts (by positional `listener` matching, §3.2) and lock command
+//!   (task 6.8).
 //!
 //! Each §6 page extends [`load_files`] with its own file loader in the same shape
 //! (read → parse → map keys to `(SettingId, Value)` → build a re-reader). Where a
@@ -55,6 +58,7 @@ use crate::core::display::DisplayModel;
 use crate::core::input::{InputModel, default_xkb_registry};
 use crate::core::model::{SettingId, Value};
 use crate::core::notifications::NotificationsModel;
+use crate::core::power::{PowerModel, power_key_path};
 use crate::core::store::{FileReader, FileValues};
 use crate::core::theme::{
     PaletteModel, ThemeRoots, ThemesModel, ThemesPaths, WallpaperModel, WallpaperPaths,
@@ -106,6 +110,11 @@ pub(crate) struct StartupLoad {
     /// R4.2). It renders the store's dirty position/timeout settings into the
     /// `config.json` write on Apply; the runtime-only DND switch needs no state here.
     pub(crate) notifications: Option<NotificationsModel>,
+    /// The Power & Idle page's helper (task 6.8): the `hypridle.conf` path, or `None` when
+    /// hypridle is absent (the Power & Idle category is then hidden entirely, R4.2). It
+    /// renders the store's dirty dim/lock/DPMS timeouts and lock command into the
+    /// `hypridle.conf` write on Apply, which the pipeline follows with a hypridle restart.
+    pub(crate) power: Option<PowerModel>,
     /// The Theme page's palette-scheme model (task 6.3), built by enumerating the
     /// discovered `colors/` directory and detecting the active scheme, or `None` when
     /// there is no dotfiles palette source (the Theme palette section is then hidden,
@@ -133,6 +142,8 @@ struct BackingPaths {
     input_conf: PathBuf,
     /// `~/.config/swaync/config.json` — the swaync notification config (JSON).
     swaync_config: PathBuf,
+    /// `~/.config/hypr/hypridle.conf` — the idle timeouts + lock command (hyprlang).
+    hypridle_conf: PathBuf,
 }
 
 impl BackingPaths {
@@ -146,6 +157,7 @@ impl BackingPaths {
         BackingPaths {
             input_conf: config_home.join("hypr").join("input.conf"),
             swaync_config: config_home.join("swaync").join("config.json"),
+            hypridle_conf: config_home.join("hypr").join("hypridle.conf"),
         }
     }
 }
@@ -180,6 +192,7 @@ pub(crate) fn load() -> StartupLoad {
     let display = load_display(&capabilities);
     let input = load_input(&capabilities);
     let notifications = load_notifications(&capabilities);
+    let power = load_power(&capabilities);
     let palette = load_palette(&capabilities);
     let themes = load_themes(&capabilities);
     let wallpaper = load_wallpaper(&capabilities);
@@ -189,6 +202,7 @@ pub(crate) fn load() -> StartupLoad {
         display,
         input,
         notifications,
+        power,
         palette,
         themes,
         wallpaper,
@@ -210,6 +224,22 @@ fn load_notifications(capabilities: &Capabilities) -> Option<NotificationsModel>
     }
     let swaync_config = config_home().join("swaync").join("config.json");
     Some(NotificationsModel::load(swaync_config))
+}
+
+/// Builds the Power & Idle page's helper on the worker thread (task 6.8; R4.2).
+///
+/// Only builds when hypridle is present — the Power & Idle category edits `hypridle.conf`
+/// and restarts hypridle on Apply (task 5.1's category gate), so without hypridle there is
+/// nothing to configure and the category is hidden entirely (R4.2). It records the live
+/// `hypridle.conf` path (R8.5) for the Apply-time timeout/lock-command write. Building it
+/// here, off the main thread, keeps startup inside the R8.1 budget (architecture §8).
+fn load_power(capabilities: &Capabilities) -> Option<PowerModel> {
+    if !capabilities.has_binary(Binary::Hypridle) {
+        tracing::info!("hypridle not found; the Power & Idle page is hidden (R4.2)");
+        return None;
+    }
+    let hypridle_conf = config_home().join("hypr").join("hypridle.conf");
+    Some(PowerModel::load(hypridle_conf))
 }
 
 /// Builds the Input page's helper on the worker thread (task 6.6; R4.2).
@@ -406,6 +436,12 @@ fn load_files(paths: &BackingPaths) -> Vec<LoadedFile> {
         load_swaync_config,
         "swaync/config.json",
     );
+    push_loaded(
+        &mut files,
+        &paths.hypridle_conf,
+        load_hypridle_conf,
+        "hypridle.conf",
+    );
     files
 }
 
@@ -542,6 +578,55 @@ fn load_swaync_config(path: &Path) -> io::Result<FileValues> {
         // The auto-dismiss timeout in whole seconds — a single top-level integer key.
         if let Some(seconds) = config.integer("timeout") {
             values.push((SettingId::NotificationTimeout, Value::Integer(seconds)));
+        }
+        values
+    };
+
+    Ok(FileValues { bytes, values })
+}
+
+/// Reads and parses `hypridle.conf` (hyprlang) into the Power & Idle-page settings it
+/// backs (task 6.8, analysis §6).
+///
+/// A read error propagates (the caller skips the file); a parse never fails — the hyprlang
+/// parser is lossless and surfaces oddities as warnings. The three idle timeouts are read
+/// by **positional listener matching** (`listener[0]` = dim, `[1]` = lock, `[2]` = DPMS),
+/// through the shared [`power_key_path`] map so a value is parsed from and written back to
+/// the identical address; the lock command comes from `general.lock_cmd`. Only the keys
+/// actually present and parseable become settings. An out-of-range value on disk is stored
+/// verbatim as the original (the store validates only staged edits), so a hand-written
+/// config is never rejected at load.
+fn load_hypridle_conf(path: &Path) -> io::Result<FileValues> {
+    let bytes = std::fs::read(path)?;
+    let values = {
+        let text = String::from_utf8_lossy(&bytes);
+        let (file, warnings) = HyprlangFile::parse(&text);
+        for warning in &warnings {
+            tracing::warn!(file = "hypridle.conf", %warning, "hyprlang parse warning");
+        }
+
+        let mut values = Vec::new();
+        // The three idle timeouts, addressed by positional listener matching (§3.2); an
+        // unparseable value is skipped rather than defaulted.
+        for id in [
+            SettingId::DimTimeout,
+            SettingId::LockTimeout,
+            SettingId::DpmsTimeout,
+        ] {
+            if let Some(path) = power_key_path(id) {
+                if let Some(raw) = file.value(&path) {
+                    if let Ok(seconds) = raw.trim().parse::<i64>() {
+                        values.push((id, Value::Integer(seconds)));
+                    }
+                }
+            }
+        }
+        // The session lock command lives in `general.lock_cmd` (not a listener's
+        // on-timeout — see `core::power`), read verbatim.
+        if let Some(path) = power_key_path(SettingId::LockCommand) {
+            if let Some(command) = file.value(&path) {
+                values.push((SettingId::LockCommand, Value::String(command.to_string())));
+            }
         }
         values
     };
@@ -719,6 +804,7 @@ mod tests {
         let paths = BackingPaths {
             input_conf: dir.path().join("no-input.conf"),
             swaync_config: dir.path().join("no-swaync.json"),
+            hypridle_conf: dir.path().join("no-hypridle.conf"),
         };
         assert!(
             load_files(&paths).is_empty(),
@@ -748,6 +834,7 @@ mod tests {
         let paths = BackingPaths {
             input_conf: dir.path().join("input.conf"),
             swaync_config: path,
+            hypridle_conf: dir.path().join("no-hypridle.conf"),
         };
         let loaded = load_files(&paths);
         assert_eq!(loaded.len(), 1, "only the parseable file loads");
@@ -772,6 +859,7 @@ mod tests {
         let paths = BackingPaths {
             input_conf: dir.path().join("input.conf"),
             swaync_config: dir.path().join("config.json"),
+            hypridle_conf: dir.path().join("hypridle.conf"),
         };
 
         let mut store = store_from(load_files(&paths));
@@ -824,6 +912,78 @@ mod tests {
         assert!(
             load_notifications(&caps).is_some(),
             "swaync present -> a Notifications model is built"
+        );
+    }
+
+    #[test]
+    fn hypridle_conf_parses_into_the_power_settings() {
+        // The four Power & Idle settings map from hypridle.conf by positional listener
+        // matching: listener[0].timeout -> dim, [1] -> lock, [2] -> DPMS, and
+        // general.lock_cmd -> the lock command (task 6.8).
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("hypridle.conf");
+        std::fs::write(
+            &path,
+            b"general {\n    lock_cmd = pidof hyprlock || hyprlock\n}\n\nlistener {\n    timeout = 150\n    on-timeout = brightnessctl -s set 10\n}\n\nlistener {\n    timeout = 300\n    on-timeout = loginctl lock-session\n}\n\nlistener {\n    timeout = 330\n    on-timeout = hyprctl dispatch dpms off\n}\n",
+        )
+        .expect("write hypridle.conf fixture");
+
+        let values = load_hypridle_conf(&path).expect("hypridle.conf loads");
+        assert_eq!(
+            values.values,
+            vec![
+                (SettingId::DimTimeout, Value::Integer(150)),
+                (SettingId::LockTimeout, Value::Integer(300)),
+                (SettingId::DpmsTimeout, Value::Integer(330)),
+                (
+                    SettingId::LockCommand,
+                    Value::String("pidof hyprlock || hyprlock".to_string())
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn hypridle_conf_loads_only_the_listeners_that_exist() {
+        // A config with fewer than three listeners contributes only the settings whose
+        // address resolves — positional matching skips the absent occurrences rather than
+        // guessing (R4.4), and a missing general block skips the lock command.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("hypridle.conf");
+        std::fs::write(
+            &path,
+            b"listener {\n    timeout = 120\n}\n\nlistener {\n    timeout = 240\n}\n",
+        )
+        .expect("write hypridle.conf fixture");
+
+        let values = load_hypridle_conf(&path).expect("hypridle.conf loads");
+        assert_eq!(
+            values.values,
+            vec![
+                (SettingId::DimTimeout, Value::Integer(120)),
+                (SettingId::LockTimeout, Value::Integer(240)),
+            ],
+            "only the two present listeners load; no DPMS timeout, no lock command"
+        );
+    }
+
+    #[test]
+    fn power_is_hidden_when_hypridle_is_absent() {
+        // R4.2 (task 6.8): the Power & Idle page edits hypridle.conf and restarts hypridle,
+        // so without the hypridle binary no model is built and the whole category is hidden
+        // (task 5.1's category gate). The gate is checked before any path is resolved, so
+        // this needs no fixture.
+        let caps = Capabilities::for_tests(&[], &[], false);
+        assert!(
+            load_power(&caps).is_none(),
+            "no hypridle -> no Power & Idle model -> the category is hidden"
+        );
+
+        // Present -> a model is built (against the resolved hypridle.conf path).
+        let caps = Capabilities::for_tests(&[Binary::Hypridle], &[], false);
+        assert!(
+            load_power(&caps).is_some(),
+            "hypridle present -> a Power & Idle model is built"
         );
     }
 

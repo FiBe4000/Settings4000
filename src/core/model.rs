@@ -344,11 +344,16 @@ impl SettingId {
             // per-item validity check is not done here (it needs the registry); an
             // unknown-but-present layout code is left to Hyprland.
             (SettingId::KeyboardLayouts, Value::String(text)) => validate_layout_list(text),
-            // Free-text String settings with no format rule beyond their kind: the lock
-            // command, and the keyboard-option list — an opaque comma-joined token
-            // string whose unknown entries are preserved verbatim (task 6.6), and which
-            // may legitimately be empty (no options set).
-            (SettingId::LockCommand | SettingId::KeyboardOptions, Value::String(_)) => Ok(()),
+            // The hypridle lock command is free text, but it is written into a hyprlang
+            // value, so it must not contain a byte that would break that config — caught
+            // here at stage time (R8.3) so the free-text Entry (task 6.8) reverts the
+            // control on the offending keystroke, rather than only failing the whole Apply.
+            (SettingId::LockCommand, Value::String(text)) => validate_command(text),
+            // The keyboard-option list is not free text: it is fed from curated tokens and
+            // on-disk values (task 6.6), an opaque comma-joined string whose unknown entries
+            // are preserved verbatim and which may legitimately be empty (no options set),
+            // so it has no format rule beyond its kind.
+            (SettingId::KeyboardOptions, Value::String(_)) => Ok(()),
             // Anything left over is a value whose kind does not match the setting.
             (id, value) => Err(ValidationError::WrongKind {
                 expected: id.kind(),
@@ -502,6 +507,14 @@ pub(crate) enum ValidationError {
     /// keyboard-layout list uses this: an empty `kb_layout` would make Hyprland fall
     /// back to its default layout, silently dropping the user's configuration (R8.3).
     EmptyKeyboardLayouts,
+    /// A free-text command destined for a hyprlang value contains a byte that would break
+    /// that config: a newline/carriage return (splits the line) or a `#` (hyprlang reads
+    /// it as an inline comment and silently truncates the value). Today only the hypridle
+    /// lock command uses this (task 6.8, R8.3).
+    UnsafeCommand {
+        /// The offending value as supplied.
+        value: String,
+    },
     /// A monitor mode string is not a recognised `WxH@Hz` mode (or special token),
     /// or its numbers are outside the plausible range.
     InvalidMonitorMode {
@@ -564,6 +577,10 @@ impl fmt::Display for ValidationError {
             ValidationError::EmptyKeyboardLayouts => {
                 write!(f, "at least one keyboard layout is required")
             }
+            ValidationError::UnsafeCommand { value } => write!(
+                f,
+                "`{value}` cannot be used as a command: it must not contain a line break or `#`"
+            ),
             ValidationError::InvalidMonitorMode { value, detail } => {
                 write!(f, "`{value}` is not a valid display mode: {detail}")
             }
@@ -681,6 +698,27 @@ pub(crate) fn validate_layout_list(value: &str) -> Result<(), ValidationError> {
         Ok(())
     } else {
         Err(ValidationError::EmptyKeyboardLayouts)
+    }
+}
+
+/// Validates a free-text command that will be written into a hyprlang value (R8.3).
+///
+/// Rejects a value containing a newline/carriage return (which would split the config
+/// line) or a `#` (which hyprlang reads as the start of an inline comment, silently
+/// truncating the value). This mirrors the hyprlang writer's own `reject_unsafe_value`
+/// guard ([`crate::parsers::hyprlang`]) so an unsafe value is caught at **stage** time —
+/// when the row framework's free-text entry (task 6.8) reverts the control on the
+/// offending keystroke — rather than only surfacing as an aborted Apply. The writer keeps
+/// its guard as defense-in-depth. Today the hypridle lock command is the only setting
+/// that reaches this validator; a command is otherwise unconstrained (any program and
+/// arguments are allowed).
+pub(crate) fn validate_command(value: &str) -> Result<(), ValidationError> {
+    if value.contains(['\n', '\r', '#']) {
+        Err(ValidationError::UnsafeCommand {
+            value: value.to_string(),
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -1137,6 +1175,40 @@ mod tests {
     }
 
     #[test]
+    fn lock_command_rejects_a_newline_or_hash() {
+        // R8.3 (task 6.8): the lock command is free text but is written into a hyprlang
+        // value, so a `#` (hyprlang comment start) or a line break would break the config.
+        // These must be rejected at stage time — the store validates on stage, so the
+        // free-text Entry reverts the control on the offending keystroke rather than the
+        // whole Apply aborting.
+        assert!(validate_command("pidof hyprlock || hyprlock").is_ok());
+        assert!(validate_command("hyprlock").is_ok());
+        // Empty is allowed (an unset command); the setting is otherwise unconstrained.
+        assert!(validate_command("").is_ok());
+
+        for unsafe_value in ["hyprlock # note", "line1\nline2", "cmd\rmore"] {
+            let error = validate_command(unsafe_value)
+                .expect_err(&format!("`{unsafe_value}` must be rejected"));
+            assert!(
+                matches!(error, ValidationError::UnsafeCommand { .. }),
+                "expected UnsafeCommand for `{unsafe_value}`, got {error:?}"
+            );
+        }
+
+        // Dispatch through the setting reaches the same guard, so `SettingsStore::stage`
+        // (which calls `validate` first) rejects it and the control reverts.
+        assert!(
+            SettingId::LockCommand
+                .validate(&Value::String("hyprlock".to_string()))
+                .is_ok()
+        );
+        let error = SettingId::LockCommand
+            .validate(&Value::String("hyprlock # oops".to_string()))
+            .expect_err("a `#` in the lock command must be rejected");
+        assert!(matches!(error, ValidationError::UnsafeCommand { .. }));
+    }
+
+    #[test]
     fn monitor_mode_validator_accepts_valid_modes_and_special_tokens() {
         for valid in [
             "2880x1800@120",
@@ -1409,6 +1481,9 @@ mod tests {
                 value: "#fff".to_string(),
             },
             ValidationError::EmptyKeyboardLayouts,
+            ValidationError::UnsafeCommand {
+                value: "hyprlock # x".to_string(),
+            },
             ValidationError::InvalidMonitorMode {
                 value: "bad".to_string(),
                 detail: "nope".to_string(),

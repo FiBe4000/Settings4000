@@ -72,7 +72,7 @@ use std::rc::Rc;
 
 use gtk4::prelude::*;
 use gtk4::{
-    Adjustment, Align, Box as GtkBox, Button, DropDown, Label, ListBox, Orientation, Scale,
+    Adjustment, Align, Box as GtkBox, Button, DropDown, Entry, Label, ListBox, Orientation, Scale,
     SelectionMode, StringList, Switch, Widget, glib,
 };
 use relm4::{Component, ComponentParts, ComponentSender, Controller, SimpleComponent};
@@ -83,10 +83,10 @@ use crate::core::store::{SettingsStore, StageError, StageOutcome};
 use crate::ui::category::SidebarCategory;
 use crate::ui::row::{
     DropDownOption, RowCapability, RowDescriptor, SetValue, WidgetKind, dropdown_index_from_value,
-    list_items_from_value, list_with_added, list_with_swapped, list_without,
+    entry_text_from_value, list_items_from_value, list_with_added, list_with_swapped, list_without,
     scale_position_from_value, switch_active_from_value, token_switch_active_from_value,
-    value_from_dropdown_option, value_from_scale, value_from_switch, value_from_token_toggle,
-    visible_rows,
+    value_from_dropdown_option, value_from_entry, value_from_scale, value_from_switch,
+    value_from_token_toggle, visible_rows,
 };
 
 /// Vertical spacing, in pixels, between rows on a page.
@@ -332,6 +332,16 @@ enum BoundControl {
         /// direct access to the store).
         current: Rc<RefCell<String>>,
     },
+    /// A `GtkEntry` for a free-text [`Value::String`] setting (the lock command,
+    /// task 6.8).
+    Entry {
+        /// The setting this control edits.
+        setting: SettingId,
+        /// The entry widget.
+        widget: Entry,
+        /// The `changed` handler, blocked while rendering to avoid feedback.
+        handler: glib::SignalHandlerId,
+    },
 }
 
 impl BoundControl {
@@ -341,7 +351,8 @@ impl BoundControl {
             BoundControl::Switch { setting, .. }
             | BoundControl::DropDown { setting, .. }
             | BoundControl::Scale { setting, .. }
-            | BoundControl::TokenSwitch { setting, .. } => *setting,
+            | BoundControl::TokenSwitch { setting, .. }
+            | BoundControl::Entry { setting, .. } => *setting,
             BoundControl::List(list) => list.setting,
         }
     }
@@ -398,6 +409,21 @@ impl BoundControl {
                 widget.block_signal(handler);
                 widget.set_active(token_switch_active_from_value(value, token));
                 widget.unblock_signal(handler);
+            }
+            BoundControl::Entry {
+                widget, handler, ..
+            } => {
+                // Re-set the text only when it differs from what is shown, so a render
+                // (which runs after every store change) never resets the cursor while the
+                // user is typing — the entry equals the store the moment its own edit is
+                // staged, so its self-edit is a no-op here. A store change from elsewhere
+                // (a Reset, an external reload) still snaps the field to the new value.
+                let text = entry_text_from_value(value);
+                if widget.text().as_str() != text {
+                    widget.block_signal(handler);
+                    widget.set_text(&text);
+                    widget.unblock_signal(handler);
+                }
             }
         }
     }
@@ -551,6 +577,7 @@ fn build_control(
             build_list(descriptor, candidates.clone(), emit)
         }
         WidgetKind::TokenSwitch { token } => build_token_switch(descriptor, token.clone(), emit),
+        WidgetKind::Entry => build_entry(descriptor, emit),
     }
 }
 
@@ -625,6 +652,41 @@ fn build_token_switch(
             widget,
             handler,
             current,
+        },
+    )
+}
+
+/// Builds a `GtkEntry` row for a free-text [`Value::String`] setting (R2.3, task 6.8).
+///
+/// The entry emits a [`SetValue`] on every text change, so the store tracks the field as
+/// the user types (it becomes dirty on the first keystroke, like any other edit).
+/// [`BoundControl::render`] re-sets the text only when it differs from what is shown, so a
+/// render never moves the cursor mid-edit (see the module docs). Validation of the text is
+/// the setting's concern (the lock command is free text with no format rule); the writer
+/// still rejects a value that would break the config (a `#`/newline), aborting the Apply.
+fn build_entry(descriptor: &RowDescriptor, emit: &Rc<dyn Fn(SetValue)>) -> (GtkBox, BoundControl) {
+    let widget = Entry::new();
+    widget.set_hexpand(true);
+    widget.set_valign(Align::Center);
+
+    let setting = descriptor.setting;
+    let handler = {
+        let emit = emit.clone();
+        widget.connect_changed(move |entry| {
+            emit(SetValue {
+                id: setting,
+                value: value_from_entry(entry.text().as_str()),
+            });
+        })
+    };
+
+    let row = labelled_row(&descriptor.label, &widget);
+    (
+        row,
+        BoundControl::Entry {
+            setting,
+            widget,
+            handler,
         },
     )
 }
@@ -807,7 +869,9 @@ fn string_list(options: &[DropDownOption]) -> StringList {
 /// anchor positions and a timeout range), so they live here and are rendered through the
 /// generic framework; the Notifications page (task 6.7) builds them via
 /// [`plan_category`] and appends its runtime-only Do-Not-Disturb switch beside them (see
-/// [`super::notifications`]).
+/// [`super::notifications`]). Power & Idle (task 6.8) is likewise fully static — three
+/// idle-timeout sliders and a free-text lock-command entry — so it lives here and is built
+/// entirely through the generic framework path with no bespoke glue.
 fn category_rows(category: SidebarCategory) -> Vec<RowDescriptor> {
     match category {
         SidebarCategory::Notifications => vec![
@@ -852,9 +916,58 @@ fn category_rows(category: SidebarCategory) -> Vec<RowDescriptor> {
                 RowCapability::Binary(Binary::Swaync),
             ),
         ],
+        // Power & Idle (task 6.8): the three idle timeouts as sliders plus the lock command
+        // as a free-text entry, all store-backed `hypridle.conf` settings, so they are fully
+        // static framework rows built through the generic path — unlike the Input page's
+        // dynamic XKB layout list. Each row is gated on the hypridle binary, matching the
+        // category gate (task 5.1); when hypridle.conf is missing/unreadable the rows still
+        // build and render their defaults, rejecting edits until the file appears (R4.4) —
+        // the same graceful degradation the Input/Notifications pages use.
+        SidebarCategory::PowerAndIdle => vec![
+            RowDescriptor::new(
+                "Dim screen after (seconds)",
+                idle_timeout_scale(),
+                SettingId::DimTimeout,
+                RowCapability::Binary(Binary::Hypridle),
+            ),
+            RowDescriptor::new(
+                "Lock session after (seconds)",
+                idle_timeout_scale(),
+                SettingId::LockTimeout,
+                RowCapability::Binary(Binary::Hypridle),
+            ),
+            RowDescriptor::new(
+                "Turn off displays after (seconds)",
+                idle_timeout_scale(),
+                SettingId::DpmsTimeout,
+                RowCapability::Binary(Binary::Hypridle),
+            ),
+            RowDescriptor::new(
+                "Lock command",
+                WidgetKind::Entry,
+                SettingId::LockCommand,
+                RowCapability::Binary(Binary::Hypridle),
+            ),
+        ],
         // The remaining categories have no framework rows yet; §6 fills them in, and
         // until then the window shows task 5.1's placeholder for them.
         _ => Vec::new(),
+    }
+}
+
+/// The idle-timeout slider shared by the three Power & Idle timeouts (task 6.8).
+///
+/// A whole-second range from half a minute to an hour with a half-minute step — a sane,
+/// ergonomic span for a dim/lock/DPMS timeout, far narrower than the validator's
+/// `1..=86400 s` range (task 4.1). Like the Notifications auto-dismiss slider, a value
+/// already on disk *outside* this span (e.g. a two-hour timeout) is preserved as the
+/// stored original and is only overwritten once the user actually drags the slider (which
+/// can then only produce a value within the range).
+fn idle_timeout_scale() -> WidgetKind {
+    WidgetKind::Scale {
+        min: 30.0,
+        max: 3600.0,
+        step: 30.0,
     }
 }
 
@@ -1083,18 +1196,32 @@ mod tests {
         // of the real config files — task 5.4 — not a demo seed, so there is no seed
         // to cross-check here; the loader maps each setting to a value of its kind and
         // is tested in `super::super::startup`.)
-        let descriptors = category_rows(SidebarCategory::Notifications);
-        assert!(
-            !descriptors.is_empty(),
-            "Notifications should have interim rows"
-        );
-        for descriptor in &descriptors {
+        for category in [
+            SidebarCategory::Notifications,
+            SidebarCategory::PowerAndIdle,
+        ] {
+            let descriptors = category_rows(category);
             assert!(
-                descriptor.is_well_formed(),
-                "{:?} pairs an incompatible widget and setting kind",
-                descriptor.setting
+                !descriptors.is_empty(),
+                "{category:?} should have framework rows"
             );
+            for descriptor in &descriptors {
+                assert!(
+                    descriptor.is_well_formed(),
+                    "{:?} pairs an incompatible widget and setting kind",
+                    descriptor.setting
+                );
+            }
         }
+
+        // Power & Idle carries the framework's first free-text entry (the lock command);
+        // confirm it is an Entry over a String setting.
+        let power = category_rows(SidebarCategory::PowerAndIdle);
+        let lock = power
+            .iter()
+            .find(|row| row.setting == SettingId::LockCommand)
+            .expect("Power & Idle has a lock-command row");
+        assert!(matches!(lock.widget, WidgetKind::Entry));
 
         // The categories without interim rows fall back to a placeholder or their own
         // glue: Theme is placeholder-backed here, and Input is now built directly by the
@@ -1155,7 +1282,11 @@ mod tests {
         // NoSpec: a category with no framework descriptors here — Theme (its own glue),
         // and Input, which the window now builds directly with runtime XKB candidates
         // (task 6.6) rather than through this interim list.
-        let any = Capabilities::for_tests(&[Binary::Hyprctl, Binary::Swaync], &[], true);
+        let any = Capabilities::for_tests(
+            &[Binary::Hyprctl, Binary::Swaync, Binary::Hypridle],
+            &[],
+            true,
+        );
         assert!(matches!(
             plan_category(SidebarCategory::Theme, &any),
             PagePlan::NoSpec
@@ -1165,17 +1296,27 @@ mod tests {
             PagePlan::NoSpec
         ));
 
-        // Framework: a category whose rows are (at least partly) present.
+        // Framework: a category whose rows are (at least partly) present. Notifications'
+        // rows need swaync; Power & Idle's need hypridle — both present in `any`.
         assert!(matches!(
             plan_category(SidebarCategory::Notifications, &any),
             PagePlan::Framework(_)
         ));
-
-        // Emptied: Notifications' rows all require swaync; with swaync absent every row
-        // is hidden, so the whole category is dropped (R4.2) rather than shown empty.
-        let no_swaync = Capabilities::for_tests(&[], &[], false);
         assert!(matches!(
-            plan_category(SidebarCategory::Notifications, &no_swaync),
+            plan_category(SidebarCategory::PowerAndIdle, &any),
+            PagePlan::Framework(_)
+        ));
+
+        // Emptied: Notifications' rows all require swaync and Power & Idle's all require
+        // hypridle; with neither present every row is hidden, so each whole category is
+        // dropped (R4.2) rather than shown empty.
+        let nothing = Capabilities::for_tests(&[], &[], false);
+        assert!(matches!(
+            plan_category(SidebarCategory::Notifications, &nothing),
+            PagePlan::Emptied
+        ));
+        assert!(matches!(
+            plan_category(SidebarCategory::PowerAndIdle, &nothing),
             PagePlan::Emptied
         ));
     }

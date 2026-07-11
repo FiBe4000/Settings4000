@@ -104,6 +104,17 @@ pub mod input;
 // is exercised in a non-test build too.
 pub mod notifications;
 
+// The Power & Idle-page domain logic (task 6.8; R4.2, R4.4, R5.6, R8.3). It provides the
+// store-`SettingId` -> `hypridle.conf` write glue: it renders the store's dirty dim/lock/
+// DPMS timeouts and lock command into one surgical `FileWrite` through the hyprlang writer,
+// addressing each timeout by positional listener matching (`listener[0]`/`[1]`/`[2]`, §3.2)
+// and the lock command by `general.lock_cmd`, so editing one listener leaves the others
+// byte-identical. Its `hypridle.conf` freshness is the store's, not its own; the Apply
+// pipeline (task 4.5) follows the write with a hypridle restart (task 4.4). It is consumed
+// by the window's Apply wiring (`ui::window`), so its public surface is exercised in a
+// non-test build too.
+pub mod power;
+
 // The Sound-page domain model (task 6.2; R3.1, R5.2). It enumerates the PipeWire audio
 // devices (from `pw-dump` JSON, falling back to parsing `wpctl status`) and builds the
 // `wpctl` command vectors the runtime-only controls run — nothing is staged and nothing

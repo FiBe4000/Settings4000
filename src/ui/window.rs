@@ -76,9 +76,10 @@
 //! target lines and reloads via `hyprctl reload`. The Input write is the general
 //! store-`SettingId` → `FileWrite` shape the Notifications page (task 6.7) reuses for
 //! swaync `config.json` — its position/timeout write is folded in the same way, and its
-//! runtime-only DND switch applies immediately outside the pipeline (R5.2). The remaining
-//! store-backed §6 pages fill in their own writes the same way, and until then their
-//! staged edits still validate and commit as before.
+//! runtime-only DND switch applies immediately outside the pipeline (R5.2) — and the Power
+//! & Idle page (task 6.8) reuses again for `hypridle.conf`: its dim/lock/DPMS timeouts and
+//! lock command render into one write folded in identically, after which the pipeline
+//! restarts hypridle (task 4.4) only because that file changed.
 //!
 //! # No libadwaita, no custom CSS (R2.1/R2.2)
 //!
@@ -105,6 +106,7 @@ use crate::core::display::DisplayModel;
 use crate::core::input::InputModel;
 use crate::core::model::Category;
 use crate::core::notifications::NotificationsModel;
+use crate::core::power::PowerModel;
 use crate::core::reload::ReloadParams;
 use crate::core::store::SettingsStore;
 use crate::core::theme::{PaletteModel, ThemesModel, WallpaperModel};
@@ -197,6 +199,14 @@ struct Shell {
     /// visible. It is runtime-only, so — like the Sound page — it feeds neither the
     /// Apply/Reset chrome nor a dirty marker (R5.2).
     notifications_page: Rc<RefCell<Option<NotificationsPage>>>,
+    /// The Power & Idle page's helper (task 6.8), shared with the Apply wiring. `None`
+    /// until the startup worker builds it, or when hypridle is absent. Like the
+    /// [`InputModel`] and [`NotificationsModel`] it is **not** a separate staging source —
+    /// the timeouts and lock command are staged in the shared store as ordinary framework
+    /// rows — so it feeds neither the dirty rollup nor a bespoke commit; it only renders
+    /// the store's dirty Power & Idle settings into the `hypridle.conf` write on Apply,
+    /// which the pipeline follows with a hypridle restart (see [`Shell::wire_apply`]).
+    power: Rc<RefCell<Option<PowerModel>>>,
     /// The mounted Sound page (task 6.2), retained so the window can re-enumerate it when
     /// the page is re-shown. Rebuilt by [`Shell::populate`]; `None` when the Sound
     /// category is not visible. It is runtime-only, so — unlike the store and the Display
@@ -285,6 +295,11 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     // `controllers`, while the bespoke DND switch handle is retained here for re-query.
     let notifications: Rc<RefCell<Option<NotificationsModel>>> = Rc::new(RefCell::new(None));
     let notifications_page: Rc<RefCell<Option<NotificationsPage>>> = Rc::new(RefCell::new(None));
+    // The Power & Idle page's helper (task 6.8) — the Apply-time hypridle.conf write for the
+    // store-backed timeouts + lock command. Filled by the worker; the page's controls are
+    // ordinary store-backed framework rows, so no separate page handle is retained (the
+    // SettingsPage controller goes in `controllers` like any framework page).
+    let power: Rc<RefCell<Option<PowerModel>>> = Rc::new(RefCell::new(None));
     // The Sound page (task 6.2) — a runtime-only bespoke page rebuilt by `populate`.
     let sound_page: Rc<RefCell<Option<SoundPage>>> = Rc::new(RefCell::new(None));
     // The Theme page's palette model and mounted page (task 6.3) — a staging source
@@ -398,6 +413,7 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
         input,
         notifications,
         notifications_page,
+        power,
         sound_page,
         palette,
         themes,
@@ -483,6 +499,7 @@ impl Shell {
             display,
             input,
             notifications,
+            power,
             palette,
             themes,
             wallpaper,
@@ -502,12 +519,13 @@ impl Shell {
             }
         }
         *self.capabilities.borrow_mut() = capabilities;
-        // Adopt the worker-built Display, Input, Notifications, palette, GTK/icon/cursor
-        // theme, and wallpaper models (tasks 6.1/6.3–6.7) before `populate` builds their
-        // pages.
+        // Adopt the worker-built Display, Input, Notifications, Power & Idle, palette,
+        // GTK/icon/cursor theme, and wallpaper models (tasks 6.1/6.3–6.8) before
+        // `populate` builds their pages.
         *self.display.borrow_mut() = display;
         *self.input.borrow_mut() = input;
         *self.notifications.borrow_mut() = notifications;
+        *self.power.borrow_mut() = power;
         *self.palette.borrow_mut() = palette;
         *self.themes.borrow_mut() = themes;
         *self.wallpaper.borrow_mut() = wallpaper;
@@ -1026,9 +1044,50 @@ impl Shell {
                 }
             }
 
+            // Fold the store-backed Power & Idle settings into one `hypridle.conf` write
+            // (task 6.8) — the same store-driven shape as the Input/Notifications writes,
+            // since hypridle.conf is store-loaded (its freshness lives in the store's
+            // tracker). Done before `store_writes` is captured so the write is committed and
+            // re-baselined by the store's `commit_apply`. When this write is present the
+            // pipeline restarts hypridle (task 4.4); when no Power & Idle setting is dirty
+            // there is no write and hypridle is left running (restart-only-when-changed).
+            let power_write = {
+                let store = shell.store.borrow();
+                let power = shell.power.borrow();
+                match power.as_ref() {
+                    Some(model) => {
+                        model.hypridle_conf_write(&store.dirty_in_category(Category::PowerAndIdle))
+                    }
+                    None => Ok(None),
+                }
+            };
+            match power_write {
+                Ok(Some(write)) => plan.writes.push(write),
+                Ok(None) => {}
+                // Pending Power & Idle edits but the write could not be prepared
+                // (hypridle.conf unreadable, or the writer rejected an edit — e.g. a `#` in
+                // the lock command). Abort the whole Apply and keep the staged edits — never
+                // proceed to commit, which would promote the values against an unchanged file
+                // and desync the store (mirroring the Input/Notifications review-M1
+                // contract). Near-unreachable in practice.
+                Err(error) => {
+                    tracing::error!(%error, "aborting apply: could not prepare the hypridle.conf write");
+                    chrome::show_warning(
+                        &shell.window,
+                        "Could not prepare the power and idle changes",
+                        &format!(
+                            "Settings4000 could not update hypridle.conf, so nothing was \
+                             written: {error}. Your power and idle changes were kept — fix the \
+                             problem and try again."
+                        ),
+                    );
+                    return;
+                }
+            }
+
             // The store-backed writes to commit to the store after a successful apply
-            // (the `input.conf` and swaync `config.json` writes folded in above are
-            // included, so `commit_apply` re-baselines them). Captured before the
+            // (the `input.conf`, swaync `config.json`, and `hypridle.conf` writes folded
+            // in above are included, so `commit_apply` re-baselines them). Captured before the
             // Display/Theme contributions are folded in, because those models commit their
             // own files separately (their freshness is owned by the model, not the store).
             let store_writes: Vec<(PathBuf, Vec<u8>)> = plan

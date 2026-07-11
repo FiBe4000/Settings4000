@@ -139,6 +139,11 @@ pub(crate) enum WidgetKind {
         /// The single comma-token this switch adds or removes (e.g. `caps:escape`).
         token: String,
     },
+    /// A `GtkEntry` free-text field, editing a [`Value::String`]. Used for a setting
+    /// whose value is arbitrary text with no fixed option set — the hypridle lock command
+    /// (task 6.8). The stored value is the entry's text verbatim; validation (if any) is
+    /// the setting's concern, not the widget's.
+    Entry,
 }
 
 impl WidgetKind {
@@ -154,9 +159,9 @@ impl WidgetKind {
             WidgetKind::DropDown { .. } => kind == ValueKind::Enum,
             WidgetKind::Switch => kind == ValueKind::Bool,
             WidgetKind::Scale { .. } => matches!(kind, ValueKind::Float | ValueKind::Integer),
-            WidgetKind::ReorderableList { .. } | WidgetKind::TokenSwitch { .. } => {
-                kind == ValueKind::String
-            }
+            WidgetKind::ReorderableList { .. }
+            | WidgetKind::TokenSwitch { .. }
+            | WidgetKind::Entry => kind == ValueKind::String,
         }
     }
 }
@@ -307,6 +312,14 @@ pub(crate) fn value_from_list_items(items: &[String]) -> Value {
     Value::String(items.join(","))
 }
 
+/// The [`Value`] a text entry produces for its current `text` (task 6.8).
+///
+/// The text is stored verbatim as a [`Value::String`]; any format rule is the setting's
+/// validation concern, not the widget's.
+pub(crate) fn value_from_entry(text: &str) -> Value {
+    Value::String(text.to_owned())
+}
+
 /// The [`Value`] a [`WidgetKind::TokenSwitch`] produces when `token` is switched
 /// `active` on or off, starting from the setting's current comma-joined `value`.
 ///
@@ -422,6 +435,14 @@ pub(crate) fn scale_position_from_value(value: Option<&Value>) -> Option<f64> {
     }
 }
 
+/// The text a [`WidgetKind::Entry`] should show for the stored `value` (task 6.8).
+///
+/// A missing value (setting not yet loaded) or a non-string value renders as an empty
+/// field rather than panicking, so the widget always has something safe to show.
+pub(crate) fn entry_text_from_value(value: Option<&Value>) -> String {
+    value.and_then(Value::as_str).unwrap_or_default().to_owned()
+}
+
 /// The ordered items a reorderable list should show for the stored `value`.
 ///
 /// Splits the comma-joined string, trimming each item and dropping empties, so a
@@ -486,6 +507,10 @@ mod tests {
         };
         assert!(token_switch.is_compatible_with(ValueKind::String));
         assert!(!token_switch.is_compatible_with(ValueKind::Bool));
+
+        // A text entry edits a free-text String setting (the lock command, task 6.8).
+        assert!(WidgetKind::Entry.is_compatible_with(ValueKind::String));
+        assert!(!WidgetKind::Entry.is_compatible_with(ValueKind::Integer));
     }
 
     #[test]
@@ -732,6 +757,29 @@ mod tests {
         assert_eq!(
             value_from_token_toggle(None, "caps:escape", true),
             Value::String("caps:escape".to_string())
+        );
+    }
+
+    #[test]
+    fn entry_value_round_trips_as_a_string() {
+        // The free-text entry (task 6.8): the typed text is stored verbatim as a String,
+        // and rendering shows the stored text back — a missing or non-string value is an
+        // empty field, never a panic.
+        assert_eq!(
+            value_from_entry("pidof hyprlock || hyprlock"),
+            Value::String("pidof hyprlock || hyprlock".to_string())
+        );
+        assert_eq!(value_from_entry(""), Value::String(String::new()));
+
+        assert_eq!(
+            entry_text_from_value(Some(&Value::String("hyprlock".to_string()))),
+            "hyprlock"
+        );
+        assert_eq!(entry_text_from_value(None), "");
+        assert_eq!(
+            entry_text_from_value(Some(&Value::Integer(5))),
+            "",
+            "a non-string value renders as an empty field"
         );
     }
 

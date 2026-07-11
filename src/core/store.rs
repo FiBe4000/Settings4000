@@ -913,6 +913,62 @@ mod tests {
     }
 
     #[test]
+    fn staging_an_unsafe_lock_command_is_rejected_and_reverts() {
+        // Task 6.8 review S1 (R8.3): the hypridle lock command is free text typed into an
+        // Entry, but is written into a hyprlang value — a `#` would be read as a comment
+        // and truncate it. Staging such a value must be refused so the framework's
+        // invalid-edit path reverts the control on the offending keystroke, rather than the
+        // value staging cleanly and only failing the whole Apply.
+        let dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let path = dir.path().join("hypridle.conf");
+        fs::write(&path, "general { lock_cmd = hyprlock }").expect("write the lock fixture");
+        let bytes = fs::read(&path).expect("read back the lock fixture");
+        let mut store = SettingsStore::new();
+        store.load_file(
+            &path,
+            FileValues {
+                bytes,
+                values: vec![(
+                    SettingId::LockCommand,
+                    Value::String("hyprlock".to_string()),
+                )],
+            },
+            Box::new(|path: &Path| {
+                let bytes = fs::read(path)?;
+                Ok(FileValues {
+                    bytes,
+                    values: Vec::new(),
+                })
+            }),
+        );
+
+        let error = store
+            .stage(
+                SettingId::LockCommand,
+                Value::String("hyprlock # oops".to_string()),
+            )
+            .expect_err("a lock command containing `#` must be rejected");
+        assert!(matches!(error, StageError::Invalid(_)));
+        assert!(!store.is_dirty(), "a rejected edit must not be staged");
+        assert_eq!(
+            store.value(SettingId::LockCommand),
+            Some(&Value::String("hyprlock".to_string())),
+            "the store reverts to the original, unchanged value"
+        );
+
+        // A safe lock command still stages fine.
+        assert_eq!(
+            store
+                .stage(
+                    SettingId::LockCommand,
+                    Value::String("hyprlock --immediate".to_string())
+                )
+                .expect("a safe lock command stages"),
+            StageOutcome::Staged
+        );
+    }
+
+    #[test]
     fn staging_an_unloaded_file_backed_setting_is_an_error() {
         // Staging a file-backed setting the loader never registered is a guarded
         // error (NotLoaded), not a silent insert.
