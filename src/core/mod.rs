@@ -91,3 +91,13 @@ pub mod display;
 // touches the store (R5.2). It is consumed by the Sound page UI glue (`ui::sound`), so
 // its public surface is exercised in a non-test build too.
 pub mod sound;
+
+// The Theme-page palette-scheme model (task 6.3; R3.2, R4.2, R4.4, R8.5). It enumerates
+// the switchable schemes from the discovered `colors/` directory, detects and preselects
+// the active scheme from the generated `colors.conf` header (task 3.7), stages a pending
+// switch, and produces the `apply::PaletteSwitch` the Apply pipeline (task 4.5) runs
+// last (`generate-colors <scheme>` + the reload chain). Like the Display model it is a
+// bespoke staging source folded into the shared Apply/Reset chrome; it is consumed by the
+// Theme page UI glue (`ui::theme`) and the window, so its surface is exercised in a
+// non-test build too.
+pub mod theme;

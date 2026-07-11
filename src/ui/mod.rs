@@ -36,6 +36,11 @@
 //!   [`crate::core::sound`] state. It is bespoke rather than declarative because every
 //!   control is runtime-only — it applies a `wpctl` command immediately and bypasses
 //!   staging entirely (R3.1/R5.2).
+//! - [`theme`] — the Theme page's bespoke glue (task 6.3): a multi-section page whose
+//!   first section is the palette-scheme drop-down (plus a color preview strip),
+//!   rendered from the [`crate::core::theme`] model. It is bespoke rather than
+//!   declarative because a palette switch runs `generate-colors` instead of writing a
+//!   store-backed setting; tasks 6.4/6.5 add further sections.
 //!
 //! The real per-category page content (§6) plugs into this shell in later tasks.
 
@@ -47,4 +52,5 @@ mod page;
 mod row;
 mod sound;
 mod startup;
+mod theme;
 mod window;

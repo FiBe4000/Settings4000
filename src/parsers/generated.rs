@@ -200,14 +200,29 @@ impl SwatchColor {
 /// reusing the task-3.1 palette parser.
 ///
 /// This never fails and never panics: [`PaletteFile::parse`] preserves every line
-/// and only surfaces problems as warnings (which it already logs), so a malformed
-/// palette simply yields a swatch with whichever schema colors it could read and a
-/// [`SchemaValidation`] that reports what is wrong. The result is display-only and
-/// read-only — nothing here writes the file.
+/// and only surfaces problems as warnings, so a malformed palette simply yields a
+/// swatch with whichever schema colors it could read and a [`SchemaValidation`] that
+/// reports what is wrong. The result is display-only and read-only — nothing here
+/// writes the file.
 pub(crate) fn parse_scheme_swatch(scheme_contents: &str) -> SchemeSwatch {
-    // Warnings are dropped here: `parse` already logs each at `warn`, and for a
-    // swatch we care only about the values we can read plus the schema report.
-    let (palette, _warnings) = PaletteFile::parse(scheme_contents);
+    // This parse is used both for the active scheme and to *probe* arbitrary files
+    // while enumerating schemes (task 6.3), so the warnings are never surfaced at
+    // `warn` (a non-palette file such as a README would otherwise log one per line).
+    // The palette parser returns warnings rather than logging them (like the sibling
+    // parsers); a swatch only needs the readable values plus the schema report. Since
+    // no caller logs palette parse warnings anymore, a single `debug` line records
+    // that a present palette parsed with warnings, so a malformed-but-present scheme
+    // still leaves a diagnostic trail (R7.3) while a non-palette probe stays quiet at
+    // the default log level.
+    let (palette, warnings) = PaletteFile::parse(scheme_contents);
+    if !warnings.is_empty() {
+        // Only the count is logged, never the file contents or the per-line details,
+        // to respect R7.3.
+        tracing::debug!(
+            warnings = warnings.len(),
+            "palette scheme parsed with warnings while building its swatch"
+        );
+    }
 
     let mut colors = Vec::new();
     for key in PALETTE_KEYS {

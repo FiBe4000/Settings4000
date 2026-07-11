@@ -100,6 +100,7 @@ use crate::core::display::DisplayModel;
 use crate::core::model::Category;
 use crate::core::reload::ReloadParams;
 use crate::core::store::SettingsStore;
+use crate::core::theme::PaletteModel;
 use crate::system::command::SystemCommandRunner;
 use crate::system::signal::SystemProcessSignaller;
 use crate::ui::category::{SidebarCategory, visible_categories};
@@ -108,6 +109,7 @@ use crate::ui::display::{self, DisplayPage};
 use crate::ui::page::{self, PageMsg, PagePlan, SettingsPage};
 use crate::ui::sound::{self, SoundPage};
 use crate::ui::startup::{self, LoadedFile, StartupLoad};
+use crate::ui::theme::{self, ThemePage};
 
 /// Title shown in the window's title bar and to the compositor.
 const WINDOW_TITLE: &str = "Settings4000";
@@ -169,6 +171,16 @@ struct Shell {
     /// category is not visible. It is runtime-only, so — unlike the store and the Display
     /// model — it feeds neither the Apply/Reset chrome nor a dirty marker (R5.2).
     sound_page: Rc<RefCell<Option<SoundPage>>>,
+    /// The Theme page's palette-scheme model (task 6.3), shared with the Theme glue.
+    /// `None` until the startup worker builds it, or when there is no dotfiles palette
+    /// source. Like the Display model it is a staging source alongside the store: its
+    /// dirty state feeds the same Apply/Reset chrome, and its scheme switch is folded
+    /// into the same Apply pipeline as a `PaletteSwitch` (see [`Shell::wire_apply`]).
+    palette: Rc<RefCell<Option<PaletteModel>>>,
+    /// The mounted Theme page, retained so the window can re-render it after a Reset or a
+    /// committed Apply. Rebuilt by [`Shell::populate`]; `None` while the Theme category
+    /// shows a placeholder (no palette source, and no other Theme section built yet).
+    theme_page: Rc<RefCell<Option<ThemePage>>>,
     /// The most recent detection result, replaced on a manual refresh (R4.3).
     capabilities: Rc<RefCell<Capabilities>>,
     /// The retained page controllers, so the window can send them [`PageMsg::Rerender`]
@@ -220,6 +232,11 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     let display_page: Rc<RefCell<Option<DisplayPage>>> = Rc::new(RefCell::new(None));
     // The Sound page (task 6.2) — a runtime-only bespoke page rebuilt by `populate`.
     let sound_page: Rc<RefCell<Option<SoundPage>>> = Rc::new(RefCell::new(None));
+    // The Theme page's palette model and mounted page (task 6.3) — a staging source
+    // folded into the chrome and the Apply pipeline, like the Display model. Both start
+    // empty; the worker fills the model and `populate` builds the page.
+    let palette: Rc<RefCell<Option<PaletteModel>>> = Rc::new(RefCell::new(None));
+    let theme_page: Rc<RefCell<Option<ThemePage>>> = Rc::new(RefCell::new(None));
 
     // The persistent content stack + sidebar. Pages are added to this same stack on
     // every populate; the stack itself is never rebuilt.
@@ -247,27 +264,36 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     let update_chrome: Rc<dyn Fn()> = {
         let store = store.clone();
         let display = display.clone();
+        let palette = palette.clone();
         let apply_button = apply_button.clone();
         let reset_button = reset_button.clone();
         let stack = stack.clone();
         let marked = marked.clone();
         Rc::new(move || {
             let store = store.borrow();
-            // The Display page is a second dirty source (task 6.1): it has no store
-            // value (monitors are dynamic), so its dirty state is read from its own
-            // model and OR-ed into the shared Apply/Reset enablement.
+            // The Display and Theme pages are second/third dirty sources (tasks 6.1/6.3):
+            // neither is a store value (monitors are dynamic; a palette switch runs
+            // `generate-colors` rather than writing a store-backed setting), so each
+            // reports its own dirty state, OR-ed into the shared Apply/Reset enablement.
             let display_dirty = display
                 .borrow()
                 .as_ref()
                 .is_some_and(DisplayModel::is_dirty);
-            let enabled = chrome::actions_enabled(&store) || display_dirty;
+            let palette_dirty = palette
+                .borrow()
+                .as_ref()
+                .is_some_and(PaletteModel::is_dirty);
+            let enabled = chrome::actions_enabled(&store) || display_dirty || palette_dirty;
             apply_button.set_sensitive(enabled);
             reset_button.set_sensitive(enabled);
             for (category, child) in marked.borrow().iter() {
-                let dirty = if *category == Category::Display {
-                    display_dirty
-                } else {
-                    store.is_category_dirty(*category)
+                // Display and Theme read their own model's dirty state; Theme also ORs in
+                // any store-backed Theme setting so it stays correct once 6.4/6.5 add
+                // them. Every other page reads the store's per-category rollup.
+                let dirty = match *category {
+                    Category::Display => display_dirty,
+                    Category::Theme => palette_dirty || store.is_category_dirty(Category::Theme),
+                    other => store.is_category_dirty(other),
                 };
                 stack.page(child).set_needs_attention(dirty);
             }
@@ -304,6 +330,8 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
         display,
         display_page,
         sound_page,
+        palette,
+        theme_page,
         capabilities,
         controllers,
         stack,
@@ -381,6 +409,7 @@ impl Shell {
             capabilities,
             files,
             display,
+            palette,
         } = load;
         let file_count = files.len();
 
@@ -397,9 +426,10 @@ impl Shell {
             }
         }
         *self.capabilities.borrow_mut() = capabilities;
-        // Adopt the worker-built Display model (task 6.1) before `populate` builds the
-        // Display page from it.
+        // Adopt the worker-built Display and palette models (tasks 6.1/6.3) before
+        // `populate` builds their pages from them.
         *self.display.borrow_mut() = display;
+        *self.palette.borrow_mut() = palette;
 
         self.populate();
 
@@ -436,10 +466,11 @@ impl Shell {
             self.stack.remove(&child);
         }
         self.marked.borrow_mut().clear();
-        // Drop any retained Display/Sound pages from a previous populate; their
+        // Drop any retained Display/Sound/Theme pages from a previous populate; their
         // `populate_*` helpers re-set them when the categories are (re)built below.
         *self.display_page.borrow_mut() = None;
         *self.sound_page.borrow_mut() = None;
+        *self.theme_page.borrow_mut() = None;
 
         // Build one page per visible category, in sidebar order (R4.2).
         let mut controllers = Vec::new();
@@ -456,6 +487,13 @@ impl Shell {
             // from the runtime-enumerated PipeWire state.
             if category == SidebarCategory::Sound {
                 self.populate_sound(category);
+                continue;
+            }
+            // Theme is bespoke as well (task 6.3): its palette switch runs
+            // `generate-colors` rather than writing a store-backed setting, so it renders
+            // from the [`PaletteModel`] instead of the declarative framework.
+            if category == SidebarCategory::Theme {
+                self.populate_theme(category);
                 continue;
             }
             match page::plan_category(category, &caps) {
@@ -529,6 +567,39 @@ impl Shell {
         self.stack
             .add_titled(page.root(), Some(category.stack_name()), category.title());
         *self.sound_page.borrow_mut() = Some(page);
+    }
+
+    /// Builds the Theme category's page (task 6.3).
+    ///
+    /// Task 6.3 adds only the palette-scheme section, present exactly when detection
+    /// discovered the dotfiles palette source (R3.2/R8.5) — the worker builds a
+    /// [`PaletteModel`] only then. When it is present the bespoke [`theme`] page is
+    /// mounted (rendering from the shared model and reporting staged switches through
+    /// `update_chrome`) and its dirty marker is registered under [`Category::Theme`].
+    /// When it is absent the palette controls are hidden and the page degrades to the
+    /// task-5.1 placeholder (R4.2/R4.4); tasks 6.4/6.5 will build the page for their own
+    /// sections too, so this condition grows as they land. The hidden-palette reason is
+    /// logged at `info`, matching the hidden-item convention (detection also logs *why*
+    /// the source is absent).
+    fn populate_theme(&self, category: SidebarCategory) {
+        if self.palette.borrow().is_some() {
+            let page = theme::build(self.palette.clone(), self.update_chrome.clone());
+            self.stack
+                .add_titled(page.root(), Some(category.stack_name()), category.title());
+            // The Theme marker tracks the palette model's dirty state (and, later, any
+            // store-backed Theme setting); it holds no store-backed setting today.
+            self.marked
+                .borrow_mut()
+                .push((Category::Theme, page.root().clone().upcast()));
+            *self.theme_page.borrow_mut() = Some(page);
+        } else {
+            tracing::info!(
+                "Theme palette section hidden: no dotfiles palette source (R3.2/R4.2/R8.5)"
+            );
+            let placeholder = build_placeholder_page(category);
+            self.stack
+                .add_titled(&placeholder, Some(category.stack_name()), category.title());
+        }
     }
 
     /// Re-enumerates the Sound page whenever it becomes the visible stack child (task
@@ -618,6 +689,21 @@ impl Shell {
                 }
             };
 
+            // Fold in the Theme page's palette switch (task 6.3): a staged scheme
+            // contributes a `PaletteSwitch`, so the pipeline runs the discovered
+            // `generate-colors <scheme>` as its last write step and then the palette
+            // reload chain. It writes no file directly — v1 never edits `colors/<scheme>`.
+            let has_palette_switch = {
+                let palette = shell.palette.borrow();
+                match palette.as_ref().and_then(PaletteModel::apply_contribution) {
+                    Some(switch) => {
+                        plan.palette = Some(switch);
+                        true
+                    }
+                    None => false,
+                }
+            };
+
             // Side-effect seams: the real system runner (created above) plus the
             // signaller. The freshness tracker is the store's own (task 5.4), holding
             // the baselines recorded when the startup load read the backing files, so
@@ -641,13 +727,24 @@ impl Shell {
                             display.commit();
                         }
                     }
+                    // Promote the staged scheme to active so the palette is clean again
+                    // (task 6.3). There is no on-disk baseline to re-record — the app
+                    // does not write the generated colors.conf, generate-colors does.
+                    if has_palette_switch {
+                        if let Some(palette) = shell.palette.borrow_mut().as_mut() {
+                            palette.commit();
+                        }
+                    }
                     shell.rerender_pages();
                     shell.rerender_display();
+                    shell.rerender_theme();
                     (shell.update_chrome)();
                     if let Some(message) = message {
                         shell.toast.show(&message);
                     }
-                    tracing::info!("apply committed; store and Display reconciled (task 5.3/6.1)");
+                    tracing::info!(
+                        "apply committed; store, Display, and palette reconciled (task 5.3/6.1/6.3)"
+                    );
                 }
                 ApplyResponse::Warn { heading, detail } => {
                     chrome::show_warning(&shell.window, &heading, &detail);
@@ -661,13 +758,17 @@ impl Shell {
         let shell = self.clone();
         reset_button.connect_clicked(move |_| {
             shell.store.borrow_mut().reset();
-            // Reset the Display page's staging too (task 6.1) — it is a second dirty
-            // source, so Reset must clear it alongside the store.
+            // Reset the Display and palette staging too (tasks 6.1/6.3) — they are
+            // additional dirty sources, so Reset must clear them alongside the store.
             if let Some(display) = shell.display.borrow_mut().as_mut() {
                 display.reset();
             }
+            if let Some(palette) = shell.palette.borrow_mut().as_mut() {
+                palette.reset();
+            }
             shell.rerender_pages();
             shell.rerender_display();
+            shell.rerender_theme();
             (shell.update_chrome)();
             tracing::debug!("discarded staged edits from the Reset button (R5.1)");
         });
@@ -724,6 +825,15 @@ impl Shell {
     /// Display drop-downs snap to the model's values.
     fn rerender_display(&self) {
         if let Some(page) = self.display_page.borrow().as_ref() {
+            page.rerender();
+        }
+    }
+
+    /// Re-renders the Theme page from its palette model (task 6.3), the bespoke
+    /// counterpart of [`Self::rerender_pages`]. Called after a Reset or a committed Apply
+    /// so the palette drop-down snaps to the model's active/staged scheme.
+    fn rerender_theme(&self) {
+        if let Some(page) = self.theme_page.borrow().as_ref() {
             page.rerender();
         }
     }

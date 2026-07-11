@@ -54,6 +54,7 @@ use crate::core::detect::{Capabilities, DetectionInputs};
 use crate::core::display::DisplayModel;
 use crate::core::model::{SettingId, Value};
 use crate::core::store::{FileReader, FileValues};
+use crate::core::theme::PaletteModel;
 use crate::parsers::hyprlang::{HyprlangFile, KeyPath};
 use crate::parsers::swaync::SwayncConfigFile;
 use crate::system::command::SystemCommandRunner;
@@ -91,6 +92,11 @@ pub(crate) struct StartupLoad {
     /// `hyprctl monitors -j` and reading `monitors.conf`, or `None` when there is no
     /// live compositor to enumerate (the Display page then shows a placeholder, R4.2).
     pub(crate) display: Option<DisplayModel>,
+    /// The Theme page's palette-scheme model (task 6.3), built by enumerating the
+    /// discovered `colors/` directory and detecting the active scheme, or `None` when
+    /// there is no dotfiles palette source (the Theme palette section is then hidden,
+    /// R4.2/R8.5).
+    pub(crate) palette: Option<PaletteModel>,
 }
 
 /// The live XDG paths of the backing config files loaded at startup (R8.5).
@@ -150,11 +156,33 @@ pub(crate) fn load() -> StartupLoad {
     let capabilities = Capabilities::detect(&DetectionInputs::from_system(Vec::new()));
     let files = load_files(&BackingPaths::from_system());
     let display = load_display(&capabilities);
+    let palette = load_palette(&capabilities);
     StartupLoad {
         capabilities,
         files,
         display,
+        palette,
     }
+}
+
+/// Builds the Theme page's palette-scheme model on the worker thread (task 6.3).
+///
+/// Only builds when detection discovered the dotfiles palette source (R3.2/R8.5): its
+/// [`PaletteSource`](crate::core::detect::PaletteSource) supplies the `colors/`
+/// directory to enumerate and the `scripts/generate-colors` path the Apply pipeline
+/// runs. When it is absent — no dotfiles repo behind the config, or an incomplete one —
+/// this returns `None` and the Theme palette section is hidden (R4.2/R4.4). The active
+/// scheme is read from the deployed generated `~/.config/hypr/colors.conf` header (task
+/// 3.7, R3.2), at its live XDG path. Running the enumeration here keeps its file reads
+/// off the main thread and inside the R8.1 cold-start budget (architecture §8).
+fn load_palette(capabilities: &Capabilities) -> Option<PaletteModel> {
+    let source = capabilities.palette_source()?;
+    let active_scheme_source = config_home().join("hypr").join("colors.conf");
+    Some(PaletteModel::load(
+        source.colors_dir(),
+        &active_scheme_source,
+        source.generate_colors().to_path_buf(),
+    ))
 }
 
 /// Builds the Display page's model on the worker thread (task 6.1).

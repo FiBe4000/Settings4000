@@ -131,8 +131,9 @@ enum LineKind {
 /// Parsing never fails and never loses data: a problematic line is preserved
 /// verbatim and reported here instead of aborting or panicking (R6.1 acceptance:
 /// "malformed lines surfaced as parse warnings, not panics"). [`PaletteFile::parse`]
-/// returns the collected warnings *and* logs each at `warn`, so the caller can
-/// both react programmatically and see them in the journal.
+/// **returns** the collected warnings for the caller to log or ignore — it does not
+/// log them itself (mirroring the sibling parsers), so a caller that probes arbitrary
+/// files while enumerating palette schemes can drop them without flooding the journal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ParseWarning {
     /// 1-based line number the warning concerns, for human-readable diagnostics.
@@ -287,12 +288,18 @@ impl PaletteFile {
     /// entry, so [`emit`](Self::emit) always reproduces the input byte-for-byte.
     /// Lines that cannot be interpreted as a palette entry (and are not comments
     /// or blanks) and entries whose value is not bare hex are returned as
-    /// [`ParseWarning`]s and additionally logged at `warn`; they are *not*
-    /// errors and do not stop parsing (R6.1 acceptance).
+    /// [`ParseWarning`]s; they are *not* errors and do not stop parsing (R6.1
+    /// acceptance).
     ///
-    /// The returned warnings carry only line numbers and, for a bad value, the
-    /// offending key/value — never the whole file, whose contents are not logged
-    /// at any level (R7.3).
+    /// Like the sibling parsers (hyprlang, INI, env), warnings are **returned** for
+    /// the caller to log or ignore — this parser does not log them itself. That
+    /// distinction matters because the same parse is used both to read the user's
+    /// actual scheme file *and* to probe arbitrary files while enumerating the
+    /// palette schemes (task 6.3, via [`crate::parsers::generated::parse_scheme_swatch`]):
+    /// a non-palette file such as a `README.md` would otherwise emit a `warn` for
+    /// every line it holds. The probe drops the warnings; a future per-key editor can
+    /// log them. The returned warnings carry only line numbers and, for a bad value,
+    /// the offending key/value — never the whole file's contents (R7.3).
     pub(crate) fn parse(input: &str) -> (Self, Vec<ParseWarning>) {
         let mut lines = Vec::new();
         let mut warnings = Vec::new();
@@ -308,13 +315,6 @@ impl PaletteFile {
                 raw: raw.to_string(),
                 kind,
             });
-        }
-
-        for warning in &warnings {
-            // Surface each problem in the journal without dumping file contents at
-            // `warn` (R7.3): the message carries the line number and, for a bad
-            // value, the key/value only.
-            tracing::warn!(warning = %warning, "palette parse warning");
         }
 
         (PaletteFile { lines }, warnings)
