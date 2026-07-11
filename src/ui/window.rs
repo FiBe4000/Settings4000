@@ -68,12 +68,15 @@
 //! files against the real baselines the startup load recorded (R5.6) rather than an
 //! empty tracker.
 //!
-//! The Display page (task 6.1) contributes the first real file write: [`wire_apply`]
-//! folds its `monitors.conf` [`FileWrite`](crate::core::apply::FileWrite) and value
-//! validations into the same plan, so an Apply rewrites the target `monitor=` record
-//! and reloads via `hyprctl reload`. The store's remaining §6 pages will fill in their
-//! own writes the same way; until then their staged edits still validate and commit as
-//! before.
+//! The Display page (task 6.1) contributed the first bespoke-model file write, and the
+//! Input page (task 6.6) the first **store-driven** one: [`wire_apply`] folds each
+//! into the same plan — Display's `monitors.conf` [`FileWrite`](crate::core::apply::FileWrite)
+//! from its own model, and Input's `input.conf` write rendered from the store's dirty
+//! Input settings (via [`InputModel::input_conf_write`]) — so an Apply rewrites the
+//! target lines and reloads via `hyprctl reload`. The Input write is the general
+//! store-`SettingId` → `FileWrite` shape task 6.7 reuses for swaync; the remaining
+//! store-backed §6 pages fill in their own writes the same way, and until then their
+//! staged edits still validate and commit as before.
 //!
 //! # No libadwaita, no custom CSS (R2.1/R2.2)
 //!
@@ -97,6 +100,7 @@ use relm4::{ComponentController, Controller};
 use crate::core::apply::{self, ApplyPlan};
 use crate::core::detect::{Capabilities, DetectionInputs};
 use crate::core::display::DisplayModel;
+use crate::core::input::InputModel;
 use crate::core::model::Category;
 use crate::core::reload::ReloadParams;
 use crate::core::store::SettingsStore;
@@ -106,7 +110,9 @@ use crate::system::signal::SystemProcessSignaller;
 use crate::ui::category::{SidebarCategory, visible_categories};
 use crate::ui::chrome::{self, ApplyResponse, Toast};
 use crate::ui::display::{self, DisplayPage};
+use crate::ui::input;
 use crate::ui::page::{self, PageMsg, PagePlan, SettingsPage};
+use crate::ui::row::visible_rows;
 use crate::ui::sound::{self, SoundPage};
 use crate::ui::startup::{self, LoadedFile, StartupLoad};
 use crate::ui::theme::{self, ThemePage};
@@ -166,6 +172,13 @@ struct Shell {
     /// or a committed Apply. Rebuilt by [`Shell::populate`]; `None` while the Display
     /// category shows a placeholder (no live monitor data).
     display_page: Rc<RefCell<Option<DisplayPage>>>,
+    /// The Input page's helper (task 6.6), shared with the Input glue. `None` until the
+    /// startup worker builds it, or when `hyprctl` is absent. Unlike the Display/Theme
+    /// models it is **not** a separate staging source — every Input setting is staged in
+    /// the shared store — so it feeds neither the dirty rollup nor a bespoke commit; it
+    /// only supplies the keyboard-layout candidates and renders the store's dirty Input
+    /// settings into the `input.conf` write on Apply (see [`Shell::wire_apply`]).
+    input: Rc<RefCell<Option<InputModel>>>,
     /// The mounted Sound page (task 6.2), retained so the window can re-enumerate it when
     /// the page is re-shown. Rebuilt by [`Shell::populate`]; `None` when the Sound
     /// category is not visible. It is runtime-only, so — unlike the store and the Display
@@ -243,6 +256,11 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     // the model and `populate` builds the page.
     let display: Rc<RefCell<Option<DisplayModel>>> = Rc::new(RefCell::new(None));
     let display_page: Rc<RefCell<Option<DisplayPage>>> = Rc::new(RefCell::new(None));
+    // The Input page's helper (task 6.6) — the layout candidates + the Apply-time
+    // `input.conf` write. Filled by the worker; the Input page's controls are ordinary
+    // store-backed rows, so no separate page handle is retained (the SettingsPage
+    // controller goes in `controllers` like any framework page).
+    let input: Rc<RefCell<Option<InputModel>>> = Rc::new(RefCell::new(None));
     // The Sound page (task 6.2) — a runtime-only bespoke page rebuilt by `populate`.
     let sound_page: Rc<RefCell<Option<SoundPage>>> = Rc::new(RefCell::new(None));
     // The Theme page's palette model and mounted page (task 6.3) — a staging source
@@ -353,6 +371,7 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
         store,
         display,
         display_page,
+        input,
         sound_page,
         palette,
         themes,
@@ -435,6 +454,7 @@ impl Shell {
             capabilities,
             files,
             display,
+            input,
             palette,
             themes,
             wallpaper,
@@ -454,9 +474,10 @@ impl Shell {
             }
         }
         *self.capabilities.borrow_mut() = capabilities;
-        // Adopt the worker-built Display, palette, GTK/icon/cursor theme, and
-        // wallpaper models (tasks 6.1/6.3–6.5) before `populate` builds their pages.
+        // Adopt the worker-built Display, Input, palette, GTK/icon/cursor theme, and
+        // wallpaper models (tasks 6.1/6.3–6.6) before `populate` builds their pages.
         *self.display.borrow_mut() = display;
+        *self.input.borrow_mut() = input;
         *self.palette.borrow_mut() = palette;
         *self.themes.borrow_mut() = themes;
         *self.wallpaper.borrow_mut() = wallpaper;
@@ -526,6 +547,13 @@ impl Shell {
                 self.populate_theme(category);
                 continue;
             }
+            // Input uses the declarative framework (its settings are store-backed), but
+            // its keyboard-layout add-control needs the runtime XKB candidates, so it is
+            // built here rather than through the pure `plan_category` (task 6.6).
+            if category == SidebarCategory::Input {
+                self.populate_input(category, &mut controllers);
+                continue;
+            }
             match page::plan_category(category, &caps) {
                 PagePlan::Framework(rows) => {
                     let controller =
@@ -583,6 +611,52 @@ impl Shell {
             self.stack
                 .add_titled(&placeholder, Some(category.stack_name()), category.title());
         }
+    }
+
+    /// Builds the Input category's page (task 6.6).
+    ///
+    /// The Input settings are ordinary store-backed [`SettingId`](crate::core::model::SettingId)s,
+    /// so this uses the declarative row framework like the generic path — the only reason
+    /// it is special-cased is that its keyboard-layout add-control is populated from the
+    /// runtime XKB candidates the [`InputModel`] holds ([`input::rows`]), which the pure
+    /// `page::plan_category` cannot supply. The built rows are gated per-row (R4.2) and, if
+    /// any survive, a [`SettingsPage`] is launched and its controller retained in
+    /// `controllers` (so a Reset/commit re-renders it via [`PageMsg::Rerender`], and its
+    /// dirty marker tracks the store's Input rollup like any framework page). If every row
+    /// is gated out the category is dropped (R4.2). The category is only reached when
+    /// `hyprctl` is present (task 5.1), so the [`InputModel`] is built too; if it were
+    /// somehow absent, the layout add-list is simply empty.
+    fn populate_input(
+        &self,
+        category: SidebarCategory,
+        controllers: &mut Vec<Controller<SettingsPage>>,
+    ) {
+        let caps = self.capabilities.borrow();
+        let layouts = self
+            .input
+            .borrow()
+            .as_ref()
+            .map(|model| model.layout_options().to_vec())
+            .unwrap_or_default();
+        let visible = visible_rows(&input::rows(&layouts), &caps);
+        if visible.is_empty() {
+            tracing::info!(
+                category = category.title(),
+                "all Input rows are gated out; hiding the whole category (R4.2)"
+            );
+            return;
+        }
+
+        let controller = page::build_page(self.store.clone(), visible, self.update_chrome.clone());
+        let root = controller.widget().clone();
+        self.stack
+            .add_titled(&root, Some(category.stack_name()), category.title());
+        // The Input marker tracks the store's per-page dirty rollup, like any framework
+        // page (its settings are all store-backed).
+        self.marked
+            .borrow_mut()
+            .push((Category::Input, root.upcast()));
+        controllers.push(controller);
     }
 
     /// Builds the Sound category's page (task 6.2).
@@ -758,10 +832,48 @@ impl Shell {
             }
 
             let mut plan = interim_apply_plan(&shell.store.borrow());
-            // The store-backed writes to commit to the store after a successful apply.
-            // Captured before the Display contribution is folded in, because the Display
-            // model commits its own `monitors.conf` write separately (its freshness is
-            // owned by the model, not the store).
+
+            // Fold the store-backed Input settings into one surgical `input.conf` write
+            // (task 6.6) — the first store-driven page to produce a real FileWrite. Done
+            // *before* `store_writes` is captured below so the write is committed and
+            // re-baselined by the store's `commit_apply`: `input.conf`'s freshness lives
+            // in the store's tracker (loaded at startup), unlike the Display/Theme models
+            // which own their files' freshness and commit separately (R5.6).
+            let input_write = {
+                let store = shell.store.borrow();
+                let input = shell.input.borrow();
+                match input.as_ref() {
+                    Some(model) => model.input_conf_write(&store.dirty_in_category(Category::Input)),
+                    None => Ok(None),
+                }
+            };
+            match input_write {
+                Ok(Some(write)) => plan.writes.push(write),
+                Ok(None) => {}
+                // The user has pending Input edits but the write could not be prepared
+                // (input.conf unreadable, or the writer rejected an edit). Abort the whole
+                // Apply and keep the staged edits — never proceed to commit, which would
+                // promote the Input values against an unchanged file and desync the store
+                // (task 6.6 review M1). Near-unreachable in practice.
+                Err(error) => {
+                    tracing::error!(%error, "aborting apply: could not prepare the input.conf write");
+                    chrome::show_warning(
+                        &shell.window,
+                        "Could not prepare the input changes",
+                        &format!(
+                            "Settings4000 could not update input.conf, so nothing was written: \
+                             {error}. Your input changes were kept — fix the problem and try again."
+                        ),
+                    );
+                    return;
+                }
+            }
+
+            // The store-backed writes to commit to the store after a successful apply
+            // (the `input.conf` write folded in above is included, so `commit_apply`
+            // re-baselines it). Captured before the Display/Theme contributions are folded
+            // in, because those models commit their own files separately (their freshness
+            // is owned by the model, not the store).
             let store_writes: Vec<(PathBuf, Vec<u8>)> = plan
                 .writes
                 .iter()
@@ -1001,12 +1113,13 @@ impl Shell {
 /// Builds the base [`ApplyPlan`] from the store's dirty edits (task 5.3).
 ///
 /// It carries the store's dirty settings as `validations` (so [`apply::run`]'s first
-/// gate re-checks them, R8.3). It still produces **no** store `writes`: turning a
-/// staged [`Value`](crate::core::model::Value) into concrete file bytes goes through
-/// the format parsers and is per-page glue, which the remaining §6 pages fill in. The
-/// Display page (task 6.1) does not go through here — [`Shell::wire_apply`] folds its
-/// `monitors.conf` write and validations into this plan after building it, since the
-/// Display staging lives in its own model rather than the store.
+/// gate re-checks them, R8.3). It produces **no** `writes` itself: turning a staged
+/// [`Value`](crate::core::model::Value) into concrete file bytes goes through the format
+/// parsers and is per-page glue. [`Shell::wire_apply`] folds those writes into the plan
+/// after building it — the Input page's `input.conf` write from the store's dirty Input
+/// settings (task 6.6), and the Display/Theme models' writes from their own staging — so
+/// this stays a thin shared starting point. The remaining store-backed §6 pages
+/// (Notifications, task 6.7) add their writes the same way as Input.
 fn interim_apply_plan(store: &SettingsStore) -> ApplyPlan {
     let validations = store
         .dirty_ids()

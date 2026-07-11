@@ -161,10 +161,20 @@ pub(crate) enum SettingId {
     /// that is the on-disk shape; the Input page edits it through the declarative
     /// reorderable list widget (task 5.2, R2.3), which splits/joins on commas. The
     /// order is significant — it is the layout switch order — so this cannot be a
-    /// plain set. Value-format validation (that each item is a real XKB layout) is
-    /// deferred to task 6.6, which sources the candidates from the XKB registry; here
-    /// it is unvalidated beyond its kind, like [`SettingId::LockCommand`].
+    /// plain set. Validated to require **at least one entry** (an empty `kb_layout`
+    /// would make Hyprland fall back to its default layout, R8.3); per-item XKB-validity
+    /// is not checked (the Input page sources candidates from the XKB registry, so an
+    /// added item is a real layout, and an unknown-but-present code is left to Hyprland).
     KeyboardLayouts,
+    /// The keyboard option list, kept as Hyprland's raw comma-joined `kb_options`
+    /// value (e.g. `grp:win_space_toggle,caps:escape`). Modelled as the whole
+    /// [`ValueKind::String`] rather than one setting per option so that options the
+    /// Input page (task 6.6) has no curated switch for are **preserved verbatim** on
+    /// an edit: the page's curated switches (e.g. `caps:escape`) toggle a single
+    /// token in and out of this string while leaving every other token untouched.
+    /// Free-text like [`SettingId::KeyboardLayouts`], so it is unvalidated beyond its
+    /// kind — an unrecognised option token is left to Hyprland to accept or ignore.
+    KeyboardOptions,
     /// Mouse/touchpad sensitivity — Hyprland's `sensitivity`, clamped to
     /// `-1.0..=1.0`.
     MouseSensitivity,
@@ -212,6 +222,7 @@ impl SettingId {
             | SettingId::WallpaperPath
             | SettingId::LockBackgroundPath
             | SettingId::KeyboardLayouts
+            | SettingId::KeyboardOptions
             | SettingId::LockCommand => ValueKind::String,
         }
     }
@@ -229,6 +240,7 @@ impl SettingId {
                 Category::Theme
             }
             SettingId::KeyboardLayouts
+            | SettingId::KeyboardOptions
             | SettingId::MouseSensitivity
             | SettingId::TouchpadNaturalScroll
             | SettingId::TouchpadTapToClick => Category::Input,
@@ -263,6 +275,7 @@ impl SettingId {
             | SettingId::WallpaperPath
             | SettingId::LockBackgroundPath
             | SettingId::KeyboardLayouts
+            | SettingId::KeyboardOptions
             | SettingId::MouseSensitivity
             | SettingId::TouchpadNaturalScroll
             | SettingId::TouchpadTapToClick
@@ -324,11 +337,18 @@ impl SettingId {
                 Value::Bool(_),
             ) => Ok(()),
             (SettingId::NotificationPosition, Value::Enum(_)) => Ok(()),
-            // Free-text String settings with no format rule beyond their kind: the
-            // lock command, and the keyboard-layout list (whose XKB-validity check is
-            // task 6.6's, since it needs the XKB registry). An empty layout list is
-            // possible here and is left for task 6.6 to prevent.
-            (SettingId::LockCommand | SettingId::KeyboardLayouts, Value::String(_)) => Ok(()),
+            // The keyboard-layout list must have at least one entry (R8.3): writing an
+            // empty `kb_layout=` makes Hyprland silently fall back to its default
+            // layout, discarding the user's configured layouts — so an empty list (the
+            // user removed every entry) is rejected and the control reverts. The XKB
+            // per-item validity check is not done here (it needs the registry); an
+            // unknown-but-present layout code is left to Hyprland.
+            (SettingId::KeyboardLayouts, Value::String(text)) => validate_layout_list(text),
+            // Free-text String settings with no format rule beyond their kind: the lock
+            // command, and the keyboard-option list — an opaque comma-joined token
+            // string whose unknown entries are preserved verbatim (task 6.6), and which
+            // may legitimately be empty (no options set).
+            (SettingId::LockCommand | SettingId::KeyboardOptions, Value::String(_)) => Ok(()),
             // Anything left over is a value whose kind does not match the setting.
             (id, value) => Err(ValidationError::WrongKind {
                 expected: id.kind(),
@@ -478,6 +498,10 @@ pub(crate) enum ValidationError {
         /// The offending value as supplied.
         value: String,
     },
+    /// A list-valued setting that requires at least one entry is empty. Today only the
+    /// keyboard-layout list uses this: an empty `kb_layout` would make Hyprland fall
+    /// back to its default layout, silently dropping the user's configuration (R8.3).
+    EmptyKeyboardLayouts,
     /// A monitor mode string is not a recognised `WxH@Hz` mode (or special token),
     /// or its numbers are outside the plausible range.
     InvalidMonitorMode {
@@ -537,6 +561,9 @@ impl fmt::Display for ValidationError {
                 f,
                 "`{value}` is not a valid color: expected six hexadecimal digits, e.g. 83c092"
             ),
+            ValidationError::EmptyKeyboardLayouts => {
+                write!(f, "at least one keyboard layout is required")
+            }
             ValidationError::InvalidMonitorMode { value, detail } => {
                 write!(f, "`{value}` is not a valid display mode: {detail}")
             }
@@ -637,6 +664,23 @@ pub(crate) fn validate_hex_color(value: &str) -> Result<(), ValidationError> {
         Err(ValidationError::NotBareHexColor {
             value: value.to_string(),
         })
+    }
+}
+
+/// Validates the keyboard-layout list: it must contain at least one non-empty entry
+/// (R8.3).
+///
+/// The value is Hyprland's comma-joined `kb_layout` string (e.g. `us,se`). A value that
+/// is empty, or only whitespace and separators (`""`, `","`, `" , "`), has no real
+/// layout and would write a bare `kb_layout=`, which Hyprland replaces with its default
+/// — silently losing the user's configured layouts. Splitting on commas and requiring a
+/// non-empty trimmed field matches how the Input page's reorderable list tokenises the
+/// value, so the two agree on what "at least one layout" means.
+pub(crate) fn validate_layout_list(value: &str) -> Result<(), ValidationError> {
+    if value.split(',').any(|item| !item.trim().is_empty()) {
+        Ok(())
+    } else {
+        Err(ValidationError::EmptyKeyboardLayouts)
     }
 }
 
@@ -839,6 +883,7 @@ mod tests {
         SettingId::WallpaperPath,
         SettingId::LockBackgroundPath,
         SettingId::KeyboardLayouts,
+        SettingId::KeyboardOptions,
         SettingId::MouseSensitivity,
         SettingId::TouchpadNaturalScroll,
         SettingId::TouchpadTapToClick,
@@ -862,6 +907,7 @@ mod tests {
             | SettingId::WallpaperPath
             | SettingId::LockBackgroundPath
             | SettingId::KeyboardLayouts
+            | SettingId::KeyboardOptions
             | SettingId::MouseSensitivity
             | SettingId::TouchpadNaturalScroll
             | SettingId::TouchpadTapToClick
@@ -889,6 +935,9 @@ mod tests {
                 Value::String("/nonexistent.png".to_string())
             }
             SettingId::KeyboardLayouts => Value::String("us,se".to_string()),
+            SettingId::KeyboardOptions => {
+                Value::String("grp:win_space_toggle,caps:escape".to_string())
+            }
             SettingId::MouseSensitivity => Value::Float(0.3),
             SettingId::TouchpadNaturalScroll | SettingId::TouchpadTapToClick => Value::Bool(true),
             SettingId::NotificationPosition => Value::Enum("top-right".to_string()),
@@ -966,6 +1015,7 @@ mod tests {
         assert_eq!(SettingId::MonitorMode.category(), Category::Display);
         assert_eq!(SettingId::WallpaperPath.category(), Category::Theme);
         assert_eq!(SettingId::KeyboardLayouts.category(), Category::Input);
+        assert_eq!(SettingId::KeyboardOptions.category(), Category::Input);
         assert_eq!(SettingId::MouseSensitivity.category(), Category::Input);
         assert_eq!(
             SettingId::NotificationTimeout.category(),
@@ -1043,6 +1093,46 @@ mod tests {
             SettingId::PaletteColor
                 .validate(&Value::String("nope".to_string()))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn keyboard_layouts_require_at_least_one_entry() {
+        // R8.3 (task 6.6 review S1): a non-empty layout list validates, but an empty one
+        // — the user removed every entry — is rejected so the framework's invalid-edit
+        // path reverts the control rather than writing a bare `kb_layout=` (which
+        // Hyprland silently replaces with its default, losing the config).
+        assert!(validate_layout_list("us,se").is_ok());
+        assert!(validate_layout_list("us").is_ok());
+
+        // Empty, and values that trim/split to no real entry, are all rejected.
+        for empty in ["", ",", " ", " , "] {
+            assert!(
+                matches!(
+                    validate_layout_list(empty),
+                    Err(ValidationError::EmptyKeyboardLayouts)
+                ),
+                "`{empty}` must be rejected as an empty layout list"
+            );
+        }
+
+        // Dispatch through the setting reaches the same guard.
+        assert!(
+            SettingId::KeyboardLayouts
+                .validate(&Value::String("us,se".to_string()))
+                .is_ok()
+        );
+        let error = SettingId::KeyboardLayouts
+            .validate(&Value::String(String::new()))
+            .expect_err("an empty layout list must be rejected");
+        assert!(matches!(error, ValidationError::EmptyKeyboardLayouts));
+
+        // The keyboard-option list, by contrast, may legitimately be empty.
+        assert!(
+            SettingId::KeyboardOptions
+                .validate(&Value::String(String::new()))
+                .is_ok(),
+            "no keyboard options set is valid"
         );
     }
 
@@ -1318,6 +1408,7 @@ mod tests {
             ValidationError::NotBareHexColor {
                 value: "#fff".to_string(),
             },
+            ValidationError::EmptyKeyboardLayouts,
             ValidationError::InvalidMonitorMode {
                 value: "bad".to_string(),
                 detail: "nope".to_string(),

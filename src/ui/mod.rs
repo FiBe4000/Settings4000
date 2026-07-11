@@ -41,6 +41,12 @@
 //!   rendered from the [`crate::core::theme`] model. It is bespoke rather than
 //!   declarative because a palette switch runs `generate-colors` instead of writing a
 //!   store-backed setting; tasks 6.4/6.5 add further sections.
+//! - [`input`] — the Input page's descriptor glue (task 6.6): the row list for the
+//!   store-backed keyboard/mouse/touchpad settings, whose keyboard-layout add-control is
+//!   populated from the runtime-loaded XKB registry. It uses the declarative row
+//!   framework (the settings are ordinary file-backed [`crate::core::model::SettingId`]s);
+//!   only the runtime candidate list and the curated keyboard-option switches need this
+//!   thin glue. The store→`input.conf` write itself lives in [`crate::core::input`].
 //!
 //! The real per-category page content (§6) plugs into this shell in later tasks.
 
@@ -48,6 +54,7 @@ pub(crate) mod app;
 mod category;
 mod chrome;
 mod display;
+mod input;
 mod page;
 mod row;
 mod sound;

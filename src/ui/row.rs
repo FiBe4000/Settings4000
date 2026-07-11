@@ -127,6 +127,18 @@ pub(crate) enum WidgetKind {
         /// The entries the user may add to the list.
         candidates: Vec<DropDownOption>,
     },
+    /// A `GtkSwitch` that toggles a single `token` in and out of a comma-joined
+    /// [`Value::String`] setting, **preserving every other token verbatim** (R4.2). It
+    /// presents one flag of a multi-flag setting — e.g. one curated keyboard option
+    /// (`caps:escape`) of Hyprland's `kb_options` list (task 6.6) — as a plain on/off
+    /// switch, so options the app has no switch for are never dropped by an edit. The
+    /// switch is on when the token is present; toggling appends or removes only that
+    /// token (see [`value_from_token_toggle`]). Several `TokenSwitch` rows may target the
+    /// same String setting, each owning a different token.
+    TokenSwitch {
+        /// The single comma-token this switch adds or removes (e.g. `caps:escape`).
+        token: String,
+    },
 }
 
 impl WidgetKind {
@@ -142,7 +154,9 @@ impl WidgetKind {
             WidgetKind::DropDown { .. } => kind == ValueKind::Enum,
             WidgetKind::Switch => kind == ValueKind::Bool,
             WidgetKind::Scale { .. } => matches!(kind, ValueKind::Float | ValueKind::Integer),
-            WidgetKind::ReorderableList { .. } => kind == ValueKind::String,
+            WidgetKind::ReorderableList { .. } | WidgetKind::TokenSwitch { .. } => {
+                kind == ValueKind::String
+            }
         }
     }
 }
@@ -293,6 +307,37 @@ pub(crate) fn value_from_list_items(items: &[String]) -> Value {
     Value::String(items.join(","))
 }
 
+/// The [`Value`] a [`WidgetKind::TokenSwitch`] produces when `token` is switched
+/// `active` on or off, starting from the setting's current comma-joined `value`.
+///
+/// Toggling on appends `token` (only if absent, so it is not duplicated); toggling off
+/// removes every occurrence of it. Crucially, **all other tokens are kept in order and
+/// verbatim** — including ones the app has no switch for — so a curated switch never
+/// drops an unrecognised entry from the list (R4.2, the `kb_options` preserve-unknowns
+/// rule of task 6.6). The result is the full comma-joined string to stage.
+pub(crate) fn value_from_token_toggle(value: Option<&Value>, token: &str, active: bool) -> Value {
+    let mut items = list_items_from_value(value);
+    if active {
+        if !items.iter().any(|item| item == token) {
+            items.push(token.to_owned());
+        }
+    } else {
+        items.retain(|item| item != token);
+    }
+    value_from_list_items(&items)
+}
+
+/// Whether a [`WidgetKind::TokenSwitch`] for `token` should show as on for the stored
+/// `value` — i.e. whether `token` is currently present in the comma-joined list.
+///
+/// A missing or non-string value reads as off, never panicking, so the switch always
+/// has a safe state to render.
+pub(crate) fn token_switch_active_from_value(value: Option<&Value>, token: &str) -> bool {
+    list_items_from_value(value)
+        .iter()
+        .any(|item| item == token)
+}
+
 // The three reorderable-list edit operations, as pure functions so the ordering
 // logic is unit-tested rather than buried in a GTK click handler (R6.2). Each
 // returns the [`Value`] to emit, or `None` when the operation would be a no-op —
@@ -434,6 +479,13 @@ mod tests {
         };
         assert!(list.is_compatible_with(ValueKind::String));
         assert!(!list.is_compatible_with(ValueKind::Enum));
+
+        // A token-switch edits one flag of a comma-joined String setting.
+        let token_switch = WidgetKind::TokenSwitch {
+            token: "caps:escape".to_string(),
+        };
+        assert!(token_switch.is_compatible_with(ValueKind::String));
+        assert!(!token_switch.is_compatible_with(ValueKind::Bool));
     }
 
     #[test]
@@ -639,6 +691,47 @@ mod tests {
         assert_eq!(
             list_with_added(&[], "us"),
             Some(Value::String("us".to_string()))
+        );
+    }
+
+    #[test]
+    fn token_switch_toggles_one_token_and_preserves_the_rest() {
+        // The curated keyboard-option switch (task 6.6): toggling one token in/out of a
+        // comma list must keep every other token — including one the app has no switch
+        // for (`compose:ralt`) — in place and in order (R4.2 preserve-unknowns).
+        let current = Value::String("grp:win_space_toggle,caps:escape,compose:ralt".to_string());
+
+        // The `caps:escape` switch is on (present) and `numlock:on` is off (absent).
+        assert!(token_switch_active_from_value(
+            Some(&current),
+            "caps:escape"
+        ));
+        assert!(!token_switch_active_from_value(
+            Some(&current),
+            "numlock:on"
+        ));
+        // A missing value reads as off, never panics.
+        assert!(!token_switch_active_from_value(None, "caps:escape"));
+
+        // Toggling `caps:escape` OFF removes only it; the unknown option is preserved.
+        assert_eq!(
+            value_from_token_toggle(Some(&current), "caps:escape", false),
+            Value::String("grp:win_space_toggle,compose:ralt".to_string())
+        );
+        // Toggling a new token ON appends it, keeping the existing (unknown) tokens.
+        assert_eq!(
+            value_from_token_toggle(Some(&current), "numlock:on", true),
+            Value::String("grp:win_space_toggle,caps:escape,compose:ralt,numlock:on".to_string())
+        );
+        // Toggling an already-present token ON is idempotent (no duplicate).
+        assert_eq!(
+            value_from_token_toggle(Some(&current), "caps:escape", true),
+            current
+        );
+        // Toggling ON from an empty/absent value starts the list with just that token.
+        assert_eq!(
+            value_from_token_toggle(None, "caps:escape", true),
+            Value::String("caps:escape".to_string())
         );
     }
 

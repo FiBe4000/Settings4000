@@ -35,8 +35,8 @@
 //! are what this loads:
 //!
 //! - `~/.config/hypr/input.conf` (the sourced `input {}` block, analysis §6.3) via
-//!   the hyprlang parser → the Input page's keyboard layouts, mouse sensitivity, and
-//!   touchpad toggles;
+//!   the hyprlang parser → the Input page's keyboard layouts, keyboard options, mouse
+//!   sensitivity, and touchpad toggles (task 6.6);
 //! - `~/.config/swaync/config.json` via the swaync JSON adapter → the Notifications
 //!   page's position and auto-dismiss timeout.
 //!
@@ -52,6 +52,7 @@ use std::path::{Path, PathBuf};
 
 use crate::core::detect::{Binary, Capabilities, DetectionInputs};
 use crate::core::display::DisplayModel;
+use crate::core::input::{InputModel, default_xkb_registry};
 use crate::core::model::{SettingId, Value};
 use crate::core::store::{FileReader, FileValues};
 use crate::core::theme::{
@@ -94,6 +95,11 @@ pub(crate) struct StartupLoad {
     /// `hyprctl monitors -j` and reading `monitors.conf`, or `None` when there is no
     /// live compositor to enumerate (the Display page then shows a placeholder, R4.2).
     pub(crate) display: Option<DisplayModel>,
+    /// The Input page's helper (task 6.6): the `input.conf` path and XKB layout
+    /// candidates, or `None` when `hyprctl` is absent (the Input category is then hidden
+    /// entirely, R4.2). It supplies the layout add-list and renders the store's dirty
+    /// Input settings into the `input.conf` write on Apply.
+    pub(crate) input: Option<InputModel>,
     /// The Theme page's palette-scheme model (task 6.3), built by enumerating the
     /// discovered `colors/` directory and detecting the active scheme, or `None` when
     /// there is no dotfiles palette source (the Theme palette section is then hidden,
@@ -166,6 +172,7 @@ pub(crate) fn load() -> StartupLoad {
     let capabilities = Capabilities::detect(&DetectionInputs::from_system(Vec::new()));
     let files = load_files(&BackingPaths::from_system());
     let display = load_display(&capabilities);
+    let input = load_input(&capabilities);
     let palette = load_palette(&capabilities);
     let themes = load_themes(&capabilities);
     let wallpaper = load_wallpaper(&capabilities);
@@ -173,10 +180,31 @@ pub(crate) fn load() -> StartupLoad {
         capabilities,
         files,
         display,
+        input,
         palette,
         themes,
         wallpaper,
     }
+}
+
+/// Builds the Input page's helper on the worker thread (task 6.6; R4.2).
+///
+/// Only builds when `hyprctl` is present — an Input change applies via `hyprctl reload`,
+/// so without it the Input category is hidden (task 5.1) and there is nothing to load.
+/// When present it reads the XKB layout registry (resolved by
+/// [`default_xkb_registry`] from the well-known locations) for the keyboard-layout
+/// add-list; a missing/unparseable registry degrades to an empty list (R4.4). Reading
+/// the (large) registry here, on the startup worker, keeps it off
+/// the main thread and inside the R8.1 cold-start budget (architecture §8). The
+/// `input.conf` settings themselves are staged in the store (loaded by [`load_input_conf`]);
+/// this helper only supplies the candidates and the Apply-time write.
+fn load_input(capabilities: &Capabilities) -> Option<InputModel> {
+    if !capabilities.has_binary(Binary::Hyprctl) {
+        tracing::info!("hyprctl not found; the Input page is hidden (R4.2)");
+        return None;
+    }
+    let input_conf = config_home().join("hypr").join("input.conf");
+    Some(InputModel::load(input_conf, &default_xkb_registry()))
 }
 
 /// Builds the Theme page's wallpaper / lock-background model on the worker thread (task
@@ -422,6 +450,19 @@ fn load_input_conf(path: &Path) -> io::Result<FileValues> {
                 Value::String(layouts.to_string()),
             ));
         }
+        // Keyboard options, kept as the whole comma-joined `kb_options` string so the
+        // curated switches (task 6.6) can toggle one token while preserving the rest
+        // (R4.2). When the key is absent but an `input {}` section exists, seed an empty
+        // string so a curated switch can stage a first option (which the writer appends);
+        // when there is no `input {}` section there is nothing to write into, so skip it.
+        if let Some(options) = file.value(&KeyPath::at(&["input"], "kb_options")) {
+            values.push((
+                SettingId::KeyboardOptions,
+                Value::String(options.to_string()),
+            ));
+        } else if file.section_count(&[], "input") > 0 {
+            values.push((SettingId::KeyboardOptions, Value::String(String::new())));
+        }
         // Mouse/touchpad sensitivity (a decimal in `-1.0..=1.0`). An unparseable
         // value is skipped rather than defaulted.
         if let Some(raw) = file.value(&KeyPath::at(&["input"], "sensitivity")) {
@@ -519,7 +560,7 @@ mod tests {
         let path = dir.path().join("input.conf");
         std::fs::write(
             &path,
-            b"input {\n    kb_layout = us,se\n    sensitivity = 0.3\n    touchpad {\n        natural_scroll = true\n        tap-to-click = no\n    }\n}\n",
+            b"input {\n    kb_layout = us,se\n    kb_options = grp:win_space_toggle,caps:escape\n    sensitivity = 0.3\n    touchpad {\n        natural_scroll = true\n        tap-to-click = no\n    }\n}\n",
         )
         .expect("write input.conf fixture");
 
@@ -531,10 +572,45 @@ mod tests {
                     SettingId::KeyboardLayouts,
                     Value::String("us,se".to_string())
                 ),
+                (
+                    SettingId::KeyboardOptions,
+                    Value::String("grp:win_space_toggle,caps:escape".to_string())
+                ),
                 (SettingId::MouseSensitivity, Value::Float(0.3)),
                 (SettingId::TouchpadNaturalScroll, Value::Bool(true)),
                 (SettingId::TouchpadTapToClick, Value::Bool(false)),
             ],
+        );
+    }
+
+    #[test]
+    fn input_conf_seeds_empty_keyboard_options_when_absent_but_the_section_exists() {
+        // With an `input {}` section but no `kb_options` key, an empty KeyboardOptions is
+        // seeded so a curated switch can stage a first option (the writer appends the
+        // key on Apply, task 6.6). With no `input {}` section at all there is nothing to
+        // write into, so the setting is skipped.
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        let with_section = dir.path().join("with-section.conf");
+        std::fs::write(&with_section, b"input {\n    kb_layout = us\n}\n")
+            .expect("write input.conf");
+        let values = load_input_conf(&with_section).expect("loads");
+        assert!(
+            values
+                .values
+                .contains(&(SettingId::KeyboardOptions, Value::String(String::new()))),
+            "an empty kb_options is seeded when the input section exists"
+        );
+
+        let no_section = dir.path().join("no-section.conf");
+        std::fs::write(&no_section, b"# no input block here\n").expect("write input.conf");
+        let values = load_input_conf(&no_section).expect("loads");
+        assert!(
+            !values
+                .values
+                .iter()
+                .any(|(id, _)| *id == SettingId::KeyboardOptions),
+            "no input section -> no KeyboardOptions to write into"
         );
     }
 
@@ -650,7 +726,9 @@ mod tests {
         };
         let loaded = load_files(&paths);
         assert_eq!(loaded.len(), 1, "only the parseable file loads");
-        assert_eq!(loaded[0].initial.values.len(), 1);
+        // The input.conf yields its sensitivity plus a seeded empty KeyboardOptions
+        // (the `input {}` section exists but has no `kb_options` key — task 6.6).
+        assert_eq!(loaded[0].initial.values.len(), 2);
     }
 
     #[test]

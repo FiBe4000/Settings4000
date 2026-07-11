@@ -85,6 +85,14 @@ pub mod apply;
 // chrome (`ui::window`), so its public surface is exercised in a non-test build too.
 pub mod display;
 
+// The Input-page domain logic (task 6.6; R2.3, R4.2, R4.4, R5.6, R8.3). It provides the
+// store-`SettingId` -> `input.conf` write glue (rendering the store's dirty Input
+// settings into one surgical `FileWrite` through the hyprlang writer) and the XKB
+// keyboard-layout candidate list. Its `input.conf` freshness is the store's, not its
+// own. It is consumed by the Input page UI glue (`ui::input`) and the window's Apply
+// wiring (`ui::window`), so its public surface is exercised in a non-test build too.
+pub mod input;
+
 // The Sound-page domain model (task 6.2; R3.1, R5.2). It enumerates the PipeWire audio
 // devices (from `pw-dump` JSON, falling back to parsing `wpctl status`) and builds the
 // `wpctl` command vectors the runtime-only controls run — nothing is staged and nothing

@@ -420,6 +420,24 @@ impl SettingsStore {
             .collect()
     }
 
+    /// The dirty settings of one page, each paired with its effective (staged) value,
+    /// in [`SettingId`] order.
+    ///
+    /// This is the reusable seam a category page's Apply glue uses to turn its staged
+    /// edits into a file write (task 6.6, reused by task 6.7): it hands the page exactly
+    /// the settings it must serialise into its backing file — the dirty ones in its
+    /// [`Category`] — with their current values, so the page renders each through its
+    /// format parser (§3) into one [`FileWrite`](crate::core::apply::FileWrite). A
+    /// clean page yields an empty vector, so no write is produced. The returned values
+    /// are cloned so the caller is free of the store's borrow while it builds the write.
+    pub(crate) fn dirty_in_category(&self, category: Category) -> Vec<(SettingId, Value)> {
+        self.settings
+            .iter()
+            .filter(|(id, entry)| id.category() == category && entry.is_dirty())
+            .map(|(id, entry)| (*id, entry.effective().clone()))
+            .collect()
+    }
+
     /// The value the UI should display for `id`: the staged edit if present, else the
     /// original. `None` if the setting has not been loaded.
     pub(crate) fn value(&self, id: SettingId) -> Option<&Value> {
@@ -711,6 +729,48 @@ mod tests {
     }
 
     #[test]
+    fn dirty_in_category_returns_only_that_pages_dirty_settings_with_values() {
+        // The reusable Apply-glue seam (task 6.6/6.7): only the dirty settings of the
+        // requested page are returned, each with its effective (staged) value, and a
+        // clean page yields nothing.
+        let dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let mut store = SettingsStore::new();
+        load_timeout(&mut store, dir.path(), 300);
+
+        // A second file-backed setting on a different page (Display).
+        let scale_path = dir.path().join("scale.conf");
+        fs::write(&scale_path, "1.0").expect("write the scale fixture");
+        let scale_bytes = fs::read(&scale_path).expect("read back the scale fixture");
+        store.load_file(
+            &scale_path,
+            FileValues {
+                bytes: scale_bytes,
+                values: vec![(SettingId::MonitorScale, Value::Float(1.0))],
+            },
+            scale_reader(),
+        );
+
+        // Nothing staged yet: both pages are clean.
+        assert!(store.dirty_in_category(Category::Notifications).is_empty());
+        assert!(store.dirty_in_category(Category::Display).is_empty());
+
+        store
+            .stage(SettingId::NotificationTimeout, Value::Integer(120))
+            .expect("stage the notification timeout");
+
+        // Only the dirtied Notifications setting is returned, carrying its staged value;
+        // the untouched Display page is still empty.
+        assert_eq!(
+            store.dirty_in_category(Category::Notifications),
+            vec![(SettingId::NotificationTimeout, Value::Integer(120))]
+        );
+        assert!(
+            store.dirty_in_category(Category::Display).is_empty(),
+            "a clean page contributes no writes"
+        );
+    }
+
+    #[test]
     fn runtime_only_setting_bypasses_staging() {
         // Accept criterion (bypass): a runtime-only edit is reported for immediate
         // application, stores nothing, and never shows as dirty (R5.2).
@@ -804,6 +864,52 @@ mod tests {
             .expect_err("a scale outside the range must be rejected");
         assert!(matches!(error, StageError::Invalid(_)));
         assert!(!store.is_dirty(), "a rejected value must not be staged");
+    }
+
+    #[test]
+    fn staging_an_empty_keyboard_layout_list_is_rejected() {
+        // Task 6.6 review S1 (R8.3): removing every layout stages `KeyboardLayouts = ""`,
+        // which must be refused on stage — so the framework's invalid-edit path reverts
+        // the control rather than letting a bare `kb_layout=` reach Apply.
+        let dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let path = dir.path().join("input.conf");
+        fs::write(&path, "us,se").expect("write the layout fixture");
+        let bytes = fs::read(&path).expect("read back the layout fixture");
+        let mut store = SettingsStore::new();
+        store.load_file(
+            &path,
+            FileValues {
+                bytes,
+                values: vec![(
+                    SettingId::KeyboardLayouts,
+                    Value::String("us,se".to_string()),
+                )],
+            },
+            Box::new(|path: &Path| {
+                let bytes = fs::read(path)?;
+                Ok(FileValues {
+                    bytes,
+                    values: Vec::new(),
+                })
+            }),
+        );
+
+        let error = store
+            .stage(SettingId::KeyboardLayouts, Value::String(String::new()))
+            .expect_err("an empty layout list must be rejected");
+        assert!(matches!(error, StageError::Invalid(_)));
+        assert!(!store.is_dirty(), "a rejected edit must not be staged");
+
+        // A non-empty reorder still stages fine.
+        assert_eq!(
+            store
+                .stage(
+                    SettingId::KeyboardLayouts,
+                    Value::String("se,us".to_string())
+                )
+                .expect("a non-empty layout list stages"),
+            StageOutcome::Staged
+        );
     }
 
     #[test]

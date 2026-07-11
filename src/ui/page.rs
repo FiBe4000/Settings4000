@@ -82,8 +82,9 @@ use crate::ui::category::SidebarCategory;
 use crate::ui::row::{
     DropDownOption, RowCapability, RowDescriptor, SetValue, WidgetKind, dropdown_index_from_value,
     list_items_from_value, list_with_added, list_with_swapped, list_without,
-    scale_position_from_value, switch_active_from_value, value_from_dropdown_option,
-    value_from_scale, value_from_switch, visible_rows,
+    scale_position_from_value, switch_active_from_value, token_switch_active_from_value,
+    value_from_dropdown_option, value_from_scale, value_from_switch, value_from_token_toggle,
+    visible_rows,
 };
 
 /// Vertical spacing, in pixels, between rows on a page.
@@ -313,6 +314,22 @@ enum BoundControl {
     /// A `GtkListBox`-backed reorderable editable list for a comma-joined
     /// [`Value::String`] (R2.3).
     List(BoundList),
+    /// A `GtkSwitch` toggling one comma-token of a [`Value::String`] setting, preserving
+    /// the others (R4.2). Several may target the same setting, one token each (task 6.6).
+    TokenSwitch {
+        /// The setting this control edits (the whole comma-joined string).
+        setting: SettingId,
+        /// The single token this switch adds/removes.
+        token: String,
+        /// The switch widget.
+        widget: Switch,
+        /// The `notify::active` handler, blocked while rendering to avoid feedback.
+        handler: glib::SignalHandlerId,
+        /// The setting's current full comma-string, synced by [`BoundControl::render`]
+        /// so the change handler can toggle one token while keeping the rest (it has no
+        /// direct access to the store).
+        current: Rc<RefCell<String>>,
+    },
 }
 
 impl BoundControl {
@@ -321,7 +338,8 @@ impl BoundControl {
         match self {
             BoundControl::Switch { setting, .. }
             | BoundControl::DropDown { setting, .. }
-            | BoundControl::Scale { setting, .. } => *setting,
+            | BoundControl::Scale { setting, .. }
+            | BoundControl::TokenSwitch { setting, .. } => *setting,
             BoundControl::List(list) => list.setting,
         }
     }
@@ -363,6 +381,22 @@ impl BoundControl {
                 }
             }
             BoundControl::List(list) => list.render(value),
+            BoundControl::TokenSwitch {
+                token,
+                widget,
+                handler,
+                current,
+                ..
+            } => {
+                // Cache the setting's current full string so the change handler can
+                // toggle this token while preserving the others (R4.2), then show
+                // whether this token is currently present.
+                *current.borrow_mut() =
+                    value.and_then(Value::as_str).unwrap_or_default().to_owned();
+                widget.block_signal(handler);
+                widget.set_active(token_switch_active_from_value(value, token));
+                widget.unblock_signal(handler);
+            }
         }
     }
 }
@@ -514,6 +548,7 @@ fn build_control(
         WidgetKind::ReorderableList { candidates } => {
             build_list(descriptor, candidates.clone(), emit)
         }
+        WidgetKind::TokenSwitch { token } => build_token_switch(descriptor, token.clone(), emit),
     }
 }
 
@@ -541,6 +576,53 @@ fn build_switch(descriptor: &RowDescriptor, emit: &Rc<dyn Fn(SetValue)>) -> (Gtk
             setting,
             widget,
             handler,
+        },
+    )
+}
+
+/// Builds a `GtkSwitch` row that toggles a single `token` of a comma-joined String
+/// setting, preserving the setting's other tokens (R4.2, task 6.6).
+///
+/// The change handler reads the cached current full string (kept in sync by
+/// [`BoundControl::render`]) so it can add/remove only `token` while leaving every other
+/// entry — including options the app has no switch for — verbatim, then emits the whole
+/// new string as one [`SetValue`].
+fn build_token_switch(
+    descriptor: &RowDescriptor,
+    token: String,
+    emit: &Rc<dyn Fn(SetValue)>,
+) -> (GtkBox, BoundControl) {
+    let widget = Switch::new();
+    widget.set_halign(Align::End);
+    widget.set_valign(Align::Center);
+
+    let setting = descriptor.setting;
+    let current = Rc::new(RefCell::new(String::new()));
+    let handler = {
+        let emit = emit.clone();
+        let current = current.clone();
+        let token = token.clone();
+        widget.connect_active_notify(move |switch| {
+            // Toggle only this token within the current full string; unknown tokens are
+            // preserved by `value_from_token_toggle`.
+            let value = value_from_token_toggle(
+                Some(&Value::String(current.borrow().clone())),
+                &token,
+                switch.is_active(),
+            );
+            emit(SetValue { id: setting, value });
+        })
+    };
+
+    let row = labelled_row(&descriptor.label, &widget);
+    (
+        row,
+        BoundControl::TokenSwitch {
+            setting,
+            token,
+            widget,
+            handler,
+            current,
         },
     )
 }
@@ -717,53 +799,12 @@ fn string_list(options: &[DropDownOption]) -> StringList {
 /// See the module docs: these are real descriptors driving the framework, but their
 /// option sets and ranges are scaffolding that §6 replaces. Only the categories whose
 /// settings already exist in the model are populated; the rest fall back to task
-/// 5.1's placeholder page.
-///
-/// The capability each row declares (R4.2) shows both variants: the touchpad toggles
-/// are [`RowCapability::Always`] (no requirement beyond the Input category, which
-/// task 5.1 already gated on `hyprctl`), while the rows that clearly depend on a
-/// specific tool declare it with [`RowCapability::Binary`].
+/// 5.1's placeholder page. The Input page is no longer built here — its layout list
+/// needs runtime XKB candidates, so the window builds it directly (task 6.6, see
+/// [`super::input`]) — leaving Notifications as the last interim category until task
+/// 6.7 gives it its own glue.
 fn category_rows(category: SidebarCategory) -> Vec<RowDescriptor> {
     match category {
-        SidebarCategory::Input => vec![
-            RowDescriptor::new(
-                "Keyboard layouts",
-                WidgetKind::ReorderableList {
-                    candidates: vec![
-                        DropDownOption::new("us", "English (US)"),
-                        DropDownOption::new("se", "Swedish"),
-                        DropDownOption::new("de", "German"),
-                        DropDownOption::new("fr", "French"),
-                        DropDownOption::new("no", "Norwegian"),
-                        DropDownOption::new("gb", "English (UK)"),
-                    ],
-                },
-                SettingId::KeyboardLayouts,
-                RowCapability::Binary(Binary::Hyprctl),
-            ),
-            RowDescriptor::new(
-                "Mouse sensitivity",
-                WidgetKind::Scale {
-                    min: -1.0,
-                    max: 1.0,
-                    step: 0.1,
-                },
-                SettingId::MouseSensitivity,
-                RowCapability::Binary(Binary::Hyprctl),
-            ),
-            RowDescriptor::new(
-                "Natural scrolling",
-                WidgetKind::Switch,
-                SettingId::TouchpadNaturalScroll,
-                RowCapability::Always,
-            ),
-            RowDescriptor::new(
-                "Tap to click",
-                WidgetKind::Switch,
-                SettingId::TouchpadTapToClick,
-                RowCapability::Always,
-            ),
-        ],
         SidebarCategory::Notifications => vec![
             RowDescriptor::new(
                 "Position",
@@ -1022,23 +1063,24 @@ mod tests {
         // of the real config files — task 5.4 — not a demo seed, so there is no seed
         // to cross-check here; the loader maps each setting to a value of its kind and
         // is tested in `super::super::startup`.)
-        for category in [SidebarCategory::Input, SidebarCategory::Notifications] {
-            let descriptors = category_rows(category);
+        let descriptors = category_rows(SidebarCategory::Notifications);
+        assert!(
+            !descriptors.is_empty(),
+            "Notifications should have interim rows"
+        );
+        for descriptor in &descriptors {
             assert!(
-                !descriptors.is_empty(),
-                "{category:?} should have interim rows"
+                descriptor.is_well_formed(),
+                "{:?} pairs an incompatible widget and setting kind",
+                descriptor.setting
             );
-            for descriptor in &descriptors {
-                assert!(
-                    descriptor.is_well_formed(),
-                    "{:?} pairs an incompatible widget and setting kind",
-                    descriptor.setting
-                );
-            }
         }
 
-        // The categories without interim rows fall back to a placeholder.
+        // The categories without interim rows fall back to a placeholder or their own
+        // glue: Theme is placeholder-backed here, and Input is now built directly by the
+        // window (task 6.6), so neither yields interim rows.
         assert!(category_rows(SidebarCategory::Theme).is_empty());
+        assert!(category_rows(SidebarCategory::Input).is_empty());
     }
 
     #[test]
@@ -1047,17 +1089,22 @@ mod tests {
         // gate). All branches asserted here are pure, so they run headlessly (no
         // display needed).
 
-        // NoSpec: a category with no framework descriptors yet (Theme today) — the
-        // window shows its task-5.1 placeholder.
+        // NoSpec: a category with no framework descriptors here — Theme (its own glue),
+        // and Input, which the window now builds directly with runtime XKB candidates
+        // (task 6.6) rather than through this interim list.
         let any = Capabilities::for_tests(&[Binary::Hyprctl, Binary::Swaync], &[], true);
         assert!(matches!(
             plan_category(SidebarCategory::Theme, &any),
             PagePlan::NoSpec
         ));
+        assert!(matches!(
+            plan_category(SidebarCategory::Input, &any),
+            PagePlan::NoSpec
+        ));
 
         // Framework: a category whose rows are (at least partly) present.
         assert!(matches!(
-            plan_category(SidebarCategory::Input, &any),
+            plan_category(SidebarCategory::Notifications, &any),
             PagePlan::Framework(_)
         ));
 
