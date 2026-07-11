@@ -54,16 +54,15 @@
 //!
 //! [`category_rows`] returns a small, real descriptor list for the categories whose
 //! settings already exist in the model, so the framework is exercised end-to-end and
-//! renders in the running app. These lists — and the seeded initial values in
-//! [`seed_store`] — are deliberately interim scaffolding, exactly like task 5.1's
-//! placeholder pages: the per-category §6 tasks supply the full control set (with
-//! real option sources, ranges, and reload wiring), and task 5.4 replaces the seeded
-//! values with the values parsed from the real config files. A category with no
+//! renders in the running app. These lists — and the interim initial values in
+//! [`demo_original`] that the window seeds the shared store with (see
+//! [`interim_seed_values`]) — are deliberately interim scaffolding, exactly like task
+//! 5.1's placeholder pages: the per-category §6 tasks supply the full control set
+//! (with real option sources, ranges, and reload wiring), and task 5.4 replaces the
+//! seeded values with the values parsed from the real config files. A category with no
 //! descriptors yet keeps its task-5.1 placeholder.
 
 use std::cell::RefCell;
-use std::io;
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gtk4::prelude::*;
@@ -71,11 +70,11 @@ use gtk4::{
     Adjustment, Align, Box as GtkBox, Button, DropDown, Label, ListBox, Orientation, Scale,
     SelectionMode, StringList, Switch, Widget, glib,
 };
-use relm4::{Component, ComponentController, ComponentParts, ComponentSender, SimpleComponent};
+use relm4::{Component, ComponentParts, ComponentSender, Controller, SimpleComponent};
 
 use crate::core::detect::{Binary, Capabilities};
 use crate::core::model::{Backing, SettingId, Value, ValueKind};
-use crate::core::store::{FileReader, FileValues, SettingsStore, StageError, StageOutcome};
+use crate::core::store::{SettingsStore, StageError, StageOutcome};
 use crate::ui::category::SidebarCategory;
 use crate::ui::row::{
     DropDownOption, RowCapability, RowDescriptor, SetValue, WidgetKind, dropdown_index_from_value,
@@ -94,30 +93,36 @@ const CONTROL_SPACING: i32 = 8;
 /// Outer margin, in pixels, around a page's rows.
 const PAGE_MARGIN: i32 = 18;
 
-/// The synthetic freshness key used for the interim seeded store (see
-/// [`seed_store`]).
-///
-/// The seeded store is in-memory demo scaffolding that is never written or refreshed,
-/// so this path is never resolved on disk; task 5.4 replaces the whole seeding step
-/// with real file loading keyed by each backing file's live XDG path.
-const SEED_STORE_KEY: &str = "<settings4000 interim seed>";
-
-/// The initialization payload for a [`SettingsPage`]: the visible rows to render.
+/// The initialization payload for a [`SettingsPage`].
 pub(crate) struct PageInit {
+    /// The shared staging store, already seeded by the window (task 5.3). The page
+    /// renders its controls from this store and stages edits into it; every page and
+    /// the window chrome share the one store.
+    store: Rc<RefCell<SettingsStore>>,
     /// The descriptors to build, already filtered to those whose capability is present
-    /// (R4.2). Their interim initial values come from [`demo_original`].
+    /// (R4.2). Their interim initial values are seeded into the store from
+    /// [`demo_original`].
     rows: Vec<RowDescriptor>,
+    /// Invoked after each staged edit so the window refreshes the Apply/Reset chrome
+    /// and the per-page markers from the new store state (task 5.3).
+    on_changed: Rc<dyn Fn()>,
 }
 
 /// A message the page processes (architecture §7).
 ///
-/// A single-variant enum today, kept as an enum because task 5.3 adds a `Reset`
-/// input (driven by the Reset button) that flows through the same `update` →
-/// `update_view` loop.
+/// Both variants flow through the same `update` → `update_view` loop: [`PageMsg::Set`]
+/// stages a user edit, and [`PageMsg::Rerender`] is a no-op update whose only purpose
+/// is to make Relm4 re-run `update_view` so the controls re-render from the shared
+/// store after the window changed it from outside a page (task 5.3).
 #[derive(Debug)]
 pub(crate) enum PageMsg {
     /// A control was changed by the user; stage the value in the store (R5.1/R5.2).
     Set(SetValue),
+    /// Re-render every control from the shared store without mutating anything. The
+    /// window broadcasts this to all pages after it changes the store from outside a
+    /// page — a Reset, an applied commit, or a conflict reload — so the controls snap
+    /// to the store's new values (task 5.3).
+    Rerender,
 }
 
 /// The Relm4 component behind one settings page (architecture §7, R6.2).
@@ -127,9 +132,20 @@ pub(crate) enum PageMsg {
 /// deliberately thin. The store-mutating logic is factored into [`Self::handle`] so
 /// the `SetValue` → store round-trip is unit-tested without launching a GTK runtime.
 pub(crate) struct SettingsPage {
-    /// The staging store this page reads from and writes to. For task 5.2 each page
-    /// owns its own seeded store; task 5.4 wires a single shared store across pages.
-    store: SettingsStore,
+    /// The staging store this page reads from and writes to (R5.1). It is the single
+    /// store shared by every page and the window chrome (task 5.3): the window seeds
+    /// and owns it behind an `Rc<RefCell<…>>`, each page stages edits into it and
+    /// renders from it, and the chrome reads its dirty state to drive the Apply/Reset
+    /// buttons and the per-page markers. Sharing is what makes an edit on one page
+    /// light up the global Apply button and that page's marker (task 5.4 replaces the
+    /// interim seed with values parsed from the real config files).
+    store: Rc<RefCell<SettingsStore>>,
+    /// Called after the page mutates the shared store, so the window can refresh the
+    /// Apply/Reset sensitivity and the per-page dirty markers from the new state
+    /// (task 5.3). It is a plain callback rather than a Relm4 output because the store
+    /// is shared synchronously on the GTK main thread, so the chrome can read it the
+    /// moment an edit lands.
+    on_changed: Rc<dyn Fn()>,
 }
 
 impl SettingsPage {
@@ -139,9 +155,9 @@ impl SettingsPage {
     /// [`SimpleComponent::update`] and exercised directly by the tests. A rejected
     /// edit (invalid value, R8.3) is logged and left unstaged; the subsequent
     /// re-render then snaps the control back to the stored value.
-    fn handle(&mut self, message: PageMsg) -> Result<StageOutcome, StageError> {
-        let PageMsg::Set(SetValue { id, value }) = message;
-        let outcome = self.store.stage(id, value);
+    fn handle(&mut self, set: SetValue) -> Result<StageOutcome, StageError> {
+        let SetValue { id, value } = set;
+        let outcome = self.store.borrow_mut().stage(id, value);
         match &outcome {
             Ok(StageOutcome::Staged) => {
                 tracing::debug!(?id, "staged edit from widget");
@@ -198,14 +214,6 @@ impl SimpleComponent for SettingsPage {
             Rc::new(move |set_value| sender.input(PageMsg::Set(set_value)))
         };
 
-        // Seed the store so every control has an original to render (interim; see the
-        // module docs).
-        let store = seed_store(
-            init.rows
-                .iter()
-                .map(|descriptor| (descriptor.setting, demo_original(descriptor.setting))),
-        );
-
         let mut controls = Vec::with_capacity(init.rows.len());
         for descriptor in &init.rows {
             let (row_widget, control) = build_control(descriptor, &emit);
@@ -214,21 +222,38 @@ impl SimpleComponent for SettingsPage {
         }
 
         // Initial render: Relm4 does not call `update_view` after `init`, so render
-        // each control from the seeded store here (the render loop's starting point).
-        for control in &controls {
-            control.render(store.value(control.setting()));
+        // each control from the pre-seeded shared store here (the render loop's
+        // starting point).
+        {
+            let store = init.store.borrow();
+            for control in &controls {
+                control.render(store.value(control.setting()));
+            }
         }
 
         ComponentParts {
-            model: SettingsPage { store },
+            model: SettingsPage {
+                store: init.store,
+                on_changed: init.on_changed,
+            },
             widgets: PageWidgets { controls },
         }
     }
 
     fn update(&mut self, message: Self::Input, _sender: ComponentSender<Self>) {
-        // The view refresh below (`update_view`) reflects the result; the outcome is
-        // consumed only by the tests, so it is ignored here.
-        let _ = self.handle(message);
+        match message {
+            PageMsg::Set(set) => {
+                // The view refresh (`update_view`) reflects the result; the outcome is
+                // consumed only by the tests, so it is ignored here.
+                let _ = self.handle(set);
+                // Tell the window an edit landed so it refreshes the Apply/Reset chrome
+                // and this page's dirty marker from the new store state (task 5.3).
+                (self.on_changed)();
+            }
+            // A no-op: `update_view` runs next and re-renders every control from the
+            // shared store, which is the whole point of the broadcast (task 5.3).
+            PageMsg::Rerender => {}
+        }
     }
 
     fn update_view(&self, widgets: &mut Self::Widgets, _sender: ComponentSender<Self>) {
@@ -236,8 +261,9 @@ impl SimpleComponent for SettingsPage {
         // control whose stored value did not change re-renders to the same value,
         // which is a cheap no-op (and, for scalar controls, cannot feed back because
         // the change signal is blocked during the set).
+        let store = self.store.borrow();
         for control in &widgets.controls {
-            control.render(self.store.value(control.setting()));
+            control.render(store.value(control.setting()));
         }
     }
 }
@@ -682,37 +708,6 @@ fn string_list(options: &[DropDownOption]) -> StringList {
     StringList::new(&labels)
 }
 
-/// Builds an in-memory staging store seeded with the given `originals` so a page's
-/// controls have a value to render (interim; see the module docs).
-///
-/// The values are registered under one synthetic freshness key ([`SEED_STORE_KEY`]);
-/// the reader simply re-serves the same values, since the demo store is never
-/// refreshed or written. Task 5.4 replaces this with real file loading.
-fn seed_store<I>(originals: I) -> SettingsStore
-where
-    I: IntoIterator<Item = (SettingId, Value)>,
-{
-    let values: Vec<(SettingId, Value)> = originals.into_iter().collect();
-    let reader_values = values.clone();
-    let reader: FileReader = Box::new(move |_path: &Path| {
-        Ok::<FileValues, io::Error>(FileValues {
-            bytes: Vec::new(),
-            values: reader_values.clone(),
-        })
-    });
-
-    let mut store = SettingsStore::new();
-    store.load_file(
-        PathBuf::from(SEED_STORE_KEY),
-        FileValues {
-            bytes: Vec::new(),
-            values,
-        },
-        reader,
-    );
-    store
-}
-
 /// The interim declarative row list for `category` (empty when §6 has not defined the
 /// category's controls yet).
 ///
@@ -806,7 +801,7 @@ fn category_rows(category: SidebarCategory) -> Vec<RowDescriptor> {
 /// docs). The explicit arms cover every setting the interim rows use; the fallback
 /// yields a kind-appropriate neutral value so a descriptor added before its seed is
 /// still renderable rather than left unloaded.
-fn demo_original(setting: SettingId) -> Value {
+pub(crate) fn demo_original(setting: SettingId) -> Value {
     match setting {
         SettingId::KeyboardLayouts => Value::String("us".to_string()),
         SettingId::MouseSensitivity => Value::Float(0.0),
@@ -824,16 +819,39 @@ fn demo_original(setting: SettingId) -> Value {
     }
 }
 
+/// Every interim setting the framework pages expose, paired with its
+/// [`demo_original`] value, for the window to seed the shared store once at startup
+/// (task 5.3).
+///
+/// It walks [`category_rows`] for every category — ignoring capabilities, so the store
+/// holds a value for a setting even while its page is hidden (harmless, and it keeps a
+/// later stage from failing `NotLoaded` if the page appears on a manual detection
+/// refresh) — and deduplicates by [`SettingId`]. This whole seeding is interim
+/// scaffolding: task 5.4 replaces it with values parsed from the real config files.
+pub(crate) fn interim_seed_values() -> Vec<(SettingId, Value)> {
+    let mut values: Vec<(SettingId, Value)> = Vec::new();
+    for &category in SidebarCategory::ALL {
+        for descriptor in category_rows(category) {
+            if !values.iter().any(|(id, _)| *id == descriptor.setting) {
+                values.push((descriptor.setting, demo_original(descriptor.setting)));
+            }
+        }
+    }
+    values
+}
+
 /// What a category's page should be, once per-row gating (R4.2) is applied to its
-/// interim descriptor list.
+/// interim descriptor list — the pure, GTK-free half of the window's page-building
+/// decision (task 5.3), split out so the composition is unit-tested headlessly (R6.2).
 ///
 /// This is how the fine, per-row gate composes with task 5.1's coarse category gate
-/// (see [`super::row`]): the window builder asks for this and either mounts the built
-/// framework page, drops the whole category when every row is gated out, or falls
-/// back to the task-5.1 placeholder when the category has no framework rows yet.
-pub(crate) enum CategoryContent {
-    /// A built framework page; its root widget should be mounted in the stack.
-    Framework(Widget),
+/// (see [`super::row`]): the window (`super::window`) asks [`plan_category`] for this
+/// and either builds the framework page, drops the whole category when every row is
+/// gated out, or falls back to the task-5.1 placeholder when the category has no
+/// framework rows yet.
+pub(crate) enum PagePlan {
+    /// The category has visible framework rows; build a [`SettingsPage`] for them.
+    Framework(Vec<RowDescriptor>),
     /// The category has framework rows, but all of them are gated out for the
     /// detected capabilities, so the whole category should be dropped (R4.2).
     Emptied,
@@ -842,20 +860,18 @@ pub(crate) enum CategoryContent {
     NoSpec,
 }
 
-/// Builds the page content for `category` under the detected `capabilities`,
+/// Decides how `category`'s page should be built under the detected `capabilities`,
 /// composing per-row gating with task 5.1's category gate (R4.2).
 ///
-/// A category with no interim descriptors yields [`CategoryContent::NoSpec`]; one
-/// whose every row is gated out yields [`CategoryContent::Emptied`] (logged at `info`
-/// as a hidden category); otherwise the visible rows are rendered into a launched
-/// [`SettingsPage`] and returned as [`CategoryContent::Framework`].
-pub(crate) fn build_category(
-    category: SidebarCategory,
-    capabilities: &Capabilities,
-) -> CategoryContent {
+/// A category with no interim descriptors yields [`PagePlan::NoSpec`]; one whose every
+/// row is gated out yields [`PagePlan::Emptied`] (logged at `info` as a hidden
+/// category); otherwise the visible rows are returned as [`PagePlan::Framework`] for
+/// [`build_page`] to render. Keeping the decision GTK-free is what lets it be tested
+/// without a display (R6.2).
+pub(crate) fn plan_category(category: SidebarCategory, capabilities: &Capabilities) -> PagePlan {
     let descriptors = category_rows(category);
     if descriptors.is_empty() {
-        return CategoryContent::NoSpec;
+        return PagePlan::NoSpec;
     }
 
     // The per-row gate (R4.2). Its result composes with task 5.1's category gate: an
@@ -866,33 +882,78 @@ pub(crate) fn build_category(
             category = category.title(),
             "all rows for this category are gated out; hiding the whole category (R4.2)"
         );
-        return CategoryContent::Emptied;
+        return PagePlan::Emptied;
     }
 
-    // Launch the page component. `detach_runtime` lets its runtime outlive this
-    // controller so the page keeps processing edits for the app's lifetime while the
-    // controller itself is dropped here (task 5.3 will retain controllers to drive a
-    // shared Apply/Reset). The root widget is already parented into the returned
-    // component, so cloning the handle for the stack is safe.
-    let mut controller = SettingsPage::builder()
-        .launch(PageInit { rows: visible })
-        .detach();
-    let widget = controller.widget().clone();
-    controller.detach_runtime();
+    PagePlan::Framework(visible)
+}
 
-    CategoryContent::Framework(widget.upcast())
+/// Launches a [`SettingsPage`] for `rows`, sharing `store` and reporting each edit
+/// through `on_changed` (task 5.3).
+///
+/// The returned [`Controller`] must be **kept alive** by the window: it owns the page's
+/// widget (mounted in the stack via [`ComponentController::widget`](relm4::ComponentController::widget))
+/// and is the handle the window sends [`PageMsg::Rerender`] through (via its
+/// [`sender`](relm4::ComponentController::sender)) to re-render the page after a
+/// Reset/commit/conflict-reload. This is why the task-5.2 `detach_runtime` call is
+/// gone — the runtime is retained, not detached, so the page keeps processing both
+/// user edits and the window's re-render broadcasts.
+pub(crate) fn build_page(
+    store: Rc<RefCell<SettingsStore>>,
+    rows: Vec<RowDescriptor>,
+    on_changed: Rc<dyn Fn()>,
+) -> Controller<SettingsPage> {
+    SettingsPage::builder()
+        .launch(PageInit {
+            store,
+            rows,
+            on_changed,
+        })
+        .detach()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::path::{Path, PathBuf};
+
     use super::*;
     use crate::core::model::Category;
+    use crate::core::store::{FileReader, FileValues};
 
-    /// Builds a page model seeded with the given originals, without launching a GTK
-    /// runtime — so the `SetValue` → store round-trip can be tested headlessly.
+    /// Builds a store loaded with `originals` under a synthetic key, with a reader that
+    /// re-serves them. These tests never refresh or write, so the key is never resolved
+    /// on disk — mirroring what the window's interim seeding does with a real temp file
+    /// at runtime.
+    fn test_store(originals: &[(SettingId, Value)]) -> SettingsStore {
+        let values = originals.to_vec();
+        let reader_values = values.clone();
+        let reader: FileReader = Box::new(move |_path: &Path| -> io::Result<FileValues> {
+            Ok(FileValues {
+                bytes: Vec::new(),
+                values: reader_values.clone(),
+            })
+        });
+        let mut store = SettingsStore::new();
+        store.load_file(
+            PathBuf::from("<page test seed>"),
+            FileValues {
+                bytes: Vec::new(),
+                values,
+            },
+            reader,
+        );
+        store
+    }
+
+    /// Builds a page model over a shared store seeded with `originals`, without
+    /// launching a GTK runtime — so the `SetValue` → store round-trip is tested
+    /// headlessly. The `on_changed` callback is a no-op here; the window supplies the
+    /// real chrome-refreshing one.
     fn seeded_page(originals: &[(SettingId, Value)]) -> SettingsPage {
         SettingsPage {
-            store: seed_store(originals.iter().cloned()),
+            store: Rc::new(RefCell::new(test_store(originals))),
+            on_changed: Rc::new(|| {}),
         }
     }
 
@@ -901,20 +962,24 @@ mod tests {
         // The core acceptance: a widget's SetValue reaches the store and is reflected
         // by `store.value` — the round-trip a rendered control then reads back.
         let mut page = seeded_page(&[(SettingId::NotificationTimeout, Value::Integer(10))]);
-        assert!(!page.store.is_dirty());
+        assert!(!page.store.borrow().is_dirty());
 
-        let outcome = page.handle(PageMsg::Set(SetValue {
+        let outcome = page.handle(SetValue {
             id: SettingId::NotificationTimeout,
             value: Value::Integer(30),
-        }));
+        });
         assert_eq!(outcome.ok(), Some(StageOutcome::Staged));
         assert_eq!(
-            page.store.value(SettingId::NotificationTimeout),
+            page.store.borrow().value(SettingId::NotificationTimeout),
             Some(&Value::Integer(30)),
             "the store reflects the staged edit, which is what the control renders"
         );
-        assert!(page.store.is_dirty());
-        assert!(page.store.is_category_dirty(Category::Notifications));
+        assert!(page.store.borrow().is_dirty());
+        assert!(
+            page.store
+                .borrow()
+                .is_category_dirty(Category::Notifications)
+        );
     }
 
     #[test]
@@ -923,18 +988,21 @@ mod tests {
         // is staged — the store holds no value for it.
         let mut page = seeded_page(&[(SettingId::NotificationTimeout, Value::Integer(10))]);
 
-        let outcome = page.handle(PageMsg::Set(SetValue {
+        let outcome = page.handle(SetValue {
             id: SettingId::LaptopDisplayEnabled,
             value: Value::Bool(true),
-        }));
+        });
         assert_eq!(
             outcome.ok(),
             Some(StageOutcome::RuntimeBypass),
             "a runtime-only edit must bypass staging (R5.2)"
         );
-        assert!(!page.store.is_dirty());
+        assert!(!page.store.borrow().is_dirty());
         assert!(
-            page.store.value(SettingId::LaptopDisplayEnabled).is_none(),
+            page.store
+                .borrow()
+                .value(SettingId::LaptopDisplayEnabled)
+                .is_none(),
             "the store holds no value for a runtime-only setting"
         );
     }
@@ -943,25 +1011,28 @@ mod tests {
     fn the_store_is_the_render_source_across_a_change() {
         // The store's value is what `update_view` renders (R5.1). Prove the render
         // source tracks a change from either direction: a widget edit stages a new
-        // value, and a store change from another source (here a reset, which task
-        // 5.3's button will trigger through the same loop) reverts it — so the control
-        // follows the store, never its own state.
+        // value, and a store change from another source (here a reset, which task 5.3's
+        // Reset button triggers) reverts it — so the control follows the store, never
+        // its own state.
         let mut page = seeded_page(&[(SettingId::NotificationTimeout, Value::Integer(10))]);
-        page.handle(PageMsg::Set(SetValue {
+        page.handle(SetValue {
             id: SettingId::NotificationTimeout,
             value: Value::Integer(45),
-        }))
+        })
         .expect("a valid edit stages");
         assert_eq!(
-            page.store.value(SettingId::NotificationTimeout),
+            page.store.borrow().value(SettingId::NotificationTimeout),
             Some(&Value::Integer(45)),
             "after an edit the render source is the staged value"
         );
 
-        page.store.reset();
-        assert!(!page.store.is_dirty(), "a reset clears staged edits");
+        page.store.borrow_mut().reset();
+        assert!(
+            !page.store.borrow().is_dirty(),
+            "a reset clears staged edits"
+        );
         assert_eq!(
-            page.store.value(SettingId::NotificationTimeout),
+            page.store.borrow().value(SettingId::NotificationTimeout),
             Some(&Value::Integer(10)),
             "after a reset the render source — and thus the control — shows the original"
         );
@@ -973,14 +1044,14 @@ mod tests {
         // re-renders to the unchanged stored value on the next `update_view`.
         let mut page = seeded_page(&[(SettingId::MouseSensitivity, Value::Float(0.0))]);
 
-        let outcome = page.handle(PageMsg::Set(SetValue {
+        let outcome = page.handle(SetValue {
             id: SettingId::MouseSensitivity,
             value: Value::Float(5.0), // outside the -1.0..=1.0 sensitivity range
-        }));
+        });
         assert!(outcome.is_err(), "an out-of-range value must be rejected");
-        assert!(!page.store.is_dirty());
+        assert!(!page.store.borrow().is_dirty());
         assert_eq!(
-            page.store.value(SettingId::MouseSensitivity),
+            page.store.borrow().value(SettingId::MouseSensitivity),
             Some(&Value::Float(0.0)),
             "a rejected edit leaves the stored value untouched"
         );
@@ -1018,26 +1089,57 @@ mod tests {
     }
 
     #[test]
-    fn build_category_composes_the_two_gates_without_launching_gtk() {
+    fn interim_seed_values_cover_every_framework_setting_without_duplicates() {
+        // The window seeds the shared store from this once at startup, so every
+        // framework row must have a seed (else staging it would fail `NotLoaded`), and
+        // no setting may appear twice.
+        let seeds = interim_seed_values();
+        for category in [SidebarCategory::Input, SidebarCategory::Notifications] {
+            for descriptor in category_rows(category) {
+                assert!(
+                    seeds.iter().any(|(id, _)| *id == descriptor.setting),
+                    "{:?} must be seeded",
+                    descriptor.setting
+                );
+            }
+        }
+        let mut ids: Vec<SettingId> = seeds.iter().map(|(id, _)| *id).collect();
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            count,
+            "interim seed values must not duplicate a setting"
+        );
+    }
+
+    #[test]
+    fn plan_category_composes_the_two_gates_without_launching_gtk() {
         // The assembled three-way decision (task 5.1 category gate + task 5.2 per-row
-        // gate). Both branches asserted here return before any component is launched,
-        // so they run headlessly (no display needed).
+        // gate). All branches asserted here are pure, so they run headlessly (no
+        // display needed).
 
         // NoSpec: a category with no framework descriptors yet (Theme today) — the
         // window shows its task-5.1 placeholder.
         let any = Capabilities::for_tests(&[Binary::Hyprctl, Binary::Swaync], &[], true);
         assert!(matches!(
-            build_category(SidebarCategory::Theme, &any),
-            CategoryContent::NoSpec
+            plan_category(SidebarCategory::Theme, &any),
+            PagePlan::NoSpec
         ));
 
-        // Emptied: a category that has descriptors but whose rows are all gated out.
-        // Notifications' rows all require swaync; with swaync absent every row is
-        // hidden, so the whole category is dropped (R4.2) rather than shown empty.
+        // Framework: a category whose rows are (at least partly) present.
+        assert!(matches!(
+            plan_category(SidebarCategory::Input, &any),
+            PagePlan::Framework(_)
+        ));
+
+        // Emptied: Notifications' rows all require swaync; with swaync absent every row
+        // is hidden, so the whole category is dropped (R4.2) rather than shown empty.
         let no_swaync = Capabilities::for_tests(&[], &[], false);
         assert!(matches!(
-            build_category(SidebarCategory::Notifications, &no_swaync),
-            CategoryContent::Emptied
+            plan_category(SidebarCategory::Notifications, &no_swaync),
+            PagePlan::Emptied
         ));
     }
 }
