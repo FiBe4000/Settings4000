@@ -13,7 +13,13 @@ description = "Native GTK4 settings GUI for a dotfiles-managed Hyprland desktop"
 # series so only a single `gtk4` version is present in the tree (architecture
 # §1). Only the `ui/` layer may use these — `core/` and `parsers/` must not
 # (enforced by tests/module_boundaries.rs).
-gtk4 = "0.10.3"
+#
+# The `v4_10` feature enables the GTK 4.10 API the Theme page's wallpaper picker
+# relies on — `gtk::FileDialog` and `gtk::AlertDialog` (task 6.5). Their
+# predecessors (`FileChooserNative`/`MessageDialog`) are deprecated in GTK 4.10+
+# and would trip the `-D warnings` clippy gate, so the modern replacements are
+# used instead; the target system ships GTK 4.22, well above the 4.10 baseline.
+gtk4 = { version = "0.10.3", features = ["v4_10"] }
 relm4 = "0.10.0"
 
 # Command-line argument parsing (R7.2). Only the `--log-level` flag exists

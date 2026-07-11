@@ -100,7 +100,7 @@ use crate::core::display::DisplayModel;
 use crate::core::model::Category;
 use crate::core::reload::ReloadParams;
 use crate::core::store::SettingsStore;
-use crate::core::theme::{PaletteModel, ThemesModel};
+use crate::core::theme::{PaletteModel, ThemesModel, WallpaperModel};
 use crate::system::command::SystemCommandRunner;
 use crate::system::signal::SystemProcessSignaller;
 use crate::ui::category::{SidebarCategory, visible_categories};
@@ -183,6 +183,13 @@ struct Shell {
     /// state feeds the same Apply/Reset chrome, and its multi-file theme/cursor writes
     /// are folded into the same Apply pipeline (see [`Shell::wire_apply`]).
     themes: Rc<RefCell<Option<ThemesModel>>>,
+    /// The Theme page's wallpaper / lock-background model (task 6.5), shared with the
+    /// Theme glue. `None` until the startup worker builds it, or when hyprpaper is
+    /// absent. Like the other Theme models it is a staging source alongside the store:
+    /// its dirty state feeds the same Apply/Reset chrome, and its `hyprpaper.conf` /
+    /// `hyprlock.conf` writes are folded into the same Apply pipeline (see
+    /// [`Shell::wire_apply`]).
+    wallpaper: Rc<RefCell<Option<WallpaperModel>>>,
     /// The mounted Theme page, retained so the window can re-render it after a Reset or a
     /// committed Apply. Rebuilt by [`Shell::populate`]; `None` while the Theme category
     /// shows a placeholder (no palette source and no `gsettings`, so no section built).
@@ -243,6 +250,7 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     // empty; the worker fills the model and `populate` builds the page.
     let palette: Rc<RefCell<Option<PaletteModel>>> = Rc::new(RefCell::new(None));
     let themes: Rc<RefCell<Option<ThemesModel>>> = Rc::new(RefCell::new(None));
+    let wallpaper: Rc<RefCell<Option<WallpaperModel>>> = Rc::new(RefCell::new(None));
     let theme_page: Rc<RefCell<Option<ThemePage>>> = Rc::new(RefCell::new(None));
 
     // The persistent content stack + sidebar. Pages are added to this same stack on
@@ -273,16 +281,18 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
         let display = display.clone();
         let palette = palette.clone();
         let themes = themes.clone();
+        let wallpaper = wallpaper.clone();
         let apply_button = apply_button.clone();
         let reset_button = reset_button.clone();
         let stack = stack.clone();
         let marked = marked.clone();
         Rc::new(move || {
             let store = store.borrow();
-            // The Display and Theme pages are additional dirty sources (tasks 6.1/6.3/6.4):
+            // The Display and Theme pages are additional dirty sources (tasks 6.1/6.3–6.5):
             // none is a store value (monitors are dynamic; a palette switch runs
-            // `generate-colors`; the GTK/icon/cursor themes are a bespoke model), so each
-            // reports its own dirty state, OR-ed into the shared Apply/Reset enablement.
+            // `generate-colors`; the GTK/icon/cursor themes and the wallpaper/lock paths
+            // are bespoke models), so each reports its own dirty state, OR-ed into the
+            // shared Apply/Reset enablement.
             let display_dirty = display
                 .borrow()
                 .as_ref()
@@ -292,7 +302,11 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
                 .as_ref()
                 .is_some_and(PaletteModel::is_dirty);
             let themes_dirty = themes.borrow().as_ref().is_some_and(ThemesModel::is_dirty);
-            let theme_dirty = palette_dirty || themes_dirty;
+            let wallpaper_dirty = wallpaper
+                .borrow()
+                .as_ref()
+                .is_some_and(WallpaperModel::is_dirty);
+            let theme_dirty = palette_dirty || themes_dirty || wallpaper_dirty;
             let enabled = chrome::actions_enabled(&store) || display_dirty || theme_dirty;
             apply_button.set_sensitive(enabled);
             reset_button.set_sensitive(enabled);
@@ -342,6 +356,7 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
         sound_page,
         palette,
         themes,
+        wallpaper,
         theme_page,
         capabilities,
         controllers,
@@ -422,6 +437,7 @@ impl Shell {
             display,
             palette,
             themes,
+            wallpaper,
         } = load;
         let file_count = files.len();
 
@@ -438,11 +454,12 @@ impl Shell {
             }
         }
         *self.capabilities.borrow_mut() = capabilities;
-        // Adopt the worker-built Display, palette, and GTK/icon/cursor theme models
-        // (tasks 6.1/6.3/6.4) before `populate` builds their pages from them.
+        // Adopt the worker-built Display, palette, GTK/icon/cursor theme, and
+        // wallpaper models (tasks 6.1/6.3–6.5) before `populate` builds their pages.
         *self.display.borrow_mut() = display;
         *self.palette.borrow_mut() = palette;
         *self.themes.borrow_mut() = themes;
+        *self.wallpaper.borrow_mut() = wallpaper;
 
         self.populate();
 
@@ -584,22 +601,25 @@ impl Shell {
 
     /// Builds the Theme category's page (tasks 6.3/6.4).
     ///
-    /// The page hosts two independent sections, each present when its model was built
+    /// The page hosts three independent sections, each present when its model was built
     /// by the worker: the palette-scheme section when the dotfiles palette source was
-    /// discovered (R3.2/R8.5), and the GTK/icon/cursor appearance section when
-    /// `gsettings` is present (R3.3/R3.4/R4.2). The bespoke [`theme`] page is mounted
-    /// whenever *either* model exists (rendering from the shared models and reporting
-    /// staged changes through `update_chrome`), and its dirty marker is registered
-    /// under [`Category::Theme`]. When neither model exists the page degrades to the
-    /// task-5.1 placeholder (R4.2/R4.4); the reason is logged at `info`, matching the
-    /// hidden-item convention (detection/startup also log *why* each model is absent).
+    /// discovered (R3.2/R8.5), the GTK/icon/cursor appearance section when `gsettings`
+    /// is present (R3.3/R3.4/R4.2), and the wallpaper section when hyprpaper is present
+    /// (task 6.5, R4.2). The bespoke [`theme`] page is mounted whenever *any* model
+    /// exists (rendering from the shared models and reporting staged changes through
+    /// `update_chrome`), and its dirty marker is registered under [`Category::Theme`].
+    /// When no model exists the page degrades to the task-5.1 placeholder (R4.2/R4.4);
+    /// the reason is logged at `info`, matching the hidden-item convention
+    /// (detection/startup also log *why* each model is absent).
     fn populate_theme(&self, category: SidebarCategory) {
         let has_palette = self.palette.borrow().is_some();
         let has_themes = self.themes.borrow().is_some();
-        if has_palette || has_themes {
+        let has_wallpaper = self.wallpaper.borrow().is_some();
+        if has_palette || has_themes || has_wallpaper {
             let page = theme::build(
                 self.palette.clone(),
                 self.themes.clone(),
+                self.wallpaper.clone(),
                 self.update_chrome.clone(),
             );
             self.stack
@@ -612,8 +632,8 @@ impl Shell {
             *self.theme_page.borrow_mut() = Some(page);
         } else {
             tracing::info!(
-                "Theme sections hidden: no dotfiles palette source and no gsettings \
-                 (R3.2/R3.3/R4.2/R8.5)"
+                "Theme sections hidden: no dotfiles palette source, no gsettings, and no \
+                 hyprpaper (R3.2/R3.3/R4.2/R8.5)"
             );
             let placeholder = build_placeholder_page(category);
             self.stack
@@ -708,6 +728,35 @@ impl Shell {
                 return;
             }
 
+            // F (R5.6): the same conflict guard for the wallpaper page's backing files
+            // (hyprpaper.conf / hyprlock.conf). Like the themes model, these are not in
+            // the store's tracker, so the wallpaper model owns their freshness and is
+            // checked here. Only relevant when a wallpaper/lock change is pending.
+            let wallpaper_conflict = {
+                let wallpaper = shell.wallpaper.borrow();
+                wallpaper
+                    .as_ref()
+                    .is_some_and(|model| model.is_dirty() && model.check_conflict())
+            };
+            if wallpaper_conflict {
+                let reloaded = shell
+                    .wallpaper
+                    .borrow()
+                    .as_ref()
+                    .map(WallpaperModel::reload);
+                *shell.wallpaper.borrow_mut() = reloaded;
+                shell.rerender_theme();
+                (shell.update_chrome)();
+                chrome::show_warning(
+                    &shell.window,
+                    "Files changed on disk",
+                    "A wallpaper configuration file changed on disk since Settings4000 read it, \
+                     so nothing was written. It has been reloaded from disk — re-apply your \
+                     wallpaper changes.",
+                );
+                return;
+            }
+
             let mut plan = interim_apply_plan(&shell.store.borrow());
             // The store-backed writes to commit to the store after a successful apply.
             // Captured before the Display contribution is folded in, because the Display
@@ -767,6 +816,29 @@ impl Shell {
                 }
             };
 
+            // Fold in the Theme page's wallpaper / lock-background writes (task 6.5): a
+            // change writes hyprpaper.conf (wallpaper path + fit) and/or hyprlock.conf
+            // (the lock background — the same path, or the override), plus the wallpaper
+            // reload parameter that drives `hyprctl hyprpaper preload`/`wallpaper` (only
+            // when hyprpaper.conf changed; a hyprlock-only change reloads nothing). Its
+            // chosen paths are re-validated by the pipeline (R8.3). Like the themes
+            // model it owns its own freshness (checked above), so it commits separately.
+            let has_wallpaper_write = {
+                let wallpaper = shell.wallpaper.borrow();
+                match wallpaper
+                    .as_ref()
+                    .and_then(WallpaperModel::apply_contribution)
+                {
+                    Some(contribution) => {
+                        plan.writes.extend(contribution.writes);
+                        plan.validations.extend(contribution.validations);
+                        merge_reload_params(&mut plan.reload_params, contribution.reload_params);
+                        true
+                    }
+                    None => false,
+                }
+            };
+
             // Side-effect seams: the real system runner (created above) plus the
             // signaller. The freshness tracker is the store's own (task 5.4), holding
             // the baselines recorded when the startup load read the backing files, so
@@ -806,6 +878,14 @@ impl Shell {
                             themes.commit();
                         }
                     }
+                    // Commit the wallpaper / lock-background model too (task 6.5), the
+                    // same way: promote staged paths/fit and re-baseline hyprpaper.conf /
+                    // hyprlock.conf freshness from the just-written bytes.
+                    if has_wallpaper_write {
+                        if let Some(wallpaper) = shell.wallpaper.borrow_mut().as_mut() {
+                            wallpaper.commit();
+                        }
+                    }
                     shell.rerender_pages();
                     shell.rerender_display();
                     shell.rerender_theme();
@@ -814,8 +894,8 @@ impl Shell {
                         shell.toast.show(&message);
                     }
                     tracing::info!(
-                        "apply committed; store, Display, palette, and themes reconciled \
-                         (task 5.3/6.1/6.3/6.4)"
+                        "apply committed; store, Display, palette, themes, and wallpaper \
+                         reconciled (task 5.3/6.1/6.3/6.4/6.5)"
                     );
                 }
                 ApplyResponse::Warn { heading, detail } => {
@@ -830,9 +910,9 @@ impl Shell {
         let shell = self.clone();
         reset_button.connect_clicked(move |_| {
             shell.store.borrow_mut().reset();
-            // Reset the Display, palette, and GTK/icon/cursor theme staging too (tasks
-            // 6.1/6.3/6.4) — they are additional dirty sources, so Reset must clear them
-            // alongside the store.
+            // Reset the Display, palette, GTK/icon/cursor theme, and wallpaper staging
+            // too (tasks 6.1/6.3–6.5) — they are additional dirty sources, so Reset must
+            // clear them alongside the store.
             if let Some(display) = shell.display.borrow_mut().as_mut() {
                 display.reset();
             }
@@ -841,6 +921,9 @@ impl Shell {
             }
             if let Some(themes) = shell.themes.borrow_mut().as_mut() {
                 themes.reset();
+            }
+            if let Some(wallpaper) = shell.wallpaper.borrow_mut().as_mut() {
+                wallpaper.reset();
             }
             shell.rerender_pages();
             shell.rerender_display();
@@ -941,11 +1024,11 @@ fn interim_apply_plan(store: &SettingsStore) -> ApplyPlan {
 /// Merges a page's reload parameters into the plan's, setting each field only when the
 /// contribution provides it (task 6.4).
 ///
-/// The Theme page (task 6.4) is the only page that fills [`ReloadParams`] today (the
-/// GTK/icon theme names and the cursor theme+size); a field is overwritten only when
-/// `Some`, so a value another page might set later (e.g. task 6.5's wallpaper) is
-/// preserved. The plan starts from [`ReloadParams::default`] (all `None`), so this is
-/// effectively an assignment of the theme fields in v1.
+/// Both Theme sub-features fill [`ReloadParams`]: the GTK/icon/cursor model (task 6.4)
+/// the theme names and cursor theme+size, and the wallpaper model (task 6.5) the
+/// wallpaper path and fit mode. A field is overwritten only when `Some`, so a value one
+/// contribution sets is never clobbered by another that leaves it `None`. The plan
+/// starts from [`ReloadParams::default`] (all `None`), so this composes both cleanly.
 fn merge_reload_params(target: &mut ReloadParams, from: ReloadParams) {
     if from.gtk_theme.is_some() {
         target.gtk_theme = from.gtk_theme;
@@ -958,6 +1041,9 @@ fn merge_reload_params(target: &mut ReloadParams, from: ReloadParams) {
     }
     if from.wallpaper.is_some() {
         target.wallpaper = from.wallpaper;
+    }
+    if from.fit.is_some() {
+        target.fit = from.fit;
     }
 }
 

@@ -54,7 +54,9 @@ use crate::core::detect::{Binary, Capabilities, DetectionInputs};
 use crate::core::display::DisplayModel;
 use crate::core::model::{SettingId, Value};
 use crate::core::store::{FileReader, FileValues};
-use crate::core::theme::{PaletteModel, ThemeRoots, ThemesModel, ThemesPaths};
+use crate::core::theme::{
+    PaletteModel, ThemeRoots, ThemesModel, ThemesPaths, WallpaperModel, WallpaperPaths,
+};
 use crate::parsers::hyprlang::{HyprlangFile, KeyPath};
 use crate::parsers::swaync::SwayncConfigFile;
 use crate::system::command::SystemCommandRunner;
@@ -101,6 +103,10 @@ pub(crate) struct StartupLoad {
     /// installed themes and reading the backing config, or `None` when `gsettings` is
     /// absent (the appearance section is then hidden, R4.2).
     pub(crate) themes: Option<ThemesModel>,
+    /// The Theme page's wallpaper / lock-background model (task 6.5), built by reading
+    /// `hyprpaper.conf`/`hyprlock.conf`, or `None` when hyprpaper is absent (the
+    /// wallpaper section is then hidden, R4.2).
+    pub(crate) wallpaper: Option<WallpaperModel>,
 }
 
 /// The live XDG paths of the backing config files loaded at startup (R8.5).
@@ -162,12 +168,47 @@ pub(crate) fn load() -> StartupLoad {
     let display = load_display(&capabilities);
     let palette = load_palette(&capabilities);
     let themes = load_themes(&capabilities);
+    let wallpaper = load_wallpaper(&capabilities);
     StartupLoad {
         capabilities,
         files,
         display,
         palette,
         themes,
+        wallpaper,
+    }
+}
+
+/// Builds the Theme page's wallpaper / lock-background model on the worker thread (task
+/// 6.5; R4.2, R4.4).
+///
+/// Only builds when hyprpaper is present — the wallpaper is applied live with
+/// `hyprctl hyprpaper`, so without hyprpaper the wallpaper section is hidden and logged
+/// at `info` (R4.2). Whether the lock-screen override is offered is gated separately on
+/// hyprlock (analysis §6.2): its absence hides only that one control, not the whole
+/// section. Reading the two config files here, on the startup worker, keeps them off the
+/// main thread and inside the R8.1 cold-start budget (architecture §8).
+fn load_wallpaper(capabilities: &Capabilities) -> Option<WallpaperModel> {
+    if !capabilities.has_binary(Binary::Hyprpaper) {
+        tracing::info!("hyprpaper not found; the wallpaper controls are hidden (R4.2)");
+        return None;
+    }
+    let lock_available = capabilities.has_binary(Binary::Hyprlock);
+    if !lock_available {
+        tracing::info!(
+            "hyprlock not found; the lock-screen override control is hidden (R4.2/R4.4)"
+        );
+    }
+    Some(WallpaperModel::load(wallpaper_paths(), lock_available))
+}
+
+/// The live XDG paths of the two config files a wallpaper / lock-background change
+/// writes (R8.5).
+fn wallpaper_paths() -> WallpaperPaths {
+    let config = config_home();
+    WallpaperPaths {
+        hyprpaper_conf: config.join("hypr").join("hyprpaper.conf"),
+        hyprlock_conf: config.join("hypr").join("hyprlock.conf"),
     }
 }
 
@@ -660,6 +701,19 @@ mod tests {
         assert!(
             load_themes(&caps).is_none(),
             "no gsettings -> no themes model -> appearance section hidden"
+        );
+    }
+
+    #[test]
+    fn wallpaper_is_hidden_when_hyprpaper_is_absent() {
+        // R4.2 (task 6.5): the wallpaper is applied live with `hyprctl hyprpaper`, so
+        // without the hyprpaper binary the model is not built and the wallpaper section
+        // is hidden. The gate is checked before any filesystem read, so this needs no
+        // fixture.
+        let caps = Capabilities::for_tests(&[], &[], false);
+        assert!(
+            load_wallpaper(&caps).is_none(),
+            "no hyprpaper -> no wallpaper model -> wallpaper section hidden"
         );
     }
 

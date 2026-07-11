@@ -148,7 +148,10 @@ impl BackingFile {
             BackingFile::HyprlockConf => Vec::new(),
             BackingFile::SwayncConfig => vec![ReloadAction::SwayncReload],
             BackingFile::HyprpaperConf => match &params.wallpaper {
-                Some(path) => vec![ReloadAction::HyprpaperWallpaper { path: path.clone() }],
+                Some(path) => vec![ReloadAction::HyprpaperWallpaper {
+                    path: path.clone(),
+                    fit: params.fit.clone(),
+                }],
                 None => {
                     tracing::warn!(
                         "hyprpaper.conf changed but no wallpaper path was provided; \
@@ -225,6 +228,12 @@ fn theme_and_cursor_actions(params: &ReloadParams, include_gtk_icon: bool) -> Ve
 pub(crate) struct ReloadParams {
     /// The new wallpaper path, for the hyprpaper reload (task 6.5).
     pub(crate) wallpaper: Option<String>,
+    /// The new wallpaper fit mode, applied live in the same hyprpaper reload (task
+    /// 6.5). hyprpaper's `wallpaper` IPC takes the fit as a third comma-field
+    /// (`monitor,path,fit_mode`), so without this a fit change would be written to
+    /// `hyprpaper.conf` but never take effect until hyprpaper restarts. Set only when
+    /// a fit is configured; the reload falls back to `,<path>` when it is `None`.
+    pub(crate) fit: Option<String>,
     /// The new cursor theme and size, for `hyprctl setcursor` and the `gsettings`
     /// cursor keys (task 6.4).
     pub(crate) cursor: Option<CursorValue>,
@@ -269,10 +278,16 @@ pub(crate) enum ReloadAction {
     /// remote-control reload; analysis §6.1).
     KittyColors,
     /// Set the wallpaper via hyprpaper: `hyprctl hyprpaper preload <path>` then
-    /// `hyprctl hyprpaper wallpaper ,<path>` (empty monitor field = all outputs).
+    /// `hyprctl hyprpaper wallpaper <monitor>,<path>[,<fit>]` (empty monitor field =
+    /// all outputs). The optional third comma-field is hyprpaper's fit mode, so a fit
+    /// change takes effect live rather than only on the next hyprpaper restart (task
+    /// 6.5).
     HyprpaperWallpaper {
         /// The image path to preload and display.
         path: String,
+        /// The fit mode to apply, or `None` to leave hyprpaper's default (the reload
+        /// then omits the third comma-field).
+        fit: Option<String>,
     },
     /// Restart hypridle so it re-reads its config: restart its systemd user unit
     /// when one is active, else SIGTERM + `setsid --fork` respawn (architecture §6;
@@ -364,7 +379,7 @@ impl ReloadAction {
             ReloadAction::SwayncReload => {
                 run_and_check(runner, Command::new("swaync-client").arg("-rs"))
             }
-            ReloadAction::HyprpaperWallpaper { path } => {
+            ReloadAction::HyprpaperWallpaper { path, fit } => {
                 // Preload the image, then set it on all outputs (empty monitor
                 // field). Preload must succeed first, so short-circuit on its
                 // failure rather than trying to display an unloaded image.
@@ -375,12 +390,19 @@ impl ReloadAction {
                         .arg("preload")
                         .arg(path.as_str()),
                 )?;
+                // hyprpaper's `wallpaper` IPC takes the fit as a third comma-field
+                // (`monitor,path,fit_mode`); include it when set so a fit change is
+                // applied live, otherwise fall back to the two-field form.
+                let wallpaper_arg = match fit {
+                    Some(fit) => format!(",{path},{fit}"),
+                    None => format!(",{path}"),
+                };
                 run_and_check(
                     runner,
                     Command::new("hyprctl")
                         .arg("hyprpaper")
                         .arg("wallpaper")
-                        .arg(format!(",{path}")),
+                        .arg(wallpaper_arg),
                 )
             }
             ReloadAction::GsettingsSet { key, value } => run_and_check(
@@ -629,6 +651,7 @@ mod tests {
     fn full_params() -> ReloadParams {
         ReloadParams {
             wallpaper: Some("/home/u/Pictures/wall.jpg".to_string()),
+            fit: Some("cover".to_string()),
             cursor: Some(CursorValue {
                 theme: "Nordic-cursors".to_string(),
                 size: 16,
@@ -691,9 +714,10 @@ mod tests {
         assert_eq!(
             BackingFile::HyprpaperConf.reload_actions(&params),
             vec![ReloadAction::HyprpaperWallpaper {
-                path: "/home/u/Pictures/wall.jpg".to_string()
+                path: "/home/u/Pictures/wall.jpg".to_string(),
+                fit: Some("cover".to_string()),
             }],
-            "hyprpaper.conf maps to the hyprpaper wallpaper action"
+            "hyprpaper.conf maps to the hyprpaper wallpaper action carrying the fit"
         );
         assert_eq!(
             BackingFile::SwayncConfig.reload_actions(&params),
@@ -984,14 +1008,43 @@ mod tests {
     }
 
     #[test]
-    fn hyprpaper_action_preloads_then_sets_the_wallpaper() {
+    fn hyprpaper_action_preloads_then_sets_the_wallpaper_with_the_fit() {
         // The single hyprpaper action expands to two ordered commands: preload the
-        // path, then set it on all outputs (empty monitor field before the comma).
+        // path, then set it on all outputs (empty monitor field before the comma) with
+        // the fit as the third comma-field, so a fit change is applied live (task 6.5).
         let runner = MockCommandRunner::new();
         let signaller = MockProcessSignaller::new();
 
         ReloadAction::HyprpaperWallpaper {
             path: "/home/u/Pictures/wall.jpg".to_string(),
+            fit: Some("tile".to_string()),
+        }
+        .execute(&runner, &signaller)
+        .expect("hyprpaper reload succeeds");
+
+        assert_eq!(
+            runner.recorded(),
+            vec![
+                Command::new("hyprctl").args(["hyprpaper", "preload", "/home/u/Pictures/wall.jpg"]),
+                Command::new("hyprctl").args([
+                    "hyprpaper",
+                    "wallpaper",
+                    ",/home/u/Pictures/wall.jpg,tile"
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn hyprpaper_action_omits_the_fit_field_when_no_fit_is_set() {
+        // With no fit configured, the wallpaper arg falls back to the two-field
+        // `,<path>` form (hyprpaper keeps its default fit).
+        let runner = MockCommandRunner::new();
+        let signaller = MockProcessSignaller::new();
+
+        ReloadAction::HyprpaperWallpaper {
+            path: "/home/u/Pictures/wall.jpg".to_string(),
+            fit: None,
         }
         .execute(&runner, &signaller)
         .expect("hyprpaper reload succeeds");
@@ -1018,6 +1071,7 @@ mod tests {
 
         let result = ReloadAction::HyprpaperWallpaper {
             path: "/x.jpg".to_string(),
+            fit: Some("cover".to_string()),
         }
         .execute(&runner, &signaller);
 

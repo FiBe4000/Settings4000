@@ -1,17 +1,25 @@
-//! The Theme page's bespoke GTK glue (task 6.3; architecture §7; R2.3, R3.2, R4.2,
-//! R4.4).
+//! The Theme page's bespoke GTK glue (tasks 6.3–6.5; architecture §7; R2.3, R3.2,
+//! R4.2, R4.4, R8.3).
 //!
-//! # A multi-section page (6.3–6.4)
+//! # A multi-section page (6.3–6.5)
 //!
-//! The Theme page is built from independent **sections** so the later Theme tasks
-//! plug in cleanly: task 6.3 adds the palette-scheme section; task 6.4 adds the
-//! GTK/icon/cursor theme drop-downs; task 6.5 adds the wallpaper and lock background
-//! — each becomes another frame appended in [`Inner::rebuild`], gated on its own
-//! model being present. Today the palette section (from a
-//! [`PaletteModel`](crate::core::theme::PaletteModel)) and the appearance section
-//! (from a [`ThemesModel`](crate::core::theme::ThemesModel)) exist; the page is built
-//! whenever *either* model is present, and each section renders only when its model
-//! is.
+//! The Theme page is built from independent **sections** so the Theme tasks plug in
+//! cleanly: task 6.3 adds the palette-scheme section; task 6.4 adds the GTK/icon/cursor
+//! theme drop-downs; task 6.5 adds the wallpaper and lock-screen background — each is a
+//! frame appended in [`Inner::rebuild`], gated on its own model being present. The page
+//! is built whenever *any* of the three models exists, and each section renders only
+//! when its model is.
+//!
+//! # The wallpaper section (task 6.5; R8.3)
+//!
+//! From a [`WallpaperModel`](crate::core::theme::WallpaperModel), the wallpaper section
+//! offers a single wallpaper image picker (a plain `gtk::FileDialog` — no libadwaita),
+//! a fit-mode drop-down, and an optional "use a different lock-screen image" toggle that
+//! reveals a second picker. A chosen path is validated (exists + readable + image
+//! extension, R8.3) before staging; an invalid choice is rejected with a plain
+//! `gtk::AlertDialog` message and nothing is staged. The lock-override toggle is shown
+//! only when hyprlock is present, and the whole section only when hyprpaper is (the
+//! window gates it, R4.2/R4.4).
 //!
 //! # The GTK_THEME override and live restyle (task 6.4; R3.3/R2.2)
 //!
@@ -58,15 +66,19 @@
 //! Cairo draw function paints the rectangles directly.
 
 use std::cell::RefCell;
+use std::path::Path;
 use std::rc::Rc;
 
+use gtk4::gio;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box as GtkBox, DrawingArea, DropDown, Frame, Image, Label, Orientation, ScrolledWindow,
-    StringList, Widget,
+    AlertDialog, Align, Box as GtkBox, Button, DrawingArea, DropDown, FileDialog, FileFilter,
+    Frame, Image, Label, Orientation, ScrolledWindow, StringList, Switch, Widget, Window,
 };
 
-use crate::core::theme::{GtkThemeOverrideSource, PaletteModel, Scheme, ThemesModel};
+use crate::core::theme::{
+    GtkThemeOverrideSource, PaletteModel, Scheme, ThemesModel, WallpaperModel,
+};
 
 /// Outer margin, in pixels, around the page content.
 const PAGE_MARGIN: i32 = 18;
@@ -120,9 +132,23 @@ struct Inner {
     /// absent (the appearance section is then not built). Shared with the window so an
     /// Apply reads the same staged theme/cursor values.
     themes: Rc<RefCell<Option<ThemesModel>>>,
+    /// The shared wallpaper / lock-background model (task 6.5) — `None` when hyprpaper is
+    /// absent (the wallpaper section is then not built). Shared with the window so an
+    /// Apply reads the same staged wallpaper/lock values.
+    wallpaper: Rc<RefCell<Option<WallpaperModel>>>,
     /// Reports a staged change so the window refreshes the Apply/Reset chrome and the
     /// Theme page's dirty marker (task 5.3).
     on_changed: Rc<dyn Fn()>,
+}
+
+/// Which wallpaper image picker was invoked, so the file-chooser callback stages the
+/// chosen path into the right [`WallpaperModel`] setter (task 6.5).
+#[derive(Clone, Copy)]
+enum WallpaperTarget {
+    /// The desktop wallpaper (`hyprpaper.conf`).
+    Wallpaper,
+    /// The lock-screen background override (`hyprlock.conf`).
+    Lock,
 }
 
 /// Which theme drop-down reported a change, so [`Inner::stage_theme`] routes it to the
@@ -141,8 +167,7 @@ enum ThemeKind {
 
 impl Inner {
     /// Rebuilds every section from the models. Each section is appended only when its
-    /// model is present (the palette source / `gsettings` gates); task 6.5 appends the
-    /// wallpaper section here too.
+    /// model is present (the palette source / `gsettings` / hyprpaper gates).
     fn rebuild(self: &Rc<Self>) {
         while let Some(child) = self.content.first_child() {
             self.content.remove(&child);
@@ -152,6 +177,9 @@ impl Inner {
         }
         if self.themes.borrow().is_some() {
             self.content.append(&self.build_themes_section());
+        }
+        if self.wallpaper.borrow().is_some() {
+            self.content.append(&self.build_wallpaper_section());
         }
     }
 
@@ -365,12 +393,225 @@ impl Inner {
         (self.on_changed)();
         self.rebuild();
     }
+
+    /// Builds the wallpaper section: a wallpaper image picker, a fit-mode drop-down, and
+    /// an optional lock-screen override toggle that reveals a second picker (task 6.5).
+    ///
+    /// When `hyprpaper.conf` is unreadable the rows are hidden behind a note (R4.4); the
+    /// lock-override toggle is shown only when hyprlock is present (R4.2).
+    fn build_wallpaper_section(self: &Rc<Self>) -> Frame {
+        let frame = Frame::new(Some("Wallpaper"));
+        let section = GtkBox::new(Orientation::Vertical, SECTION_SPACING);
+        section.set_margin_top(SECTION_SPACING);
+        section.set_margin_bottom(SECTION_SPACING);
+        section.set_margin_start(SECTION_SPACING);
+        section.set_margin_end(SECTION_SPACING);
+
+        let model_ref = self.wallpaper.borrow();
+        let Some(model) = model_ref.as_ref() else {
+            // The window only builds this section when a wallpaper model exists, so this
+            // is a defensive fallback rather than an expected state.
+            section.append(&note("No wallpaper settings are available."));
+            frame.set_child(Some(&section));
+            return frame;
+        };
+
+        if !model.wallpaper_editable() {
+            // R4.4: no readable hyprpaper.conf, so there is nothing to preselect or write.
+            section.append(&note(
+                "hyprpaper.conf was not found, so the wallpaper cannot be changed here.",
+            ));
+            frame.set_child(Some(&section));
+            return frame;
+        }
+
+        // The wallpaper image picker.
+        let button = self.image_chooser_button(model.wallpaper_path(), WallpaperTarget::Wallpaper);
+        section.append(&labelled_row("Image", &button));
+
+        // The fit-mode drop-down.
+        let weak = Rc::downgrade(self);
+        let fit_dropdown = build_dropdown(
+            model.fit_options(),
+            model.selected_fit_index().map(|index| index as u32),
+            move |fit| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.stage_fit(fit);
+                }
+            },
+        );
+        section.append(&labelled_row("Fit", &fit_dropdown));
+
+        // The optional lock-screen override — only when hyprlock is present (R4.2).
+        if model.lock_editable() {
+            let switch = Switch::new();
+            switch.set_halign(Align::End);
+            switch.set_valign(Align::Center);
+            // Set the state before connecting the handler so the programmatic set never
+            // masquerades as a user toggle (the same discipline as the drop-downs).
+            switch.set_active(model.override_on());
+            let weak = Rc::downgrade(self);
+            switch.connect_active_notify(move |switch| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.set_override(switch.is_active());
+                }
+            });
+            section.append(&labelled_row("Use a different lock-screen image", &switch));
+
+            if model.override_on() {
+                let lock_button =
+                    self.image_chooser_button(model.lock_path(), WallpaperTarget::Lock);
+                section.append(&labelled_row("Lock-screen image", &lock_button));
+            }
+        }
+
+        frame.set_child(Some(&section));
+        frame
+    }
+
+    /// Builds a button showing the current image's file name (or "Choose…") that opens a
+    /// file chooser for `target` on click; the full path is the tooltip (task 6.5).
+    fn image_chooser_button(
+        self: &Rc<Self>,
+        current: Option<&str>,
+        target: WallpaperTarget,
+    ) -> Button {
+        let label = current
+            .map(basename)
+            .unwrap_or_else(|| "Choose…".to_string());
+        let button = Button::with_label(&label);
+        button.set_halign(Align::End);
+        if let Some(path) = current {
+            button.set_tooltip_text(Some(path));
+        }
+        let weak = Rc::downgrade(self);
+        let initial = current.map(str::to_string);
+        button.connect_clicked(move |button| {
+            if let Some(inner) = weak.upgrade() {
+                inner.choose_image(button, target, initial.clone());
+            }
+        });
+        button
+    }
+
+    /// Opens a plain `gtk::FileDialog` filtered to image files and stages the chosen
+    /// path into `target` (task 6.5).
+    ///
+    /// The dialog is asynchronous: its callback runs later on the main thread, upgrades
+    /// the captured [`Weak`](std::rc::Weak), and stages (with validation) the chosen
+    /// path. A dismissed dialog is not an error. No libadwaita is involved.
+    fn choose_image(
+        self: &Rc<Self>,
+        button: &Button,
+        target: WallpaperTarget,
+        initial: Option<String>,
+    ) {
+        let dialog = FileDialog::builder()
+            .title("Choose an image")
+            .modal(true)
+            .build();
+        if let Some(path) = &initial {
+            dialog.set_initial_file(Some(&gio::File::for_path(path)));
+        }
+        // Offer an image-only filter (the same extensions the validator accepts).
+        let filter = FileFilter::new();
+        filter.set_name(Some("Images"));
+        for suffix in ["png", "jpg", "jpeg", "webp"] {
+            filter.add_suffix(suffix);
+        }
+        let filters = gio::ListStore::new::<FileFilter>();
+        filters.append(&filter);
+        dialog.set_filters(Some(&filters));
+
+        let parent = button.root().and_downcast::<Window>();
+        let weak = Rc::downgrade(self);
+        dialog.open(parent.as_ref(), gio::Cancellable::NONE, move |result| {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            match result {
+                Ok(file) => {
+                    if let Some(path) = file.path() {
+                        inner.apply_chosen_image(target, &path.to_string_lossy());
+                    }
+                }
+                Err(error) => {
+                    // A dismissed/cancelled dialog reports an error; it is not worth
+                    // surfacing to the user.
+                    tracing::debug!(%error, "image chooser dismissed");
+                }
+            }
+        });
+    }
+
+    /// Stages a chosen image path into the model, validating it first (R8.3); on
+    /// rejection shows a plain-GTK error dialog and stages nothing.
+    fn apply_chosen_image(self: &Rc<Self>, target: WallpaperTarget, path: &str) {
+        let result = {
+            let mut wallpaper = self.wallpaper.borrow_mut();
+            match wallpaper.as_mut() {
+                Some(model) => match target {
+                    WallpaperTarget::Wallpaper => model.stage_wallpaper(path),
+                    WallpaperTarget::Lock => model.stage_lock(path),
+                },
+                None => Ok(()),
+            }
+        };
+        match result {
+            Ok(()) => {
+                (self.on_changed)();
+                self.rebuild();
+            }
+            Err(error) => {
+                // R8.3: reject a missing / unreadable / non-image path with a clear
+                // message, leaving the previously staged value unchanged.
+                self.show_image_error(&error.to_string());
+            }
+        }
+    }
+
+    /// Stages a fit mode, notifies the chrome, and rebuilds the sections.
+    fn stage_fit(self: &Rc<Self>, fit: String) {
+        {
+            let mut wallpaper = self.wallpaper.borrow_mut();
+            if let Some(model) = wallpaper.as_mut() {
+                model.stage_fit(&fit);
+            }
+        }
+        (self.on_changed)();
+        self.rebuild();
+    }
+
+    /// Sets the lock-screen override toggle, notifies the chrome, and rebuilds so the
+    /// override picker appears or disappears.
+    fn set_override(self: &Rc<Self>, on: bool) {
+        {
+            let mut wallpaper = self.wallpaper.borrow_mut();
+            if let Some(model) = wallpaper.as_mut() {
+                model.set_override(on);
+            }
+        }
+        (self.on_changed)();
+        self.rebuild();
+    }
+
+    /// Shows a plain `gtk::AlertDialog` explaining why a chosen image was rejected
+    /// (R8.3) — no libadwaita, no custom CSS.
+    fn show_image_error(&self, detail: &str) {
+        let dialog = AlertDialog::builder()
+            .message("That image can't be used")
+            .detail(detail)
+            .modal(true)
+            .build();
+        let parent = self.content.root().and_downcast::<Window>();
+        dialog.show(parent.as_ref());
+    }
 }
 
-/// Builds the Theme page over the shared `palette` and `themes` models, reporting
-/// staged changes through `on_changed` (tasks 6.3/6.4).
+/// Builds the Theme page over the shared `palette`, `themes`, and `wallpaper` models,
+/// reporting staged changes through `on_changed` (tasks 6.3/6.4/6.5).
 ///
-/// Either model may be `None` (its section is then not rendered); the window builds the
+/// Any model may be `None` (its section is then not rendered); the window builds the
 /// page whenever at least one is present. The returned [`ThemePage`] must be kept alive
 /// by the window: it owns the strong reference to the render state whose handlers keep
 /// the models wired. The window mounts [`ThemePage::root`] in the stack and calls
@@ -378,6 +619,7 @@ impl Inner {
 pub(crate) fn build(
     palette: Rc<RefCell<Option<PaletteModel>>>,
     themes: Rc<RefCell<Option<ThemesModel>>>,
+    wallpaper: Rc<RefCell<Option<WallpaperModel>>>,
     on_changed: Rc<dyn Fn()>,
 ) -> ThemePage {
     let content = GtkBox::new(Orientation::Vertical, SECTION_SPACING);
@@ -390,6 +632,7 @@ pub(crate) fn build(
         content: content.clone(),
         palette,
         themes,
+        wallpaper,
         on_changed,
     });
     inner.rebuild();
@@ -485,6 +728,16 @@ fn note(text: &str) -> Label {
     label.set_wrap(true);
     label.set_xalign(0.0);
     label
+}
+
+/// The file name of a path, for a compact chooser-button label. Falls back to the whole
+/// path when it has no final component (which a real image path always does).
+fn basename(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| path.to_string())
 }
 
 /// A plain-GTK banner explaining an active `GTK_THEME` override (R3.3).
