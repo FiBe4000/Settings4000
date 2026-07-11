@@ -54,6 +54,7 @@ use crate::core::detect::{Binary, Capabilities, DetectionInputs};
 use crate::core::display::DisplayModel;
 use crate::core::input::{InputModel, default_xkb_registry};
 use crate::core::model::{SettingId, Value};
+use crate::core::notifications::NotificationsModel;
 use crate::core::store::{FileReader, FileValues};
 use crate::core::theme::{
     PaletteModel, ThemeRoots, ThemesModel, ThemesPaths, WallpaperModel, WallpaperPaths,
@@ -100,6 +101,11 @@ pub(crate) struct StartupLoad {
     /// entirely, R4.2). It supplies the layout add-list and renders the store's dirty
     /// Input settings into the `input.conf` write on Apply.
     pub(crate) input: Option<InputModel>,
+    /// The Notifications page's helper (task 6.7): the `swaync/config.json` path, or
+    /// `None` when swaync is absent (the Notifications category is then hidden entirely,
+    /// R4.2). It renders the store's dirty position/timeout settings into the
+    /// `config.json` write on Apply; the runtime-only DND switch needs no state here.
+    pub(crate) notifications: Option<NotificationsModel>,
     /// The Theme page's palette-scheme model (task 6.3), built by enumerating the
     /// discovered `colors/` directory and detecting the active scheme, or `None` when
     /// there is no dotfiles palette source (the Theme palette section is then hidden,
@@ -173,6 +179,7 @@ pub(crate) fn load() -> StartupLoad {
     let files = load_files(&BackingPaths::from_system());
     let display = load_display(&capabilities);
     let input = load_input(&capabilities);
+    let notifications = load_notifications(&capabilities);
     let palette = load_palette(&capabilities);
     let themes = load_themes(&capabilities);
     let wallpaper = load_wallpaper(&capabilities);
@@ -181,10 +188,28 @@ pub(crate) fn load() -> StartupLoad {
         files,
         display,
         input,
+        notifications,
         palette,
         themes,
         wallpaper,
     }
+}
+
+/// Builds the Notifications page's helper on the worker thread (task 6.7; R4.2).
+///
+/// Only builds when swaync is present — the Notifications category edits `swaync/config.json`
+/// and reloads via `swaync-client` (task 5.1's category gate), so without swaync there is
+/// nothing to configure and the category is hidden entirely (R4.2). It records the live
+/// `config.json` path (R8.5) for the Apply-time position/timeout write; the runtime-only
+/// DND switch reads and sets live daemon state directly and needs no state here. Building
+/// it here, off the main thread, keeps startup inside the R8.1 budget (architecture §8).
+fn load_notifications(capabilities: &Capabilities) -> Option<NotificationsModel> {
+    if !capabilities.has_binary(Binary::Swaync) {
+        tracing::info!("swaync not found; the Notifications page is hidden (R4.2)");
+        return None;
+    }
+    let swaync_config = config_home().join("swaync").join("config.json");
+    Some(NotificationsModel::load(swaync_config))
 }
 
 /// Builds the Input page's helper on the worker thread (task 6.6; R4.2).
@@ -779,6 +804,26 @@ mod tests {
         assert!(
             load_themes(&caps).is_none(),
             "no gsettings -> no themes model -> appearance section hidden"
+        );
+    }
+
+    #[test]
+    fn notifications_are_hidden_when_swaync_is_absent() {
+        // R4.2 (task 6.7): the Notifications page edits swaync's config.json and reloads
+        // via swaync-client, so without the swaync binary no model is built and the whole
+        // category is hidden (task 5.1's category gate). The gate is checked before any
+        // path is resolved, so this needs no fixture.
+        let caps = Capabilities::for_tests(&[], &[], false);
+        assert!(
+            load_notifications(&caps).is_none(),
+            "no swaync -> no Notifications model -> the category is hidden"
+        );
+
+        // Present -> a model is built (against the resolved config.json path).
+        let caps = Capabilities::for_tests(&[Binary::Swaync], &[], false);
+        assert!(
+            load_notifications(&caps).is_some(),
+            "swaync present -> a Notifications model is built"
         );
     }
 

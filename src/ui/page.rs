@@ -50,14 +50,16 @@
 //! and [`BoundList::render`] rebuilds only when the stored value actually differs
 //! from what is shown.
 //!
-//! # Interim page content (replaced by §6)
+//! # Framework page content
 //!
-//! [`category_rows`] returns a small, real descriptor list for the categories whose
-//! settings already exist in the model, so the framework is exercised end-to-end and
-//! renders in the running app. These lists are deliberately interim scaffolding,
-//! exactly like task 5.1's placeholder pages: the per-category §6 tasks supply the
-//! full control set (with real option sources, ranges, and reload wiring). A category
-//! with no descriptors yet keeps its task-5.1 placeholder.
+//! [`category_rows`] returns the declarative descriptor list for a category whose
+//! settings map onto the fixed [`SettingId`] with a *static* control set. Today that is
+//! the Notifications page's position and auto-dismiss timeout (task 6.7): fixed anchor
+//! positions and a timeout range, rendered through the generic framework and driven by
+//! the store. The Notifications page (see [`super::notifications`]) builds them via
+//! [`plan_category`] and appends its runtime-only Do-Not-Disturb switch beside them. A
+//! category with a dynamic control set (Input's XKB layouts, task 6.6) is built by its
+//! own glue instead, and one with no framework rows yet keeps its task-5.1 placeholder.
 //!
 //! The store the pages render from is populated by the worker-thread startup load
 //! (task 5.4, see [`super::startup`]): the initial values are parsed from the real
@@ -793,26 +795,40 @@ fn string_list(options: &[DropDownOption]) -> StringList {
     StringList::new(&labels)
 }
 
-/// The interim declarative row list for `category` (empty when §6 has not defined the
-/// category's controls yet).
+/// The declarative row list for `category` (empty when the category has no framework
+/// rows).
 ///
-/// See the module docs: these are real descriptors driving the framework, but their
-/// option sets and ranges are scaffolding that §6 replaces. Only the categories whose
-/// settings already exist in the model are populated; the rest fall back to task
-/// 5.1's placeholder page. The Input page is no longer built here — its layout list
-/// needs runtime XKB candidates, so the window builds it directly (task 6.6, see
-/// [`super::input`]) — leaving Notifications as the last interim category until task
-/// 6.7 gives it its own glue.
+/// Only the categories whose settings map cleanly onto the fixed
+/// [`SettingId`](crate::core::model::SettingId) with a *static* control set are built
+/// here; the rest fall back to task 5.1's placeholder page or their own glue. The Input
+/// page is not built here — its layout list needs runtime XKB candidates, so the window
+/// builds it directly (task 6.6, see [`super::input`]). Notifications' position and
+/// auto-dismiss timeout, by contrast, are fully static framework rows (a fixed set of
+/// anchor positions and a timeout range), so they live here and are rendered through the
+/// generic framework; the Notifications page (task 6.7) builds them via
+/// [`plan_category`] and appends its runtime-only Do-Not-Disturb switch beside them (see
+/// [`super::notifications`]).
 fn category_rows(category: SidebarCategory) -> Vec<RowDescriptor> {
     match category {
         SidebarCategory::Notifications => vec![
             RowDescriptor::new(
                 "Position",
                 WidgetKind::DropDown {
+                    // swaync anchors a notification by a `positionY` (top/center/bottom)
+                    // × `positionX` (left/center/right) grid — all nine combinations — so
+                    // every one is offered here as the combined `<positionY>-<positionX>`
+                    // token the store carries. Covering all nine is what lets a live
+                    // `positionY: center` config preselect correctly rather than falling
+                    // back to index 0 (task 6.7 review S1). Ordered top→centre→bottom for
+                    // natural vertical reading; the order is cosmetic (preselect matches by
+                    // token, not index).
                     options: vec![
                         DropDownOption::new("top-right", "Top right"),
                         DropDownOption::new("top-left", "Top left"),
                         DropDownOption::new("top-center", "Top centre"),
+                        DropDownOption::new("center-right", "Centre right"),
+                        DropDownOption::new("center-left", "Centre left"),
+                        DropDownOption::new("center-center", "Centre"),
                         DropDownOption::new("bottom-right", "Bottom right"),
                         DropDownOption::new("bottom-left", "Bottom left"),
                         DropDownOption::new("bottom-center", "Bottom centre"),
@@ -823,6 +839,10 @@ fn category_rows(category: SidebarCategory) -> Vec<RowDescriptor> {
             ),
             RowDescriptor::new(
                 "Auto-dismiss timeout (seconds)",
+                // The slider caps at 60 s — an intentional, ergonomic ceiling far narrower
+                // than the validator's 1..=86400 s range (task 4.1). A larger value already
+                // on disk is preserved as the stored original and is only overwritten once
+                // the user actually drags the slider (which can then only produce 1..=60).
                 WidgetKind::Scale {
                     min: 1.0,
                     max: 60.0,
@@ -1081,6 +1101,49 @@ mod tests {
         // window (task 6.6), so neither yields interim rows.
         assert!(category_rows(SidebarCategory::Theme).is_empty());
         assert!(category_rows(SidebarCategory::Input).is_empty());
+    }
+
+    #[test]
+    fn notifications_position_covers_all_nine_swaync_positions_and_preselects() {
+        // Review S1: the position drop-down must offer swaync's full positionY × positionX
+        // grid (top/center/bottom × left/center/right = 9 combinations), so a live
+        // `positionY: center` config preselects the matching option rather than silently
+        // falling back to index 0 ("Top right").
+        let rows = category_rows(SidebarCategory::Notifications);
+        let position = rows
+            .iter()
+            .find(|row| row.setting == SettingId::NotificationPosition)
+            .expect("Notifications has a position row");
+        let WidgetKind::DropDown { options } = &position.widget else {
+            panic!("the position row must be a drop-down");
+        };
+
+        // All nine combined `<positionY>-<positionX>` tokens are offered.
+        let tokens: std::collections::BTreeSet<&str> =
+            options.iter().map(|option| option.token.as_str()).collect();
+        let expected: std::collections::BTreeSet<&str> = [
+            "top-left",
+            "top-center",
+            "top-right",
+            "center-left",
+            "center-center",
+            "center-right",
+            "bottom-left",
+            "bottom-center",
+            "bottom-right",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            tokens, expected,
+            "all nine swaync positions must be offered"
+        );
+
+        // A `center-*` value preselects the matching option, not index 0.
+        let index =
+            dropdown_index_from_value(options, Some(&Value::Enum("center-right".to_string())))
+                .expect("a center-right value must match an option");
+        assert_eq!(options[index as usize].token, "center-right");
     }
 
     #[test]

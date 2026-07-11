@@ -93,6 +93,17 @@ pub mod display;
 // wiring (`ui::window`), so its public surface is exercised in a non-test build too.
 pub mod input;
 
+// The Notifications-page domain logic (task 6.7; R4.2, R4.4, R5.2, R5.6). It provides the
+// store-`SettingId` -> `swaync/config.json` write glue (rendering the store's dirty
+// position/timeout settings into one `FileWrite` through the swaync JSON adapter, position
+// decomposed back into `positionY`/`positionX`) and the runtime-only do-not-disturb
+// commands (`swaync-client --get-dnd`/`--dnd-on`/`--dnd-off`) — DND is live daemon state,
+// not a config key, so it bypasses staging (R5.2). Its `config.json` freshness is the
+// store's, not its own. It is consumed by the Notifications page UI glue
+// (`ui::notifications`) and the window's Apply wiring (`ui::window`), so its public surface
+// is exercised in a non-test build too.
+pub mod notifications;
+
 // The Sound-page domain model (task 6.2; R3.1, R5.2). It enumerates the PipeWire audio
 // devices (from `pw-dump` JSON, falling back to parsing `wpctl status`) and builds the
 // `wpctl` command vectors the runtime-only controls run — nothing is staged and nothing

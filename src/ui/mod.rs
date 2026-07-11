@@ -47,6 +47,12 @@
 //!   framework (the settings are ordinary file-backed [`crate::core::model::SettingId`]s);
 //!   only the runtime candidate list and the curated keyboard-option switches need this
 //!   thin glue. The store→`input.conf` write itself lives in [`crate::core::input`].
+//! - [`notifications`] — the Notifications page's bespoke Do-Not-Disturb glue (task 6.7):
+//!   the position/timeout controls are ordinary store-backed framework rows (built via
+//!   [`page`]), so this module supplies only the runtime-only DND switch, which reads and
+//!   sets live daemon state via `swaync-client` and bypasses staging (R5.2). The
+//!   store→`config.json` write for position/timeout lives in
+//!   [`crate::core::notifications`].
 //!
 //! The real per-category page content (§6) plugs into this shell in later tasks.
 
@@ -55,6 +61,7 @@ mod category;
 mod chrome;
 mod display;
 mod input;
+mod notifications;
 mod page;
 mod row;
 mod sound;

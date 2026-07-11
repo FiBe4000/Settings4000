@@ -74,7 +74,9 @@
 //! from its own model, and Input's `input.conf` write rendered from the store's dirty
 //! Input settings (via [`InputModel::input_conf_write`]) — so an Apply rewrites the
 //! target lines and reloads via `hyprctl reload`. The Input write is the general
-//! store-`SettingId` → `FileWrite` shape task 6.7 reuses for swaync; the remaining
+//! store-`SettingId` → `FileWrite` shape the Notifications page (task 6.7) reuses for
+//! swaync `config.json` — its position/timeout write is folded in the same way, and its
+//! runtime-only DND switch applies immediately outside the pipeline (R5.2). The remaining
 //! store-backed §6 pages fill in their own writes the same way, and until then their
 //! staged edits still validate and commit as before.
 //!
@@ -102,6 +104,7 @@ use crate::core::detect::{Capabilities, DetectionInputs};
 use crate::core::display::DisplayModel;
 use crate::core::input::InputModel;
 use crate::core::model::Category;
+use crate::core::notifications::NotificationsModel;
 use crate::core::reload::ReloadParams;
 use crate::core::store::SettingsStore;
 use crate::core::theme::{PaletteModel, ThemesModel, WallpaperModel};
@@ -111,6 +114,7 @@ use crate::ui::category::{SidebarCategory, visible_categories};
 use crate::ui::chrome::{self, ApplyResponse, Toast};
 use crate::ui::display::{self, DisplayPage};
 use crate::ui::input;
+use crate::ui::notifications::{self, NotificationsPage};
 use crate::ui::page::{self, PageMsg, PagePlan, SettingsPage};
 use crate::ui::row::visible_rows;
 use crate::ui::sound::{self, SoundPage};
@@ -179,6 +183,20 @@ struct Shell {
     /// only supplies the keyboard-layout candidates and renders the store's dirty Input
     /// settings into the `input.conf` write on Apply (see [`Shell::wire_apply`]).
     input: Rc<RefCell<Option<InputModel>>>,
+    /// The Notifications page's helper (task 6.7), shared with the Notifications glue.
+    /// `None` until the startup worker builds it, or when swaync is absent. Like the
+    /// [`InputModel`] it is **not** a separate staging source — the position/timeout are
+    /// staged in the shared store — so it feeds neither the dirty rollup nor a bespoke
+    /// commit; it only renders the store's dirty Notifications settings into the
+    /// `config.json` write on Apply (see [`Shell::wire_apply`]). The runtime-only DND
+    /// switch is applied immediately and holds no state here.
+    notifications: Rc<RefCell<Option<NotificationsModel>>>,
+    /// The Notifications page's mounted Do-Not-Disturb control (task 6.7), retained so the
+    /// window can re-query the daemon and re-render the switch when the page is re-shown.
+    /// Rebuilt by [`Shell::populate`]; `None` when the Notifications category is not
+    /// visible. It is runtime-only, so — like the Sound page — it feeds neither the
+    /// Apply/Reset chrome nor a dirty marker (R5.2).
+    notifications_page: Rc<RefCell<Option<NotificationsPage>>>,
     /// The mounted Sound page (task 6.2), retained so the window can re-enumerate it when
     /// the page is re-shown. Rebuilt by [`Shell::populate`]; `None` when the Sound
     /// category is not visible. It is runtime-only, so — unlike the store and the Display
@@ -261,6 +279,12 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     // store-backed rows, so no separate page handle is retained (the SettingsPage
     // controller goes in `controllers` like any framework page).
     let input: Rc<RefCell<Option<InputModel>>> = Rc::new(RefCell::new(None));
+    // The Notifications page's helper (task 6.7) — the Apply-time config.json write for the
+    // store-backed position/timeout — plus the runtime-only DND switch page handle. Filled
+    // by the worker; the store-backed rows go through a SettingsPage controller in
+    // `controllers`, while the bespoke DND switch handle is retained here for re-query.
+    let notifications: Rc<RefCell<Option<NotificationsModel>>> = Rc::new(RefCell::new(None));
+    let notifications_page: Rc<RefCell<Option<NotificationsPage>>> = Rc::new(RefCell::new(None));
     // The Sound page (task 6.2) — a runtime-only bespoke page rebuilt by `populate`.
     let sound_page: Rc<RefCell<Option<SoundPage>>> = Rc::new(RefCell::new(None));
     // The Theme page's palette model and mounted page (task 6.3) — a staging source
@@ -372,6 +396,8 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
         display,
         display_page,
         input,
+        notifications,
+        notifications_page,
         sound_page,
         palette,
         themes,
@@ -389,6 +415,7 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     shell.wire_reset(&reset_button);
     shell.wire_refresh(&refresh_button);
     shell.wire_sound_page_entry();
+    shell.wire_notifications_page_entry();
 
     // Initial (disabled) chrome state, then kick off the worker.
     (shell.update_chrome)();
@@ -455,6 +482,7 @@ impl Shell {
             files,
             display,
             input,
+            notifications,
             palette,
             themes,
             wallpaper,
@@ -474,10 +502,12 @@ impl Shell {
             }
         }
         *self.capabilities.borrow_mut() = capabilities;
-        // Adopt the worker-built Display, Input, palette, GTK/icon/cursor theme, and
-        // wallpaper models (tasks 6.1/6.3–6.6) before `populate` builds their pages.
+        // Adopt the worker-built Display, Input, Notifications, palette, GTK/icon/cursor
+        // theme, and wallpaper models (tasks 6.1/6.3–6.7) before `populate` builds their
+        // pages.
         *self.display.borrow_mut() = display;
         *self.input.borrow_mut() = input;
+        *self.notifications.borrow_mut() = notifications;
         *self.palette.borrow_mut() = palette;
         *self.themes.borrow_mut() = themes;
         *self.wallpaper.borrow_mut() = wallpaper;
@@ -517,10 +547,12 @@ impl Shell {
             self.stack.remove(&child);
         }
         self.marked.borrow_mut().clear();
-        // Drop any retained Display/Sound/Theme pages from a previous populate; their
-        // `populate_*` helpers re-set them when the categories are (re)built below.
+        // Drop any retained Display/Sound/Notifications/Theme pages from a previous
+        // populate; their `populate_*` helpers re-set them when the categories are
+        // (re)built below.
         *self.display_page.borrow_mut() = None;
         *self.sound_page.borrow_mut() = None;
+        *self.notifications_page.borrow_mut() = None;
         *self.theme_page.borrow_mut() = None;
 
         // Build one page per visible category, in sidebar order (R4.2).
@@ -552,6 +584,14 @@ impl Shell {
             // built here rather than through the pure `plan_category` (task 6.6).
             if category == SidebarCategory::Input {
                 self.populate_input(category, &mut controllers);
+                continue;
+            }
+            // Notifications is a hybrid (task 6.7): its position/timeout are store-backed
+            // framework rows, but a runtime-only DND switch (NOT a config key) is appended
+            // beside them, so the window special-cases it to build the framework page and
+            // add the bespoke switch.
+            if category == SidebarCategory::Notifications {
+                self.populate_notifications(category, &mut controllers);
                 continue;
             }
             match page::plan_category(category, &caps) {
@@ -659,6 +699,63 @@ impl Shell {
         controllers.push(controller);
     }
 
+    /// Builds the Notifications category's page (task 6.7).
+    ///
+    /// The page is a hybrid. Its **position** and **auto-dismiss timeout** are ordinary
+    /// store-backed [`SettingId`](crate::core::model::SettingId)s, so they are built by the
+    /// declarative row framework exactly like the generic path (via [`page::plan_category`]);
+    /// their dirty marker tracks the store's Notifications rollup and their `config.json`
+    /// write is folded into the shared Apply pipeline (see [`Shell::wire_apply`]). The one
+    /// thing the framework cannot build is appended here: the **runtime-only DND switch**
+    /// (task 6.7 gotcha — swaync's do-not-disturb is live daemon state via `swaync-client`,
+    /// **not** a config key), which applies immediately and never stages/dirties (R5.2). The
+    /// framework controller is retained in `controllers` (so a Reset/commit re-renders it)
+    /// and the bespoke switch handle in [`Self::notifications_page`] (so the daemon state is
+    /// re-queried on page entry). The category is only reached when swaync is present (task
+    /// 5.1), so the framework rows are always visible; the defensive arms fall back to a
+    /// placeholder should that ever change.
+    fn populate_notifications(
+        &self,
+        category: SidebarCategory,
+        controllers: &mut Vec<Controller<SettingsPage>>,
+    ) {
+        let plan = {
+            let caps = self.capabilities.borrow();
+            page::plan_category(category, &caps)
+        };
+        let rows = match plan {
+            PagePlan::Framework(rows) => rows,
+            // Notifications always has framework rows and is only reached when swaync is
+            // present, so these arms are not expected; fall back to the task-5.1
+            // placeholder rather than let the page silently vanish.
+            PagePlan::Emptied | PagePlan::NoSpec => {
+                let placeholder = build_placeholder_page(category);
+                self.stack
+                    .add_titled(&placeholder, Some(category.stack_name()), category.title());
+                return;
+            }
+        };
+
+        let controller = page::build_page(self.store.clone(), rows, self.update_chrome.clone());
+        let root = controller.widget().clone();
+
+        // Append the runtime-only Do-Not-Disturb switch beside the store-backed rows. It is
+        // NOT a config setting (swaync's DND is live daemon state), so it is bespoke glue
+        // that applies immediately and never stages/dirties (task 6.7 gotcha, R5.2).
+        let dnd = notifications::build_dnd_section();
+        root.append(dnd.widget());
+
+        self.stack
+            .add_titled(&root, Some(category.stack_name()), category.title());
+        // The marker tracks the store's Notifications rollup (position/timeout); the DND
+        // switch is runtime-only and contributes no dirty state.
+        self.marked
+            .borrow_mut()
+            .push((Category::Notifications, root.upcast()));
+        controllers.push(controller);
+        *self.notifications_page.borrow_mut() = Some(dnd);
+    }
+
     /// Builds the Sound category's page (task 6.2).
     ///
     /// Mounts the bespoke [`sound`] page, which enumerates the live PipeWire devices on
@@ -728,6 +825,27 @@ impl Shell {
             if stack.visible_child_name().as_deref() == Some(SidebarCategory::Sound.stack_name()) {
                 if let Some(page) = sound_page.borrow().as_ref() {
                     page.refresh();
+                }
+            }
+        });
+    }
+
+    /// Re-queries swaync's do-not-disturb state whenever the Notifications page becomes the
+    /// visible stack child (task 6.7), so the runtime-only DND switch reflects the live
+    /// daemon state on page entry (R5.2) — picking up a change made elsewhere (e.g. a
+    /// compositor keybind) while the app was on another page.
+    ///
+    /// The handler is connected once to the persistent stack (never rebuilt) and reads the
+    /// current [`Self::notifications_page`] on each change, so it survives every repopulate
+    /// without accumulating handlers — the same pattern as [`Self::wire_sound_page_entry`].
+    fn wire_notifications_page_entry(&self) {
+        let notifications_page = self.notifications_page.clone();
+        self.stack.connect_visible_child_name_notify(move |stack| {
+            if stack.visible_child_name().as_deref()
+                == Some(SidebarCategory::Notifications.stack_name())
+            {
+                if let Some(page) = notifications_page.borrow().as_ref() {
+                    page.refresh_dnd();
                 }
             }
         });
@@ -869,11 +987,50 @@ impl Shell {
                 }
             }
 
+            // Fold the store-backed Notifications settings into one swaync `config.json`
+            // write (task 6.7) — the same store-driven shape as the Input write, since
+            // config.json is store-loaded (its freshness lives in the store's tracker).
+            // Done before `store_writes` is captured so the write is committed and
+            // re-baselined by the store's `commit_apply`. (Do Not Disturb is runtime-only
+            // and applies immediately from the switch, so it never appears here.)
+            let notifications_write = {
+                let store = shell.store.borrow();
+                let notifications = shell.notifications.borrow();
+                match notifications.as_ref() {
+                    Some(model) => {
+                        model.swaync_config_write(&store.dirty_in_category(Category::Notifications))
+                    }
+                    None => Ok(None),
+                }
+            };
+            match notifications_write {
+                Ok(Some(write)) => plan.writes.push(write),
+                Ok(None) => {}
+                // Pending Notifications edits but the write could not be prepared
+                // (config.json unreadable, or no longer valid JSON). Abort the whole Apply
+                // and keep the staged edits — never proceed to commit, which would promote
+                // the values against an unchanged file and desync the store (task 6.7,
+                // mirroring the Input review-M1 contract). Near-unreachable in practice.
+                Err(error) => {
+                    tracing::error!(%error, "aborting apply: could not prepare the swaync config.json write");
+                    chrome::show_warning(
+                        &shell.window,
+                        "Could not prepare the notification changes",
+                        &format!(
+                            "Settings4000 could not update swaync's config.json, so nothing was \
+                             written: {error}. Your notification changes were kept — fix the \
+                             problem and try again."
+                        ),
+                    );
+                    return;
+                }
+            }
+
             // The store-backed writes to commit to the store after a successful apply
-            // (the `input.conf` write folded in above is included, so `commit_apply`
-            // re-baselines it). Captured before the Display/Theme contributions are folded
-            // in, because those models commit their own files separately (their freshness
-            // is owned by the model, not the store).
+            // (the `input.conf` and swaync `config.json` writes folded in above are
+            // included, so `commit_apply` re-baselines them). Captured before the
+            // Display/Theme contributions are folded in, because those models commit their
+            // own files separately (their freshness is owned by the model, not the store).
             let store_writes: Vec<(PathBuf, Vec<u8>)> = plan
                 .writes
                 .iter()
@@ -1118,8 +1275,9 @@ impl Shell {
 /// parsers and is per-page glue. [`Shell::wire_apply`] folds those writes into the plan
 /// after building it — the Input page's `input.conf` write from the store's dirty Input
 /// settings (task 6.6), and the Display/Theme models' writes from their own staging — so
-/// this stays a thin shared starting point. The remaining store-backed §6 pages
-/// (Notifications, task 6.7) add their writes the same way as Input.
+/// this stays a thin shared starting point — the Notifications page (task 6.7) folds in
+/// its swaync `config.json` write the same way as Input, and the remaining store-backed
+/// §6 pages will do likewise.
 fn interim_apply_plan(store: &SettingsStore) -> ApplyPlan {
     let validations = store
         .dirty_ids()
