@@ -100,7 +100,7 @@ use crate::core::display::DisplayModel;
 use crate::core::model::Category;
 use crate::core::reload::ReloadParams;
 use crate::core::store::SettingsStore;
-use crate::core::theme::PaletteModel;
+use crate::core::theme::{PaletteModel, ThemesModel};
 use crate::system::command::SystemCommandRunner;
 use crate::system::signal::SystemProcessSignaller;
 use crate::ui::category::{SidebarCategory, visible_categories};
@@ -177,9 +177,15 @@ struct Shell {
     /// dirty state feeds the same Apply/Reset chrome, and its scheme switch is folded
     /// into the same Apply pipeline as a `PaletteSwitch` (see [`Shell::wire_apply`]).
     palette: Rc<RefCell<Option<PaletteModel>>>,
+    /// The Theme page's GTK/icon/cursor theme model (task 6.4), shared with the Theme
+    /// glue. `None` until the startup worker builds it, or when `gsettings` is absent.
+    /// Like the palette model it is a staging source alongside the store: its dirty
+    /// state feeds the same Apply/Reset chrome, and its multi-file theme/cursor writes
+    /// are folded into the same Apply pipeline (see [`Shell::wire_apply`]).
+    themes: Rc<RefCell<Option<ThemesModel>>>,
     /// The mounted Theme page, retained so the window can re-render it after a Reset or a
     /// committed Apply. Rebuilt by [`Shell::populate`]; `None` while the Theme category
-    /// shows a placeholder (no palette source, and no other Theme section built yet).
+    /// shows a placeholder (no palette source and no `gsettings`, so no section built).
     theme_page: Rc<RefCell<Option<ThemePage>>>,
     /// The most recent detection result, replaced on a manual refresh (R4.3).
     capabilities: Rc<RefCell<Capabilities>>,
@@ -236,6 +242,7 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     // folded into the chrome and the Apply pipeline, like the Display model. Both start
     // empty; the worker fills the model and `populate` builds the page.
     let palette: Rc<RefCell<Option<PaletteModel>>> = Rc::new(RefCell::new(None));
+    let themes: Rc<RefCell<Option<ThemesModel>>> = Rc::new(RefCell::new(None));
     let theme_page: Rc<RefCell<Option<ThemePage>>> = Rc::new(RefCell::new(None));
 
     // The persistent content stack + sidebar. Pages are added to this same stack on
@@ -265,15 +272,16 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
         let store = store.clone();
         let display = display.clone();
         let palette = palette.clone();
+        let themes = themes.clone();
         let apply_button = apply_button.clone();
         let reset_button = reset_button.clone();
         let stack = stack.clone();
         let marked = marked.clone();
         Rc::new(move || {
             let store = store.borrow();
-            // The Display and Theme pages are second/third dirty sources (tasks 6.1/6.3):
-            // neither is a store value (monitors are dynamic; a palette switch runs
-            // `generate-colors` rather than writing a store-backed setting), so each
+            // The Display and Theme pages are additional dirty sources (tasks 6.1/6.3/6.4):
+            // none is a store value (monitors are dynamic; a palette switch runs
+            // `generate-colors`; the GTK/icon/cursor themes are a bespoke model), so each
             // reports its own dirty state, OR-ed into the shared Apply/Reset enablement.
             let display_dirty = display
                 .borrow()
@@ -283,16 +291,18 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
                 .borrow()
                 .as_ref()
                 .is_some_and(PaletteModel::is_dirty);
-            let enabled = chrome::actions_enabled(&store) || display_dirty || palette_dirty;
+            let themes_dirty = themes.borrow().as_ref().is_some_and(ThemesModel::is_dirty);
+            let theme_dirty = palette_dirty || themes_dirty;
+            let enabled = chrome::actions_enabled(&store) || display_dirty || theme_dirty;
             apply_button.set_sensitive(enabled);
             reset_button.set_sensitive(enabled);
             for (category, child) in marked.borrow().iter() {
-                // Display and Theme read their own model's dirty state; Theme also ORs in
-                // any store-backed Theme setting so it stays correct once 6.4/6.5 add
-                // them. Every other page reads the store's per-category rollup.
+                // Display reads its own model; Theme ORs its two bespoke models (palette +
+                // GTK/icon/cursor) with any store-backed Theme setting so it stays correct
+                // once 6.5 adds one. Every other page reads the store's per-category rollup.
                 let dirty = match *category {
                     Category::Display => display_dirty,
-                    Category::Theme => palette_dirty || store.is_category_dirty(Category::Theme),
+                    Category::Theme => theme_dirty || store.is_category_dirty(Category::Theme),
                     other => store.is_category_dirty(other),
                 };
                 stack.page(child).set_needs_attention(dirty);
@@ -331,6 +341,7 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
         display_page,
         sound_page,
         palette,
+        themes,
         theme_page,
         capabilities,
         controllers,
@@ -410,6 +421,7 @@ impl Shell {
             files,
             display,
             palette,
+            themes,
         } = load;
         let file_count = files.len();
 
@@ -426,10 +438,11 @@ impl Shell {
             }
         }
         *self.capabilities.borrow_mut() = capabilities;
-        // Adopt the worker-built Display and palette models (tasks 6.1/6.3) before
-        // `populate` builds their pages from them.
+        // Adopt the worker-built Display, palette, and GTK/icon/cursor theme models
+        // (tasks 6.1/6.3/6.4) before `populate` builds their pages from them.
         *self.display.borrow_mut() = display;
         *self.palette.borrow_mut() = palette;
+        *self.themes.borrow_mut() = themes;
 
         self.populate();
 
@@ -569,32 +582,38 @@ impl Shell {
         *self.sound_page.borrow_mut() = Some(page);
     }
 
-    /// Builds the Theme category's page (task 6.3).
+    /// Builds the Theme category's page (tasks 6.3/6.4).
     ///
-    /// Task 6.3 adds only the palette-scheme section, present exactly when detection
-    /// discovered the dotfiles palette source (R3.2/R8.5) — the worker builds a
-    /// [`PaletteModel`] only then. When it is present the bespoke [`theme`] page is
-    /// mounted (rendering from the shared model and reporting staged switches through
-    /// `update_chrome`) and its dirty marker is registered under [`Category::Theme`].
-    /// When it is absent the palette controls are hidden and the page degrades to the
-    /// task-5.1 placeholder (R4.2/R4.4); tasks 6.4/6.5 will build the page for their own
-    /// sections too, so this condition grows as they land. The hidden-palette reason is
-    /// logged at `info`, matching the hidden-item convention (detection also logs *why*
-    /// the source is absent).
+    /// The page hosts two independent sections, each present when its model was built
+    /// by the worker: the palette-scheme section when the dotfiles palette source was
+    /// discovered (R3.2/R8.5), and the GTK/icon/cursor appearance section when
+    /// `gsettings` is present (R3.3/R3.4/R4.2). The bespoke [`theme`] page is mounted
+    /// whenever *either* model exists (rendering from the shared models and reporting
+    /// staged changes through `update_chrome`), and its dirty marker is registered
+    /// under [`Category::Theme`]. When neither model exists the page degrades to the
+    /// task-5.1 placeholder (R4.2/R4.4); the reason is logged at `info`, matching the
+    /// hidden-item convention (detection/startup also log *why* each model is absent).
     fn populate_theme(&self, category: SidebarCategory) {
-        if self.palette.borrow().is_some() {
-            let page = theme::build(self.palette.clone(), self.update_chrome.clone());
+        let has_palette = self.palette.borrow().is_some();
+        let has_themes = self.themes.borrow().is_some();
+        if has_palette || has_themes {
+            let page = theme::build(
+                self.palette.clone(),
+                self.themes.clone(),
+                self.update_chrome.clone(),
+            );
             self.stack
                 .add_titled(page.root(), Some(category.stack_name()), category.title());
-            // The Theme marker tracks the palette model's dirty state (and, later, any
-            // store-backed Theme setting); it holds no store-backed setting today.
+            // The Theme marker tracks the palette and GTK/icon/cursor models' dirty
+            // state (and, later, any store-backed Theme setting).
             self.marked
                 .borrow_mut()
                 .push((Category::Theme, page.root().clone().upcast()));
             *self.theme_page.borrow_mut() = Some(page);
         } else {
             tracing::info!(
-                "Theme palette section hidden: no dotfiles palette source (R3.2/R4.2/R8.5)"
+                "Theme sections hidden: no dotfiles palette source and no gsettings \
+                 (R3.2/R3.3/R4.2/R8.5)"
             );
             let placeholder = build_placeholder_page(category);
             self.stack
@@ -663,6 +682,32 @@ impl Shell {
                 return;
             }
 
+            // F (R5.6): the same conflict guard for the Theme page's GTK/icon/cursor
+            // backing files (both settings.ini, hyprland.conf, uwsm/env). These are not
+            // in the store's tracker, so the pipeline's own conflict check does not cover
+            // them — the themes model owns their freshness and is checked here. Only
+            // relevant when a theme change is pending (the only case that writes them).
+            let themes_conflict = {
+                let themes = shell.themes.borrow();
+                themes
+                    .as_ref()
+                    .is_some_and(|model| model.is_dirty() && model.check_conflict())
+            };
+            if themes_conflict {
+                let reloaded = shell.themes.borrow().as_ref().map(ThemesModel::reload);
+                *shell.themes.borrow_mut() = reloaded;
+                shell.rerender_theme();
+                (shell.update_chrome)();
+                chrome::show_warning(
+                    &shell.window,
+                    "Files changed on disk",
+                    "A theme configuration file changed on disk since Settings4000 read it, so \
+                     nothing was written. It has been reloaded from disk — re-apply your theme \
+                     changes.",
+                );
+                return;
+            }
+
             let mut plan = interim_apply_plan(&shell.store.borrow());
             // The store-backed writes to commit to the store after a successful apply.
             // Captured before the Display contribution is folded in, because the Display
@@ -704,6 +749,24 @@ impl Shell {
                 }
             };
 
+            // Fold in the Theme page's GTK/icon/cursor theme writes (task 6.4): a change
+            // writes the value identically to both settings.ini and — for the cursor —
+            // hyprland.conf's env lines and uwsm/env, and carries the reload parameters
+            // that drive `gsettings set` (+ `hyprctl setcursor` for the cursor). The
+            // themes model owns its own freshness (checked above), so it commits
+            // separately from the store, like the Display model.
+            let has_themes_write = {
+                let themes = shell.themes.borrow();
+                match themes.as_ref().and_then(ThemesModel::apply_contribution) {
+                    Some(contribution) => {
+                        plan.writes.extend(contribution.writes);
+                        merge_reload_params(&mut plan.reload_params, contribution.reload_params);
+                        true
+                    }
+                    None => false,
+                }
+            };
+
             // Side-effect seams: the real system runner (created above) plus the
             // signaller. The freshness tracker is the store's own (task 5.4), holding
             // the baselines recorded when the startup load read the backing files, so
@@ -735,6 +798,14 @@ impl Shell {
                             palette.commit();
                         }
                     }
+                    // Commit the GTK/icon/cursor theme model too (task 6.4): promote its
+                    // staged selections and re-baseline its backing files' freshness from
+                    // the just-written bytes, so the app's own write is not a self-conflict.
+                    if has_themes_write {
+                        if let Some(themes) = shell.themes.borrow_mut().as_mut() {
+                            themes.commit();
+                        }
+                    }
                     shell.rerender_pages();
                     shell.rerender_display();
                     shell.rerender_theme();
@@ -743,7 +814,8 @@ impl Shell {
                         shell.toast.show(&message);
                     }
                     tracing::info!(
-                        "apply committed; store, Display, and palette reconciled (task 5.3/6.1/6.3)"
+                        "apply committed; store, Display, palette, and themes reconciled \
+                         (task 5.3/6.1/6.3/6.4)"
                     );
                 }
                 ApplyResponse::Warn { heading, detail } => {
@@ -758,13 +830,17 @@ impl Shell {
         let shell = self.clone();
         reset_button.connect_clicked(move |_| {
             shell.store.borrow_mut().reset();
-            // Reset the Display and palette staging too (tasks 6.1/6.3) — they are
-            // additional dirty sources, so Reset must clear them alongside the store.
+            // Reset the Display, palette, and GTK/icon/cursor theme staging too (tasks
+            // 6.1/6.3/6.4) — they are additional dirty sources, so Reset must clear them
+            // alongside the store.
             if let Some(display) = shell.display.borrow_mut().as_mut() {
                 display.reset();
             }
             if let Some(palette) = shell.palette.borrow_mut().as_mut() {
                 palette.reset();
+            }
+            if let Some(themes) = shell.themes.borrow_mut().as_mut() {
+                themes.reset();
             }
             shell.rerender_pages();
             shell.rerender_display();
@@ -859,6 +935,29 @@ fn interim_apply_plan(store: &SettingsStore) -> ApplyPlan {
         writes: Vec::new(),
         palette: None,
         reload_params: ReloadParams::default(),
+    }
+}
+
+/// Merges a page's reload parameters into the plan's, setting each field only when the
+/// contribution provides it (task 6.4).
+///
+/// The Theme page (task 6.4) is the only page that fills [`ReloadParams`] today (the
+/// GTK/icon theme names and the cursor theme+size); a field is overwritten only when
+/// `Some`, so a value another page might set later (e.g. task 6.5's wallpaper) is
+/// preserved. The plan starts from [`ReloadParams::default`] (all `None`), so this is
+/// effectively an assignment of the theme fields in v1.
+fn merge_reload_params(target: &mut ReloadParams, from: ReloadParams) {
+    if from.gtk_theme.is_some() {
+        target.gtk_theme = from.gtk_theme;
+    }
+    if from.icon_theme.is_some() {
+        target.icon_theme = from.icon_theme;
+    }
+    if from.cursor.is_some() {
+        target.cursor = from.cursor;
+    }
+    if from.wallpaper.is_some() {
+        target.wallpaper = from.wallpaper;
     }
 }
 

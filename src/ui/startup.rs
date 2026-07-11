@@ -50,11 +50,11 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::core::detect::{Capabilities, DetectionInputs};
+use crate::core::detect::{Binary, Capabilities, DetectionInputs};
 use crate::core::display::DisplayModel;
 use crate::core::model::{SettingId, Value};
 use crate::core::store::{FileReader, FileValues};
-use crate::core::theme::PaletteModel;
+use crate::core::theme::{PaletteModel, ThemeRoots, ThemesModel, ThemesPaths};
 use crate::parsers::hyprlang::{HyprlangFile, KeyPath};
 use crate::parsers::swaync::SwayncConfigFile;
 use crate::system::command::SystemCommandRunner;
@@ -97,6 +97,10 @@ pub(crate) struct StartupLoad {
     /// there is no dotfiles palette source (the Theme palette section is then hidden,
     /// R4.2/R8.5).
     pub(crate) palette: Option<PaletteModel>,
+    /// The Theme page's GTK/icon/cursor theme model (task 6.4), built by discovering
+    /// installed themes and reading the backing config, or `None` when `gsettings` is
+    /// absent (the appearance section is then hidden, R4.2).
+    pub(crate) themes: Option<ThemesModel>,
 }
 
 /// The live XDG paths of the backing config files loaded at startup (R8.5).
@@ -157,11 +161,13 @@ pub(crate) fn load() -> StartupLoad {
     let files = load_files(&BackingPaths::from_system());
     let display = load_display(&capabilities);
     let palette = load_palette(&capabilities);
+    let themes = load_themes(&capabilities);
     StartupLoad {
         capabilities,
         files,
         display,
         palette,
+        themes,
     }
 }
 
@@ -183,6 +189,89 @@ fn load_palette(capabilities: &Capabilities) -> Option<PaletteModel> {
         &active_scheme_source,
         source.generate_colors().to_path_buf(),
     ))
+}
+
+/// Builds the Theme page's GTK/icon/cursor theme model on the worker thread (task
+/// 6.4; R3.3, R3.4, R4.2, R2.2).
+///
+/// Only builds when `gsettings` is present — the whole GTK/icon/cursor feature applies
+/// its changes with `gsettings set`, so without it the controls are hidden and logged
+/// at `info` (R4.2). When present, it discovers installed themes under the XDG theme
+/// roots (`~/.themes`, the data dirs, `/usr/share/...`), reads the backing config
+/// (both `settings.ini`, `hyprland.conf`, `uwsm/env`), gates the live-restyle claim on
+/// the settings portal (R2.2), and passes the app's own `GTK_THEME` environment value
+/// so an override disables the GTK-theme drop-down (R3.3). Running the discovery here,
+/// on the startup worker, keeps its filesystem scans off the main thread and inside the
+/// R8.1 cold-start budget (architecture §8).
+fn load_themes(capabilities: &Capabilities) -> Option<ThemesModel> {
+    if !capabilities.has_binary(Binary::Gsettings) {
+        tracing::info!("gsettings not found; the GTK/icon/cursor theme controls are hidden (R4.2)");
+        return None;
+    }
+    Some(ThemesModel::load(
+        &theme_roots(),
+        themes_paths(),
+        capabilities.settings_portal_available(),
+        std::env::var("GTK_THEME").ok(),
+    ))
+}
+
+/// The XDG roots scanned for installed GTK, icon, and cursor themes (R3.3/R3.4).
+///
+/// GTK themes live under `~/.themes`, `$XDG_DATA_HOME/themes`, and
+/// `/usr/share/themes`; icon and cursor themes under `~/.icons`,
+/// `$XDG_DATA_HOME/icons`, and `/usr/share/icons`. `$XDG_DATA_HOME` falls back to
+/// `~/.local/share`. A root that does not exist is simply skipped by discovery, so a
+/// missing `~/.themes` is harmless.
+fn theme_roots() -> ThemeRoots {
+    let data_home = data_home();
+    let home = home_dir();
+    let mut gtk_theme_dirs = Vec::new();
+    let mut icon_dirs = Vec::new();
+    if let Some(home) = &home {
+        gtk_theme_dirs.push(home.join(".themes"));
+        icon_dirs.push(home.join(".icons"));
+    }
+    gtk_theme_dirs.push(data_home.join("themes"));
+    gtk_theme_dirs.push(PathBuf::from("/usr/share/themes"));
+    icon_dirs.push(data_home.join("icons"));
+    icon_dirs.push(PathBuf::from("/usr/share/icons"));
+    ThemeRoots {
+        gtk_theme_dirs,
+        icon_dirs,
+    }
+}
+
+/// The live XDG paths of the four config files a theme/cursor change writes (R8.5).
+fn themes_paths() -> ThemesPaths {
+    let config = config_home();
+    ThemesPaths {
+        gtk3_settings: config.join("gtk-3.0").join("settings.ini"),
+        gtk4_settings: config.join("gtk-4.0").join("settings.ini"),
+        hyprland_conf: config.join("hypr").join("hyprland.conf"),
+        uwsm_env: config.join("uwsm").join("env"),
+    }
+}
+
+/// The XDG data base directory: `$XDG_DATA_HOME`, else `$HOME/.local/share`, else a
+/// bare `.local/share` relative path (which simply misses on scan).
+fn data_home() -> PathBuf {
+    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+        if !data_home.is_empty() {
+            return PathBuf::from(data_home);
+        }
+    }
+    match home_dir() {
+        Some(home) => home.join(".local").join("share"),
+        None => PathBuf::from(".local").join("share"),
+    }
+}
+
+/// The user's home directory from `$HOME`, or `None` when it is unset.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Builds the Display page's model on the worker thread (task 6.1).
@@ -558,6 +647,19 @@ mod tests {
         assert!(
             store.refresh().is_empty(),
             "the freshness baseline matches the on-disk bytes, so no self-conflict"
+        );
+    }
+
+    #[test]
+    fn themes_are_hidden_when_gsettings_is_absent() {
+        // R4.2 (task 6.4): the GTK/icon/cursor feature applies its changes with
+        // `gsettings set`, so without the binary the model is not built and the
+        // appearance section is hidden. The gate is checked before any filesystem
+        // scan, so this needs no fixture.
+        let caps = Capabilities::for_tests(&[], &[], false);
+        assert!(
+            load_themes(&caps).is_none(),
+            "no gsettings -> no themes model -> appearance section hidden"
         );
     }
 
