@@ -156,6 +156,15 @@ pub(crate) enum SettingId {
     LockBackgroundPath,
 
     // --- Input (task 6.6) ---
+    /// The ordered keyboard layout list, serialized to Hyprland's comma-joined
+    /// `kb_layout` value (e.g. `us,se`). Modelled as a [`ValueKind::String`] because
+    /// that is the on-disk shape; the Input page edits it through the declarative
+    /// reorderable list widget (task 5.2, R2.3), which splits/joins on commas. The
+    /// order is significant — it is the layout switch order — so this cannot be a
+    /// plain set. Value-format validation (that each item is a real XKB layout) is
+    /// deferred to task 6.6, which sources the candidates from the XKB registry; here
+    /// it is unvalidated beyond its kind, like [`SettingId::LockCommand`].
+    KeyboardLayouts,
     /// Mouse/touchpad sensitivity — Hyprland's `sensitivity`, clamped to
     /// `-1.0..=1.0`.
     MouseSensitivity,
@@ -202,6 +211,7 @@ impl SettingId {
             SettingId::PaletteColor
             | SettingId::WallpaperPath
             | SettingId::LockBackgroundPath
+            | SettingId::KeyboardLayouts
             | SettingId::LockCommand => ValueKind::String,
         }
     }
@@ -218,7 +228,8 @@ impl SettingId {
             SettingId::PaletteColor | SettingId::WallpaperPath | SettingId::LockBackgroundPath => {
                 Category::Theme
             }
-            SettingId::MouseSensitivity
+            SettingId::KeyboardLayouts
+            | SettingId::MouseSensitivity
             | SettingId::TouchpadNaturalScroll
             | SettingId::TouchpadTapToClick => Category::Input,
             SettingId::NotificationPosition | SettingId::NotificationTimeout => {
@@ -251,6 +262,7 @@ impl SettingId {
             | SettingId::PaletteColor
             | SettingId::WallpaperPath
             | SettingId::LockBackgroundPath
+            | SettingId::KeyboardLayouts
             | SettingId::MouseSensitivity
             | SettingId::TouchpadNaturalScroll
             | SettingId::TouchpadTapToClick
@@ -312,7 +324,11 @@ impl SettingId {
                 Value::Bool(_),
             ) => Ok(()),
             (SettingId::NotificationPosition, Value::Enum(_)) => Ok(()),
-            (SettingId::LockCommand, Value::String(_)) => Ok(()),
+            // Free-text String settings with no format rule beyond their kind: the
+            // lock command, and the keyboard-layout list (whose XKB-validity check is
+            // task 6.6's, since it needs the XKB registry). An empty layout list is
+            // possible here and is left for task 6.6 to prevent.
+            (SettingId::LockCommand | SettingId::KeyboardLayouts, Value::String(_)) => Ok(()),
             // Anything left over is a value whose kind does not match the setting.
             (id, value) => Err(ValidationError::WrongKind {
                 expected: id.kind(),
@@ -822,6 +838,7 @@ mod tests {
         SettingId::PaletteColor,
         SettingId::WallpaperPath,
         SettingId::LockBackgroundPath,
+        SettingId::KeyboardLayouts,
         SettingId::MouseSensitivity,
         SettingId::TouchpadNaturalScroll,
         SettingId::TouchpadTapToClick,
@@ -844,6 +861,7 @@ mod tests {
             | SettingId::PaletteColor
             | SettingId::WallpaperPath
             | SettingId::LockBackgroundPath
+            | SettingId::KeyboardLayouts
             | SettingId::MouseSensitivity
             | SettingId::TouchpadNaturalScroll
             | SettingId::TouchpadTapToClick
@@ -870,6 +888,7 @@ mod tests {
             SettingId::WallpaperPath | SettingId::LockBackgroundPath => {
                 Value::String("/nonexistent.png".to_string())
             }
+            SettingId::KeyboardLayouts => Value::String("us,se".to_string()),
             SettingId::MouseSensitivity => Value::Float(0.3),
             SettingId::TouchpadNaturalScroll | SettingId::TouchpadTapToClick => Value::Bool(true),
             SettingId::NotificationPosition => Value::Enum("top-right".to_string()),
@@ -946,6 +965,7 @@ mod tests {
         // Pins the page grouping the store's per-page dirty rollup depends on.
         assert_eq!(SettingId::MonitorMode.category(), Category::Display);
         assert_eq!(SettingId::WallpaperPath.category(), Category::Theme);
+        assert_eq!(SettingId::KeyboardLayouts.category(), Category::Input);
         assert_eq!(SettingId::MouseSensitivity.category(), Category::Input);
         assert_eq!(
             SettingId::NotificationTimeout.category(),

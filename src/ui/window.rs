@@ -10,13 +10,15 @@
 //! switches the stack when the user clicks it — the sidebar/stack layout required by
 //! R2.4.
 //!
-//! For task 5.1 each page is a placeholder: a scrollable container with the category
-//! title. This is deliberately the *shell* the real controls plug into — the
-//! declarative rows (task 5.2) and the per-category page content (§6) replace the
-//! placeholder later. Wrapping every page in a [`ScrolledWindow`](gtk4::ScrolledWindow)
-//! now means the content area already scrolls, so the window stays usable at the
-//! small logical sizes R2.4 targets (a 1.33-scaled 2880×1800 panel and 1440p
-//! monitors) once pages fill with controls.
+//! A category's page is built one of two ways (see [`build_shell`]). When the
+//! declarative row framework (task 5.2, [`super::page`]) has interim descriptors for
+//! the category, its page is a rendered [`SettingsPage`](super::page::SettingsPage)
+//! that round-trips edits through the store; per-row gating may also drop the whole
+//! category when every row is hidden (R4.2). Otherwise the page is a task-5.1
+//! placeholder — a scrollable titled container — that the per-category §6 content
+//! replaces later. Every page is wrapped so the content area scrolls, keeping the
+//! window usable at the small logical sizes R2.4 targets (a 1.33-scaled 2880×1800
+//! panel and 1440p monitors) once pages fill with controls.
 //!
 //! # No libadwaita, no custom CSS (R2.1/R2.2)
 //!
@@ -35,6 +37,7 @@ use gtk4::{
 
 use crate::core::detect::Capabilities;
 use crate::ui::category::{SidebarCategory, visible_categories};
+use crate::ui::page::{self, CategoryContent};
 
 /// Title shown in the window's title bar and to the compositor.
 const WINDOW_TITLE: &str = "Settings4000";
@@ -82,9 +85,20 @@ pub(crate) fn build(app: &Application, capabilities: &Capabilities) -> Applicati
 /// R4.2).
 ///
 /// The stack expands to fill the space beside the sidebar; the sidebar takes its
-/// natural width. Only categories returned by [`visible_categories`] get a page, so
-/// an absent category leaves no trace in either the stack or the sidebar (R4.2). If
-/// every category is hidden the stack is simply empty, which is the correct
+/// natural width. Only categories returned by [`visible_categories`] (task 5.1's
+/// coarse gate) are considered, and each is then resolved by [`page::build_category`]
+/// (task 5.2's per-row gate). This composes the two gates (R4.2):
+///
+/// - [`CategoryContent::Framework`] — the category has visible framework rows, so its
+///   rendered page is mounted.
+/// - [`CategoryContent::Emptied`] — the category has framework rows but every one is
+///   gated out, so it is dropped entirely (the "hide the whole category when
+///   emptied" half of R4.2 the coarse gate cannot see); [`page::build_category`] has
+///   already logged it.
+/// - [`CategoryContent::NoSpec`] — the category has no framework rows yet, so its
+///   task-5.1 placeholder is shown until §6 fills it in.
+///
+/// If that leaves the stack empty the sidebar is simply empty, which is the correct
 /// degenerate result rather than a crash.
 fn build_shell(capabilities: &Capabilities) -> GtkBox {
     let stack = Stack::new();
@@ -99,10 +113,20 @@ fn build_shell(capabilities: &Capabilities) -> GtkBox {
     sidebar.set_stack(&stack);
 
     for category in visible_categories(capabilities) {
-        let page = build_placeholder_page(category);
-        // `add_titled` registers the page under its machine name and the title the
+        // `add_titled` registers a page under its machine name and the title the
         // sidebar displays (see `SidebarCategory::stack_name`/`title`).
-        stack.add_titled(&page, Some(category.stack_name()), category.title());
+        match page::build_category(category, capabilities) {
+            CategoryContent::Framework(widget) => {
+                stack.add_titled(&widget, Some(category.stack_name()), category.title());
+            }
+            CategoryContent::NoSpec => {
+                let placeholder = build_placeholder_page(category);
+                stack.add_titled(&placeholder, Some(category.stack_name()), category.title());
+            }
+            // Every row gated out: drop the category (R4.2). Already logged by
+            // `build_category`.
+            CategoryContent::Emptied => {}
+        }
     }
 
     let shell = GtkBox::new(Orientation::Horizontal, 0);
