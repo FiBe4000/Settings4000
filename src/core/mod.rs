@@ -76,3 +76,11 @@ pub mod reload;
 // test builds (where the surface is used); remove it once 5.3 consumes the pipeline.
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod apply;
+
+// The Display-page domain model (task 6.1; R2.3, R4.2, R4.4, R5.2, R5.4, R8.3). It
+// merges the `monitors.conf` records with the live `hyprctl monitors -j` state into a
+// per-monitor staging model, produces the `monitors.conf` FileWrite the Apply pipeline
+// (task 4.5) applies, and drives the runtime-only laptop-display toggle. It is
+// consumed by the Display page UI glue (`ui::display`) and the window's Apply/Reset
+// chrome (`ui::window`), so its public surface is exercised in a non-test build too.
+pub mod display;

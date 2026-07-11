@@ -66,10 +66,14 @@
 //! warning without committing. The pipeline is given the **store's** freshness tracker
 //! (via [`SettingsStore::freshness`]), so its step-2 conflict check measures the target
 //! files against the real baselines the startup load recorded (R5.6) rather than an
-//! empty tracker. The [`ApplyPlan`] is still interim — it validates the dirty settings
-//! but produces **no** file writes yet, because rendering staged edits through the
-//! parsers into file bytes is §6 page glue; that write-production is what finishes the
-//! Apply path.
+//! empty tracker.
+//!
+//! The Display page (task 6.1) contributes the first real file write: [`wire_apply`]
+//! folds its `monitors.conf` [`FileWrite`](crate::core::apply::FileWrite) and value
+//! validations into the same plan, so an Apply rewrites the target `monitor=` record
+//! and reloads via `hyprctl reload`. The store's remaining §6 pages will fill in their
+//! own writes the same way; until then their staged edits still validate and commit as
+//! before.
 //!
 //! # No libadwaita, no custom CSS (R2.1/R2.2)
 //!
@@ -92,6 +96,7 @@ use relm4::{ComponentController, Controller};
 
 use crate::core::apply::{self, ApplyPlan};
 use crate::core::detect::{Capabilities, DetectionInputs};
+use crate::core::display::DisplayModel;
 use crate::core::model::Category;
 use crate::core::reload::ReloadParams;
 use crate::core::store::SettingsStore;
@@ -99,6 +104,7 @@ use crate::system::command::SystemCommandRunner;
 use crate::system::signal::SystemProcessSignaller;
 use crate::ui::category::{SidebarCategory, visible_categories};
 use crate::ui::chrome::{self, ApplyResponse, Toast};
+use crate::ui::display::{self, DisplayPage};
 use crate::ui::page::{self, PageMsg, PagePlan, SettingsPage};
 use crate::ui::startup::{self, LoadedFile, StartupLoad};
 
@@ -147,6 +153,16 @@ struct Shell {
     window: ApplicationWindow,
     /// The single staging store every page and the chrome share (task 5.3).
     store: Rc<RefCell<SettingsStore>>,
+    /// The Display page's runtime-discovered model (task 6.1), shared with the Display
+    /// glue. `None` until the startup worker builds it, or when there is no live
+    /// compositor. It is a second staging source alongside the store: its dirty state
+    /// feeds the same Apply/Reset chrome, and its `monitors.conf` write is folded into
+    /// the same Apply pipeline (see [`Shell::wire_apply`]).
+    display: Rc<RefCell<Option<DisplayModel>>>,
+    /// The mounted Display page, retained so the window can re-render it after a Reset
+    /// or a committed Apply. Rebuilt by [`Shell::populate`]; `None` while the Display
+    /// category shows a placeholder (no live monitor data).
+    display_page: Rc<RefCell<Option<DisplayPage>>>,
     /// The most recent detection result, replaced on a manual refresh (R4.3).
     capabilities: Rc<RefCell<Capabilities>>,
     /// The retained page controllers, so the window can send them [`PageMsg::Rerender`]
@@ -191,6 +207,11 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     let store = Rc::new(RefCell::new(SettingsStore::new()));
     let capabilities = Rc::new(RefCell::new(Capabilities::absent()));
     let controllers: Rc<RefCell<Vec<Controller<SettingsPage>>>> = Rc::new(RefCell::new(Vec::new()));
+    // The Display page's model and mounted page — a second staging source folded into
+    // the chrome and the Apply pipeline (task 6.1). Both start empty; the worker fills
+    // the model and `populate` builds the page.
+    let display: Rc<RefCell<Option<DisplayModel>>> = Rc::new(RefCell::new(None));
+    let display_page: Rc<RefCell<Option<DisplayPage>>> = Rc::new(RefCell::new(None));
 
     // The persistent content stack + sidebar. Pages are added to this same stack on
     // every populate; the stack itself is never rebuilt.
@@ -217,19 +238,30 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     // and reused across repopulates.
     let update_chrome: Rc<dyn Fn()> = {
         let store = store.clone();
+        let display = display.clone();
         let apply_button = apply_button.clone();
         let reset_button = reset_button.clone();
         let stack = stack.clone();
         let marked = marked.clone();
         Rc::new(move || {
             let store = store.borrow();
-            let enabled = chrome::actions_enabled(&store);
+            // The Display page is a second dirty source (task 6.1): it has no store
+            // value (monitors are dynamic), so its dirty state is read from its own
+            // model and OR-ed into the shared Apply/Reset enablement.
+            let display_dirty = display
+                .borrow()
+                .as_ref()
+                .is_some_and(DisplayModel::is_dirty);
+            let enabled = chrome::actions_enabled(&store) || display_dirty;
             apply_button.set_sensitive(enabled);
             reset_button.set_sensitive(enabled);
             for (category, child) in marked.borrow().iter() {
-                stack
-                    .page(child)
-                    .set_needs_attention(store.is_category_dirty(*category));
+                let dirty = if *category == Category::Display {
+                    display_dirty
+                } else {
+                    store.is_category_dirty(*category)
+                };
+                stack.page(child).set_needs_attention(dirty);
             }
         })
     };
@@ -261,6 +293,8 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     let shell = Shell {
         window: window.clone(),
         store,
+        display,
+        display_page,
         capabilities,
         controllers,
         stack,
@@ -336,6 +370,7 @@ impl Shell {
         let StartupLoad {
             capabilities,
             files,
+            display,
         } = load;
         let file_count = files.len();
 
@@ -352,6 +387,9 @@ impl Shell {
             }
         }
         *self.capabilities.borrow_mut() = capabilities;
+        // Adopt the worker-built Display model (task 6.1) before `populate` builds the
+        // Display page from it.
+        *self.display.borrow_mut() = display;
 
         self.populate();
 
@@ -388,10 +426,20 @@ impl Shell {
             self.stack.remove(&child);
         }
         self.marked.borrow_mut().clear();
+        // Drop any retained Display page from a previous populate; `populate_display`
+        // re-sets it when the Display category is (re)built below.
+        *self.display_page.borrow_mut() = None;
 
         // Build one page per visible category, in sidebar order (R4.2).
         let mut controllers = Vec::new();
         for category in visible_categories(&caps) {
+            // Display is bespoke (task 6.1): its per-monitor controls are dynamic and
+            // its laptop toggle is runtime-only, so it does not use the declarative
+            // framework. Build it directly from the runtime-discovered model.
+            if category == SidebarCategory::Display {
+                self.populate_display(category);
+                continue;
+            }
             match page::plan_category(category, &caps) {
                 PagePlan::Framework(rows) => {
                     let controller =
@@ -425,6 +473,32 @@ impl Shell {
         *self.controllers.borrow_mut() = controllers;
     }
 
+    /// Builds the Display category's page (task 6.1).
+    ///
+    /// When a runtime-discovered [`DisplayModel`] is available, mounts the bespoke
+    /// [`display`] page (rendering from the shared model and reporting staged edits
+    /// through `update_chrome`) and registers its dirty marker under
+    /// [`Category::Display`]. When there is no live monitor data — `hyprctl` is present
+    /// (so the category is visible, task 5.1) but the compositor is not reloadable —
+    /// it falls back to the task-5.1 placeholder so the page degrades cleanly (R4.2).
+    fn populate_display(&self, category: SidebarCategory) {
+        if self.display.borrow().is_some() {
+            let page = display::build(self.display.clone(), self.update_chrome.clone());
+            self.stack
+                .add_titled(page.root(), Some(category.stack_name()), category.title());
+            // The Display page's marker tracks its own model's dirty state, not the
+            // store's (it holds no store-backed settings).
+            self.marked
+                .borrow_mut()
+                .push((Category::Display, page.root().clone().upcast()));
+            *self.display_page.borrow_mut() = Some(page);
+        } else {
+            let placeholder = build_placeholder_page(category);
+            self.stack
+                .add_titled(&placeholder, Some(category.stack_name()), category.title());
+        }
+    }
+
     /// Wires the Apply button to run the pipeline and handle its outcome (R5.3–R5.6).
     ///
     /// See the module docs: the plan is interim (validations only, no writes yet), the
@@ -438,13 +512,66 @@ impl Shell {
     fn wire_apply(&self, apply_button: &Button) {
         let shell = self.clone();
         apply_button.connect_clicked(move |_| {
-            let plan = interim_apply_plan(&shell.store.borrow());
-
-            // Side-effect seams: the real system runner/signaller. The freshness tracker
-            // is the store's own (task 5.4), holding the baselines recorded when the
-            // startup load read the backing files, so step 2 measures against them
-            // (R5.6). The immutable borrow ends before the commit below borrows mutably.
             let runner = SystemCommandRunner::new();
+
+            // F2 (R5.6): before writing a pending monitor edit, check whether
+            // monitors.conf changed on disk since it was loaded. Only relevant when the
+            // Display page is dirty (that is the only case that would write it). On a
+            // conflict, warn and re-load the model rather than clobbering the stale
+            // parse — the pipeline's own conflict check covers the store's files.
+            let display_conflict = {
+                let display = shell.display.borrow();
+                display
+                    .as_ref()
+                    .is_some_and(|model| model.is_dirty() && model.check_conflict())
+            };
+            if display_conflict {
+                let reloaded = {
+                    let display = shell.display.borrow();
+                    display.as_ref().and_then(|model| model.reload(&runner))
+                };
+                *shell.display.borrow_mut() = reloaded;
+                shell.rerender_display();
+                (shell.update_chrome)();
+                chrome::show_warning(
+                    &shell.window,
+                    "Files changed on disk",
+                    "monitors.conf changed on disk since Settings4000 read it, so nothing was \
+                     written. It has been reloaded from disk — re-apply your display changes.",
+                );
+                return;
+            }
+
+            let mut plan = interim_apply_plan(&shell.store.borrow());
+            // The store-backed writes to commit to the store after a successful apply.
+            // Captured before the Display contribution is folded in, because the Display
+            // model commits its own `monitors.conf` write separately (its freshness is
+            // owned by the model, not the store).
+            let store_writes: Vec<(PathBuf, Vec<u8>)> = plan
+                .writes
+                .iter()
+                .map(|write| (write.path.clone(), write.contents.clone()))
+                .collect();
+
+            // Fold in the Display page's `monitors.conf` write + validations (task 6.1)
+            // — the first real file write in the app. The immutable borrow ends here,
+            // before the commit below borrows the model mutably.
+            let has_display_write = {
+                let display = shell.display.borrow();
+                match display.as_ref().and_then(DisplayModel::apply_contribution) {
+                    Some(contribution) => {
+                        plan.writes.push(contribution.write);
+                        plan.validations.extend(contribution.validations);
+                        true
+                    }
+                    None => false,
+                }
+            };
+
+            // Side-effect seams: the real system runner (created above) plus the
+            // signaller. The freshness tracker is the store's own (task 5.4), holding
+            // the baselines recorded when the startup load read the backing files, so
+            // the pipeline's step-2 conflict check measures against them (R5.6).
             let signaller = SystemProcessSignaller::new();
             let outcome = {
                 let store = shell.store.borrow();
@@ -454,24 +581,23 @@ impl Shell {
 
             match chrome::respond_to_apply(&outcome) {
                 ApplyResponse::Commit { toast: message } => {
-                    // The writes stood (R5.5). Commit reconciles the store: promote
-                    // staged→original and re-baseline the written files' freshness from
-                    // the exact bytes written, so the app's own write is not seen as an
-                    // external conflict on the next apply (task 4.5). The bytes come from
-                    // the plan's writes (empty for the interim plan, so this promotes
-                    // staged→original).
-                    let committed: Vec<(PathBuf, Vec<u8>)> = plan
-                        .writes
-                        .iter()
-                        .map(|write| (write.path.clone(), write.contents.clone()))
-                        .collect();
-                    shell.store.borrow_mut().commit_apply(&committed);
+                    // The writes stood (R5.5). Commit reconciles each staging source:
+                    // the store promotes staged→original and re-baselines its own
+                    // written files' freshness (task 4.5); the Display model promotes
+                    // its staged monitor edits and updates its in-memory records.
+                    shell.store.borrow_mut().commit_apply(&store_writes);
+                    if has_display_write {
+                        if let Some(display) = shell.display.borrow_mut().as_mut() {
+                            display.commit();
+                        }
+                    }
                     shell.rerender_pages();
+                    shell.rerender_display();
                     (shell.update_chrome)();
                     if let Some(message) = message {
                         shell.toast.show(&message);
                     }
-                    tracing::info!("apply committed; store reconciled (task 5.3/4.5)");
+                    tracing::info!("apply committed; store and Display reconciled (task 5.3/6.1)");
                 }
                 ApplyResponse::Warn { heading, detail } => {
                     chrome::show_warning(&shell.window, &heading, &detail);
@@ -485,7 +611,13 @@ impl Shell {
         let shell = self.clone();
         reset_button.connect_clicked(move |_| {
             shell.store.borrow_mut().reset();
+            // Reset the Display page's staging too (task 6.1) — it is a second dirty
+            // source, so Reset must clear it alongside the store.
+            if let Some(display) = shell.display.borrow_mut().as_mut() {
+                display.reset();
+            }
             shell.rerender_pages();
+            shell.rerender_display();
             (shell.update_chrome)();
             tracing::debug!("discarded staged edits from the Reset button (R5.1)");
         });
@@ -536,18 +668,26 @@ impl Shell {
             let _ = controller.sender().send(PageMsg::Rerender);
         }
     }
+
+    /// Re-renders the Display page from its model (task 6.1), the bespoke counterpart
+    /// of [`Self::rerender_pages`]. Called after a Reset or a committed Apply so the
+    /// Display drop-downs snap to the model's values.
+    fn rerender_display(&self) {
+        if let Some(page) = self.display_page.borrow().as_ref() {
+            page.rerender();
+        }
+    }
 }
 
-/// Builds the interim [`ApplyPlan`] for the current dirty edits (task 5.3).
+/// Builds the base [`ApplyPlan`] from the store's dirty edits (task 5.3).
 ///
-/// It carries the dirty settings as `validations` (so [`apply::run`]'s first gate
-/// re-checks them, R8.3) but **no** `writes` and no palette switch: turning a staged
-/// [`Value`](crate::core::model::Value) into concrete file bytes goes through the
-/// format parsers and is §6 page glue. So a v1 Apply validates and — with nothing to
-/// write — completes as
-/// [`ApplyOutcome::Applied`](crate::core::apply::ApplyOutcome::Applied), which the
-/// caller commits (promoting staged→original, clearing dirty). §6 fills in the real
-/// writes.
+/// It carries the store's dirty settings as `validations` (so [`apply::run`]'s first
+/// gate re-checks them, R8.3). It still produces **no** store `writes`: turning a
+/// staged [`Value`](crate::core::model::Value) into concrete file bytes goes through
+/// the format parsers and is per-page glue, which the remaining §6 pages fill in. The
+/// Display page (task 6.1) does not go through here — [`Shell::wire_apply`] folds its
+/// `monitors.conf` write and validations into this plan after building it, since the
+/// Display staging lives in its own model rather than the store.
 fn interim_apply_plan(store: &SettingsStore) -> ApplyPlan {
     let validations = store
         .dirty_ids()

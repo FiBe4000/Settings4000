@@ -420,6 +420,40 @@ impl MonitorsFile {
         }
     }
 
+    /// The raw comma-separated body of the enabled record named `name` — the text
+    /// after the `monitor=<name>,` prefix up to any inline comment — or `None` when
+    /// there is no such record or it is in the disable form.
+    ///
+    /// This is the `<mode>,<position>,<scale>[,<extras>]` a caller re-applies live with
+    /// `hyprctl keyword monitor "<output>,<body>"` (the granular path the dotfiles'
+    /// laptop-display toggle uses, analysis §3/§6.2): it reproduces the record's mode,
+    /// position, scale, and any trailing extras (`bitdepth,10`) exactly as configured,
+    /// so a live re-enable matches the single-source `monitors.conf` record. The
+    /// disable form has no such body, so it returns `None`.
+    ///
+    /// If several records share the name the last (effective, later-rule-wins) one is
+    /// read, mirroring [`Self::field`].
+    pub(crate) fn record_body(&self, name: &str) -> Option<&str> {
+        let index = self.find_record(name)?;
+        match &self.lines[index].kind {
+            LineKind::Record {
+                fields, disabled, ..
+            } => {
+                if *disabled {
+                    return None;
+                }
+                // The body spans from the start of field 2 (the mode) to the end of the
+                // last field — a contiguous slice of the raw line, so it keeps the
+                // commas and in-field spacing between them while excluding the
+                // `monitor=<name>,` prefix and any trailing inline comment.
+                let start = fields.get(1)?.0;
+                let end = fields.last()?.1;
+                Some(&self.lines[index].raw[start..end])
+            }
+            _ => None,
+        }
+    }
+
     /// Rewrites one field (mode, position, or scale) of the enabled record named
     /// `name`, changing exactly that field's byte span and nothing else.
     ///
@@ -1318,6 +1352,25 @@ monitor=eDP-1,1920x1200@60,0x0,2.0
             reparsed.field("DP-1", MonitorField::Mode),
             Some("1920x1080@60")
         );
+    }
+
+    #[test]
+    fn record_body_returns_the_fields_after_the_name() {
+        // `record_body` yields the raw `<mode>,<position>,<scale>[,<extras>]` used to
+        // re-apply a monitor live via `hyprctl keyword monitor` — the mode, position,
+        // scale, and trailing extras, but not the `monitor=<name>,` prefix.
+        let (file, _) = MonitorsFile::parse(MONITORS_CONF);
+        assert_eq!(
+            file.record_body("eDP-1"),
+            Some("2880x1800@120,0x0,1.333333,bitdepth,10"),
+            "the body includes the trailing extras and excludes the name prefix"
+        );
+        assert_eq!(file.record_body(""), Some("preferred,auto,1"));
+
+        // The disable form has no re-applyable body.
+        assert_eq!(file.record_body("desc:AU Optronics 0x2036"), None);
+        // An unknown monitor has none.
+        assert_eq!(file.record_body("DP-9"), None);
     }
 
     #[test]

@@ -26,12 +26,18 @@
 //! - [`startup`] — the worker-thread startup load (task 5.4): the GTK-free logic that
 //!   runs detection and parses the backing config files off the main thread, which
 //!   the window applies on completion. Headlessly tested (R6.2).
+//! - [`display`] — the Display page's bespoke glue (task 6.1): per-monitor
+//!   resolution/refresh/scale/position drop-downs and a per-monitor enable switch
+//!   rendered from the runtime-discovered [`crate::core::display`] model, plus the
+//!   runtime-only laptop-display toggle. It is bespoke rather than declarative because
+//!   monitors are dynamic and the laptop toggle bypasses staging (R5.2).
 //!
 //! The real per-category page content (§6) plugs into this shell in later tasks.
 
 pub(crate) mod app;
 mod category;
 mod chrome;
+mod display;
 mod page;
 mod row;
 mod startup;

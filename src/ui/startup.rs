@@ -51,10 +51,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::core::detect::{Capabilities, DetectionInputs};
+use crate::core::display::DisplayModel;
 use crate::core::model::{SettingId, Value};
 use crate::core::store::{FileReader, FileValues};
 use crate::parsers::hyprlang::{HyprlangFile, KeyPath};
 use crate::parsers::swaync::SwayncConfigFile;
+use crate::system::command::SystemCommandRunner;
 
 /// One backing config file loaded at startup: the live XDG path it was read from,
 /// the bytes + parsed originals, and a reader to re-parse it later.
@@ -85,6 +87,10 @@ pub(crate) struct StartupLoad {
     /// The backing files that loaded, in a fixed order; each is applied to the store.
     /// A file that was missing/unreadable/unparseable is simply absent here.
     pub(crate) files: Vec<LoadedFile>,
+    /// The Display page's runtime-discovered model (task 6.1), built by probing
+    /// `hyprctl monitors -j` and reading `monitors.conf`, or `None` when there is no
+    /// live compositor to enumerate (the Display page then shows a placeholder, R4.2).
+    pub(crate) display: Option<DisplayModel>,
 }
 
 /// The live XDG paths of the backing config files loaded at startup (R8.5).
@@ -143,10 +149,34 @@ fn config_home() -> PathBuf {
 pub(crate) fn load() -> StartupLoad {
     let capabilities = Capabilities::detect(&DetectionInputs::from_system(Vec::new()));
     let files = load_files(&BackingPaths::from_system());
+    let display = load_display(&capabilities);
     StartupLoad {
         capabilities,
         files,
+        display,
     }
+}
+
+/// Builds the Display page's model on the worker thread (task 6.1).
+///
+/// Only probes when Hyprland is reloadable (`hyprctl` on `$PATH` plus a live IPC
+/// socket) — otherwise there is no compositor to enumerate, so it returns `None` and
+/// the Display page shows a placeholder (R4.2). Running the `hyprctl monitors -j`
+/// probe here, on the startup worker, keeps it off the main thread and inside the
+/// R8.1 cold-start budget (architecture §8). The merge itself is the GTK-free
+/// [`DisplayModel::load`]; a failed probe or an unreadable `monitors.conf` degrades
+/// gracefully there (R4.4).
+fn load_display(capabilities: &Capabilities) -> Option<DisplayModel> {
+    if !capabilities.hyprland_reloadable() {
+        tracing::info!(
+            "Hyprland is not reloadable (no hyprctl, or no live IPC socket); the Display page \
+             has no monitor data — it is hidden entirely when hyprctl is absent, or shows a \
+             placeholder when hyprctl is present but the compositor is not running (R4.2)"
+        );
+        return None;
+    }
+    let monitors_conf = config_home().join("hypr").join("monitors.conf");
+    DisplayModel::load(&SystemCommandRunner::new(), monitors_conf)
 }
 
 /// Reads and parses each backing file at `paths`, returning one [`LoadedFile`] per
