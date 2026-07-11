@@ -50,17 +50,20 @@
 //! and [`BoundList::render`] rebuilds only when the stored value actually differs
 //! from what is shown.
 //!
-//! # Interim page content (replaced by §6 / task 5.4)
+//! # Interim page content (replaced by §6)
 //!
 //! [`category_rows`] returns a small, real descriptor list for the categories whose
 //! settings already exist in the model, so the framework is exercised end-to-end and
-//! renders in the running app. These lists — and the interim initial values in
-//! [`demo_original`] that the window seeds the shared store with (see
-//! [`interim_seed_values`]) — are deliberately interim scaffolding, exactly like task
-//! 5.1's placeholder pages: the per-category §6 tasks supply the full control set
-//! (with real option sources, ranges, and reload wiring), and task 5.4 replaces the
-//! seeded values with the values parsed from the real config files. A category with no
-//! descriptors yet keeps its task-5.1 placeholder.
+//! renders in the running app. These lists are deliberately interim scaffolding,
+//! exactly like task 5.1's placeholder pages: the per-category §6 tasks supply the
+//! full control set (with real option sources, ranges, and reload wiring). A category
+//! with no descriptors yet keeps its task-5.1 placeholder.
+//!
+//! The store the pages render from is populated by the worker-thread startup load
+//! (task 5.4, see [`super::startup`]): the initial values are parsed from the real
+//! config files, not demo constants. A setting whose backing file is missing or lacks
+//! its key simply has no store value — its control renders its default and rejects
+//! edits (`NotLoaded`) — which is the intended graceful degradation (R4.3/R4.4).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -95,13 +98,13 @@ const PAGE_MARGIN: i32 = 18;
 
 /// The initialization payload for a [`SettingsPage`].
 pub(crate) struct PageInit {
-    /// The shared staging store, already seeded by the window (task 5.3). The page
+    /// The shared staging store, populated by the startup load (task 5.4). The page
     /// renders its controls from this store and stages edits into it; every page and
     /// the window chrome share the one store.
     store: Rc<RefCell<SettingsStore>>,
     /// The descriptors to build, already filtered to those whose capability is present
-    /// (R4.2). Their interim initial values are seeded into the store from
-    /// [`demo_original`].
+    /// (R4.2). Their initial values come from the store, parsed from the real config
+    /// files by the startup load (task 5.4).
     rows: Vec<RowDescriptor>,
     /// Invoked after each staged edit so the window refreshes the Apply/Reset chrome
     /// and the per-page markers from the new store state (task 5.3).
@@ -133,12 +136,12 @@ pub(crate) enum PageMsg {
 /// the `SetValue` → store round-trip is unit-tested without launching a GTK runtime.
 pub(crate) struct SettingsPage {
     /// The staging store this page reads from and writes to (R5.1). It is the single
-    /// store shared by every page and the window chrome (task 5.3): the window seeds
-    /// and owns it behind an `Rc<RefCell<…>>`, each page stages edits into it and
-    /// renders from it, and the chrome reads its dirty state to drive the Apply/Reset
-    /// buttons and the per-page markers. Sharing is what makes an edit on one page
-    /// light up the global Apply button and that page's marker (task 5.4 replaces the
-    /// interim seed with values parsed from the real config files).
+    /// store shared by every page and the window chrome (task 5.3): the window owns it
+    /// behind an `Rc<RefCell<…>>`, each page stages edits into it and renders from it,
+    /// and the chrome reads its dirty state to drive the Apply/Reset buttons and the
+    /// per-page markers. Sharing is what makes an edit on one page light up the global
+    /// Apply button and that page's marker. The store's values are parsed from the real
+    /// config files by the startup load (task 5.4).
     store: Rc<RefCell<SettingsStore>>,
     /// Called after the page mutates the shared store, so the window can refresh the
     /// Apply/Reset sensitivity and the per-page dirty markers from the new state
@@ -222,8 +225,8 @@ impl SimpleComponent for SettingsPage {
         }
 
         // Initial render: Relm4 does not call `update_view` after `init`, so render
-        // each control from the pre-seeded shared store here (the render loop's
-        // starting point).
+        // each control from the shared store here (already populated by the startup
+        // load — task 5.4 — the render loop's starting point).
         {
             let store = init.store.borrow();
             for control in &controls {
@@ -794,52 +797,6 @@ fn category_rows(category: SidebarCategory) -> Vec<RowDescriptor> {
     }
 }
 
-/// The interim value a control initially shows for `setting`, before task 5.4 loads
-/// the real value parsed from the config file.
-///
-/// This is placeholder scaffolding paired with [`category_rows`] (see the module
-/// docs). The explicit arms cover every setting the interim rows use; the fallback
-/// yields a kind-appropriate neutral value so a descriptor added before its seed is
-/// still renderable rather than left unloaded.
-pub(crate) fn demo_original(setting: SettingId) -> Value {
-    match setting {
-        SettingId::KeyboardLayouts => Value::String("us".to_string()),
-        SettingId::MouseSensitivity => Value::Float(0.0),
-        SettingId::TouchpadNaturalScroll => Value::Bool(false),
-        SettingId::TouchpadTapToClick => Value::Bool(true),
-        SettingId::NotificationPosition => Value::Enum("top-right".to_string()),
-        SettingId::NotificationTimeout => Value::Integer(10),
-        other => match other.kind() {
-            ValueKind::Enum => Value::Enum(String::new()),
-            ValueKind::Bool => Value::Bool(false),
-            ValueKind::Float => Value::Float(0.0),
-            ValueKind::Integer => Value::Integer(0),
-            ValueKind::String => Value::String(String::new()),
-        },
-    }
-}
-
-/// Every interim setting the framework pages expose, paired with its
-/// [`demo_original`] value, for the window to seed the shared store once at startup
-/// (task 5.3).
-///
-/// It walks [`category_rows`] for every category — ignoring capabilities, so the store
-/// holds a value for a setting even while its page is hidden (harmless, and it keeps a
-/// later stage from failing `NotLoaded` if the page appears on a manual detection
-/// refresh) — and deduplicates by [`SettingId`]. This whole seeding is interim
-/// scaffolding: task 5.4 replaces it with values parsed from the real config files.
-pub(crate) fn interim_seed_values() -> Vec<(SettingId, Value)> {
-    let mut values: Vec<(SettingId, Value)> = Vec::new();
-    for &category in SidebarCategory::ALL {
-        for descriptor in category_rows(category) {
-            if !values.iter().any(|(id, _)| *id == descriptor.setting) {
-                values.push((descriptor.setting, demo_original(descriptor.setting)));
-            }
-        }
-    }
-    values
-}
-
 /// What a category's page should be, once per-row gating (R4.2) is applied to its
 /// interim descriptor list — the pure, GTK-free half of the window's page-building
 /// decision (task 5.3), split out so the composition is unit-tested headlessly (R6.2).
@@ -1058,11 +1015,13 @@ mod tests {
     }
 
     #[test]
-    fn category_rows_are_well_formed_with_matching_seeds() {
+    fn category_rows_are_well_formed() {
         // Guards the interim descriptor lists: every row's widget kind matches its
-        // setting's value kind (so the framework builds the right control and stages
-        // the right Value), and the seed `demo_original` provides for each setting is
-        // of that same kind (so the control has a renderable original).
+        // setting's value kind, so the framework builds the right control and stages
+        // the right Value. (The initial values now come from the startup load's parse
+        // of the real config files — task 5.4 — not a demo seed, so there is no seed
+        // to cross-check here; the loader maps each setting to a value of its kind and
+        // is tested in `super::super::startup`.)
         for category in [SidebarCategory::Input, SidebarCategory::Notifications] {
             let descriptors = category_rows(category);
             assert!(
@@ -1075,43 +1034,11 @@ mod tests {
                     "{:?} pairs an incompatible widget and setting kind",
                     descriptor.setting
                 );
-                assert_eq!(
-                    demo_original(descriptor.setting).kind(),
-                    descriptor.setting.kind(),
-                    "the seeded value kind must match the setting for {:?}",
-                    descriptor.setting
-                );
             }
         }
 
         // The categories without interim rows fall back to a placeholder.
         assert!(category_rows(SidebarCategory::Theme).is_empty());
-    }
-
-    #[test]
-    fn interim_seed_values_cover_every_framework_setting_without_duplicates() {
-        // The window seeds the shared store from this once at startup, so every
-        // framework row must have a seed (else staging it would fail `NotLoaded`), and
-        // no setting may appear twice.
-        let seeds = interim_seed_values();
-        for category in [SidebarCategory::Input, SidebarCategory::Notifications] {
-            for descriptor in category_rows(category) {
-                assert!(
-                    seeds.iter().any(|(id, _)| *id == descriptor.setting),
-                    "{:?} must be seeded",
-                    descriptor.setting
-                );
-            }
-        }
-        let mut ids: Vec<SettingId> = seeds.iter().map(|(id, _)| *id).collect();
-        let count = ids.len();
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(
-            ids.len(),
-            count,
-            "interim seed values must not duplicate a setting"
-        );
     }
 
     #[test]

@@ -1,36 +1,61 @@
-//! The main window: the category sidebar and content stack (task 5.1) plus the
-//! Apply/Reset chrome, dirty markers, toast, and detection refresh (task 5.3;
-//! architecture §7; R2.1, R2.4, R4.2, R4.3, R5.1, R5.5, R5.6).
+//! The main window: the category sidebar and content stack (task 5.1), the
+//! Apply/Reset chrome, dirty markers, toast, and detection refresh (task 5.3), and
+//! the worker-thread startup sequencing that populates them (task 5.4; architecture
+//! §7, §8; R2.1, R2.4, R4.2, R4.3, R5.1, R5.5, R5.6, R8.1).
 //!
 //! # What this builds
 //!
 //! The window has a [`HeaderBar`] titlebar carrying the chrome — a **Refresh** button,
 //! a **Reset** button, and a suggested-action **Apply** button — over a content area
-//! that is a [`StackSidebar`] beside a [`Stack`] of category pages, all wrapped in a
+//! that is a [`StackSidebar`] beside a [`Stack`] of category pages, all wrapped in an
 //! [`Overlay`] so a non-fatal [`Toast`](super::chrome::Toast) can float over it (R5.5).
 //! One stack page is added per *visible* category (see [`super::category`]); a
 //! [`super::page::PagePlan`] decides whether each is a rendered
 //! [`SettingsPage`](super::page::SettingsPage), a task-5.1 placeholder, or dropped
 //! entirely when its rows are all gated out (R4.2).
 //!
+//! # The persistent shell vs. the repopulated pages (task 5.1/5.4)
+//!
+//! Everything structural — the window, the titlebar with its chrome buttons, the
+//! overlay, the sidebar, and the (initially empty) stack — is built **once**, up front,
+//! and never rebuilt. Only the stack's *category pages* are (re)populated: on startup
+//! when the worker delivers detection results, and again on each manual refresh. This
+//! split matters for a concrete GTK reason as much as a conceptual one: GTK only
+//! permits [`ApplicationWindow::set_titlebar`] on an *unrealized* window, and the shell
+//! is populated after the window has been presented (the worker runs concurrently), so
+//! the titlebar must be set once before that — swapping it later would warn and may not
+//! take effect. [`Shell`] bundles the shared handles the population and chrome closures
+//! operate on; [`Shell::populate`] is the single routine that (re)builds the pages.
+//!
+//! # Startup sequencing: build the shell now, populate when the worker completes (5.4)
+//!
+//! Cold start must stay under the R8.1 budget, so the window does **not** block on
+//! detection or config parsing (architecture §8). [`build`] returns a fully assembled
+//! shell whose stack shows only a lightweight loading placeholder, having handed the
+//! slow work — detection (task 4.3) and parsing every backing config file (§3 parsers)
+//! — to a worker thread via [`super::startup::load`]. The parsed
+//! [`StartupLoad`](super::startup::StartupLoad) is delivered back to the main thread
+//! over a channel and applied by [`Shell::apply_startup_load`]: it populates the shared
+//! store from the real config files (establishing the true `original` values and
+//! freshness baselines) and rebuilds the stack pages from the detected
+//! [`Capabilities`]. A missing binary/daemon, an unreadable/unparseable config, or an
+//! absent repo never blocks or crashes startup — detection degrades to absent and the
+//! loader skips the file (R4.3/R4.4) — so the window always comes up with whatever is
+//! available.
+//!
 //! # One shared store drives the chrome (task 5.3)
 //!
-//! Unlike task 5.2 (where each page owned its own store), the window owns a **single**
-//! [`SettingsStore`] behind an `Rc<RefCell<…>>` that every page shares. This is what
-//! makes the chrome meaningful: an edit on any page stages into the one store, so the
-//! Apply/Reset buttons (enabled while [`SettingsStore::is_dirty`]) and the per-page
-//! `needs-attention` markers (from [`SettingsStore::is_category_dirty`]) all read the
-//! same dirty state. Each page reports an edit through a shared `on_changed` callback
-//! so the window re-derives the chrome immediately; the window drives the pages back
-//! by sending each retained [`Controller`] a [`PageMsg::Rerender`] after a Reset,
-//! commit, or conflict reload.
+//! The window owns a **single** [`SettingsStore`] behind an `Rc<RefCell<…>>` that every
+//! page shares. This is what makes the chrome meaningful: an edit on any page stages
+//! into the one store, so the Apply/Reset buttons (enabled while
+//! [`SettingsStore::is_dirty`]) and the per-page `needs-attention` markers (from
+//! [`SettingsStore::is_category_dirty`]) all read the same dirty state. Each page
+//! reports an edit through a shared `on_changed` callback ([`Shell::update_chrome`]) so
+//! the window re-derives the chrome immediately; the window drives the pages back by
+//! sending each retained [`Controller`] a [`PageMsg::Rerender`] after a Reset, commit,
+//! or conflict reload.
 //!
-//! The store is seeded once with the interim demo values ([`page::interim_seed_values`])
-//! against a real temporary file ([`SeedSource`]) so [`SettingsStore::refresh`] behaves
-//! — task 5.4 replaces this whole seeding with detection + real config parsing on a
-//! worker thread.
-//!
-//! # Apply wires the real pipeline (task 4.5 / 5.3)
+//! # Apply wires the real pipeline and the store's freshness tracker (task 4.5 / 5.4)
 //!
 //! **Apply** runs [`apply::run`] and dispatches its [`ApplyOutcome`] through the pure
 //! [`chrome::respond_to_apply`]: an [`ApplyOutcome::Applied`] is committed to the store
@@ -38,10 +63,13 @@
 //! the written files so the app's own write is not seen as a conflict next time),
 //! optionally raising a toast for non-fatal reload failures (R5.5); every other outcome
 //! (invalid values, an external conflict, a write failure) is surfaced as a modal
-//! warning without committing. The [`ApplyPlan`] is interim — it validates the dirty
-//! settings but produces **no** file writes yet, because rendering staged edits through
-//! the parsers into file bytes is §6 page glue; the headline here is the chrome, the
-//! outcome handling, and the commit wiring.
+//! warning without committing. The pipeline is given the **store's** freshness tracker
+//! (via [`SettingsStore::freshness`]), so its step-2 conflict check measures the target
+//! files against the real baselines the startup load recorded (R5.6) rather than an
+//! empty tracker. The [`ApplyPlan`] is still interim — it validates the dirty settings
+//! but produces **no** file writes yet, because rendering staged edits through the
+//! parsers into file bytes is §6 page glue; that write-production is what finishes the
+//! Apply path.
 //!
 //! # No libadwaita, no custom CSS (R2.1/R2.2)
 //!
@@ -52,29 +80,27 @@
 //! enforced by `tests/no_custom_css.rs`.
 
 use std::cell::RefCell;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use gtk4::prelude::*;
 use gtk4::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, HeaderBar, Label, Orientation,
-    Overlay, ScrolledWindow, Stack, StackSidebar,
+    Overlay, ScrolledWindow, Spinner, Stack, StackSidebar, Widget,
 };
 use relm4::{ComponentController, Controller};
-use tempfile::NamedTempFile;
 
 use crate::core::apply::{self, ApplyPlan};
 use crate::core::detect::{Capabilities, DetectionInputs};
-use crate::core::freshness::FreshnessTracker;
 use crate::core::model::Category;
 use crate::core::reload::ReloadParams;
-use crate::core::store::{FileReader, FileValues, SettingsStore};
+use crate::core::store::SettingsStore;
 use crate::system::command::SystemCommandRunner;
 use crate::system::signal::SystemProcessSignaller;
 use crate::ui::category::{SidebarCategory, visible_categories};
 use crate::ui::chrome::{self, ApplyResponse, Toast};
 use crate::ui::page::{self, PageMsg, PagePlan, SettingsPage};
+use crate::ui::startup::{self, LoadedFile, StartupLoad};
 
 /// Title shown in the window's title bar and to the compositor.
 const WINDOW_TITLE: &str = "Settings4000";
@@ -99,25 +125,59 @@ const CONTENT_MARGIN: i32 = 18;
 /// consistently once §6 adds rows.
 const CONTENT_SPACING: i32 = 12;
 
-/// The marker bytes written into the interim [`SeedSource`] temp file.
+/// The `GtkStack` name of the loading placeholder page shown while the worker runs.
 ///
-/// The content is irrelevant — the interim store parses fixed demo values, not this
-/// file — but a real, readable, stable file lets [`SettingsStore::refresh`] compare a
-/// baseline against unchanged bytes and find no spurious conflict.
-const SEED_MARKER: &[u8] = b"settings4000 interim seed\n";
+/// It is added with a name but no title, so [`StackSidebar`] does not show a row for
+/// it — the sidebar is empty during loading — and [`Shell::populate`] removes it once
+/// the real pages arrive.
+const LOADING_PAGE_NAME: &str = "__loading";
 
-/// The path used for the interim seed when a temp file cannot be created — a synthetic
-/// key that is never resolved on disk (the near-impossible fallback, see [`SeedSource`]).
-const SEED_FALLBACK_PATH: &str = "<settings4000 interim seed>";
-
-/// Builds the top-level [`ApplicationWindow`] with its chrome and category pages
-/// (task 5.1/5.3).
+/// The shared, persistent handles the window's chrome and page (re)population operate
+/// on (task 5.4).
 ///
-/// This is what task 1.3's bootstrap presents. `capabilities` is detected once at
-/// startup by the caller (`super::app`); the window keeps its own copy so the manual
-/// refresh action (R4.3) can replace it and repopulate. The single shared store is
-/// created and seeded here, then [`rebuild`] assembles the shell.
-pub(crate) fn build(app: &Application, capabilities: &Capabilities) -> ApplicationWindow {
+/// The window's structure is built once (see the module docs); this bundle is what the
+/// chrome button closures and the startup/refresh flows capture so they can repopulate
+/// the stack and re-derive the chrome without rebuilding the shell. It is [`Clone`]
+/// because every field is a refcounted handle (GTK objects, `Rc`s, the `Rc<dyn Fn>`
+/// chrome refresher, and the refcounted [`Toast`]), so a clone shares the same
+/// underlying state.
+#[derive(Clone)]
+struct Shell {
+    /// The top-level window, used as the transient parent for modal warnings.
+    window: ApplicationWindow,
+    /// The single staging store every page and the chrome share (task 5.3).
+    store: Rc<RefCell<SettingsStore>>,
+    /// The most recent detection result, replaced on a manual refresh (R4.3).
+    capabilities: Rc<RefCell<Capabilities>>,
+    /// The retained page controllers, so the window can send them [`PageMsg::Rerender`]
+    /// and so their widgets stay alive while mounted in the stack. Replaced by
+    /// [`Shell::populate`].
+    controllers: Rc<RefCell<Vec<Controller<SettingsPage>>>>,
+    /// The persistent content stack whose category pages are (re)populated in place.
+    stack: Stack,
+    /// The `(Category, stack page)` pairs whose `needs-attention` marker tracks per-page
+    /// dirty state; refilled by [`Shell::populate`] and read by [`Shell::update_chrome`].
+    marked: Rc<RefCell<Vec<(Category, Widget)>>>,
+    /// Re-derives all chrome from the store (Apply/Reset enablement + per-page markers).
+    /// Shared as the pages' `on_changed` and called after every store change.
+    update_chrome: Rc<dyn Fn()>,
+    /// The non-fatal reload-failure toast (R5.5).
+    toast: Toast,
+}
+
+/// Builds the top-level [`ApplicationWindow`], returning it immediately with a loading
+/// placeholder while detection and config parsing run on a worker thread (task
+/// 5.1/5.3/5.4, architecture §8).
+///
+/// This is what task 1.3's bootstrap presents. The whole shell — titlebar, chrome, and
+/// an empty stack showing a loading placeholder — is assembled here, before the window
+/// is presented (so the titlebar is set on an unrealized window). The shared store
+/// starts empty and the capabilities start [absent](Capabilities::absent);
+/// [`Shell::start_load`] kicks off the worker, and [`Shell::apply_startup_load`]
+/// populates the store and stack on the main thread when it completes. Returning before
+/// that finishes is the whole point — the window maps at once and fills in when ready,
+/// which keeps cold start inside the R8.1 budget.
+pub(crate) fn build(app: &Application) -> ApplicationWindow {
     let window = ApplicationWindow::builder()
         .application(app)
         .title(WINDOW_TITLE)
@@ -125,53 +185,23 @@ pub(crate) fn build(app: &Application, capabilities: &Capabilities) -> Applicati
         .default_height(DEFAULT_HEIGHT)
         .build();
 
-    // The single store every page and the chrome share (see the module docs). Seeded
-    // once here with the interim demo values; task 5.4 replaces this with real config
-    // parsing on a worker thread.
+    // The single store every page and the chrome share (see the module docs). Empty
+    // until the worker delivers the parsed config files; capabilities start absent so
+    // no category shows during the (momentary) loading state.
     let store = Rc::new(RefCell::new(SettingsStore::new()));
-    let seed = Rc::new(SeedSource::new());
-    seed_interim_store(&mut store.borrow_mut(), &seed);
-
-    // Held behind `Rc<RefCell<…>>` so the refresh action can replace them and rebuild.
-    let capabilities = Rc::new(RefCell::new(capabilities.clone()));
+    let capabilities = Rc::new(RefCell::new(Capabilities::absent()));
     let controllers: Rc<RefCell<Vec<Controller<SettingsPage>>>> = Rc::new(RefCell::new(Vec::new()));
 
-    rebuild(&window, &store, &capabilities, &controllers, &seed);
-    window
-}
-
-/// Builds (or rebuilds) the window's chrome + content and installs it on `window`.
-///
-/// Called once at startup and again on every manual detection refresh (R4.3): a
-/// refresh re-detects capabilities into `capabilities`, then calls this to repopulate
-/// the sidebar/stack for the new set (categories and rows may appear or disappear). The
-/// shared `store` persists across rebuilds, so staged edits are preserved; the previous
-/// page controllers are dropped (their widgets removed with the old content) and fresh
-/// ones stored in `controllers`.
-///
-/// The chrome closures capture clones of the shared state, so a fresh Refresh button
-/// wired here calls `rebuild` again with the same handles — the recursion happens only
-/// on a user click, never at build time.
-fn rebuild(
-    window: &ApplicationWindow,
-    store: &Rc<RefCell<SettingsStore>>,
-    capabilities: &Rc<RefCell<Capabilities>>,
-    controllers: &Rc<RefCell<Vec<Controller<SettingsPage>>>>,
-    seed: &Rc<SeedSource>,
-) {
-    let caps = capabilities.borrow().clone();
-
+    // The persistent content stack + sidebar. Pages are added to this same stack on
+    // every populate; the stack itself is never rebuilt.
     let stack = Stack::new();
-    // The content pane fills the width and height beside the sidebar so pages (and
-    // their scrollers) use the whole window (R2.4).
     stack.set_hexpand(true);
     stack.set_vexpand(true);
-
     let sidebar = StackSidebar::new();
     sidebar.set_stack(&stack);
 
-    // Chrome widgets, created before the pages so `update_chrome` can capture them;
-    // their click handlers are wired further down, once the shared state is in hand.
+    // Chrome widgets. Built once and wired once — the pages and stack they act on are
+    // persistent, so their handlers never need re-wiring across a repopulate.
     let apply_button = Button::with_label("Apply");
     // A built-in theme style class (not custom CSS, R2.1) that renders Apply as the
     // primary/affirmative action.
@@ -180,14 +210,11 @@ fn rebuild(
     let refresh_button = Button::with_label("Refresh");
     let toast = Toast::new();
 
-    // The (Category, stack child) pairs whose `needs-attention` marker tracks per-page
-    // dirty state. Filled during the page loop below and read by `update_chrome` at
-    // call time, so it is populated before any edit can fire the callback.
-    let marked: Rc<RefCell<Vec<(Category, gtk4::Widget)>>> = Rc::new(RefCell::new(Vec::new()));
+    let marked: Rc<RefCell<Vec<(Category, Widget)>>> = Rc::new(RefCell::new(Vec::new()));
 
     // Re-derives all chrome from the store: Apply/Reset enablement and each page's
-    // dirty marker (R5.1). Shared as the pages' `on_changed` and called after every
-    // store change the window makes.
+    // dirty marker (R5.1). Captures the persistent stack + marked, so it is built once
+    // and reused across repopulates.
     let update_chrome: Rc<dyn Fn()> = {
         let store = store.clone();
         let apply_button = apply_button.clone();
@@ -207,27 +234,11 @@ fn rebuild(
         })
     };
 
-    // Build one page per visible category, in sidebar order (R4.2).
-    let mut page_controllers = Vec::new();
-    for category in visible_categories(&caps) {
-        match page::plan_category(category, &caps) {
-            PagePlan::Framework(rows) => {
-                let controller = page::build_page(store.clone(), rows, update_chrome.clone());
-                let root = controller.widget().clone();
-                stack.add_titled(&root, Some(category.stack_name()), category.title());
-                if let Some(model_category) = chrome::marker_category(category) {
-                    marked.borrow_mut().push((model_category, root.upcast()));
-                }
-                page_controllers.push(controller);
-            }
-            PagePlan::NoSpec => {
-                let placeholder = build_placeholder_page(category);
-                stack.add_titled(&placeholder, Some(category.stack_name()), category.title());
-            }
-            // Every row gated out: drop the category (R4.2); `plan_category` logged it.
-            PagePlan::Emptied => {}
-        }
-    }
+    // Show the loading placeholder immediately (architecture §8): a non-sidebar stack
+    // page the worker's result replaces via `populate`.
+    let loading = build_loading_page();
+    stack.add_named(&loading, Some(LOADING_PAGE_NAME));
+    stack.set_visible_child_name(LOADING_PAGE_NAME);
 
     // Assemble the content, floated under the toast so it can appear over the pages.
     let content = GtkBox::new(Orientation::Horizontal, 0);
@@ -242,168 +253,288 @@ fn rebuild(
     header.pack_end(&apply_button);
     header.pack_end(&reset_button);
 
-    wire_apply(
-        &apply_button,
-        window,
-        store,
-        capabilities,
-        controllers,
-        &update_chrome,
-        &toast,
-    );
-    wire_reset(&reset_button, store, controllers, &update_chrome);
-    wire_refresh(
-        &refresh_button,
-        window,
-        store,
-        capabilities,
-        controllers,
-        seed,
-    );
-
+    // Install the shell once, before the window is presented — the titlebar can only be
+    // set on an unrealized window (see the module docs).
     window.set_titlebar(Some(&header));
     window.set_child(Some(&overlay));
 
-    // Initial chrome state, and retain the fresh controllers so the window can send
-    // them `Rerender` (dropping any from a previous build).
-    update_chrome();
-    *controllers.borrow_mut() = page_controllers;
+    let shell = Shell {
+        window: window.clone(),
+        store,
+        capabilities,
+        controllers,
+        stack,
+        marked,
+        update_chrome,
+        toast,
+    };
+
+    shell.wire_apply(&apply_button);
+    shell.wire_reset(&reset_button);
+    shell.wire_refresh(&refresh_button);
+
+    // Initial (disabled) chrome state, then kick off the worker.
+    (shell.update_chrome)();
+    shell.start_load();
+
+    window
 }
 
-/// Wires the Apply button to run the pipeline and handle its outcome (R5.3–R5.6).
-///
-/// See the module docs: the plan is interim (validations only, no writes yet), the
-/// outcome is dispatched through [`chrome::respond_to_apply`], and an
-/// [`ApplyOutcome::Applied`](crate::core::apply::ApplyOutcome::Applied) is committed to
-/// the store with the plan's written paths + bytes before the pages are re-rendered and
-/// the chrome refreshed. A non-fatal reload failure raises a toast; any abort/failure
-/// shows a modal warning.
-fn wire_apply(
-    apply_button: &Button,
-    window: &ApplicationWindow,
-    store: &Rc<RefCell<SettingsStore>>,
-    capabilities: &Rc<RefCell<Capabilities>>,
-    controllers: &Rc<RefCell<Vec<Controller<SettingsPage>>>>,
-    update_chrome: &Rc<dyn Fn()>,
-    toast: &Toast,
-) {
-    let store = store.clone();
-    let capabilities = capabilities.clone();
-    let controllers = controllers.clone();
-    let update_chrome = update_chrome.clone();
-    let toast = toast.clone();
-    let window = window.clone();
-    apply_button.connect_clicked(move |_| {
-        let plan = interim_apply_plan(&store.borrow());
+impl Shell {
+    /// Runs detection + config parsing on a worker thread and applies the result on the
+    /// main thread when it completes (task 5.4, architecture §8; R4.3, R8.1).
+    ///
+    /// The blocking work goes to relm4's shared blocking pool ([`relm4::spawn_blocking`])
+    /// so it runs concurrently with the main thread returning to the GTK loop; the parsed
+    /// [`StartupLoad`] is delivered back over a [`relm4::channel`] and awaited on the main
+    /// thread by a local future ([`relm4::spawn_local`]), which then populates the store
+    /// and builds the pages — GTK is only ever touched on the main thread. If the worker
+    /// finishes without delivering a result (e.g. the window closed first), the stack is
+    /// still populated (empty, from the absent capabilities) so the user has a working
+    /// Refresh (R4.3).
+    fn start_load(&self) {
+        let (sender, receiver) = relm4::channel::<StartupLoad>();
+        relm4::spawn_blocking(move || {
+            let load = startup::load();
+            // A send failure only means the receiver was dropped — the window closed
+            // before the load finished, which is harmless, so it is not an error.
+            if sender.send(load).is_err() {
+                tracing::debug!("startup load discarded; window closed before it completed");
+            }
+        });
 
-        // Side-effect seams: the real system runner/signaller. The freshness tracker is
-        // interim-empty because the interim plan writes no tracked file yet (§6 will
-        // pass the store's real tracker); with no writes there is nothing to conflict.
-        let runner = SystemCommandRunner::new();
-        let signaller = SystemProcessSignaller::new();
-        let tracker = FreshnessTracker::new();
-        let outcome = {
-            let caps = capabilities.borrow();
-            apply::run(&plan, &tracker, &caps, &runner, &signaller)
-        };
-
-        match chrome::respond_to_apply(&outcome) {
-            ApplyResponse::Commit { toast: message } => {
-                // The writes stood (R5.5). Commit reconciles the store: promote
-                // staged→original and re-baseline the written files' freshness from the
-                // exact bytes written, so the app's own write is not seen as an external
-                // conflict on the next apply (task 4.5). The bytes come from the plan's
-                // writes (empty for the interim plan, so this promotes staged→original).
-                let committed: Vec<(PathBuf, Vec<u8>)> = plan
-                    .writes
-                    .iter()
-                    .map(|write| (write.path.clone(), write.contents.clone()))
-                    .collect();
-                store.borrow_mut().commit_apply(&committed);
-                rerender_pages(&controllers);
-                update_chrome();
-                if let Some(message) = message {
-                    toast.show(&message);
+        let shell = self.clone();
+        relm4::spawn_local(async move {
+            match receiver.recv().await {
+                Some(load) => shell.apply_startup_load(load),
+                None => {
+                    tracing::warn!(
+                        "startup worker finished without delivering a result; showing an empty \
+                         window (R4.3)"
+                    );
+                    // Still populate (empty, from the absent capabilities) so the user
+                    // has a working Refresh to retry.
+                    shell.populate();
                 }
-                tracing::info!("apply committed; store reconciled (task 5.3/4.5)");
             }
-            ApplyResponse::Warn { heading, detail } => {
-                chrome::show_warning(&window, &heading, &detail);
+        });
+    }
+
+    /// Applies a completed [`StartupLoad`] on the main thread: populate the store from
+    /// the parsed config files, adopt the detected capabilities, and build the pages
+    /// (task 5.4).
+    ///
+    /// This is the "populate on completion" step. Each parsed file is fed to
+    /// [`SettingsStore::load_file`], which records its originals and the freshness
+    /// baseline (from the exact bytes read) and keeps a reader for the conflict-reload
+    /// path (R5.6). Then [`Shell::populate`] builds the stack pages for the detected
+    /// capabilities, so the categories/rows the machine supports appear and the rest are
+    /// cleanly hidden (R4.2). A one-line summary is logged at `info` (architecture §8,
+    /// R7.3) — visible-category counts only, never file contents; per-file parse issues
+    /// were already logged by the loader.
+    fn apply_startup_load(&self, load: StartupLoad) {
+        let StartupLoad {
+            capabilities,
+            files,
+        } = load;
+        let file_count = files.len();
+
+        // Populate the store with the real originals + freshness baselines (R5.1/R5.6).
+        {
+            let mut store = self.store.borrow_mut();
+            for LoadedFile {
+                path,
+                initial,
+                reader,
+            } in files
+            {
+                store.load_file(path, initial, reader);
             }
         }
-    });
-}
+        *self.capabilities.borrow_mut() = capabilities;
 
-/// Wires the Reset button to discard staged edits and revert the controls (R5.1).
-fn wire_reset(
-    reset_button: &Button,
-    store: &Rc<RefCell<SettingsStore>>,
-    controllers: &Rc<RefCell<Vec<Controller<SettingsPage>>>>,
-    update_chrome: &Rc<dyn Fn()>,
-) {
-    let store = store.clone();
-    let controllers = controllers.clone();
-    let update_chrome = update_chrome.clone();
-    reset_button.connect_clicked(move |_| {
-        store.borrow_mut().reset();
-        rerender_pages(&controllers);
-        update_chrome();
-        tracing::debug!("discarded staged edits from the Reset button (R5.1)");
-    });
-}
+        self.populate();
 
-/// Wires the Refresh button to re-run detection, repopulate, and warn on conflicts
-/// (R4.3/R5.6).
-///
-/// It re-detects capabilities, re-reads the tracked files (surfacing external edits as
-/// a conflict warning via [`chrome::refresh_conflict_warning`]), then rebuilds the
-/// shell so categories/rows that appeared or disappeared are reflected.
-fn wire_refresh(
-    refresh_button: &Button,
-    window: &ApplicationWindow,
-    store: &Rc<RefCell<SettingsStore>>,
-    capabilities: &Rc<RefCell<Capabilities>>,
-    controllers: &Rc<RefCell<Vec<Controller<SettingsPage>>>>,
-    seed: &Rc<SeedSource>,
-) {
-    let window = window.clone();
-    let store = store.clone();
-    let capabilities = capabilities.clone();
-    let controllers = controllers.clone();
-    let seed = seed.clone();
-    refresh_button.connect_clicked(move |_| {
-        // R4.3: re-run detection over freshly gathered inputs.
-        let inputs = DetectionInputs::from_system(Vec::new());
-        *capabilities.borrow_mut() = Capabilities::detect(&inputs);
+        // R7.3 / architecture §8: a one-line startup summary — which categories are
+        // visible and how many backing files loaded — counts only, never file contents.
+        let caps = self.capabilities.borrow();
+        let visible: Vec<&str> = visible_categories(&caps)
+            .iter()
+            .map(|category| category.title())
+            .collect();
+        tracing::info!(
+            files_loaded = file_count,
+            categories = visible.len(),
+            visible = ?visible,
+            "startup load complete; store populated and pages built (task 5.4, architecture §8)"
+        );
+    }
 
-        // R5.6: re-read the tracked files; an external edit reloads originals (keeping
-        // pending edits) and is reported for the warning below.
-        let report = store.borrow_mut().refresh();
+    /// (Re)builds the stack's category pages from the current capabilities (task
+    /// 5.1/5.4; R4.2).
+    ///
+    /// Called on startup-load completion and again on every manual detection refresh
+    /// (R4.3): the persistent stack has all its pages removed (the loading placeholder
+    /// and any pages from a previous populate, since categories/rows may appear or
+    /// disappear) and rebuilt for the current capabilities. The shared store persists,
+    /// so staged edits are preserved; the previous page controllers are dropped (their
+    /// widgets removed with the old pages) and fresh ones retained.
+    fn populate(&self) {
+        let caps = self.capabilities.borrow().clone();
 
-        // Repopulate the sidebar/stack for the new capabilities (categories/rows may
-        // appear or disappear). This replaces the content that holds this very button,
-        // which GTK tolerates: the emission holds the button until this closure returns.
-        rebuild(&window, &store, &capabilities, &controllers, &seed);
-
-        if let Some(warning) = chrome::refresh_conflict_warning(&report) {
-            chrome::show_warning(&window, &warning.heading, &warning.detail);
+        // Remove every current stack page (the loading placeholder, and any pages from a
+        // previous populate).
+        while let Some(child) = self.stack.first_child() {
+            self.stack.remove(&child);
         }
-        tracing::info!("manual detection refresh + external-edit check complete (R4.3/R5.6)");
-    });
-}
+        self.marked.borrow_mut().clear();
 
-/// Sends every retained page controller a [`PageMsg::Rerender`] so its controls
-/// re-render from the shared store (task 5.3).
-///
-/// Used after the window changes the store from outside a page — a Reset, an applied
-/// commit, or a conflict reload — so a control that no longer matches the store (its
-/// original reverted, or reloaded) snaps back.
-fn rerender_pages(controllers: &Rc<RefCell<Vec<Controller<SettingsPage>>>>) {
-    for controller in controllers.borrow().iter() {
-        // The receiver only goes away if the page's runtime has stopped, which cannot
-        // happen while the window holds its controller; ignore the send result rather
-        // than unwrap a case that cannot occur here.
-        let _ = controller.sender().send(PageMsg::Rerender);
+        // Build one page per visible category, in sidebar order (R4.2).
+        let mut controllers = Vec::new();
+        for category in visible_categories(&caps) {
+            match page::plan_category(category, &caps) {
+                PagePlan::Framework(rows) => {
+                    let controller =
+                        page::build_page(self.store.clone(), rows, self.update_chrome.clone());
+                    let root = controller.widget().clone();
+                    self.stack
+                        .add_titled(&root, Some(category.stack_name()), category.title());
+                    if let Some(model_category) = chrome::marker_category(category) {
+                        self.marked
+                            .borrow_mut()
+                            .push((model_category, root.upcast()));
+                    }
+                    controllers.push(controller);
+                }
+                PagePlan::NoSpec => {
+                    let placeholder = build_placeholder_page(category);
+                    self.stack.add_titled(
+                        &placeholder,
+                        Some(category.stack_name()),
+                        category.title(),
+                    );
+                }
+                // Every row gated out: drop the category (R4.2); `plan_category` logged it.
+                PagePlan::Emptied => {}
+            }
+        }
+
+        // Refresh the chrome for the new page set, and retain the fresh controllers so
+        // the window can send them `Rerender` (dropping any from a previous populate).
+        (self.update_chrome)();
+        *self.controllers.borrow_mut() = controllers;
+    }
+
+    /// Wires the Apply button to run the pipeline and handle its outcome (R5.3–R5.6).
+    ///
+    /// See the module docs: the plan is interim (validations only, no writes yet), the
+    /// pipeline is given the store's real freshness tracker so its conflict check
+    /// measures against the loaded baselines (R5.6), the outcome is dispatched through
+    /// [`chrome::respond_to_apply`], and an
+    /// [`ApplyOutcome::Applied`](crate::core::apply::ApplyOutcome::Applied) is committed
+    /// to the store with the plan's written paths + bytes before the pages are
+    /// re-rendered and the chrome refreshed. A non-fatal reload failure raises a toast;
+    /// any abort/failure shows a modal warning.
+    fn wire_apply(&self, apply_button: &Button) {
+        let shell = self.clone();
+        apply_button.connect_clicked(move |_| {
+            let plan = interim_apply_plan(&shell.store.borrow());
+
+            // Side-effect seams: the real system runner/signaller. The freshness tracker
+            // is the store's own (task 5.4), holding the baselines recorded when the
+            // startup load read the backing files, so step 2 measures against them
+            // (R5.6). The immutable borrow ends before the commit below borrows mutably.
+            let runner = SystemCommandRunner::new();
+            let signaller = SystemProcessSignaller::new();
+            let outcome = {
+                let store = shell.store.borrow();
+                let caps = shell.capabilities.borrow();
+                apply::run(&plan, store.freshness(), &caps, &runner, &signaller)
+            };
+
+            match chrome::respond_to_apply(&outcome) {
+                ApplyResponse::Commit { toast: message } => {
+                    // The writes stood (R5.5). Commit reconciles the store: promote
+                    // staged→original and re-baseline the written files' freshness from
+                    // the exact bytes written, so the app's own write is not seen as an
+                    // external conflict on the next apply (task 4.5). The bytes come from
+                    // the plan's writes (empty for the interim plan, so this promotes
+                    // staged→original).
+                    let committed: Vec<(PathBuf, Vec<u8>)> = plan
+                        .writes
+                        .iter()
+                        .map(|write| (write.path.clone(), write.contents.clone()))
+                        .collect();
+                    shell.store.borrow_mut().commit_apply(&committed);
+                    shell.rerender_pages();
+                    (shell.update_chrome)();
+                    if let Some(message) = message {
+                        shell.toast.show(&message);
+                    }
+                    tracing::info!("apply committed; store reconciled (task 5.3/4.5)");
+                }
+                ApplyResponse::Warn { heading, detail } => {
+                    chrome::show_warning(&shell.window, &heading, &detail);
+                }
+            }
+        });
+    }
+
+    /// Wires the Reset button to discard staged edits and revert the controls (R5.1).
+    fn wire_reset(&self, reset_button: &Button) {
+        let shell = self.clone();
+        reset_button.connect_clicked(move |_| {
+            shell.store.borrow_mut().reset();
+            shell.rerender_pages();
+            (shell.update_chrome)();
+            tracing::debug!("discarded staged edits from the Reset button (R5.1)");
+        });
+    }
+
+    /// Wires the Refresh button to re-run detection, repopulate, and warn on conflicts
+    /// (R4.3/R5.6).
+    ///
+    /// It re-detects capabilities, re-reads the tracked files (surfacing external edits
+    /// as a conflict warning via [`chrome::refresh_conflict_warning`]), then repopulates
+    /// the stack so categories/rows that appeared or disappeared are reflected. Detection
+    /// is re-run synchronously here — unlike the cold-start path (task 5.4) it is a
+    /// user-initiated action off the startup budget, and re-reading the already-tracked
+    /// files is quick.
+    fn wire_refresh(&self, refresh_button: &Button) {
+        let shell = self.clone();
+        refresh_button.connect_clicked(move |_| {
+            // R4.3: re-run detection over freshly gathered inputs.
+            let inputs = DetectionInputs::from_system(Vec::new());
+            *shell.capabilities.borrow_mut() = Capabilities::detect(&inputs);
+
+            // R5.6: re-read the tracked files; an external edit reloads originals
+            // (keeping pending edits) and is reported for the warning below.
+            let report = shell.store.borrow_mut().refresh();
+
+            // Repopulate the stack for the new capabilities (categories/rows may appear
+            // or disappear).
+            shell.populate();
+
+            if let Some(warning) = chrome::refresh_conflict_warning(&report) {
+                chrome::show_warning(&shell.window, &warning.heading, &warning.detail);
+            }
+            tracing::info!("manual detection refresh + external-edit check complete (R4.3/R5.6)");
+        });
+    }
+
+    /// Sends every retained page controller a [`PageMsg::Rerender`] so its controls
+    /// re-render from the shared store (task 5.3).
+    ///
+    /// Used after the window changes the store from outside a page — a Reset or an
+    /// applied commit — so a control that no longer matches the store (its original
+    /// reverted, or reloaded) snaps back.
+    fn rerender_pages(&self) {
+        for controller in self.controllers.borrow().iter() {
+            // The receiver only goes away if the page's runtime has stopped, which cannot
+            // happen while the window holds its controller; ignore the send result rather
+            // than unwrap a case that cannot occur here.
+            let _ = controller.sender().send(PageMsg::Rerender);
+        }
     }
 }
 
@@ -415,8 +546,8 @@ fn rerender_pages(controllers: &Rc<RefCell<Vec<Controller<SettingsPage>>>>) {
 /// format parsers and is §6 page glue. So a v1 Apply validates and — with nothing to
 /// write — completes as
 /// [`ApplyOutcome::Applied`](crate::core::apply::ApplyOutcome::Applied), which the
-/// caller commits (promoting staged→original, clearing dirty). Task 5.4/§6 fill in the
-/// real writes and the store's freshness tracker.
+/// caller commits (promoting staged→original, clearing dirty). §6 fills in the real
+/// writes.
 fn interim_apply_plan(store: &SettingsStore) -> ApplyPlan {
     let validations = store
         .dirty_ids()
@@ -431,97 +562,29 @@ fn interim_apply_plan(store: &SettingsStore) -> ApplyPlan {
     }
 }
 
-/// Seeds the shared store with the interim demo values against the [`SeedSource`] file
-/// (task 5.3).
+/// Builds the loading placeholder shown while the startup worker runs (task 5.4).
 ///
-/// Registers every framework setting ([`page::interim_seed_values`]) under the seed
-/// file's path so the pages have values to render and staging never fails `NotLoaded`.
-/// The baseline bytes match the file's on-disk contents so a later
-/// [`SettingsStore::refresh`] finds no self-conflict. Interim only — task 5.4 replaces
-/// it with real config parsing.
-fn seed_interim_store(store: &mut SettingsStore, seed: &SeedSource) {
-    let values = page::interim_seed_values();
-    let reader_values = values.clone();
-    // The reader re-reads the seed file and re-serves the fixed demo values. It is only
-    // ever invoked if the seed file's bytes change (they do not), so in practice it is
-    // never called; it exists to keep the store parser-agnostic.
-    let reader: FileReader = Box::new(move |path: &Path| {
-        let bytes = std::fs::read(path)?;
-        Ok(FileValues {
-            bytes,
-            values: reader_values.clone(),
-        })
-    });
-    store.load_file(
-        seed.path().to_path_buf(),
-        FileValues {
-            bytes: seed.baseline_bytes(),
-            values,
-        },
-        reader,
-    );
-}
+/// A centred spinner and label so the window reads as "working" rather than empty
+/// during the brief window before detection + parsing complete. It uses only plain
+/// GTK4 widgets and inherits the system theme (R2.1); [`Shell::populate`] removes it
+/// from the stack once the real pages arrive.
+fn build_loading_page() -> GtkBox {
+    let content = GtkBox::new(Orientation::Vertical, CONTENT_SPACING);
+    content.set_halign(Align::Center);
+    content.set_valign(Align::Center);
+    content.set_hexpand(true);
+    content.set_vexpand(true);
 
-/// An interim on-disk backing for the seeded store so [`SettingsStore::refresh`]
-/// behaves during task 5.3 (task 5.4 replaces this with the real config files).
-///
-/// The store's freshness tracker needs a real, readable file to compare against, so
-/// the seed values are backed by a [`NamedTempFile`] kept alive here. If the temp file
-/// cannot be created (a near-impossible degraded environment), it falls back to a
-/// synthetic path: staging still works (the store is loaded), but a manual refresh may
-/// then report the seed path as an external change — an acceptable degradation for a
-/// case that essentially never occurs.
-struct SeedSource {
-    /// The path the store tracks the seed under — the temp file, or the fallback.
-    path: PathBuf,
-    /// The temp file, kept alive so it is not deleted; `None` in the fallback.
-    _file: Option<NamedTempFile>,
-}
+    let spinner = Spinner::new();
+    spinner.set_halign(Align::Center);
+    spinner.start();
+    content.append(&spinner);
 
-impl SeedSource {
-    /// Creates the interim seed, preferring a real temp file (see the type docs).
-    fn new() -> Self {
-        match create_seed_file() {
-            Ok(file) => SeedSource {
-                path: file.path().to_path_buf(),
-                _file: Some(file),
-            },
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "could not create the interim seed temp file; external-edit refresh may be \
-                     inaccurate until real config loading (task 5.4)"
-                );
-                SeedSource {
-                    path: PathBuf::from(SEED_FALLBACK_PATH),
-                    _file: None,
-                }
-            }
-        }
-    }
+    let label = Label::new(Some("Detecting installed applications…"));
+    label.set_halign(Align::Center);
+    content.append(&label);
 
-    /// The path the seed is tracked under.
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// The bytes matching the seed file's on-disk contents, for the freshness baseline.
-    fn baseline_bytes(&self) -> Vec<u8> {
-        if self._file.is_some() {
-            SEED_MARKER.to_vec()
-        } else {
-            Vec::new()
-        }
-    }
-}
-
-/// Creates and populates the interim seed temp file.
-fn create_seed_file() -> io::Result<NamedTempFile> {
-    use std::io::Write;
-    let mut file = NamedTempFile::new()?;
-    file.write_all(SEED_MARKER)?;
-    file.flush()?;
-    Ok(file)
+    content
 }
 
 /// Builds the placeholder content for one category page (task 5.1).

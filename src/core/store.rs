@@ -432,6 +432,21 @@ impl SettingsStore {
         self.settings.get(&id).map(|entry| &entry.original)
     }
 
+    /// The freshness tracker holding the baselines recorded when the backing files
+    /// were loaded, for the Apply pipeline's conflict check (task 4.5/5.4; R5.6).
+    ///
+    /// The Apply pipeline ([`crate::core::apply::run`]) is a pure orchestrator that
+    /// takes the tracker by reference so its step-2 conflict check measures the target
+    /// files against the *store's* real baselines — the exact bytes it parsed each
+    /// original from — rather than an empty tracker that could never detect an
+    /// external edit. Exposed as a shared borrow because `run` only reads it;
+    /// re-baselining after a successful apply happens through
+    /// [`commit_apply`](Self::commit_apply), which the caller invokes with `&mut self`
+    /// once the borrow returned here has ended.
+    pub(crate) fn freshness(&self) -> &FreshnessTracker {
+        &self.freshness
+    }
+
     /// Re-reads the tracked backing files and reloads the originals of any that were
     /// edited externally since the store last read them (R5.6).
     ///

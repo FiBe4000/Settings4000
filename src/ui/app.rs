@@ -38,7 +38,6 @@ use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, gio, glib};
 
 use super::window;
-use crate::core::detect::{Capabilities, DetectionInputs};
 
 /// The fixed GApplication ID that identifies Settings4000 on the session bus.
 ///
@@ -116,22 +115,16 @@ fn on_activate(app: &Application) {
 }
 
 /// Builds the top-level [`ApplicationWindow`] with its sidebar-plus-stack content
-/// (task 5.1).
+/// (task 5.1/5.4).
 ///
-/// Runs installed-app detection (task 4.3) once so the window shows only the
-/// categories whose backing tools are present (R4.2), then hands the resulting
-/// [`Capabilities`] to [`window::build`], which constructs the sidebar and stack.
-///
-/// Detection runs synchronously here for now. Moving it — and the file parsing —
-/// onto a worker thread that runs concurrently with window construction, to stay
-/// inside the <500 ms cold-start budget (R8.1, architecture §8), is task 5.4. No
-/// config-readability paths are passed to detection: that gating is a per-row (§6)
-/// concern, whereas the category shell gates only on binary/daemon/palette-source
-/// presence.
+/// Returns immediately: [`window::build`] shows a loading placeholder and runs
+/// installed-app detection (task 4.3) plus config parsing on a worker thread, then
+/// populates the store and builds the sidebar/pages on the main thread when that
+/// completes (architecture §8). Doing the slow work off-thread — rather than
+/// synchronously here — is what keeps cold start inside the <500 ms budget (R8.1); a
+/// missing tool or unreadable config never blocks startup (R4.3).
 fn build_main_window(app: &Application) -> ApplicationWindow {
-    let inputs = DetectionInputs::from_system(Vec::new());
-    let capabilities = Capabilities::detect(&inputs);
-    window::build(app, &capabilities)
+    window::build(app)
 }
 
 #[cfg(test)]

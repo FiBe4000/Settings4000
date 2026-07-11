@@ -8,6 +8,16 @@
 //! and fails if any file imports or otherwise references `gtk`, `gtk4`, or
 //! `relm4` (the latter re-exports GTK and would be an equivalent backdoor).
 //!
+//! It also guards a small set of **individual files inside the otherwise-GTK
+//! `ui/` layer** that are GTK-free by design — currently `src/ui/startup.rs`,
+//! the worker-thread startup-load logic (task 5.4), which is headlessly tested
+//! (R6.2) and must stay pure so the load can be reasoned about without a
+//! display. Nothing else prevents a future edit from importing the toolkit
+//! there, so this test does. For those files the forbidden set additionally
+//! includes `glib` (the GLib bindings `gtk4` re-exports): the threading handoff
+//! belongs in `window.rs`, which owns the persistent shell, not in the pure
+//! load logic.
+//!
 //! The task breakdown (`docs/tasks.md` §1.1) explicitly calls for this
 //! grep-style guard "or workspace crate split"; should the crate later be split
 //! so that `core`/`parsers` live in a GUI-free crate, this test becomes
@@ -31,16 +41,30 @@ use std::path::{Path, PathBuf};
 /// supposedly headless layers just as effectively.
 const FORBIDDEN_CRATES: &[&str] = &["gtk", "gtk4", "relm4"];
 
+/// Crate roots forbidden in the individually-guarded GTK-free files under `ui/`
+/// (see [`GTK_FREE_UI_FILES`]).
+///
+/// Extends [`FORBIDDEN_CRATES`] with `glib`, the GLib bindings `gtk4` re-exports:
+/// `src/ui/startup.rs` is the worker-thread startup-load logic and is GTK-free by
+/// construction (headlessly tested, R6.2), so it must not reach for glib's
+/// main-context/executor either — the threading handoff belongs in `window.rs`,
+/// which owns the persistent shell.
+const UI_FILE_FORBIDDEN_CRATES: &[&str] = &["gtk", "gtk4", "relm4", "glib"];
+
 /// The GTK-free layers whose source is scanned. Paths are relative to the crate
 /// root (`CARGO_MANIFEST_DIR`).
 const GTK_FREE_LAYERS: &[&str] = &["src/core", "src/parsers"];
+
+/// GTK-free source *files* that live inside the otherwise-GTK `ui/` layer and so
+/// are guarded individually rather than by directory. Paths are relative to the
+/// crate root.
+const GTK_FREE_UI_FILES: &[&str] = &["src/ui/startup.rs"];
 
 #[test]
 fn core_and_parsers_are_gtk_free() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
-    let mut violations: Vec<String> = Vec::new();
-
+    let mut files: Vec<PathBuf> = Vec::new();
     for layer in GTK_FREE_LAYERS {
         let layer_dir = manifest_dir.join(layer);
         assert!(
@@ -48,34 +72,80 @@ fn core_and_parsers_are_gtk_free() {
             "expected GTK-free layer directory {} to exist (architecture §2)",
             layer_dir.display()
         );
-
-        for file in rust_sources(&layer_dir) {
-            let source = fs::read_to_string(&file)
-                .unwrap_or_else(|e| panic!("failed to read {}: {e}", file.display()));
-            let code = strip_comments(&source);
-
-            for (line_no, line) in code.lines().enumerate() {
-                if let Some(crate_name) = forbidden_reference(line) {
-                    // Report a repo-relative path so the failure reads clearly
-                    // regardless of where the checkout lives.
-                    let rel = file.strip_prefix(&manifest_dir).unwrap_or(&file);
-                    violations.push(format!(
-                        "{}:{} references `{crate_name}`: {}",
-                        rel.display(),
-                        line_no + 1,
-                        line.trim()
-                    ));
-                }
-            }
-        }
+        files.extend(rust_sources(&layer_dir));
     }
 
+    let violations = scan_for_forbidden(&files, FORBIDDEN_CRATES, &manifest_dir);
     assert!(
         violations.is_empty(),
         "`core/` and `parsers/` must not import or reference gtk/relm4 \
          (architecture §2, R6.2). Offending lines:\n{}",
         violations.join("\n")
     );
+}
+
+#[test]
+fn startup_load_logic_is_gtk_free() {
+    // `src/ui/startup.rs` lives under the GTK `ui/` layer but is GTK-free by
+    // design (task 5.4): its detection + config-parsing logic is headlessly
+    // tested (R6.2), so it must not import the toolkit — nor `glib`, since the
+    // worker/main-thread handoff belongs in `window.rs`, not the pure load.
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    let files: Vec<PathBuf> = GTK_FREE_UI_FILES
+        .iter()
+        .map(|file| manifest_dir.join(file))
+        .collect();
+    for file in &files {
+        assert!(
+            file.is_file(),
+            "expected guarded GTK-free file {} to exist (task 5.4)",
+            file.display()
+        );
+    }
+
+    let violations = scan_for_forbidden(&files, UI_FILE_FORBIDDEN_CRATES, &manifest_dir);
+    assert!(
+        violations.is_empty(),
+        "the GTK-free `ui/` files must not import or reference gtk/relm4/glib \
+         (architecture §2, R6.2). Offending lines:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// Scans each file in `files` for a reference to any crate in `forbidden`,
+/// returning a repo-relative description of every offending line.
+///
+/// Comments are blanked first (see [`strip_comments`]) so a crate name mentioned
+/// in prose never counts. Shared by both guards so the layer scan and the
+/// individual-file scan apply identical lexical rules, differing only in which
+/// crates they forbid.
+fn scan_for_forbidden(
+    files: &[PathBuf],
+    forbidden: &[&'static str],
+    manifest_dir: &Path,
+) -> Vec<String> {
+    let mut violations: Vec<String> = Vec::new();
+    for file in files {
+        let source = fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", file.display()));
+        let code = strip_comments(&source);
+
+        for (line_no, line) in code.lines().enumerate() {
+            if let Some(crate_name) = forbidden_reference(line, forbidden) {
+                // Report a repo-relative path so the failure reads clearly
+                // regardless of where the checkout lives.
+                let rel = file.strip_prefix(manifest_dir).unwrap_or(file);
+                violations.push(format!(
+                    "{}:{} references `{crate_name}`: {}",
+                    rel.display(),
+                    line_no + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+    violations
 }
 
 /// Collects every `.rs` file under `dir`, recursing into subdirectories so that
@@ -159,13 +229,17 @@ fn strip_comments(source: &str) -> String {
 }
 
 /// Inspects a single comment-free code line and returns the forbidden crate it
-/// references, if any.
+/// references, if any, from the `forbidden` set.
 ///
 /// Two shapes are recognized:
 /// 1. An import declaration — `use <crate>…` or `extern crate <crate>` (after
 ///    an optional `pub`/`pub(…)` visibility modifier).
 /// 2. A fully-qualified path — a bare `<crate>::` prefix used without a `use`.
-fn forbidden_reference(line: &str) -> Option<&'static str> {
+///
+/// The `forbidden` set is a parameter so the same lexical rules guard both the
+/// `core`/`parsers` layers and the individually-guarded `ui/` files, which forbid
+/// a slightly wider set (adding `glib`).
+fn forbidden_reference(line: &str, forbidden: &[&'static str]) -> Option<&'static str> {
     let trimmed = strip_visibility(line.trim());
 
     // Case 1: import declarations.
@@ -174,13 +248,13 @@ fn forbidden_reference(line: &str) -> Option<&'static str> {
         .or_else(|| trimmed.strip_prefix("extern crate "));
     if let Some(rest) = import_target {
         let first = first_path_segment(rest);
-        if let Some(&crate_name) = FORBIDDEN_CRATES.iter().find(|&&c| first == c) {
+        if let Some(&crate_name) = forbidden.iter().find(|&&c| first == c) {
             return Some(crate_name);
         }
     }
 
     // Case 2: any fully-qualified `<crate>::` usage anywhere on the line.
-    FORBIDDEN_CRATES
+    forbidden
         .iter()
         .find(|&&crate_name| contains_path_prefix(line, crate_name))
         .copied()

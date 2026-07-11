@@ -23,13 +23,16 @@
 //!   apply-outcome→toast/dialog/commit, refresh-report→conflict warning) plus the
 //!   plain-GTK toast and warning dialog (task 5.3). The decisions are headlessly
 //!   tested (R6.2).
+//! - [`startup`] — the worker-thread startup load (task 5.4): the GTK-free logic that
+//!   runs detection and parses the backing config files off the main thread, which
+//!   the window applies on completion. Headlessly tested (R6.2).
 //!
-//! The real per-category page content (§6) and worker-thread startup wiring (task
-//! 5.4) plug into this shell in later tasks.
+//! The real per-category page content (§6) plugs into this shell in later tasks.
 
 pub(crate) mod app;
 mod category;
 mod chrome;
 mod page;
 mod row;
+mod startup;
 mod window;

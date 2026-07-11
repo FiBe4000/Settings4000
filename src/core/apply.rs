@@ -1269,4 +1269,93 @@ mod tests {
             );
         }
     }
+
+    // --- The store's freshness tracker wired into apply (task 5.4) ---------------
+
+    #[test]
+    fn a_second_apply_after_commit_is_not_a_self_conflict() {
+        // Task 5.4 wires the store's real freshness tracker (populated by the startup
+        // load) into `run` via `SettingsStore::freshness`, replacing the empty tracker
+        // the interim 5.3 wiring used. This exercises the loop the task-4.5 commit
+        // contract closes: after a successful apply the caller commits — promoting
+        // staged→original and re-baselining the written file from the exact bytes —
+        // so the app's own write is NOT mistaken for an external edit on the next
+        // apply's step-2 conflict check.
+        use crate::core::store::{FileReader, FileValues, SettingsStore};
+
+        let dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let path = write_file(&dir, "input.conf", b"input {\n  sensitivity = 0.0\n}\n");
+
+        // Load the file into a real store, establishing the freshness baseline from
+        // the exact bytes read (as the startup loader does). The reader is trivial
+        // here: these assertions never trigger a conflict reload.
+        let reader: FileReader = Box::new(|p: &Path| {
+            let bytes = fs::read(p)?;
+            Ok(FileValues {
+                bytes,
+                values: Vec::new(),
+            })
+        });
+        let mut store = SettingsStore::new();
+        let bytes = fs::read(&path).expect("read the fixture");
+        store.load_file(
+            &path,
+            FileValues {
+                bytes,
+                values: vec![(SettingId::MouseSensitivity, Value::Float(0.0))],
+            },
+            reader,
+        );
+        store
+            .stage(SettingId::MouseSensitivity, Value::Float(0.5))
+            .expect("a valid edit stages");
+
+        let new_bytes = b"input {\n  sensitivity = 0.5\n}\n".to_vec();
+        let plan = ApplyPlan {
+            validations: vec![(SettingId::MouseSensitivity, Value::Float(0.5))],
+            writes: vec![FileWrite {
+                path: path.clone(),
+                contents: new_bytes.clone(),
+                changed_keys: vec!["input:sensitivity".to_string()],
+                backing: BackingFile::InputConf,
+            }],
+            palette: None,
+            reload_params: ReloadParams::default(),
+        };
+        let runner = MockCommandRunner::new();
+        let signaller = MockProcessSignaller::new();
+        // No hyprctl/live IPC, so the InputConf reload is gated out — this test is
+        // about the conflict check, not the reload set.
+        let caps = Capabilities::for_tests(&[], &[], false);
+
+        // First apply: the baseline still matches disk, so no conflict; the file is
+        // written and reported for the caller to commit.
+        let written = match run(&plan, store.freshness(), &caps, &runner, &signaller) {
+            ApplyOutcome::Applied { written, .. } => written,
+            other => panic!("expected Applied on the first apply, got {other:?}"),
+        };
+        assert_eq!(written, vec![path.clone()]);
+
+        // Commit reconciles the store: promote staged→original and re-baseline the
+        // written file from the exact bytes written.
+        let committed: Vec<(PathBuf, Vec<u8>)> = written
+            .into_iter()
+            .map(|p| (p, new_bytes.clone()))
+            .collect();
+        store.commit_apply(&committed);
+
+        // Second apply over the store's now-re-baselined tracker: the on-disk bytes
+        // are the app's own write, which must NOT read as an external conflict.
+        let empty_plan = ApplyPlan {
+            validations: Vec::new(),
+            writes: Vec::new(),
+            palette: None,
+            reload_params: ReloadParams::default(),
+        };
+        let outcome = run(&empty_plan, store.freshness(), &caps, &runner, &signaller);
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied { .. }),
+            "a second apply after commit must not self-conflict, got {outcome:?}"
+        );
+    }
 }

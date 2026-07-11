@@ -391,6 +391,28 @@ impl Capabilities {
         capabilities
     }
 
+    /// An all-absent capability set: no binary, no live daemon, no portal, no
+    /// palette source (task 5.4).
+    ///
+    /// This is the window's *initial* state before the startup worker delivers real
+    /// detection results (architecture §8): the shell is built while detection runs
+    /// concurrently on a worker thread, so the window needs a placeholder capability
+    /// value before the first real one arrives. Every query reports "absent", so no
+    /// category is shown until the worker completes. It is also the value the window
+    /// falls back to if the worker fails to deliver a result, so the user still gets
+    /// a usable (if empty) window with a working Refresh action (R4.3). Unlike
+    /// [`Capabilities::detect`] it runs no probes and logs nothing.
+    pub(crate) fn absent() -> Capabilities {
+        Capabilities {
+            present_binaries: BTreeSet::new(),
+            live_daemons: BTreeSet::new(),
+            hyprland_ipc: false,
+            settings_portal: false,
+            palette_source: None,
+            unreadable_configs: BTreeSet::new(),
+        }
+    }
+
     /// Whether `binary` was found on `$PATH`.
     pub(crate) fn has_binary(&self, binary: Binary) -> bool {
         self.present_binaries.contains(&binary)
