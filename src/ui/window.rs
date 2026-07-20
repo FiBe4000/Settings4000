@@ -1407,7 +1407,11 @@ impl Shell {
 /// this stays a thin shared starting point — the Notifications page (task 6.7) folds in
 /// its swaync `config.json` write the same way as Input, and the remaining store-backed
 /// §6 pages will do likewise.
-fn interim_apply_plan(store: &SettingsStore) -> ApplyPlan {
+///
+/// Crate-visible so `crate::testing` can re-expose it to the integration suites (task
+/// 7.2), which assemble their Apply plans through this exact function rather than a
+/// test re-implementation.
+pub(crate) fn interim_apply_plan(store: &SettingsStore) -> ApplyPlan {
     let validations = store
         .dirty_ids()
         .into_iter()

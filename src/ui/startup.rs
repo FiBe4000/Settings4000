@@ -491,7 +491,11 @@ fn push_loaded(
 /// actually present and parseable become settings. An out-of-range value on disk is
 /// stored verbatim as the original (the store validates only staged edits), so a
 /// hand-written config is never rejected at load.
-fn load_input_conf(path: &Path) -> io::Result<FileValues> {
+///
+/// Crate-visible (like the other two loaders) so `crate::testing` can re-expose it
+/// to the integration suites, which must load the store through the app's real
+/// loader rather than a test re-implementation (task 7.2).
+pub(crate) fn load_input_conf(path: &Path) -> io::Result<FileValues> {
     let bytes = std::fs::read(path)?;
     // Scope the parse so the borrow of `bytes` (through `text`) and the parsed file
     // are both dropped before `bytes` is moved into the returned `FileValues`.
@@ -556,7 +560,9 @@ fn load_input_conf(path: &Path) -> io::Result<FileValues> {
 /// [`io::Error`] so the caller skips the file with a `warn`, consistent with the
 /// other loaders — swaync itself would reject such a file, so there is nothing to
 /// edit.
-fn load_swaync_config(path: &Path) -> io::Result<FileValues> {
+///
+/// Crate-visible for the same reason as [`load_input_conf`] (task 7.2).
+pub(crate) fn load_swaync_config(path: &Path) -> io::Result<FileValues> {
     let bytes = std::fs::read(path)?;
     let values = {
         let text = String::from_utf8_lossy(&bytes);
@@ -596,7 +602,9 @@ fn load_swaync_config(path: &Path) -> io::Result<FileValues> {
 /// actually present and parseable become settings. An out-of-range value on disk is stored
 /// verbatim as the original (the store validates only staged edits), so a hand-written
 /// config is never rejected at load.
-fn load_hypridle_conf(path: &Path) -> io::Result<FileValues> {
+///
+/// Crate-visible for the same reason as [`load_input_conf`] (task 7.2).
+pub(crate) fn load_hypridle_conf(path: &Path) -> io::Result<FileValues> {
     let bytes = std::fs::read(path)?;
     let values = {
         let text = String::from_utf8_lossy(&bytes);

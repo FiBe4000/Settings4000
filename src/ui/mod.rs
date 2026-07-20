@@ -72,6 +72,11 @@ mod notifications;
 mod page;
 mod row;
 mod sound;
-mod startup;
+// `startup` and `window` are crate-visible (not `pub`) so the test-support
+// module (`crate::testing`, task 7.2) can re-expose their GTK-free pieces —
+// the backing-file loaders and the base Apply-plan builder — letting the
+// integration suites drive the exact code paths the app runs. Nothing outside
+// the crate can reach them directly; the public surface stays `ui::app`.
+pub(crate) mod startup;
 mod theme;
-mod window;
+pub(crate) mod window;

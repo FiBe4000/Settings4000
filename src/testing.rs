@@ -1,4 +1,5 @@
-//! Test support: the fixture-dotfiles installer (task 7.1, R6.1).
+//! Test support: the fixture-dotfiles installer (task 7.1, R6.1) and the shared
+//! harness of the end-to-end Apply suites (task 7.2).
 //!
 //! Integration suites need a realistic dotfiles environment: a repo tree like
 //! `~/.dotfiles` (palette sources, `scripts/generate-colors`, `theme/fonts`,
@@ -29,11 +30,17 @@
 //! runtime paths" rule applies to the shipped application, not to test-only
 //! scaffolding.
 
+use std::collections::BTreeMap;
 use std::fs;
+use std::io;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
+
+use crate::core::apply::{ApplyOutcome, ApplyPlan};
+use crate::core::reload::ReloadError;
+use crate::core::store::{FileValues, SettingsStore};
 
 /// The placeholder home-directory prefix used inside fixture files.
 ///
@@ -275,4 +282,168 @@ fn create_parent_dirs(path: &Path) {
         fs::create_dir_all(parent)
             .unwrap_or_else(|e| panic!("failed to create {}: {e}", parent.display()));
     }
+}
+
+// ===========================================================================
+// End-to-end Apply-suite harness (task 7.2, R5.3–R5.6, R6.1)
+// ===========================================================================
+
+/// The app's real startup loaders, re-exposed for the integration suites (task 7.2).
+///
+/// The end-to-end Apply suites must load the [`SettingsStore`] **exactly as the app
+/// does** — the same `SettingId` ↔ file-key mapping, the same re-reader registered
+/// for conflict reloads — so instead of re-implementing the mapping (which would
+/// drift), these thin wrappers hand the suites the crate-private loader functions
+/// from [`crate::ui::startup`]. Each has the plain-`fn` shape a
+/// [`FileReader`](crate::core::store::FileReader) needs, so a suite can pass the
+/// same function as both the initial load and the store's re-reader, mirroring the
+/// startup wiring.
+pub mod loaders {
+    use std::io;
+    use std::path::Path;
+
+    use crate::core::store::FileValues;
+
+    /// The app's `~/.config/hypr/input.conf` loader (Input page, task 6.6).
+    pub fn input_conf(path: &Path) -> io::Result<FileValues> {
+        crate::ui::startup::load_input_conf(path)
+    }
+
+    /// The app's `~/.config/swaync/config.json` loader (Notifications page, task 6.7).
+    pub fn swaync_config(path: &Path) -> io::Result<FileValues> {
+        crate::ui::startup::load_swaync_config(path)
+    }
+
+    /// The app's `~/.config/hypr/hypridle.conf` loader (Power & Idle page, task 6.8).
+    pub fn hypridle_conf(path: &Path) -> io::Result<FileValues> {
+        crate::ui::startup::load_hypridle_conf(path)
+    }
+}
+
+/// Loads one backing file into `store` through the given app loader, registering the
+/// same loader as the file's conflict re-reader — the exact wiring the startup path
+/// performs per [`LoadedFile`](crate::ui::startup) (task 5.4/7.2).
+///
+/// Panics on a load failure: the suites always load a fixture file that exists, so a
+/// failure is a broken test setup to surface loudly (see the module docs on panics).
+pub fn load_into_store(
+    store: &mut SettingsStore,
+    path: &Path,
+    loader: fn(&Path) -> io::Result<FileValues>,
+) {
+    let initial =
+        loader(path).unwrap_or_else(|e| panic!("failed to load fixture {}: {e}", path.display()));
+    store.load_file(path, initial, Box::new(loader));
+}
+
+/// Builds the base [`ApplyPlan`] from the store's dirty edits, through the app's real
+/// plan builder (`ui::window::interim_apply_plan`, task 5.3/7.2).
+///
+/// The suites then fold in the per-page writes exactly as the window's Apply handler
+/// does — the store-driven `FileWrite`s from the page models, plus the Display/Theme
+/// contributions — so the plan a suite runs is assembled by the same code the app runs.
+pub fn base_apply_plan(store: &SettingsStore) -> ApplyPlan {
+    crate::ui::window::interim_apply_plan(store)
+}
+
+/// Unwraps an [`ApplyOutcome::Applied`], returning its reload failures and written
+/// paths; panics (with the outcome) on any other variant.
+///
+/// The suites' happy-path and reload-failure assertions all start from an `Applied`
+/// outcome, so this keeps the match noise out of every test.
+pub fn expect_applied(outcome: ApplyOutcome) -> (Vec<ReloadError>, Vec<PathBuf>) {
+    match outcome {
+        ApplyOutcome::Applied {
+            reload_failures,
+            written,
+        } => (reload_failures, written),
+        other => panic!("expected ApplyOutcome::Applied, got {other:?}"),
+    }
+}
+
+/// Snapshots every file in the installed repo tree: repo-relative path → exact bytes.
+///
+/// Taken before an Apply and diffed after it (see [`assert_repo_untouched_except`]),
+/// this is what lets a suite assert the surgical-write contract tree-wide: *only* the
+/// planned files changed, and every other file — including the generated color/font
+/// partials a rolled-back palette apply must never touch — is byte-identical (R5.3).
+pub fn repo_snapshot(fx: &FixtureDotfiles) -> BTreeMap<String, Vec<u8>> {
+    let mut snapshot = BTreeMap::new();
+    let root = fx.repo_root();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries =
+            fs::read_dir(&dir).unwrap_or_else(|e| panic!("failed to read {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry
+                .unwrap_or_else(|e| panic!("failed to read entry in {}: {e}", dir.display()))
+                .path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap_or_else(|_| panic!("{} is outside the repo root", path.display()))
+                    .to_str()
+                    .unwrap_or_else(|| panic!("non-UTF-8 fixture path {}", path.display()))
+                    .to_string();
+                let bytes = fs::read(&path)
+                    .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+                snapshot.insert(relative, bytes);
+            }
+        }
+    }
+    snapshot
+}
+
+/// Asserts that, relative to the `before` snapshot, exactly the files named in
+/// `expected_changed` (repo-relative paths) changed and every other repo file is
+/// byte-identical — the tree-wide surgical-write assertion (task 7.2, R5.3/R5.4).
+///
+/// Files named in `expected_changed` are additionally asserted to have *actually*
+/// changed, so a test that expected a write cannot pass vacuously on a no-op apply.
+/// The file **set** must be unchanged too: an Apply never creates or deletes repo
+/// files.
+pub fn assert_repo_untouched_except(
+    fx: &FixtureDotfiles,
+    before: &BTreeMap<String, Vec<u8>>,
+    expected_changed: &[&str],
+) {
+    let after = repo_snapshot(fx);
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>(),
+        "an Apply must never create or delete repo files"
+    );
+    for (path, old_bytes) in before {
+        let new_bytes = &after[path];
+        if expected_changed.contains(&path.as_str()) {
+            assert_ne!(
+                old_bytes, new_bytes,
+                "{path} was expected to change but is byte-identical"
+            );
+        } else {
+            assert_eq!(
+                old_bytes, new_bytes,
+                "{path} changed but was not a planned write target"
+            );
+        }
+    }
+}
+
+/// Replaces exactly one occurrence of `from` in `text` with `to`, panicking unless
+/// `from` occurs exactly once.
+///
+/// The suites build their *expected* post-apply bytes by patching the original
+/// fixture text — the surgical-edit contract says everything but the target span is
+/// byte-identical, so the expectation *is* the original with one span replaced. The
+/// exactly-once check keeps an ambiguous pattern (which could silently build a wrong
+/// expectation) from passing.
+pub fn replace_once(text: &str, from: &str, to: &str) -> String {
+    let occurrences = text.matches(from).count();
+    assert_eq!(
+        occurrences, 1,
+        "pattern {from:?} must occur exactly once in the fixture text, found {occurrences}"
+    );
+    text.replacen(from, to, 1)
 }
