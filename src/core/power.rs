@@ -97,7 +97,7 @@ const DPMS_LISTENER: usize = 2;
 /// the `timeout` key of a specific `listener { }` occurrence, and the lock command to
 /// `general.lock_cmd`. The read side ([`crate::ui::startup`]) uses this same map, so a
 /// value is parsed from and written back to the identical address.
-pub(crate) fn power_key_path(id: SettingId) -> Option<KeyPath> {
+pub fn power_key_path(id: SettingId) -> Option<KeyPath> {
     match id {
         SettingId::DimTimeout => Some(listener_timeout_path(DIM_LISTENER)),
         SettingId::LockTimeout => Some(listener_timeout_path(LOCK_LISTENER)),
@@ -141,11 +141,11 @@ fn value_to_hypr_string(id: SettingId, value: &Value) -> Option<String> {
 /// paths (e.g. `listener[1].timeout`, `general.lock_cmd`) used only for the apply-level
 /// log line (R7.3), never the file contents.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct HypridleConfEdit {
+pub struct HypridleConfEdit {
     /// The complete new file contents (surgical, span-preserving — §3).
-    pub(crate) contents: Vec<u8>,
+    pub contents: Vec<u8>,
     /// The section paths this edit changed, for logging.
-    pub(crate) changed_keys: Vec<String>,
+    pub changed_keys: Vec<String>,
 }
 
 /// Why [`PowerModel::hypridle_conf_write`] could not produce a write despite there being
@@ -159,7 +159,7 @@ pub(crate) struct HypridleConfEdit {
 /// in practice (`hypridle.conf` is readable and was parseable at load), but treating them
 /// as failures keeps the store and the file in agreement (R8.3).
 #[derive(Debug)]
-pub(crate) enum PowerWriteError {
+pub enum PowerWriteError {
     /// `hypridle.conf` could not be read to render the edits.
     Read(io::Error),
     /// The hyprlang writer rejected an edit — a value it cannot represent (a `#` or
@@ -196,7 +196,7 @@ impl std::error::Error for PowerWriteError {}
 /// newline/`#` (R8.3), or an addressed `listener`/`general` section that does not exist —
 /// leaving the caller to abort the apply rather than emit a partial file. A setting with
 /// no Power & Idle address is ignored (it does not belong to this file).
-pub(crate) fn render_hypridle_conf(
+pub fn render_hypridle_conf(
     bytes: &[u8],
     edits: &[(SettingId, Value)],
 ) -> Result<HypridleConfEdit, EditError> {
@@ -232,7 +232,7 @@ pub(crate) fn render_hypridle_conf(
 /// just turns the store's dirty Power & Idle settings into the one `hypridle.conf`
 /// [`FileWrite`] on Apply, which the pipeline then follows with a hypridle restart
 /// (task 4.4).
-pub(crate) struct PowerModel {
+pub struct PowerModel {
     /// The live XDG path of `hypridle.conf` (R8.5), read fresh when rendering a write.
     hypridle_conf: PathBuf,
 }
@@ -240,7 +240,7 @@ pub(crate) struct PowerModel {
 impl PowerModel {
     /// Builds the model, recording the `hypridle.conf` path (the production entry point,
     /// called from the startup worker — architecture §8).
-    pub(crate) fn load(hypridle_conf: PathBuf) -> PowerModel {
+    pub fn load(hypridle_conf: PathBuf) -> PowerModel {
         PowerModel { hypridle_conf }
     }
 
@@ -268,7 +268,7 @@ impl PowerModel {
     ///   caller must **abort the Apply** rather than skip the write, since the store would
     ///   otherwise commit the staged values against an unchanged file and desync. Both
     ///   failure modes are near-unreachable in practice.
-    pub(crate) fn hypridle_conf_write(
+    pub fn hypridle_conf_write(
         &self,
         dirty: &[(SettingId, Value)],
     ) -> Result<Option<FileWrite>, PowerWriteError> {

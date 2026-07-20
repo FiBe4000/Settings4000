@@ -88,7 +88,7 @@ use std::fmt;
 /// byte spans of its comma-separated fields. Emitting concatenates the raw line
 /// texts, so an unedited file reproduces its input exactly.
 #[derive(Clone, Debug)]
-pub(crate) struct MonitorsFile {
+pub struct MonitorsFile {
     /// The file's lines in original order. Concatenating every line's raw text
     /// reproduces the original input exactly (round-trip identity), and the
     /// order encodes Hyprland's later-rule-wins precedence, so it is never
@@ -151,7 +151,7 @@ enum LineKind {
 /// (analysis §6.2): mode is field 2, position field 3, scale field 4 — see the
 /// module-level "Keeping edits awk-parseable" note.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MonitorField {
+pub enum MonitorField {
     /// The mode, `WxH@Hz` or `preferred` (field 2).
     Mode,
     /// The position, `XxY` or `auto` (field 3).
@@ -184,7 +184,7 @@ impl MonitorField {
 /// The desired configuration of a monitor, used by
 /// [`MonitorsFile::set_state`] to enable, disable, or create a record.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum MonitorState {
+pub enum MonitorState {
     /// The output is on, with an explicit mode, position, and scale. Written as
     /// `monitor=<name>,<mode>,<position>,<scale>`. Any pre-existing trailing
     /// extras on the edited record are dropped, since this rewrites the whole
@@ -205,7 +205,7 @@ pub(crate) enum MonitorState {
 /// Whether [`MonitorsFile::set_state`] edited an existing record or appended a
 /// new one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SetOutcome {
+pub enum SetOutcome {
     /// A record with the target name already existed and was rewritten in place.
     Edited,
     /// No record matched, so a new one was appended after the last `monitor=`
@@ -221,7 +221,7 @@ pub(crate) enum SetOutcome {
 /// and surfaced as warnings, not panics). [`MonitorsFile::parse`] returns the
 /// collected warnings *and* logs each at `warn`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ParseWarning {
+pub struct ParseWarning {
     /// 1-based line number the warning concerns, for human-readable diagnostics.
     line: usize,
     /// What was wrong with the line.
@@ -230,12 +230,12 @@ pub(crate) struct ParseWarning {
 
 impl ParseWarning {
     /// The 1-based line number this warning concerns.
-    pub(crate) fn line(&self) -> usize {
+    pub fn line(&self) -> usize {
         self.line
     }
 
     /// What was wrong with the line.
-    pub(crate) fn kind(&self) -> &ParseWarningKind {
+    pub fn kind(&self) -> &ParseWarningKind {
         &self.kind
     }
 }
@@ -256,7 +256,7 @@ impl fmt::Display for ParseWarning {
 
 /// The specific reason a line produced a [`ParseWarning`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ParseWarningKind {
+pub enum ParseWarningKind {
     /// A `monitor=` line that is neither the disable form (`<name>,disable`) nor
     /// a full record with at least the four `name,mode,position,scale` fields the
     /// awk in `scripts/hypr-display-profile.sh` expects. It is kept byte-for-byte
@@ -274,7 +274,7 @@ pub(crate) enum ParseWarningKind {
 /// Every variant leaves the file completely unchanged: the check happens before
 /// any byte is spliced, so a rejected edit can never partially rewrite a record.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum EditError {
+pub enum EditError {
     /// No `monitor=` record whose name field equals the target exists.
     /// [`MonitorsFile::set_field`] returns this rather than creating a record,
     /// because a single field is not enough to build a valid one; use
@@ -335,7 +335,7 @@ impl MonitorsFile {
     /// (sorted by line number) and additionally logged at `warn`; it is not an
     /// error and does not stop parsing. Warnings carry only line numbers and a
     /// field count, never file contents (R7.3).
-    pub(crate) fn parse(input: &str) -> (Self, Vec<ParseWarning>) {
+    pub fn parse(input: &str) -> (Self, Vec<ParseWarning>) {
         let mut lines = Vec::new();
         let mut warnings = Vec::new();
 
@@ -366,7 +366,7 @@ impl MonitorsFile {
     ///
     /// After edits, the output is identical to the input except within the edited
     /// field spans and any record appended by [`set_state`](Self::set_state).
-    pub(crate) fn emit(&self) -> String {
+    pub fn emit(&self) -> String {
         let mut out = String::new();
         for line in &self.lines {
             out.push_str(&line.raw);
@@ -378,7 +378,7 @@ impl MonitorsFile {
     /// Hyprland's later-rule-wins order). The catch-all rule contributes an empty
     /// string. Lets a caller enumerate the configured outputs without guessing
     /// names.
-    pub(crate) fn record_names(&self) -> Vec<&str> {
+    pub fn record_names(&self) -> Vec<&str> {
         self.lines
             .iter()
             .filter_map(|line| match &line.kind {
@@ -390,7 +390,7 @@ impl MonitorsFile {
 
     /// Whether the record named `name` is enabled (`Some(true)`) or in the
     /// disable form (`Some(false)`), or `None` if no such record exists.
-    pub(crate) fn is_enabled(&self, name: &str) -> Option<bool> {
+    pub fn is_enabled(&self, name: &str) -> Option<bool> {
         let index = self.find_record(name)?;
         match &self.lines[index].kind {
             LineKind::Record { disabled, .. } => Some(!*disabled),
@@ -404,7 +404,7 @@ impl MonitorsFile {
     /// no such field), or the record is too short to have the requested field.
     /// If several records share the name the last (effective, later-rule-wins)
     /// one is read.
-    pub(crate) fn field(&self, name: &str, field: MonitorField) -> Option<&str> {
+    pub fn field(&self, name: &str, field: MonitorField) -> Option<&str> {
         let index = self.find_record(name)?;
         match &self.lines[index].kind {
             LineKind::Record {
@@ -433,7 +433,7 @@ impl MonitorsFile {
     ///
     /// If several records share the name the last (effective, later-rule-wins) one is
     /// read, mirroring [`Self::field`].
-    pub(crate) fn record_body(&self, name: &str) -> Option<&str> {
+    pub fn record_body(&self, name: &str) -> Option<&str> {
         let index = self.find_record(name)?;
         match &self.lines[index].kind {
             LineKind::Record {
@@ -474,7 +474,7 @@ impl MonitorsFile {
     ///   never creates a record.
     /// - [`EditError::RecordDisabled`] if the record is in the disable form.
     /// - [`EditError::FieldMissing`] if the record is too short to have the field.
-    pub(crate) fn set_field(
+    pub fn set_field(
         &mut self,
         name: &str,
         field: MonitorField,
@@ -539,11 +539,7 @@ impl MonitorsFile {
     /// Errors (each leaving the file untouched):
     /// - [`EditError::InvalidValue`] if any written value (the `Active` fields, or
     ///   the name when appending) contains a comma, newline, or `#`.
-    pub(crate) fn set_state(
-        &mut self,
-        name: &str,
-        state: &MonitorState,
-    ) -> Result<SetOutcome, EditError> {
+    pub fn set_state(&mut self, name: &str, state: &MonitorState) -> Result<SetOutcome, EditError> {
         let body = match state {
             MonitorState::Active {
                 mode,

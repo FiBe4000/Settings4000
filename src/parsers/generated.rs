@@ -53,7 +53,7 @@ use super::palette::{PALETTE_KEYS, PaletteFile, SchemaValidation};
 /// scheme in its drop-down, and falls back to a neutral "unknown" display when it
 /// cannot be determined.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ActiveScheme {
+pub enum ActiveScheme {
     /// A scheme name was extracted from a `# Generated from colors/<scheme>`
     /// header (e.g. `everforest`). The string is the `<scheme>` token exactly as
     /// it appeared after `colors/`, with its original case preserved (scheme names
@@ -70,7 +70,7 @@ impl ActiveScheme {
     ///
     /// A small convenience so callers can treat detection as an `Option` without
     /// matching the enum.
-    pub(crate) fn name(&self) -> Option<&str> {
+    pub fn name(&self) -> Option<&str> {
         match self {
             ActiveScheme::Named(name) => Some(name),
             ActiveScheme::Unknown => None,
@@ -95,7 +95,7 @@ impl ActiveScheme {
 /// are all accepted, while the two words and the literal `colors/` prefix followed
 /// by a non-empty scheme token are all *required*. Anything else yields
 /// [`ActiveScheme::Unknown`].
-pub(crate) fn detect_active_scheme(generated_file_contents: &str) -> ActiveScheme {
+pub fn detect_active_scheme(generated_file_contents: &str) -> ActiveScheme {
     for line in generated_file_contents.lines() {
         if let Some(scheme) = scheme_from_header_line(line) {
             return ActiveScheme::Named(scheme);
@@ -114,7 +114,7 @@ pub(crate) fn detect_active_scheme(generated_file_contents: &str) -> ActiveSchem
 /// this dotfiles setup, so it is logged at `debug` and treated as unknown — never
 /// an error that could abort startup (R4, R8.5). Only the path is logged, never
 /// the file contents (R7.3).
-pub(crate) fn read_active_scheme(generated_file_path: &Path) -> ActiveScheme {
+pub fn read_active_scheme(generated_file_path: &Path) -> ActiveScheme {
     match std::fs::read_to_string(generated_file_path) {
         Ok(contents) => detect_active_scheme(&contents),
         Err(error) => {
@@ -136,7 +136,7 @@ pub(crate) fn read_active_scheme(generated_file_path: &Path) -> ActiveScheme {
 /// complete, well-formed scheme from a broken one (e.g. one missing a key). It is
 /// purely a read view — there is no way to edit through it.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct SchemeSwatch {
+pub struct SchemeSwatch {
     /// The schema colors present in the file, in canonical [`PALETTE_KEYS`] order.
     /// A schema key with no entry in the file is omitted (a swatch can only show a
     /// color it has), so on a valid palette this holds all 17 and on a malformed
@@ -150,12 +150,12 @@ pub(crate) struct SchemeSwatch {
 
 impl SchemeSwatch {
     /// The present schema colors, in canonical schema order.
-    pub(crate) fn colors(&self) -> &[SwatchColor] {
+    pub fn colors(&self) -> &[SwatchColor] {
         &self.colors
     }
 
     /// The bare-hex value of `key`, if that schema key is present in the file.
-    pub(crate) fn color(&self, key: &str) -> Option<&str> {
+    pub fn color(&self, key: &str) -> Option<&str> {
         self.colors
             .iter()
             .find(|color| color.key == key)
@@ -164,7 +164,7 @@ impl SchemeSwatch {
 
     /// The palette's schema-validity report, for deciding whether the scheme is
     /// complete and well-formed.
-    pub(crate) fn validation(&self) -> &SchemaValidation {
+    pub fn validation(&self) -> &SchemaValidation {
         &self.validation
     }
 }
@@ -177,7 +177,7 @@ impl SchemeSwatch {
 /// carries a non-hex value is already reported through
 /// [`SchemeSwatch::validation`] and the palette parser's own warnings.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SwatchColor {
+pub struct SwatchColor {
     /// The canonical schema key (e.g. `bg0`, `accent0`).
     key: &'static str,
     /// The value as read from the file (a bare-hex color on a well-formed scheme).
@@ -186,12 +186,12 @@ pub(crate) struct SwatchColor {
 
 impl SwatchColor {
     /// The canonical schema key.
-    pub(crate) fn key(&self) -> &'static str {
+    pub fn key(&self) -> &'static str {
         self.key
     }
 
     /// The value as read from the file.
-    pub(crate) fn value(&self) -> &str {
+    pub fn value(&self) -> &str {
         &self.value
     }
 }
@@ -204,7 +204,7 @@ impl SwatchColor {
 /// swatch with whichever schema colors it could read and a [`SchemaValidation`] that
 /// reports what is wrong. The result is display-only and read-only — nothing here
 /// writes the file.
-pub(crate) fn parse_scheme_swatch(scheme_contents: &str) -> SchemeSwatch {
+pub fn parse_scheme_swatch(scheme_contents: &str) -> SchemeSwatch {
     // This parse is used both for the active scheme and to *probe* arbitrary files
     // while enumerating schemes (task 6.3), so the warnings are never surfaced at
     // `warn` (a non-palette file such as a README would otherwise log one per line).
@@ -248,7 +248,7 @@ pub(crate) fn parse_scheme_swatch(scheme_contents: &str) -> SchemeSwatch {
 /// or not valid UTF-8 — treated as "no swatch for this scheme" rather than an
 /// error, consistent with how missing sources degrade elsewhere (R4, R8.5). Only
 /// the path is logged, never the file contents (R7.3).
-pub(crate) fn read_scheme_swatch(scheme_path: &Path) -> Option<SchemeSwatch> {
+pub fn read_scheme_swatch(scheme_path: &Path) -> Option<SchemeSwatch> {
     match std::fs::read_to_string(scheme_path) {
         Ok(contents) => Some(parse_scheme_swatch(&contents)),
         Err(error) => {

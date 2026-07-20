@@ -58,7 +58,7 @@ use tempfile::NamedTempFile;
 /// `Write` failure discards the temp file without touching the target (the new
 /// bytes only reach the target through the final atomic rename).
 #[derive(Debug)]
-pub(crate) enum WriteError {
+pub enum WriteError {
     /// The target's real path could not be resolved with
     /// [`std::fs::canonicalize`] — most commonly because it does not exist. No
     /// write was attempted and nothing was created.
@@ -136,7 +136,7 @@ impl std::error::Error for WriteError {
 /// [`restore`](FileSnapshot::restore) reapply it faithfully rather than trusting
 /// whatever mode happens to be on disk at rollback time.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct FileSnapshot {
+pub struct FileSnapshot {
     /// The canonicalized real path these bytes were read from and are restored
     /// to. Storing the resolved path means [`restore`](FileSnapshot::restore)
     /// rewrites the same real file (preserving any symlink that points at it),
@@ -154,12 +154,12 @@ pub(crate) struct FileSnapshot {
 
 impl FileSnapshot {
     /// The canonicalized real path this snapshot was taken from.
-    pub(crate) fn resolved_path(&self) -> &Path {
+    pub fn resolved_path(&self) -> &Path {
         &self.resolved_path
     }
 
     /// The captured original bytes.
-    pub(crate) fn contents(&self) -> &[u8] {
+    pub fn contents(&self) -> &[u8] {
         &self.contents
     }
 
@@ -173,7 +173,7 @@ impl FileSnapshot {
     /// file's link is preserved here too. Reapplying the snapshotted mode is
     /// best-effort, matching the forward write: a chmod failure logs at `debug`
     /// and does not fail the restore (R8.3).
-    pub(crate) fn restore(&self) -> Result<(), WriteError> {
+    pub fn restore(&self) -> Result<(), WriteError> {
         // Restore both the bytes and the snapshotted permission mode, so rollback
         // returns the file's full pre-write state rather than trusting the mode
         // currently on disk (which may have been tightened, see the type docs).
@@ -206,7 +206,7 @@ impl FileSnapshot {
 /// On any failure the original file is left untouched and no partial or temp file
 /// remains. `target` must exist (canonicalization requires it); a missing path is
 /// a [`WriteError::Resolve`].
-pub(crate) fn write_atomic(target: &Path, contents: &[u8]) -> Result<FileSnapshot, WriteError> {
+pub fn write_atomic(target: &Path, contents: &[u8]) -> Result<FileSnapshot, WriteError> {
     let resolved = resolve_target(target)?;
 
     // Capture the pre-write bytes before touching anything, so rollback has the

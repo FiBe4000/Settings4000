@@ -79,7 +79,7 @@ use crate::parsers::palette::is_bare_hex;
 /// as a [`SettingId`] for routing but never contributes a staged value or dirty
 /// state to its category.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Category {
+pub enum Category {
     /// Per-monitor display settings backed by `monitors.conf` (task 6.1).
     Display,
     /// Palette, GTK/icon/cursor themes, wallpaper and lock background (tasks
@@ -104,7 +104,7 @@ pub(crate) enum Category {
 /// declared once on [`SettingId`] via [`SettingId::backing`] rather than being
 /// decided per edit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Backing {
+pub enum Backing {
     /// The value is written to a config file and only takes effect on Apply. The
     /// store keeps it as an `original`/`staged` pair, and it contributes to dirty
     /// state and the per-page rollup (R5.1).
@@ -129,7 +129,7 @@ pub(crate) enum Backing {
 /// category page (§6) extends the enum with its remaining settings; see the module
 /// docs for the three mappings a new variant must be added to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum SettingId {
+pub enum SettingId {
     // --- Display (task 6.1) ---
     /// A monitor's mode, e.g. `2880x1800@120` — chosen from the modes the output
     /// reports, so it is a [`ValueKind::Enum`] validated as a `WxH@Hz` string.
@@ -207,7 +207,7 @@ impl SettingId {
     /// A single source of truth for the "expected" kind: [`Self::validate`]
     /// reports a [`ValidationError::WrongKind`] against exactly this value, and the
     /// UI/store use it to build the right widget and coerce input.
-    pub(crate) fn kind(&self) -> ValueKind {
+    pub fn kind(&self) -> ValueKind {
         match self {
             SettingId::MonitorMode | SettingId::NotificationPosition => ValueKind::Enum,
             SettingId::MonitorScale | SettingId::MouseSensitivity => ValueKind::Float,
@@ -231,7 +231,7 @@ impl SettingId {
     ///
     /// Used by the store (task 4.2) to roll per-setting dirty state up into a
     /// per-page "modified" marker.
-    pub(crate) fn category(&self) -> Category {
+    pub fn category(&self) -> Category {
         match self {
             SettingId::MonitorMode | SettingId::MonitorScale | SettingId::LaptopDisplayEnabled => {
                 Category::Display
@@ -262,7 +262,7 @@ impl SettingId {
     /// at once, so it never becomes dirty. The match is exhaustive on purpose —
     /// adding a [`SettingId`] variant without classifying it fails to compile, which
     /// forces every new setting to declare how it reaches the system.
-    pub(crate) fn backing(&self) -> Backing {
+    pub fn backing(&self) -> Backing {
         match self {
             // Runtime-only: applied to the live session immediately, never staged
             // (R5.2). The laptop-display toggle drives the hotplug state file
@@ -302,7 +302,7 @@ impl SettingId {
     ///
     /// It never panics: an invalid value, a wrong kind, or a filesystem error while
     /// checking a path all return an [`Err`], never an unwind.
-    pub(crate) fn validate(&self, value: &Value) -> Result<(), ValidationError> {
+    pub fn validate(&self, value: &Value) -> Result<(), ValidationError> {
         // Matching the (id, value) pair together dispatches to the right validator
         // and, in the final arm, turns any leftover (i.e. wrong-kind) pairing into a
         // WrongKind error — so the kind check and the dispatch cannot drift apart.
@@ -371,7 +371,7 @@ impl SettingId {
 /// [`ValidationError::WrongKind`] can name the expected and found kinds in a
 /// human-readable way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ValueKind {
+pub enum ValueKind {
     /// A choice from a fixed set, presented as a drop-down (e.g. a monitor mode or
     /// a notification position). Distinguished from [`ValueKind::String`] to signal
     /// that only a member of a known set is meaningful, even though it is carried
@@ -411,7 +411,7 @@ impl fmt::Display for ValueKind {
 /// [`Value::Float`] wraps an [`f64`], which is only partially ordered; equality
 /// comparison is all the store needs.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum Value {
+pub enum Value {
     /// A choice token from a fixed set (see [`ValueKind::Enum`]).
     Enum(String),
     /// A boolean.
@@ -426,7 +426,7 @@ pub(crate) enum Value {
 
 impl Value {
     /// The [`ValueKind`] discriminant of this value.
-    pub(crate) fn kind(&self) -> ValueKind {
+    pub fn kind(&self) -> ValueKind {
         match self {
             Value::Enum(_) => ValueKind::Enum,
             Value::Bool(_) => ValueKind::Bool,
@@ -437,7 +437,7 @@ impl Value {
     }
 
     /// The choice token if this is a [`Value::Enum`], else `None`.
-    pub(crate) fn as_enum(&self) -> Option<&str> {
+    pub fn as_enum(&self) -> Option<&str> {
         match self {
             Value::Enum(token) => Some(token),
             _ => None,
@@ -445,7 +445,7 @@ impl Value {
     }
 
     /// The boolean if this is a [`Value::Bool`], else `None`.
-    pub(crate) fn as_bool(&self) -> Option<bool> {
+    pub fn as_bool(&self) -> Option<bool> {
         match self {
             Value::Bool(flag) => Some(*flag),
             _ => None,
@@ -453,7 +453,7 @@ impl Value {
     }
 
     /// The number if this is a [`Value::Float`], else `None`.
-    pub(crate) fn as_float(&self) -> Option<f64> {
+    pub fn as_float(&self) -> Option<f64> {
         match self {
             Value::Float(number) => Some(*number),
             _ => None,
@@ -461,7 +461,7 @@ impl Value {
     }
 
     /// The number if this is a [`Value::Integer`], else `None`.
-    pub(crate) fn as_integer(&self) -> Option<i64> {
+    pub fn as_integer(&self) -> Option<i64> {
         match self {
             Value::Integer(number) => Some(*number),
             _ => None,
@@ -472,7 +472,7 @@ impl Value {
     ///
     /// Note this is deliberately *not* satisfied by [`Value::Enum`]: an enum token
     /// is retrieved with [`Self::as_enum`], keeping the two kinds distinct.
-    pub(crate) fn as_str(&self) -> Option<&str> {
+    pub fn as_str(&self) -> Option<&str> {
         match self {
             Value::String(text) => Some(text),
             _ => None,
@@ -488,7 +488,7 @@ impl Value {
 /// variant (with [`matches!`]) or render the message; they do not need to clone or
 /// compare errors.
 #[derive(Debug)]
-pub(crate) enum ValidationError {
+pub enum ValidationError {
     /// The value's kind does not match what the setting expects. A guard against a
     /// programming error (the UI staging the wrong widget's output), not something
     /// a user can normally trigger.
@@ -548,7 +548,7 @@ pub(crate) enum ValidationError {
 /// Split out so the UI can phrase an accurate message — "does not exist" versus
 /// "not an image" versus "cannot be read" are different fixes for the user.
 #[derive(Debug)]
-pub(crate) enum ImagePathProblem {
+pub enum ImagePathProblem {
     /// Nothing exists at the path.
     DoesNotExist,
     /// Something exists there, but it is not a regular file (e.g. a directory).
@@ -619,7 +619,7 @@ impl std::error::Error for ValidationError {}
 /// Hyprland clamps input `sensitivity` to `-1.0..=1.0`; a value outside that is
 /// silently clamped by the compositor, so we reject it up front to keep the stored
 /// value and the effective value in agreement (analysis §4).
-pub(crate) const SENSITIVITY_RANGE: RangeInclusive<f64> = -1.0..=1.0;
+pub const SENSITIVITY_RANGE: RangeInclusive<f64> = -1.0..=1.0;
 
 /// Plausible monitor scale factors. Hyprland fractional scaling is used at values
 /// such as `1.066667` and `1.333333` in the real dotfiles (analysis §4). This is a
@@ -629,13 +629,13 @@ pub(crate) const SENSITIVITY_RANGE: RangeInclusive<f64> = -1.0..=1.0;
 /// number of logical pixels — needs the monitor's resolution, so it is deferred to
 /// the Display page (task 6.1); passing this range check is necessary but not
 /// sufficient.
-pub(crate) const SCALE_RANGE: RangeInclusive<f64> = 0.5..=3.0;
+pub const SCALE_RANGE: RangeInclusive<f64> = 0.5..=3.0;
 
 /// Allowed idle/notification timeouts, in whole seconds: strictly positive (R8.3
 /// "timeout ranges"), up to one day. The upper bound is a sanity ceiling for an
 /// idle timeout (dim/lock/DPMS in `hypridle.conf`, swaync auto-dismiss); the
 /// requirement asks only that timeouts be positive with a sensible maximum.
-pub(crate) const TIMEOUT_SECONDS_RANGE: RangeInclusive<i64> = 1..=86_400;
+pub const TIMEOUT_SECONDS_RANGE: RangeInclusive<i64> = 1..=86_400;
 
 /// Plausible pixels per axis for a monitor resolution. `16384` is generous
 /// headroom beyond current panels (8K is 7680×4320); the point is to reject a
@@ -674,7 +674,7 @@ fn supported_image_extensions() -> String {
 /// Reuses [`crate::parsers::palette::is_bare_hex`] so the model validator and the
 /// palette writer agree on exactly what a color is. See the module docs for why
 /// `#rrggbb`/`rgb(...)` forms are out of scope.
-pub(crate) fn validate_hex_color(value: &str) -> Result<(), ValidationError> {
+pub fn validate_hex_color(value: &str) -> Result<(), ValidationError> {
     if is_bare_hex(value) {
         Ok(())
     } else {
@@ -693,7 +693,7 @@ pub(crate) fn validate_hex_color(value: &str) -> Result<(), ValidationError> {
 /// — silently losing the user's configured layouts. Splitting on commas and requiring a
 /// non-empty trimmed field matches how the Input page's reorderable list tokenises the
 /// value, so the two agree on what "at least one layout" means.
-pub(crate) fn validate_layout_list(value: &str) -> Result<(), ValidationError> {
+pub fn validate_layout_list(value: &str) -> Result<(), ValidationError> {
     if value.split(',').any(|item| !item.trim().is_empty()) {
         Ok(())
     } else {
@@ -712,7 +712,7 @@ pub(crate) fn validate_layout_list(value: &str) -> Result<(), ValidationError> {
 /// its guard as defense-in-depth. Today the hypridle lock command is the only setting
 /// that reaches this validator; a command is otherwise unconstrained (any program and
 /// arguments are allowed).
-pub(crate) fn validate_command(value: &str) -> Result<(), ValidationError> {
+pub fn validate_command(value: &str) -> Result<(), ValidationError> {
     if value.contains(['\n', '\r', '#']) {
         Err(ValidationError::UnsafeCommand {
             value: value.to_string(),
@@ -746,7 +746,7 @@ pub(crate) fn validate_command(value: &str) -> Result<(), ValidationError> {
 /// constants): the goal is to reject a broken string (`0x0`, a typo, or a non-mode)
 /// before it reaches a working `monitors.conf`, not to reproduce the monitor's
 /// exact capability list.
-pub(crate) fn validate_monitor_mode(value: &str) -> Result<(), ValidationError> {
+pub fn validate_monitor_mode(value: &str) -> Result<(), ValidationError> {
     if SPECIAL_MODE_TOKENS.contains(&value) {
         return Ok(());
     }
@@ -819,7 +819,7 @@ fn parse_dimension(text: &str) -> Option<u32> {
 /// A non-finite value (`NaN`, infinity) is outside every finite range and so is
 /// rejected — [`RangeInclusive::contains`] compares with `NaN` as `false` and
 /// infinity against the finite bounds, both of which fail the check.
-pub(crate) fn validate_float_range(
+pub fn validate_float_range(
     value: f64,
     range: &RangeInclusive<f64>,
 ) -> Result<(), ValidationError> {
@@ -835,10 +835,7 @@ pub(crate) fn validate_float_range(
 }
 
 /// Validates that a whole-number `value` lies within the inclusive `range` (R8.3).
-pub(crate) fn validate_int_range(
-    value: i64,
-    range: &RangeInclusive<i64>,
-) -> Result<(), ValidationError> {
+pub fn validate_int_range(value: i64, range: &RangeInclusive<i64>) -> Result<(), ValidationError> {
     if range.contains(&value) {
         Ok(())
     } else {
@@ -860,7 +857,7 @@ pub(crate) fn validate_int_range(
 /// are reported separately (see [`ImagePathProblem`]) so the UI can tell the user
 /// precisely what to fix. Any filesystem error is turned into an [`Err`]; this
 /// function never panics.
-pub(crate) fn validate_image_path(path: &Path) -> Result<(), ValidationError> {
+pub fn validate_image_path(path: &Path) -> Result<(), ValidationError> {
     let image_error = |problem: ImagePathProblem| ValidationError::ImagePath {
         path: path.to_path_buf(),
         problem,

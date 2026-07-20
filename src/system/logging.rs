@@ -57,7 +57,7 @@ const SYSLOG_IDENTIFIER: &str = "settings4000";
 /// GUI dependencies emit (see the module docs); the quieter levels apply to
 /// every target.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum LogLevel {
+pub enum LogLevel {
     /// Everything, including parsed values and staged diffs (R7.3).
     Debug,
     /// Normal operational logging: detection results, writes, reloads (R7.3).
@@ -79,7 +79,7 @@ impl LogLevel {
     /// target, since none is verbose enough for dependency chatter to bury the
     /// app's logs.
     #[must_use]
-    pub(crate) const fn directive(self) -> &'static str {
+    pub const fn directive(self) -> &'static str {
         match self {
             // `settings4000` is this crate's tracing target (its module-path
             // root), so scoping the directive to it raises only the app while
@@ -97,7 +97,7 @@ impl LogLevel {
 /// Returned by [`init`] so callers (and tests) can observe whether the journal
 /// was reachable or the stderr fallback was used.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum LogBackend {
+pub enum LogBackend {
     /// Logs are written to the systemd journal (`journalctl --user -t
     /// settings4000`).
     Journald,
@@ -117,7 +117,7 @@ pub(crate) enum LogBackend {
 /// the already-installed global subscriber and is reported to stderr rather than
 /// panicking, since it indicates a programming error rather than a runtime
 /// condition.
-pub(crate) fn init(cli_level: Option<LogLevel>) -> LogBackend {
+pub fn init(cli_level: Option<LogLevel>) -> LogBackend {
     let directive = resolve_directive(
         cli_level,
         std::env::var("SETTINGS4000_LOG").ok(),
@@ -164,7 +164,7 @@ pub(crate) fn init(cli_level: Option<LogLevel>) -> LogBackend {
 /// logging. This function is pure — it takes the environment values as arguments
 /// rather than reading them — so the precedence rules are unit-testable.
 #[must_use]
-pub(crate) fn resolve_directive(
+pub fn resolve_directive(
     cli_level: Option<LogLevel>,
     settings4000_log: Option<String>,
     rust_log: Option<String>,

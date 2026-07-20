@@ -89,7 +89,7 @@ const HYPRIDLE_UNIT: &str = "hypridle";
 /// the generated color partials `generate-colors` rewrites) rather than a single
 /// file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum BackingFile {
+pub enum BackingFile {
     /// `config/hypr/monitors.conf` — a display change; Hyprland re-reads it on
     /// `hyprctl reload` (task 6.1).
     MonitorsConf,
@@ -135,7 +135,7 @@ impl BackingFile {
     /// e.g. a change that touched only the icon theme yields only the icon-theme
     /// `gsettings set`. A parameterized file whose value is missing from `params`
     /// yields no action for it (with a warning) rather than an ill-formed command.
-    pub(crate) fn reload_actions(self, params: &ReloadParams) -> Vec<ReloadAction> {
+    pub fn reload_actions(self, params: &ReloadParams) -> Vec<ReloadAction> {
         match self {
             // A plain Hyprland config re-read. hyprland.conf is here (not with the
             // cursor reload) because architecture §6 maps the file to `hyprctl
@@ -225,22 +225,22 @@ fn theme_and_cursor_actions(params: &ReloadParams, include_gtk_icon: bool) -> Ve
 /// [`BackingFile::reload_actions`]). The default (all `None`) is the correct state
 /// for a change that touches no parameterized file.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ReloadParams {
+pub struct ReloadParams {
     /// The new wallpaper path, for the hyprpaper reload (task 6.5).
-    pub(crate) wallpaper: Option<String>,
+    pub wallpaper: Option<String>,
     /// The new wallpaper fit mode, applied live in the same hyprpaper reload (task
     /// 6.5). hyprpaper's `wallpaper` IPC takes the fit as a third comma-field
     /// (`monitor,path,fit_mode`), so without this a fit change would be written to
     /// `hyprpaper.conf` but never take effect until hyprpaper restarts. Set only when
     /// a fit is configured; the reload falls back to `,<path>` when it is `None`.
-    pub(crate) fit: Option<String>,
+    pub fit: Option<String>,
     /// The new cursor theme and size, for `hyprctl setcursor` and the `gsettings`
     /// cursor keys (task 6.4).
-    pub(crate) cursor: Option<CursorValue>,
+    pub cursor: Option<CursorValue>,
     /// The new GTK theme name, for `gsettings set … gtk-theme` (task 6.4).
-    pub(crate) gtk_theme: Option<String>,
+    pub gtk_theme: Option<String>,
     /// The new icon theme name, for `gsettings set … icon-theme` (task 6.4).
-    pub(crate) icon_theme: Option<String>,
+    pub icon_theme: Option<String>,
 }
 
 /// A cursor theme selection: the theme name and its pixel size.
@@ -249,11 +249,11 @@ pub(crate) struct ReloadParams {
 /// together via `hyprctl setcursor <theme> <size>` and the `gsettings` cursor keys
 /// (R3.4), so they travel as one value.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CursorValue {
+pub struct CursorValue {
     /// The cursor theme name (e.g. `Nordic-cursors`).
-    pub(crate) theme: String,
+    pub theme: String,
     /// The cursor size in pixels (e.g. `16`).
-    pub(crate) size: u32,
+    pub size: u32,
 }
 
 /// A single distinct live-reload the app can issue (architecture §6 /
@@ -266,7 +266,7 @@ pub(crate) struct CursorValue {
 /// signal-plus-respawn fallback — both routed through the seams in
 /// [`Self::execute`] rather than a plain command.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ReloadAction {
+pub enum ReloadAction {
     /// `hyprctl reload` — Hyprland re-reads `hyprland.conf` and every `source=`d
     /// file.
     HyprctlReload,
@@ -322,7 +322,7 @@ impl ReloadAction {
     /// hypridle) require that daemon to be live. `gsettings set` requires the
     /// `gsettings` binary. A component that is absent or stopped yields `false`, so
     /// [`plan_reloads`] drops the action.
-    pub(crate) fn is_available(&self, capabilities: &Capabilities) -> bool {
+    pub fn is_available(&self, capabilities: &Capabilities) -> bool {
         match self {
             ReloadAction::HyprctlReload | ReloadAction::HyprctlSetCursor { .. } => {
                 capabilities.hyprland_reloadable()
@@ -366,7 +366,7 @@ impl ReloadAction {
     /// (R5.5) but is not fatal here — the Apply pipeline (task 4.5) decides whether
     /// to continue and how to surface it. The file write it accompanies always
     /// stands.
-    pub(crate) fn execute(
+    pub fn execute(
         &self,
         runner: &dyn CommandRunner,
         signaller: &dyn ProcessSignaller,
@@ -446,7 +446,7 @@ fn gsettings_key_rank(key: &str) -> u8 {
 /// files that share a reload (e.g. a cursor written to `settings.ini`, `uwsm/env`,
 /// and `hyprland.conf`) issues each reload once, in a deterministic order. This is
 /// the list the Apply pipeline (task 4.5) executes after writing the files.
-pub(crate) fn plan_reloads(
+pub fn plan_reloads(
     changed: &[BackingFile],
     params: &ReloadParams,
     capabilities: &Capabilities,
@@ -593,7 +593,7 @@ fn restart_hypridle(
 /// because [`ReloadError::Command`] and [`ReloadError::Signal`] wrap error types that
 /// implement neither; callers render the message or match the variant.
 #[derive(Debug)]
-pub(crate) enum ReloadError {
+pub enum ReloadError {
     /// A reload command could not be run at all (spawn failure or timeout).
     Command(CommandError),
     /// A reload command ran but exited non-zero.

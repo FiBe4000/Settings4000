@@ -85,7 +85,7 @@ struct FileFreshness {
 /// warning — "changed on disk" versus "no longer readable" — and decide how to
 /// recover (reload the new contents, or drop the file from the plan).
 #[derive(Debug)]
-pub(crate) enum ConflictReason {
+pub enum ConflictReason {
     /// The file is still readable but its contents differ from what was recorded,
     /// i.e. it was edited externally since the app read it.
     ContentChanged,
@@ -104,7 +104,7 @@ pub(crate) enum ConflictReason {
 /// runtime path) so the caller can surface it to the user and reload it, plus the
 /// [`ConflictReason`].
 #[derive(Debug)]
-pub(crate) struct Conflict {
+pub struct Conflict {
     /// The path that was tracked and is now in conflict.
     path: PathBuf,
     /// Why it is considered a conflict.
@@ -113,12 +113,12 @@ pub(crate) struct Conflict {
 
 impl Conflict {
     /// The tracked path this conflict concerns.
-    pub(crate) fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         &self.path
     }
 
     /// Why the file is in conflict.
-    pub(crate) fn reason(&self) -> &ConflictReason {
+    pub fn reason(&self) -> &ConflictReason {
         &self.reason
     }
 }
@@ -132,7 +132,7 @@ impl Conflict {
 /// focus/manual refresh) to catch external edits; after handling a conflict by
 /// reloading a file, [`record`](Self::record) it again to re-baseline.
 #[derive(Debug, Default)]
-pub(crate) struct FreshnessTracker {
+pub struct FreshnessTracker {
     /// The recorded fingerprint per tracked path.
     ///
     /// A [`BTreeMap`] rather than a `HashMap` so that [`Self::check_conflicts`]
@@ -143,7 +143,7 @@ pub(crate) struct FreshnessTracker {
 
 impl FreshnessTracker {
     /// Creates an empty tracker.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
@@ -160,7 +160,7 @@ impl FreshnessTracker {
     /// records a file straight after successfully reading it, so this is expected
     /// to succeed on the normal path, but it is fallible rather than panicking so a
     /// racing deletion is handled cleanly.
-    pub(crate) fn record(&mut self, path: impl Into<PathBuf>) -> io::Result<()> {
+    pub fn record(&mut self, path: impl Into<PathBuf>) -> io::Result<()> {
         let path = path.into();
         let freshness = capture(&path)?;
         tracing::debug!(
@@ -201,7 +201,7 @@ impl FreshnessTracker {
     /// Re-recording an already-tracked path overwrites its baseline, exactly as
     /// [`record`](Self::record) does. Unlike [`record`](Self::record) this cannot
     /// fail: the caller already holds the bytes, and a missing mtime is tolerated.
-    pub(crate) fn record_bytes(&mut self, path: impl Into<PathBuf>, contents: &[u8]) {
+    pub fn record_bytes(&mut self, path: impl Into<PathBuf>, contents: &[u8]) {
         let path = path.into();
         let freshness = FileFreshness {
             content_hash: hash_contents(contents),
@@ -215,7 +215,7 @@ impl FreshnessTracker {
     }
 
     /// Whether no files are currently tracked.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
 
@@ -229,7 +229,7 @@ impl FreshnessTracker {
     /// never logged (R7.3). This never returns an `Err`: an unreadable file is
     /// itself reported as a [`ConflictReason::Unreadable`] conflict rather than
     /// aborting the whole check, so one bad file cannot mask changes to the others.
-    pub(crate) fn check_conflicts(&self) -> Vec<Conflict> {
+    pub fn check_conflicts(&self) -> Vec<Conflict> {
         let mut conflicts = Vec::new();
 
         for (path, recorded) in &self.records {

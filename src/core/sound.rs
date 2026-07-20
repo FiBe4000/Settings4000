@@ -68,7 +68,7 @@ const AUDIO_SOURCE_CLASS: &str = "Audio/Source";
 /// value `wpctl set-volume` accepts and `wpctl status` reports — already cube-rooted
 /// from the stored `channelVolumes` when read from `pw-dump` (see the module docs).
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct SoundDevice {
+pub struct SoundDevice {
     /// The PipeWire node id — the argument every `wpctl` control command targets.
     id: u32,
     /// The human-readable label shown in the drop-down (`node.description`, else
@@ -85,27 +85,27 @@ pub(crate) struct SoundDevice {
 
 impl SoundDevice {
     /// The PipeWire node id (the `wpctl` command target).
-    pub(crate) fn id(&self) -> u32 {
+    pub fn id(&self) -> u32 {
         self.id
     }
 
     /// The human-readable label shown in the device drop-down.
-    pub(crate) fn label(&self) -> &str {
+    pub fn label(&self) -> &str {
         &self.label
     }
 
     /// Whether this device is the current default of its kind.
-    pub(crate) fn is_default(&self) -> bool {
+    pub fn is_default(&self) -> bool {
         self.is_default
     }
 
     /// The device's `wpctl`-scale volume (`0.0`..=`1.0`).
-    pub(crate) fn volume(&self) -> f64 {
+    pub fn volume(&self) -> f64 {
         self.volume
     }
 
     /// Whether the device is muted.
-    pub(crate) fn muted(&self) -> bool {
+    pub fn muted(&self) -> bool {
         self.muted
     }
 }
@@ -116,7 +116,7 @@ impl SoundDevice {
 /// Produced by [`enumerate`] on page entry (and on a manual rescan). A default value is
 /// the empty state used when no audio source could be read.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct SoundState {
+pub struct SoundState {
     /// The audio output (sink) devices, in enumeration order.
     outputs: Vec<SoundDevice>,
     /// The audio input (source/microphone) devices, in enumeration order.
@@ -125,12 +125,12 @@ pub(crate) struct SoundState {
 
 impl SoundState {
     /// The audio output (sink) devices.
-    pub(crate) fn outputs(&self) -> &[SoundDevice] {
+    pub fn outputs(&self) -> &[SoundDevice] {
         &self.outputs
     }
 
     /// The audio input (source/microphone) devices.
-    pub(crate) fn inputs(&self) -> &[SoundDevice] {
+    pub fn inputs(&self) -> &[SoundDevice] {
         &self.inputs
     }
 }
@@ -142,7 +142,7 @@ impl SoundState {
 /// output that cannot be parsed; if neither can be read it returns an empty
 /// [`SoundState`]. It never panics — a missing binary, a non-zero exit, or garbled
 /// output each degrade to the next source, then to empty.
-pub(crate) fn enumerate(runner: &dyn CommandRunner) -> SoundState {
+pub fn enumerate(runner: &dyn CommandRunner) -> SoundState {
     if let Some(state) = enumerate_pw_dump(runner) {
         return state;
     }
@@ -494,7 +494,7 @@ fn parse_status_volume(bracket: &str) -> (f64, bool) {
 
 /// Builds the `wpctl set-default ID` command that switches the default output/input to
 /// the node `id` (R3.1/R5.2). `wpctl` infers the kind (playback/capture) from the node.
-pub(crate) fn set_default_command(id: u32) -> Command {
+pub fn set_default_command(id: u32) -> Command {
     Command::new("wpctl").arg("set-default").arg(id.to_string())
 }
 
@@ -503,7 +503,7 @@ pub(crate) fn set_default_command(id: u32) -> Command {
 ///
 /// `wpctl` applies the cubic curve itself (see the module docs), so the value passed
 /// here is exactly what the slider shows.
-pub(crate) fn set_volume_command(id: u32, volume: f64) -> Command {
+pub fn set_volume_command(id: u32, volume: f64) -> Command {
     let clamped = volume.clamp(0.0, 1.0);
     Command::new("wpctl")
         .arg("set-volume")
@@ -513,7 +513,7 @@ pub(crate) fn set_volume_command(id: u32, volume: f64) -> Command {
 
 /// Builds the `wpctl set-mute ID 1|0` command that mutes (`true`) or unmutes (`false`)
 /// node `id`.
-pub(crate) fn set_mute_command(id: u32, muted: bool) -> Command {
+pub fn set_mute_command(id: u32, muted: bool) -> Command {
     Command::new("wpctl")
         .arg("set-mute")
         .arg(id.to_string())
@@ -521,17 +521,17 @@ pub(crate) fn set_mute_command(id: u32, muted: bool) -> Command {
 }
 
 /// Immediately switches the default device to node `id` (R5.2), logging the outcome.
-pub(crate) fn set_default(runner: &dyn CommandRunner, id: u32) {
+pub fn set_default(runner: &dyn CommandRunner, id: u32) {
     run_control(runner, set_default_command(id));
 }
 
 /// Immediately sets node `id`'s volume to the `wpctl`-scale `volume` (R5.2).
-pub(crate) fn set_volume(runner: &dyn CommandRunner, id: u32, volume: f64) {
+pub fn set_volume(runner: &dyn CommandRunner, id: u32, volume: f64) {
     run_control(runner, set_volume_command(id, volume));
 }
 
 /// Immediately mutes/unmutes node `id` (R5.2).
-pub(crate) fn set_mute(runner: &dyn CommandRunner, id: u32, muted: bool) {
+pub fn set_mute(runner: &dyn CommandRunner, id: u32, muted: bool) {
     run_control(runner, set_mute_command(id, muted));
 }
 

@@ -77,7 +77,7 @@ use std::path::{Path, PathBuf};
 /// (see [`Capabilities::settings_portal_available`]); it does not gate a page of
 /// its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Binary {
+pub enum Binary {
     /// Hyprland's control client — needed by nearly every live reload
     /// (`hyprctl reload`, `hyprctl setcursor`, `hyprctl hyprpaper …`).
     Hyprctl,
@@ -134,7 +134,7 @@ impl Binary {
     ];
 
     /// The executable file name looked up in each `$PATH` directory.
-    pub(crate) fn command_name(self) -> &'static str {
+    pub fn command_name(self) -> &'static str {
         match self {
             Binary::Hyprctl => "hyprctl",
             Binary::Gsettings => "gsettings",
@@ -163,7 +163,7 @@ impl Binary {
 /// while the screen is locked and receives no reload (its config is read at the
 /// next lock), so a running check would be meaningless.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Daemon {
+pub enum Daemon {
     /// The kitty terminal (reloaded via SIGUSR1).
     Kitty,
     /// The eww bar daemon (`eww reload`).
@@ -190,7 +190,7 @@ impl Daemon {
     /// that identifies a running instance of this daemon. All five are under 15
     /// bytes, so they would survive `/proc/comm` truncation too, but detection
     /// matches them against the untruncated name for uniformity with the portal.
-    pub(crate) fn process_name(self) -> &'static str {
+    pub fn process_name(self) -> &'static str {
         match self {
             Daemon::Kitty => "kitty",
             Daemon::Eww => "eww",
@@ -246,7 +246,7 @@ const REPO_ANCHOR_RELATIVE: &[&str] = &["config", "hypr", "colors.conf"];
 /// the generator. All three paths are held resolved so consumers never re-derive
 /// them.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PaletteSource {
+pub struct PaletteSource {
     /// The dotfiles repository root (the canonicalized directory the deployed
     /// config symlink resolves into).
     repo_root: PathBuf,
@@ -260,17 +260,17 @@ pub(crate) struct PaletteSource {
 
 impl PaletteSource {
     /// The dotfiles repository root.
-    pub(crate) fn repo_root(&self) -> &Path {
+    pub fn repo_root(&self) -> &Path {
         &self.repo_root
     }
 
     /// The `colors/` directory of scheme files.
-    pub(crate) fn colors_dir(&self) -> &Path {
+    pub fn colors_dir(&self) -> &Path {
         &self.colors_dir
     }
 
     /// The `scripts/generate-colors` generator.
-    pub(crate) fn generate_colors(&self) -> &Path {
+    pub fn generate_colors(&self) -> &Path {
         &self.generate_colors
     }
 }
@@ -281,11 +281,11 @@ impl PaletteSource {
 /// constructs it directly to drive any branch deterministically. See the module
 /// docs for how each field is turned into a capability.
 #[derive(Clone, Debug)]
-pub(crate) struct DetectionInputs {
+pub struct DetectionInputs {
     /// The `$PATH` to scan for target binaries (colon-separated directories).
     /// `None` (no `$PATH` in the environment) disables the scan, so every binary
     /// reads as absent.
-    pub(crate) path: Option<String>,
+    pub path: Option<String>,
     /// The names of currently running processes, as **untruncated** executable
     /// names (the basename of argv[0] from `/proc/<pid>/cmdline`) — the real
     /// detector fills this from a procfs scan, a test injects a fixed set. Daemon
@@ -293,18 +293,18 @@ pub(crate) struct DetectionInputs {
     /// rather than `/proc/<pid>/comm` because the kernel truncates `comm` to 15
     /// bytes, which would make the whole `xdg-desktop-portal-*` family
     /// indistinguishable (see [`SETTINGS_PORTAL_BACKENDS`]).
-    pub(crate) running_processes: Vec<String>,
+    pub running_processes: Vec<String>,
     /// The Hyprland IPC socket path whose existence signals a live compositor, or
     /// `None` when it cannot be located from the environment. Its existence is
     /// checked against the real filesystem.
-    pub(crate) hyprland_socket: Option<PathBuf>,
+    pub hyprland_socket: Option<PathBuf>,
     /// The deployed config path used to discover the dotfiles repo root (R8.5),
     /// conventionally `~/.config/hypr/colors.conf`. It must be a symlink into the
     /// repo for the palette source to be considered present.
-    pub(crate) palette_config_anchor: PathBuf,
+    pub palette_config_anchor: PathBuf,
     /// The live XDG paths of backing config files to check for readability (R4.4).
     /// Each unreadable path is recorded and logged at `warn`.
-    pub(crate) config_paths: Vec<PathBuf>,
+    pub config_paths: Vec<PathBuf>,
 }
 
 impl DetectionInputs {
@@ -318,7 +318,7 @@ impl DetectionInputs {
     /// best-effort: a missing environment variable or an unreadable `/proc` simply
     /// yields an empty/`None` input, which [`Capabilities::detect`] turns into the
     /// "absent" capability rather than an error.
-    pub(crate) fn from_system(config_paths: Vec<PathBuf>) -> Self {
+    pub fn from_system(config_paths: Vec<PathBuf>) -> Self {
         DetectionInputs {
             path: std::env::var("PATH").ok(),
             running_processes: scan_procfs_process_names(),
@@ -336,7 +336,7 @@ impl DetectionInputs {
 /// so a refresh (R4.3) can compare a new pass against the previous one, and it is
 /// cheap to hold for the life of a window.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Capabilities {
+pub struct Capabilities {
     /// Target binaries found on `$PATH`.
     present_binaries: BTreeSet<Binary>,
     /// Daemons found running by the procfs scan.
@@ -362,7 +362,7 @@ impl Capabilities {
     /// discovery, and config-readability checks, logging absent page-gating items
     /// at `info` and unreadable configs at `warn` (R4.2/R4.4/R7.3), then returns
     /// the plain [`Capabilities`]. It never fails: every probe degrades to "absent".
-    pub(crate) fn detect(inputs: &DetectionInputs) -> Capabilities {
+    pub fn detect(inputs: &DetectionInputs) -> Capabilities {
         let present_binaries = scan_binaries(inputs.path.as_deref());
         log_binary_results(&present_binaries);
 
@@ -410,7 +410,7 @@ impl Capabilities {
     /// falls back to if the worker fails to deliver a result, so the user still gets
     /// a usable (if empty) window with a working Refresh action (R4.3). Unlike
     /// [`Capabilities::detect`] it runs no probes and logs nothing.
-    pub(crate) fn absent() -> Capabilities {
+    pub fn absent() -> Capabilities {
         Capabilities {
             present_binaries: BTreeSet::new(),
             live_daemons: BTreeSet::new(),
@@ -422,7 +422,7 @@ impl Capabilities {
     }
 
     /// Whether `binary` was found on `$PATH`.
-    pub(crate) fn has_binary(&self, binary: Binary) -> bool {
+    pub fn has_binary(&self, binary: Binary) -> bool {
         self.present_binaries.contains(&binary)
     }
 
@@ -435,38 +435,38 @@ impl Capabilities {
     /// so it is gated on [`Binary::Wpctl`] specifically — a `pactl`-only host would
     /// otherwise render a dead, inert page, which R4.2 forbids. `pactl`-only support is
     /// out of v1 scope.
-    pub(crate) fn audio_available(&self) -> bool {
+    pub fn audio_available(&self) -> bool {
         self.has_binary(Binary::Wpctl) || self.has_binary(Binary::Pactl)
     }
 
     /// Whether `daemon` was found running by the procfs scan (task 4.4 gates a
     /// reload on this).
-    pub(crate) fn is_daemon_live(&self, daemon: Daemon) -> bool {
+    pub fn is_daemon_live(&self, daemon: Daemon) -> bool {
         self.live_daemons.contains(&daemon)
     }
 
     /// Whether the Hyprland IPC socket exists — i.e. the compositor is live.
-    pub(crate) fn hyprland_ipc_live(&self) -> bool {
+    pub fn hyprland_ipc_live(&self) -> bool {
         self.hyprland_ipc
     }
 
     /// Whether a Hyprland reload can be issued: the `hyprctl` client is installed
     /// *and* the compositor is live (architecture §4). The reload table (task 4.4)
     /// uses this to decide whether to run `hyprctl reload`.
-    pub(crate) fn hyprland_reloadable(&self) -> bool {
+    pub fn hyprland_reloadable(&self) -> bool {
         self.has_binary(Binary::Hyprctl) && self.hyprland_ipc
     }
 
     /// Whether a live theme-restyle path is available — the GTK settings portal is
     /// running or a dconf GSettings backend is present (R2.2). Gates whether the
     /// Theme page may claim a live restyle versus "takes effect at next launch".
-    pub(crate) fn settings_portal_available(&self) -> bool {
+    pub fn settings_portal_available(&self) -> bool {
         self.settings_portal
     }
 
     /// The discovered dotfiles palette source, or `None` when the palette switcher
     /// must be hidden (R3.2, R8.5).
-    pub(crate) fn palette_source(&self) -> Option<&PaletteSource> {
+    pub fn palette_source(&self) -> Option<&PaletteSource> {
         self.palette_source.as_ref()
     }
 
@@ -483,13 +483,13 @@ impl Capabilities {
     /// vs absolute form, a trailing slash, an unresolved symlink) are treated as
     /// different keys and would misreport, so callers should register and query one
     /// canonical form.
-    pub(crate) fn config_readable(&self, path: &Path) -> bool {
+    pub fn config_readable(&self, path: &Path) -> bool {
         !self.unreadable_configs.contains(path)
     }
 
     /// The backing config paths that could not be read (missing or unreadable),
     /// for the UI to hide the affected controls (R4.4).
-    pub(crate) fn unreadable_configs(&self) -> &BTreeSet<PathBuf> {
+    pub fn unreadable_configs(&self) -> &BTreeSet<PathBuf> {
         &self.unreadable_configs
     }
 
@@ -508,7 +508,10 @@ impl Capabilities {
     }
 }
 
-#[cfg(test)]
+// Available to in-crate unit tests via `cfg(test)` and to the integration suites
+// in `tests/` (separate crates, where `cfg(test)` does not reach) via the
+// `testing` feature — never in a release build.
+#[cfg(any(test, feature = "testing"))]
 impl Capabilities {
     /// Builds a [`Capabilities`] directly from explicit sets, for tests in other
     /// modules that need a precise capability combination without constructing a
@@ -520,7 +523,7 @@ impl Capabilities {
     /// `unreadable_configs` are irrelevant to the reload table, so they are fixed to
     /// their "absent"/empty forms; a test that needs them exercises the real
     /// [`Capabilities::detect`] path instead.
-    pub(crate) fn for_tests(
+    pub fn for_tests(
         binaries: &[Binary],
         live_daemons: &[Daemon],
         hyprland_ipc: bool,
@@ -543,7 +546,7 @@ impl Capabilities {
     /// exercises [`Capabilities::detect`] against a temp-dir fixture instead. It is
     /// builder-style so it chains onto [`Self::for_tests`], keeping that constructor's
     /// signature (and its "absent" defaults) unchanged.
-    pub(crate) fn with_palette_source_for_tests(mut self) -> Capabilities {
+    pub fn with_palette_source_for_tests(mut self) -> Capabilities {
         self.palette_source = Some(PaletteSource {
             repo_root: PathBuf::from("/test/dotfiles"),
             colors_dir: PathBuf::from("/test/dotfiles/colors"),

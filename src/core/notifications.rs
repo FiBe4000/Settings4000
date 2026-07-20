@@ -79,12 +79,12 @@ const FLAG_DND_OFF: &str = "--dnd-off";
 /// edit touched (e.g. `positionY`, `timeout`), used only for the apply-level log line
 /// (R7.3), never the file contents.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SwayncConfEdit {
+pub struct SwayncConfEdit {
     /// The complete new file contents — canonical 2-space pretty JSON with a trailing
     /// newline, with only the edited value spans changed and key order preserved (§3.4).
-    pub(crate) contents: Vec<u8>,
+    pub contents: Vec<u8>,
     /// The JSON keys this edit changed, for logging.
-    pub(crate) changed_keys: Vec<String>,
+    pub changed_keys: Vec<String>,
 }
 
 /// Why [`render_swaync_config`] could not produce the new bytes.
@@ -95,7 +95,7 @@ pub(crate) struct SwayncConfEdit {
 /// successfully at startup — but it is treated as a failure so a corrupted file aborts
 /// the apply instead of the store committing an unwritten value (R8.3).
 #[derive(Debug)]
-pub(crate) enum SwayncRenderError {
+pub enum SwayncRenderError {
     /// The current `config.json` bytes are no longer valid swaync JSON.
     Parse(ParseError),
 }
@@ -129,7 +129,7 @@ impl std::error::Error for SwayncRenderError {
 /// in practice (`config.json` is readable and was parseable at load), but treating them as
 /// failures keeps the store and the file in agreement (R8.3).
 #[derive(Debug)]
-pub(crate) enum SwayncWriteError {
+pub enum SwayncWriteError {
     /// `config.json` could not be read to render the edits.
     Read(io::Error),
     /// The JSON could no longer be parsed to apply the edits.
@@ -191,7 +191,7 @@ fn decompose_position(token: &str) -> Option<(&str, &str)> {
 ///
 /// Returns [`SwayncRenderError`] only if the current bytes are no longer valid swaync
 /// JSON, leaving the caller to abort the apply rather than emit a corrupt file.
-pub(crate) fn render_swaync_config(
+pub fn render_swaync_config(
     bytes: &[u8],
     edits: &[(SettingId, Value)],
 ) -> Result<SwayncConfEdit, SwayncRenderError> {
@@ -244,7 +244,7 @@ pub(crate) fn render_swaync_config(
 /// just turns the store's dirty Notifications settings into the one `config.json`
 /// [`FileWrite`] on Apply. (Do Not Disturb needs no state here — it is applied through the
 /// free [`set_dnd`]/[`dnd_state`] functions by the UI.)
-pub(crate) struct NotificationsModel {
+pub struct NotificationsModel {
     /// The live XDG path of `swaync/config.json` (R8.5), read fresh when rendering a write.
     swaync_config: PathBuf,
 }
@@ -252,7 +252,7 @@ pub(crate) struct NotificationsModel {
 impl NotificationsModel {
     /// Builds the model, recording the `config.json` path (the production entry point,
     /// called from the startup worker — architecture §8).
-    pub(crate) fn load(swaync_config: PathBuf) -> NotificationsModel {
+    pub fn load(swaync_config: PathBuf) -> NotificationsModel {
         NotificationsModel { swaync_config }
     }
 
@@ -278,7 +278,7 @@ impl NotificationsModel {
     ///   The caller must **abort the Apply** rather than skip the write, since the store
     ///   would otherwise commit the staged values against an unchanged file and desync.
     ///   Both failure modes are near-unreachable in practice.
-    pub(crate) fn swaync_config_write(
+    pub fn swaync_config_write(
         &self,
         dirty: &[(SettingId, Value)],
     ) -> Result<Option<FileWrite>, SwayncWriteError> {
@@ -345,7 +345,7 @@ fn set_dnd_command(enabled: bool) -> Command {
 /// degrade to `None` (logged at `info`, never an error) — the UI then shows the switch as
 /// off, since an unreachable daemon has no DND to report. This never touches a config file
 /// or the store: DND is live daemon state, not a persisted setting.
-pub(crate) fn dnd_state(runner: &dyn CommandRunner) -> Option<bool> {
+pub fn dnd_state(runner: &dyn CommandRunner) -> Option<bool> {
     let command = dnd_query_command();
     match runner.run(&command) {
         Ok(output) if output.success() => {
@@ -387,7 +387,7 @@ fn parse_dnd(stdout: &[u8]) -> Option<bool> {
 /// applied at once — so nothing here is dirty or committed. A failure (e.g. the daemon is
 /// not running) is logged at `error` and otherwise ignored — it is non-fatal and leaves
 /// the daemon's DND state as it was.
-pub(crate) fn set_dnd(runner: &dyn CommandRunner, enabled: bool) {
+pub fn set_dnd(runner: &dyn CommandRunner, enabled: bool) {
     let command = set_dnd_command(enabled);
     match runner.run(&command) {
         Ok(output) if output.success() => {

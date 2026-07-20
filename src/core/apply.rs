@@ -131,20 +131,20 @@ use crate::system::writer::{FileSnapshot, WriteError, write_atomic};
 /// through the relevant parser (§3). The pipeline treats the bytes as opaque: it
 /// only writes them atomically and, on a later failure, rolls them back.
 #[derive(Clone, Debug)]
-pub(crate) struct FileWrite {
+pub struct FileWrite {
     /// The live XDG runtime path to rewrite (R8.5). [`write_atomic`] canonicalizes
     /// it, so a symlink into a dotfiles repo has its real target rewritten and the
     /// link preserved; a plain file is rewritten in place.
-    pub(crate) path: PathBuf,
+    pub path: PathBuf,
     /// The complete new file contents, produced by the page's parser glue from the
     /// staged values (surgical, span-preserving — §3). Written verbatim.
-    pub(crate) contents: Vec<u8>,
+    pub contents: Vec<u8>,
     /// Human-readable labels of the keys/values this write changes, logged with the
     /// path at `info` on a successful write (R7.3). Never the file contents.
-    pub(crate) changed_keys: Vec<String>,
+    pub changed_keys: Vec<String>,
     /// The reload concern this file drives, used to plan the post-write reloads
     /// (task 4.4).
-    pub(crate) backing: BackingFile,
+    pub backing: BackingFile,
 }
 
 /// A palette (color-scheme) switch — the last write step (the palette gotcha, §6
@@ -156,13 +156,13 @@ pub(crate) struct FileWrite {
 /// therefore modelled separately from [`FileWrite`] and always run *after* every
 /// file write, so a rollback never strands the generated files on the new scheme.
 #[derive(Clone, Debug)]
-pub(crate) struct PaletteSwitch {
+pub struct PaletteSwitch {
     /// The scheme name passed to the generator (e.g. `nord`).
-    pub(crate) scheme: String,
+    pub scheme: String,
     /// The discovered `scripts/generate-colors` path (from the capabilities palette
     /// source, R8.5). Run as `generate-colors <scheme>` through the
     /// [`CommandRunner`] — no shell.
-    pub(crate) generate_colors: PathBuf,
+    pub generate_colors: PathBuf,
 }
 
 /// A complete, self-contained description of one Apply — the pipeline's input.
@@ -177,32 +177,32 @@ pub(crate) struct PaletteSwitch {
 /// treats them separately), so a buggy caller could let them drift; the contract is
 /// that every dirty setting appears in both.
 #[derive(Clone, Debug)]
-pub(crate) struct ApplyPlan {
+pub struct ApplyPlan {
     /// The dirty staged values to re-validate before any write (step 1, R8.3),
     /// read by the caller from the store's dirty settings.
-    pub(crate) validations: Vec<(SettingId, Value)>,
+    pub validations: Vec<(SettingId, Value)>,
     /// The backing-file writes to apply atomically, in order (step 3, R5.4).
-    pub(crate) writes: Vec<FileWrite>,
+    pub writes: Vec<FileWrite>,
     /// The palette switch to run last, if this Apply changes the color scheme
     /// (step 4).
-    pub(crate) palette: Option<PaletteSwitch>,
+    pub palette: Option<PaletteSwitch>,
     /// The runtime values the parameterized reloads need (step 5, task 4.4).
-    pub(crate) reload_params: ReloadParams,
+    pub reload_params: ReloadParams,
 }
 
 /// A staged value that failed validation, with the setting it belongs to (R8.3).
 #[derive(Debug)]
-pub(crate) struct InvalidSetting {
+pub struct InvalidSetting {
     /// The setting whose staged value was rejected.
-    pub(crate) id: SettingId,
+    pub id: SettingId,
     /// Why it was rejected — its [`Display`](std::fmt::Display) is UI-ready.
-    pub(crate) error: ValidationError,
+    pub error: ValidationError,
 }
 
 /// Why the write phase (steps 3–4) failed, after which the earlier writes were
 /// rolled back.
 #[derive(Debug)]
-pub(crate) enum WriteFailureCause {
+pub enum WriteFailureCause {
     /// A backing-file write failed (step 3). Carries the live path that was being
     /// written and the underlying writer error.
     File {
@@ -254,15 +254,15 @@ impl fmt::Display for WriteFailureCause {
 /// hold the **resolved** (symlink-followed) paths taken from the snapshots of files
 /// that had already been written.
 #[derive(Debug)]
-pub(crate) struct WriteFailure {
+pub struct WriteFailure {
     /// What went wrong in the write phase.
-    pub(crate) cause: WriteFailureCause,
+    pub cause: WriteFailureCause,
     /// The resolved (symlink-followed) paths of files that had already been written
     /// and were successfully restored to their pre-apply contents.
-    pub(crate) rolled_back: Vec<PathBuf>,
+    pub rolled_back: Vec<PathBuf>,
     /// Rollback restores that themselves failed, each with the resolved path and the
     /// writer error. Non-empty means the desktop may be left partially changed.
-    pub(crate) rollback_failures: Vec<(PathBuf, WriteError)>,
+    pub rollback_failures: Vec<(PathBuf, WriteError)>,
 }
 
 /// The terminal state of an Apply, for the UI (task 5.3) to surface (R5.3–R5.6).
@@ -272,7 +272,7 @@ pub(crate) struct WriteFailure {
 /// The enum carries error types that are neither `Clone` nor `PartialEq`, so it
 /// derives only [`Debug`]; callers match on the variant and render the messages.
 #[derive(Debug)]
-pub(crate) enum ApplyOutcome {
+pub enum ApplyOutcome {
     /// Step 1 failed: one or more staged values are invalid (R8.3). Nothing was
     /// written; the UI shows the errors and keeps the staged edits for correction.
     ValidationFailed(Vec<InvalidSetting>),
@@ -318,7 +318,7 @@ pub(crate) enum ApplyOutcome {
 /// module docs for the step-by-step contract; the load-bearing guarantees are the
 /// **order** (validate → conflict → write → generate-colors → reload) and the
 /// **rollback** (any write-phase failure restores every already-written file).
-pub(crate) fn run(
+pub fn run(
     plan: &ApplyPlan,
     freshness: &FreshnessTracker,
     capabilities: &Capabilities,

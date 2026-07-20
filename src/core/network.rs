@@ -64,7 +64,7 @@ const LOOPBACK_TYPE: &str = "loopback";
 
 /// One active NetworkManager connection as shown on the Network page.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ActiveConnection {
+pub struct ActiveConnection {
     /// The user-facing connection name (`NAME`, e.g. the Wi-Fi SSID profile name).
     name: String,
     /// The raw NetworkManager connection type (`TYPE`, e.g. `802-11-wireless`);
@@ -77,7 +77,7 @@ pub(crate) struct ActiveConnection {
 
 impl ActiveConnection {
     /// The user-facing connection name.
-    pub(crate) fn name(&self) -> &str {
+    pub fn name(&self) -> &str {
         &self.name
     }
 
@@ -85,7 +85,7 @@ impl ActiveConnection {
     /// type identifiers are mapped to plain words (`802-11-wireless` → "Wi-Fi"),
     /// and an unrecognised type is shown as-is rather than hidden — a raw
     /// identifier is still more informative than nothing.
-    pub(crate) fn kind_label(&self) -> &str {
+    pub fn kind_label(&self) -> &str {
         match self.kind.as_str() {
             "802-11-wireless" => "Wi-Fi",
             "802-3-ethernet" => "Ethernet",
@@ -97,14 +97,14 @@ impl ActiveConnection {
     }
 
     /// The interface the connection is active on; may be empty.
-    pub(crate) fn device(&self) -> &str {
+    pub fn device(&self) -> &str {
         &self.device
     }
 }
 
 /// The Network page's read-only status: what [`read_status`] found.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum NetworkStatus {
+pub enum NetworkStatus {
     /// `nmcli` ran successfully and reported these active connections (possibly
     /// none — a machine that is simply offline).
     Connections(Vec<ActiveConnection>),
@@ -121,7 +121,7 @@ pub(crate) enum NetworkStatus {
 /// manual status refresh. Any failure — `nmcli` missing (it gates the page, but it
 /// can disappear between detection and now), a non-zero exit (NetworkManager daemon
 /// not running) — degrades to [`NetworkStatus::Unavailable`], never a panic.
-pub(crate) fn read_status(runner: &dyn CommandRunner) -> NetworkStatus {
+pub fn read_status(runner: &dyn CommandRunner) -> NetworkStatus {
     match runner.run(&status_command()) {
         Ok(output) if output.success() => NetworkStatus::Connections(parse_active_connections(
             &String::from_utf8_lossy(output.stdout()),
@@ -212,7 +212,7 @@ fn split_terse_fields(line: &str) -> Vec<String> {
 
 /// Which tool the "Open Network Settings" button launches (task 6.9, R3.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Launcher {
+pub enum Launcher {
     /// `nm-connection-editor`, NetworkManager's native GUI — preferred when
     /// installed, since it needs no terminal and matches a GUI settings app.
     ConnectionEditor,
@@ -224,7 +224,7 @@ pub(crate) enum Launcher {
 impl Launcher {
     /// A short user-facing description of what the button will open, for the
     /// button's tooltip.
-    pub(crate) fn description(self) -> &'static str {
+    pub fn description(self) -> &'static str {
         match self {
             Launcher::ConnectionEditor => "Opens nm-connection-editor",
             Launcher::KittyNmtui => "Opens nmtui in a kitty terminal",
@@ -238,7 +238,7 @@ impl Launcher {
 /// Preference order: `nm-connection-editor` when installed (the native GUI), else
 /// `kitty` + `nmtui`. The hidden-button case is logged at `info`, matching the
 /// hidden-item convention of the rest of detection-driven visibility.
-pub(crate) fn launcher(capabilities: &Capabilities) -> Option<Launcher> {
+pub fn launcher(capabilities: &Capabilities) -> Option<Launcher> {
     if capabilities.has_binary(Binary::NmConnectionEditor) {
         Some(Launcher::ConnectionEditor)
     } else if capabilities.has_binary(Binary::Kitty) {
@@ -277,7 +277,7 @@ fn launch_command(launcher: Launcher) -> Command {
 /// present at detection time but fails to start in the detached session is not
 /// observable from here. A failure to launch `setsid` itself is logged at
 /// `error`; it is non-fatal — nothing on disk or in the session changed.
-pub(crate) fn open_settings(runner: &dyn CommandRunner, launcher: Launcher) {
+pub fn open_settings(runner: &dyn CommandRunner, launcher: Launcher) {
     let command = launch_command(launcher);
     match runner.run(&command) {
         Ok(output) if output.success() => {

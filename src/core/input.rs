@@ -68,7 +68,7 @@ use crate::parsers::hyprlang::{EditError, HyprlangFile, KeyPath};
 /// near-unreachable in practice (`input.conf` is app-owned and readable), but treating
 /// them as failures keeps the store and the file in agreement (R8.3).
 #[derive(Debug)]
-pub(crate) enum InputWriteError {
+pub enum InputWriteError {
     /// `input.conf` could not be read to render the edits.
     Read(io::Error),
     /// The hyprlang writer rejected an edit — a value it cannot represent, or a missing
@@ -98,7 +98,7 @@ impl std::error::Error for InputWriteError {}
 /// first that exists. The registry path is still passed explicitly to
 /// [`InputModel::load`], so a test injects a fixture path instead of reading the system
 /// file, and a machine with neither location degrades to an empty candidate list (R4.4).
-pub(crate) const XKB_REGISTRY_CANDIDATES: &[&str] = &[
+pub const XKB_REGISTRY_CANDIDATES: &[&str] = &[
     "/usr/share/xkb/rules/evdev.xml",
     "/usr/share/X11/xkb/rules/evdev.xml",
 ];
@@ -110,7 +110,7 @@ pub(crate) const XKB_REGISTRY_CANDIDATES: &[&str] = &[
 /// Existence is probed rather than assumed because the file's location varies by distro
 /// (see [`XKB_REGISTRY_CANDIDATES`]); when none exists, reading the fallback simply
 /// yields an empty candidate list (R4.4).
-pub(crate) fn default_xkb_registry() -> PathBuf {
+pub fn default_xkb_registry() -> PathBuf {
     XKB_REGISTRY_CANDIDATES
         .iter()
         .map(PathBuf::from)
@@ -126,11 +126,11 @@ pub(crate) fn default_xkb_registry() -> PathBuf {
 /// same split the row framework's [`DropDownOption`](crate::ui::row::DropDownOption)
 /// uses, which the Input page maps these onto.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LayoutOption {
+pub struct LayoutOption {
     /// The XKB layout code stored in `kb_layout` (e.g. `us`).
-    pub(crate) code: String,
+    pub code: String,
     /// The registry's human-readable description (e.g. `English (US)`).
-    pub(crate) description: String,
+    pub description: String,
 }
 
 /// The complete new `input.conf` bytes plus the changed-key labels, produced by
@@ -141,11 +141,11 @@ pub(crate) struct LayoutOption {
 /// (e.g. `input.kb_layout`) used only for the apply-level log line (R7.3), never the
 /// file contents.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct InputConfEdit {
+pub struct InputConfEdit {
     /// The complete new file contents (surgical, span-preserving — §3).
-    pub(crate) contents: Vec<u8>,
+    pub contents: Vec<u8>,
     /// The section paths this edit changed, for logging.
-    pub(crate) changed_keys: Vec<String>,
+    pub changed_keys: Vec<String>,
 }
 
 /// The `input.conf` section path each Input [`SettingId`] edits, or `None` for a
@@ -157,7 +157,7 @@ pub(crate) struct InputConfEdit {
 /// section deeper under `input.touchpad`. The paths match the read side in
 /// [`crate::ui::startup`] so a value round-trips through the same address it was parsed
 /// from.
-pub(crate) fn input_section_path(id: SettingId) -> Option<KeyPath> {
+pub fn input_section_path(id: SettingId) -> Option<KeyPath> {
     match id {
         SettingId::KeyboardLayouts => Some(KeyPath::at(&["input"], "kb_layout")),
         SettingId::KeyboardOptions => Some(KeyPath::at(&["input"], "kb_options")),
@@ -205,7 +205,7 @@ fn value_to_hypr_string(id: SettingId, value: &Value) -> Option<String> {
 /// newline/`#` (R8.3), or an `input {}` section that does not exist — leaving the caller
 /// to skip the write rather than emit a partial file. A setting with no Input section
 /// path is ignored (it does not belong to this file).
-pub(crate) fn render_input_conf(
+pub fn render_input_conf(
     bytes: &[u8],
     edits: &[(SettingId, Value)],
 ) -> Result<InputConfEdit, EditError> {
@@ -244,7 +244,7 @@ pub(crate) fn render_input_conf(
 /// add-control (R4.4). A small hand-rolled scan is used rather than adding an XML
 /// dependency, matching the project's dependency-light parsers (§3); it targets exactly
 /// this file's regular shape.
-pub(crate) fn parse_xkb_layouts(xml: &str) -> Vec<LayoutOption> {
+pub fn parse_xkb_layouts(xml: &str) -> Vec<LayoutOption> {
     let Some(list) = slice_between(xml, "<layoutList>", "</layoutList>") else {
         return Vec::new();
     };
@@ -339,7 +339,7 @@ fn unescape_xml(text: &str) -> String {
 /// setting is staged in the shared store, so dirty tracking, validation, reset, and
 /// commit all flow through the store. This just supplies the layout add-list and turns
 /// the store's dirty Input settings into the `input.conf` [`FileWrite`] on Apply.
-pub(crate) struct InputModel {
+pub struct InputModel {
     /// The live XDG path of `input.conf` (R8.5), read fresh when rendering a write.
     input_conf: PathBuf,
     /// The XKB layout candidates the reorderable add-control offers (R2.3).
@@ -353,7 +353,7 @@ impl InputModel {
     ///
     /// Reading the (large) registry here, off the main thread, keeps it inside the R8.1
     /// cold-start budget; an unreadable registry degrades to no candidates (R4.4).
-    pub(crate) fn load(input_conf: PathBuf, xkb_registry: &Path) -> InputModel {
+    pub fn load(input_conf: PathBuf, xkb_registry: &Path) -> InputModel {
         InputModel {
             input_conf,
             layouts: read_xkb_layouts(xkb_registry),
@@ -361,7 +361,7 @@ impl InputModel {
     }
 
     /// The XKB layout candidates for the reorderable add-control (R2.3).
-    pub(crate) fn layout_options(&self) -> &[LayoutOption] {
+    pub fn layout_options(&self) -> &[LayoutOption] {
         &self.layouts
     }
 
@@ -386,7 +386,7 @@ impl InputModel {
     ///   caller must **abort the Apply** in this case rather than skip the write, since
     ///   the store would otherwise commit the staged values against an unchanged file and
     ///   desync (task 6.6 review M1). Both failure modes are near-unreachable in practice.
-    pub(crate) fn input_conf_write(
+    pub fn input_conf_write(
         &self,
         dirty: &[(SettingId, Value)],
     ) -> Result<Option<FileWrite>, InputWriteError> {

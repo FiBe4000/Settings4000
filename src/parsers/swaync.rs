@@ -65,7 +65,7 @@ use serde_json::{Map, Value};
 /// the file's key order and, for a file already in canonical form, its exact
 /// bytes.
 #[derive(Clone, Debug)]
-pub(crate) struct SwayncConfigFile {
+pub struct SwayncConfigFile {
     /// The config's top-level object. Storing the map directly (rather than a
     /// `Value`) encodes the invariant, established at [`parse`](Self::parse)
     /// time, that the root is an object — so the setters never have to re-check
@@ -80,7 +80,7 @@ pub(crate) struct SwayncConfigFile {
 /// partial representation, so it surfaces as an error rather than a panic (task
 /// 3.4 acceptance).
 #[derive(Debug)]
-pub(crate) enum ParseError {
+pub enum ParseError {
     /// The input is not syntactically valid JSON. Carries the underlying
     /// `serde_json` error, whose message includes the offending line and column.
     InvalidJson(serde_json::Error),
@@ -118,7 +118,7 @@ impl SwayncConfigFile {
     /// [`ParseError::NotAnObject`] if it parses to something other than a JSON
     /// object. Neither case panics (task 3.4 acceptance: "malformed JSON returns
     /// an error without panicking").
-    pub(crate) fn parse(input: &str) -> Result<Self, ParseError> {
+    pub fn parse(input: &str) -> Result<Self, ParseError> {
         let value: Value = serde_json::from_str(input).map_err(ParseError::InvalidJson)?;
         match value {
             Value::Object(root) => Ok(SwayncConfigFile { root }),
@@ -140,7 +140,7 @@ impl SwayncConfigFile {
     /// unreachable in practice and exists only to keep `emit` total (panic-free):
     /// it logs the anomaly and falls back to compact JSON, which loses the pretty
     /// formatting but no data.
-    pub(crate) fn emit(&self) -> String {
+    pub fn emit(&self) -> String {
         let value = Value::Object(self.root.clone());
         match serde_json::to_string_pretty(&value) {
             Ok(mut pretty) => {
@@ -163,7 +163,7 @@ impl SwayncConfigFile {
     ///
     /// Used for enum-like settings the Notifications page presents as a drop-down,
     /// e.g. `positionX` (`"left"`/`"right"`) and `positionY` (`"top"`/`"bottom"`).
-    pub(crate) fn string(&self, key: &str) -> Option<&str> {
+    pub fn string(&self, key: &str) -> Option<&str> {
         self.root.get(key).and_then(Value::as_str)
     }
 
@@ -172,7 +172,7 @@ impl SwayncConfigFile {
     ///
     /// Used for the notification timeout settings (`timeout`, `timeout-low`,
     /// `timeout-critical`), which are whole seconds.
-    pub(crate) fn integer(&self, key: &str) -> Option<i64> {
+    pub fn integer(&self, key: &str) -> Option<i64> {
         self.root.get(key).and_then(Value::as_i64)
     }
 
@@ -189,7 +189,7 @@ impl SwayncConfigFile {
     /// not as a top-level boolean. Setting `dnd` here would append a dead key
     /// swaync ignores, so the DND control must drive the runtime mechanism, not
     /// this accessor; confirm the mechanism before treating DND as a config key.
-    pub(crate) fn boolean(&self, key: &str) -> Option<bool> {
+    pub fn boolean(&self, key: &str) -> Option<bool> {
         self.root.get(key).and_then(Value::as_bool)
     }
 
@@ -199,21 +199,21 @@ impl SwayncConfigFile {
     /// key order is kept; a new key is appended after the existing keys. This
     /// holds for every setter below and follows `serde_json`'s (index-map-backed)
     /// insertion semantics under the `preserve_order` feature.
-    pub(crate) fn set_string(&mut self, key: &str, value: &str) {
+    pub fn set_string(&mut self, key: &str, value: &str) {
         self.root.insert(key.to_string(), Value::from(value));
         tracing::debug!(key, value, "set swaync string value");
     }
 
     /// Sets a top-level key to an integer value. See [`set_string`](Self::set_string)
     /// for the insert-vs-update ordering behavior.
-    pub(crate) fn set_integer(&mut self, key: &str, value: i64) {
+    pub fn set_integer(&mut self, key: &str, value: i64) {
         self.root.insert(key.to_string(), Value::from(value));
         tracing::debug!(key, value, "set swaync integer value");
     }
 
     /// Sets a top-level key to a boolean value. See [`set_string`](Self::set_string)
     /// for the insert-vs-update ordering behavior.
-    pub(crate) fn set_boolean(&mut self, key: &str, value: bool) {
+    pub fn set_boolean(&mut self, key: &str, value: bool) {
         self.root.insert(key.to_string(), Value::from(value));
         tracing::debug!(key, value, "set swaync boolean value");
     }

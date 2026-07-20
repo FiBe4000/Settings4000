@@ -208,7 +208,7 @@ impl Monitor {
 /// [`Self::from_sources`] (tests, with canned `hyprctl` JSON). Its file-backed edits
 /// are surfaced to the Apply pipeline through [`Self::apply_contribution`]; its
 /// runtime laptop toggle is [`Self::toggle_laptop`].
-pub(crate) struct DisplayModel {
+pub struct DisplayModel {
     /// The merged monitors, in the order `hyprctl` reported them.
     monitors: Vec<Monitor>,
     /// The parsed `monitors.conf`, or `None` when it could not be read (R4.4) — in
@@ -233,12 +233,12 @@ pub(crate) struct DisplayModel {
 
 /// The Display page's contribution to an [`ApplyPlan`](crate::core::apply::ApplyPlan):
 /// the single `monitors.conf` write plus the value validations to re-check (R8.3).
-pub(crate) struct DisplayApply {
+pub struct DisplayApply {
     /// The atomic write rewriting only the changed `monitor=` records.
-    pub(crate) write: FileWrite,
+    pub write: FileWrite,
     /// The staged monitor values to validate before writing (mode strings, scale
     /// ranges), reusing the model validators (R8.3).
-    pub(crate) validations: Vec<(SettingId, Value)>,
+    pub validations: Vec<(SettingId, Value)>,
 }
 
 impl DisplayModel {
@@ -251,7 +251,7 @@ impl DisplayModel {
     /// enumerate — so the Display page degrades to a placeholder (R4.2). A readable
     /// probe with an unreadable `monitors.conf` still yields a model (the file-backed
     /// controls are then hidden, R4.4).
-    pub(crate) fn load(runner: &dyn CommandRunner, monitors_conf_path: PathBuf) -> Option<Self> {
+    pub fn load(runner: &dyn CommandRunner, monitors_conf_path: PathBuf) -> Option<Self> {
         Self::load_with(runner, monitors_conf_path, PathBuf::from(LAPTOP_STATE_FILE))
     }
 
@@ -342,36 +342,36 @@ impl DisplayModel {
     }
 
     /// The number of monitors discovered.
-    pub(crate) fn monitor_count(&self) -> usize {
+    pub fn monitor_count(&self) -> usize {
         self.monitors.len()
     }
 
     /// Whether the per-monitor file-backed controls should be shown: `monitors.conf`
     /// was readable, so edits can be written (R4.4).
-    pub(crate) fn records_editable(&self) -> bool {
+    pub fn records_editable(&self) -> bool {
         self.records.is_some()
     }
 
     /// The live output name of monitor `index` (e.g. `eDP-1`).
-    pub(crate) fn monitor_name(&self, index: usize) -> &str {
+    pub fn monitor_name(&self, index: usize) -> &str {
         &self.monitors[index].output_name
     }
 
     /// The `hyprctl` description (make/model) of monitor `index`.
-    pub(crate) fn monitor_description(&self, index: usize) -> &str {
+    pub fn monitor_description(&self, index: usize) -> &str {
         &self.monitors[index].description
     }
 
     /// Whether monitor `index` is an internal laptop panel — its enablement uses the
     /// runtime toggle (R5.2), its mode/scale the staged record edit.
-    pub(crate) fn is_laptop(&self, index: usize) -> bool {
+    pub fn is_laptop(&self, index: usize) -> bool {
         self.monitors[index].is_laptop
     }
 
     /// The resolution (`WIDTHxHEIGHT`) drop-down options for monitor `index`: the
     /// distinct resolutions the compositor reports, plus the configured resolution
     /// when it is not among them, so the current value is always selectable.
-    pub(crate) fn resolution_options(&self, index: usize) -> Vec<String> {
+    pub fn resolution_options(&self, index: usize) -> Vec<String> {
         let mut options: Vec<String> = Vec::new();
         for mode in &self.monitors[index].available {
             if !options.contains(&mode.resolution) {
@@ -389,14 +389,14 @@ impl DisplayModel {
     /// selected resolution: the refresh rates the compositor reports for that
     /// resolution, plus the configured refresh when set and not among them. Empty for
     /// a special mode token (`preferred`), whose refresh is Hyprland's choice.
-    pub(crate) fn refresh_options(&self, index: usize) -> Vec<String> {
+    pub fn refresh_options(&self, index: usize) -> Vec<String> {
         let resolution = self.effective_resolution(index);
         self.refresh_options_for(index, &resolution)
     }
 
     /// The scale drop-down options for monitor `index`: the configured scale (first,
     /// so it is preselected) followed by the [`CURATED_SCALES`] not already listed.
-    pub(crate) fn scale_options(&self, index: usize) -> Vec<String> {
+    pub fn scale_options(&self, index: usize) -> Vec<String> {
         let configured = self.effective_scale(index);
         let mut options = vec![configured.clone()];
         for scale in CURATED_SCALES {
@@ -409,7 +409,7 @@ impl DisplayModel {
 
     /// The position drop-down options for monitor `index`: [`CURATED_POSITIONS`] plus
     /// the configured position when it is neither.
-    pub(crate) fn position_options(&self, index: usize) -> Vec<String> {
+    pub fn position_options(&self, index: usize) -> Vec<String> {
         let mut options: Vec<String> = CURATED_POSITIONS.iter().map(|p| (*p).to_string()).collect();
         let configured = self.effective_position(index);
         if !options.contains(&configured) {
@@ -420,30 +420,30 @@ impl DisplayModel {
 
     /// The currently selected resolution (`WIDTHxHEIGHT` or a mode token) of monitor
     /// `index`, from its staged-or-original mode.
-    pub(crate) fn effective_resolution(&self, index: usize) -> String {
+    pub fn effective_resolution(&self, index: usize) -> String {
         split_mode(&self.monitors[index].effective().mode).0
     }
 
     /// The currently selected refresh rate of monitor `index`, or `None` when the mode
     /// carries none (a bare `WIDTHxHEIGHT` or a token).
-    pub(crate) fn effective_refresh(&self, index: usize) -> Option<String> {
+    pub fn effective_refresh(&self, index: usize) -> Option<String> {
         split_mode(&self.monitors[index].effective().mode).1
     }
 
     /// The currently selected scale of monitor `index`.
-    pub(crate) fn effective_scale(&self, index: usize) -> String {
+    pub fn effective_scale(&self, index: usize) -> String {
         self.monitors[index].effective().scale.clone()
     }
 
     /// The currently selected position of monitor `index`.
-    pub(crate) fn effective_position(&self, index: usize) -> String {
+    pub fn effective_position(&self, index: usize) -> String {
         self.monitors[index].effective().position.clone()
     }
 
     /// Whether monitor `index` is currently enabled (staged-or-original). For a
     /// non-laptop output this drives its enable switch; a laptop panel's live
     /// enablement is the runtime toggle instead (see [`Self::laptop_forced_on`]).
-    pub(crate) fn effective_enabled(&self, index: usize) -> bool {
+    pub fn effective_enabled(&self, index: usize) -> bool {
         self.monitors[index].effective().enabled
     }
 
@@ -451,7 +451,7 @@ impl DisplayModel {
     /// state (`!disabled`). This drives the runtime laptop enable switch's position —
     /// the panel's actual on/off state, as `scripts/hypr-toggle-laptop-display` reads
     /// it — independent of the staged record edits.
-    pub(crate) fn laptop_enabled(&self, index: usize) -> bool {
+    pub fn laptop_enabled(&self, index: usize) -> bool {
         self.monitors[index].live_enabled
     }
 
@@ -462,7 +462,7 @@ impl DisplayModel {
     /// model re-loaded rather than clobbering the stale parse. Always `false` when the
     /// file was unreadable at load (nothing was baselined, and there is nothing to
     /// write).
-    pub(crate) fn check_conflict(&self) -> bool {
+    pub fn check_conflict(&self) -> bool {
         !self.freshness.check_conflicts().is_empty()
     }
 
@@ -473,7 +473,7 @@ impl DisplayModel {
     /// re-parses the current file (discarding the now-stale staged edits, which were
     /// based on the superseded bytes) so a subsequent Apply builds on the current
     /// contents. Returns `None` if the compositor can no longer be probed.
-    pub(crate) fn reload(&self, runner: &dyn CommandRunner) -> Option<Self> {
+    pub fn reload(&self, runner: &dyn CommandRunner) -> Option<Self> {
         Self::load_with(
             runner,
             self.monitors_conf_path.clone(),
@@ -484,7 +484,7 @@ impl DisplayModel {
     /// Stages a new resolution for monitor `index`, composing it with a refresh rate
     /// valid for that resolution (keeping the current one when still available, else
     /// the first the compositor reports) into the mode field.
-    pub(crate) fn stage_resolution(&mut self, index: usize, resolution: String) {
+    pub fn stage_resolution(&mut self, index: usize, resolution: String) {
         let refresh = {
             let current = self.effective_refresh(index);
             let available = self.refresh_options_for(index, &resolution);
@@ -497,14 +497,14 @@ impl DisplayModel {
     }
 
     /// Stages a new refresh rate for monitor `index`, keeping its current resolution.
-    pub(crate) fn stage_refresh(&mut self, index: usize, refresh: String) {
+    pub fn stage_refresh(&mut self, index: usize, refresh: String) {
         let resolution = self.effective_resolution(index);
         self.stage_mode(index, compose_mode(&resolution, Some(&refresh)));
     }
 
     /// Stages a new scale for monitor `index`, rejecting a value outside the plausible
     /// range (R8.3) so the drop-down snaps back rather than writing a broken scale.
-    pub(crate) fn stage_scale(&mut self, index: usize, scale: String) {
+    pub fn stage_scale(&mut self, index: usize, scale: String) {
         match scale.parse::<f64>() {
             Ok(value) if validate_float_range(value, &SCALE_RANGE).is_ok() => {}
             _ => {
@@ -517,7 +517,7 @@ impl DisplayModel {
     }
 
     /// Stages a new position for monitor `index`.
-    pub(crate) fn stage_position(&mut self, index: usize, position: String) {
+    pub fn stage_position(&mut self, index: usize, position: String) {
         self.ensure_staged(index).position = position;
         self.clear_if_unchanged(index);
     }
@@ -525,7 +525,7 @@ impl DisplayModel {
     /// Stages an enable/disable edit for a **non-laptop** monitor `index` (a staged
     /// `monitors.conf` change). A laptop panel must use [`Self::toggle_laptop`]
     /// instead; calling this for one is a no-op guarded by a debug assertion.
-    pub(crate) fn stage_enabled(&mut self, index: usize, enabled: bool) {
+    pub fn stage_enabled(&mut self, index: usize, enabled: bool) {
         debug_assert!(
             !self.monitors[index].is_laptop,
             "a laptop panel's enablement is runtime-only (R5.2); use toggle_laptop"
@@ -592,12 +592,12 @@ impl DisplayModel {
 
     /// Whether any monitor has a pending file-backed edit — the Display page's dirty
     /// state, which the window folds into the global Apply/Reset chrome (R5.1).
-    pub(crate) fn is_dirty(&self) -> bool {
+    pub fn is_dirty(&self) -> bool {
         self.monitors.iter().any(Monitor::is_dirty)
     }
 
     /// Discards every staged monitor edit, returning the page to clean (R5.1).
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         for monitor in &mut self.monitors {
             monitor.staged = None;
         }
@@ -612,7 +612,7 @@ impl DisplayModel {
     /// [`FileWrite`] for the shared pipeline, alongside the value validations (R8.3).
     /// A parser edit error (which should not occur for validated values) is logged and
     /// yields `None` rather than a partial write.
-    pub(crate) fn apply_contribution(&self) -> Option<DisplayApply> {
+    pub fn apply_contribution(&self) -> Option<DisplayApply> {
         if !self.is_dirty() {
             return None;
         }
@@ -642,7 +642,7 @@ impl DisplayModel {
     /// Commits the staged edits after a successful Apply: applies them to the in-memory
     /// `monitors.conf` and promotes each monitor's staged config to its original, so
     /// the model reflects what was just written and the page is clean again.
-    pub(crate) fn commit(&mut self) {
+    pub fn commit(&mut self) {
         // Apply the staged edits to the in-memory records and capture the resulting
         // bytes — the exact bytes the pipeline just wrote.
         let written = if let Some(records) = self.records.as_mut() {
@@ -725,7 +725,7 @@ impl DisplayModel {
     /// failure is logged but does not fail the toggle, since the persistent override is
     /// still recorded. The stored live-enabled state is updated so the switch reflects
     /// the new state.
-    pub(crate) fn toggle_laptop(
+    pub fn toggle_laptop(
         &mut self,
         index: usize,
         enable: bool,

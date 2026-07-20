@@ -43,7 +43,7 @@ use nix::unistd::Pid;
 /// `MockProcessSignaller`. Making it a trait is what lets the kitty and hypridle
 /// reloads (task 4.4) be tested by asserting the exact `(process, signal, PIDs)`
 /// against a recorder rather than signalling real processes (R6.1).
-pub(crate) trait ProcessSignaller {
+pub trait ProcessSignaller {
     /// Sends `signal` to every running process whose executable basename equals
     /// `process_name`, returning the PIDs that were signalled.
     ///
@@ -64,11 +64,11 @@ pub(crate) trait ProcessSignaller {
 /// `/proc` for the current PIDs, since a daemon's PID can change between reloads
 /// (e.g. hypridle after a respawn).
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct SystemProcessSignaller;
+pub struct SystemProcessSignaller;
 
 impl SystemProcessSignaller {
     /// Creates the signaller. Stateless — see the type documentation.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         SystemProcessSignaller
     }
 }
@@ -161,13 +161,17 @@ fn process_basename(cmdline: &[u8]) -> Option<String> {
 ///
 /// State is behind a [`std::sync::Mutex`] so the recorder can be shared behind an
 /// `&dyn ProcessSignaller` and inspected after use while `signal_all` takes `&self`.
-#[cfg(test)]
-pub(crate) struct MockProcessSignaller {
+///
+/// Available to in-crate unit tests via `cfg(test)` and to the integration
+/// suites in `tests/` (separate crates, where `cfg(test)` does not reach) via
+/// the `testing` feature — never in a release build.
+#[cfg(any(test, feature = "testing"))]
+pub struct MockProcessSignaller {
     inner: std::sync::Mutex<MockSignalState>,
 }
 
 /// The interior, lock-guarded state of a [`MockProcessSignaller`].
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 struct MockSignalState {
     /// The processes considered "running", mapped to the PIDs a matching
     /// [`ProcessSignaller::signal_all`] call reports as signalled.
@@ -183,21 +187,29 @@ struct MockSignalState {
 }
 
 /// One recorded [`ProcessSignaller::signal_all`] invocation.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SignalCall {
+pub struct SignalCall {
     /// The process name that was targeted.
-    pub(crate) process_name: String,
+    pub process_name: String,
     /// The signal that was requested.
-    pub(crate) signal: Signal,
+    pub signal: Signal,
     /// The PIDs reported as signalled (the mock's configured PIDs for the name).
-    pub(crate) pids: Vec<i32>,
+    pub pids: Vec<i32>,
 }
 
-#[cfg(test)]
+/// Equivalent to [`MockProcessSignaller::new`]: no running processes, no failures.
+#[cfg(any(test, feature = "testing"))]
+impl Default for MockProcessSignaller {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
 impl MockProcessSignaller {
     /// Creates a recorder with no running processes; every call reports zero PIDs.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             inner: std::sync::Mutex::new(MockSignalState {
                 running: std::collections::BTreeMap::new(),
@@ -208,7 +220,7 @@ impl MockProcessSignaller {
     }
 
     /// Creates a recorder seeded with the given running processes and their PIDs.
-    pub(crate) fn with_running<I>(running: I) -> Self
+    pub fn with_running<I>(running: I) -> Self
     where
         I: IntoIterator<Item = (String, Vec<i32>)>,
     {
@@ -224,7 +236,7 @@ impl MockProcessSignaller {
     /// Creates a recorder whose every [`ProcessSignaller::signal_all`] call fails
     /// with an [`io::Error`] of `kind`, standing in for a process-enumeration
     /// failure so the reload executor's `ReloadError::Signal` path can be tested.
-    pub(crate) fn failing(kind: io::ErrorKind) -> Self {
+    pub fn failing(kind: io::ErrorKind) -> Self {
         Self {
             inner: std::sync::Mutex::new(MockSignalState {
                 running: std::collections::BTreeMap::new(),
@@ -235,7 +247,7 @@ impl MockProcessSignaller {
     }
 
     /// Returns a snapshot of the recorded calls, in order.
-    pub(crate) fn calls(&self) -> Vec<SignalCall> {
+    pub fn calls(&self) -> Vec<SignalCall> {
         self.lock().calls.clone()
     }
 
@@ -251,7 +263,7 @@ impl MockProcessSignaller {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl ProcessSignaller for MockProcessSignaller {
     fn signal_all(&self, process_name: &str, signal: Signal) -> io::Result<Vec<i32>> {
         let mut state = self.lock();

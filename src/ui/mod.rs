@@ -62,7 +62,7 @@
 //!
 //! The real per-category page content (§6) plugs into this shell in later tasks.
 
-pub(crate) mod app;
+pub mod app;
 mod category;
 mod chrome;
 mod display;

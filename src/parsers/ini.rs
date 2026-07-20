@@ -74,7 +74,7 @@ use std::fmt;
 /// file reproduces its input exactly; editing a value splices new bytes into a
 /// single line's value span and leaves every other line alone.
 #[derive(Clone, Debug)]
-pub(crate) struct IniFile {
+pub struct IniFile {
     /// The file's lines in original order. Concatenating every line's raw text
     /// reproduces the original input exactly (round-trip identity).
     lines: Vec<Line>,
@@ -149,7 +149,7 @@ enum LineKind {
 /// logs each at `warn`, so the caller can both react programmatically and see
 /// them in the journal.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ParseWarning {
+pub struct ParseWarning {
     /// 1-based line number the warning concerns, for human-readable diagnostics.
     line: usize,
     /// What was wrong with the line.
@@ -158,12 +158,12 @@ pub(crate) struct ParseWarning {
 
 impl ParseWarning {
     /// The 1-based line number this warning concerns.
-    pub(crate) fn line(&self) -> usize {
+    pub fn line(&self) -> usize {
         self.line
     }
 
     /// What was wrong with the line.
-    pub(crate) fn kind(&self) -> &ParseWarningKind {
+    pub fn kind(&self) -> &ParseWarningKind {
         &self.kind
     }
 }
@@ -182,7 +182,7 @@ impl fmt::Display for ParseWarning {
 
 /// The specific reason a line produced a [`ParseWarning`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ParseWarningKind {
+pub enum ParseWarningKind {
     /// The line is not blank, not a comment, not a well-formed `[section]`
     /// header, and not a `key=value` assignment with a non-empty key — so it
     /// cannot be interpreted. It is kept byte-for-byte and ignored by edits.
@@ -192,7 +192,7 @@ pub(crate) enum ParseWarningKind {
 /// Which action [`IniFile::set_value`] took, for logging and for tests that need
 /// to distinguish an in-place edit from an append or a section creation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SetOutcome {
+pub enum SetOutcome {
     /// The key already existed in the target section; its value span was
     /// rewritten in place.
     Edited,
@@ -217,7 +217,7 @@ pub(crate) enum SetOutcome {
 // distinct rejected input (value / key / section).
 #[allow(clippy::enum_variant_names)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum EditError {
+pub enum EditError {
     /// The requested value contains a newline or carriage return, which would
     /// split the single `key=value` line into two and corrupt the file. Rejecting
     /// it upholds R8.3 — the app never writes a value that breaks a working
@@ -270,7 +270,7 @@ impl IniFile {
     ///
     /// The returned warnings carry only line numbers — never the file's
     /// contents, which are not logged at any level (R7.3).
-    pub(crate) fn parse(input: &str) -> (Self, Vec<ParseWarning>) {
+    pub fn parse(input: &str) -> (Self, Vec<ParseWarning>) {
         let mut lines = Vec::new();
         let mut warnings = Vec::new();
 
@@ -302,7 +302,7 @@ impl IniFile {
     /// The first [`set_value`](Self::set_value) call then creates the `[Settings]`
     /// section and its first key. Emitting an untouched empty file yields the
     /// empty string, so writing one out unchanged is a no-op.
-    pub(crate) fn empty() -> Self {
+    pub fn empty() -> Self {
         IniFile { lines: Vec::new() }
     }
 
@@ -312,7 +312,7 @@ impl IniFile {
     /// After [`set_value`](Self::set_value) edits, the output is identical to the
     /// input except within edited value spans and any lines appended by a new
     /// key or a created section.
-    pub(crate) fn emit(&self) -> String {
+    pub fn emit(&self) -> String {
         let mut out = String::new();
         for line in &self.lines {
             out.push_str(&line.raw);
@@ -326,7 +326,7 @@ impl IniFile {
     /// value, so this reads the *last* matching entry inside the first matching
     /// section — the value GTK actually uses. Comment, blank, and malformed
     /// lines — and entries in other sections — are never considered.
-    pub(crate) fn value(&self, section: &str, key: &str) -> Option<&str> {
+    pub fn value(&self, section: &str, key: &str) -> Option<&str> {
         let (_, body_start, body_end) = self.section_range(section)?;
         // Iterate in reverse so the first hit is the last (GLib-effective)
         // occurrence within the section body.
@@ -370,7 +370,7 @@ impl IniFile {
     /// completely unchanged (R8.3). If a key appears more than once in a section
     /// only the **last** occurrence — the one GLib treats as effective — is
     /// edited; earlier shadowed duplicates stay byte-identical.
-    pub(crate) fn set_value(
+    pub fn set_value(
         &mut self,
         section: &str,
         key: &str,

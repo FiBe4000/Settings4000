@@ -7,6 +7,17 @@ edition = "2024"
 rust-version = "1.85"
 description = "Native GTK4 settings GUI for a dotfiles-managed Hyprland desktop"
 
+[features]
+# Compiles the crate's test-support surface — the fixture-dotfiles installer
+# (`testing` module, task 7.1) and the mock seams (`MockCommandRunner`,
+# `MockProcessSignaller`, `Capabilities::for_tests`) — into the library for
+# consumers *outside* the crate. In-crate unit tests see that surface via
+# `cfg(test)` regardless; integration tests in `tests/` compile as separate
+# crates where `cfg(test)` does not apply to the library, so they get it through
+# this feature via the self-referential dev-dependency below (R6.1). Never
+# enabled for a release build.
+testing = []
+
 [dependencies]
 # GUI toolkit. Relm4 provides the declarative, message-driven component
 # framework; `gtk4` is the underlying binding. Both are pinned to the same 0.10
@@ -64,3 +75,11 @@ wait-timeout = "0.2.1"
 # it must be a regular dependency (which also keeps it available to the tests
 # that build fixture dotfiles trees, architecture §9).
 tempfile = "3.27.0"
+
+[dev-dependencies]
+# The crate depends on itself with the `testing` feature enabled so that every
+# test target (unit, integration, doc) gets the test-support surface — the
+# fixture installer and mock seams — without release builds ever carrying it.
+# This self-referential dev-dependency is the standard Cargo pattern for
+# enabling a feature in tests only; it introduces no second copy of the crate.
+settings4000 = { path = ".", features = ["testing"] }

@@ -42,7 +42,7 @@ use wait_timeout::ChildExt;
 /// interactively-blocked process can never stall Apply or startup. The value is
 /// fixed for production; tests may construct a [`SystemCommandRunner`] with a
 /// shorter limit to exercise the timeout path quickly.
-pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Upper bound, in bytes, on how much captured stderr is emitted to the logs.
 ///
@@ -74,7 +74,7 @@ const STDERR_LOG_LIMIT: usize = 512;
 /// within this crate it refers to this value type, and the standard library's
 /// builder is reached as `std::process::Command` in the runner's implementation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Command {
+pub struct Command {
     /// The executable to run, resolved against `PATH` by the OS at spawn time.
     program: String,
     /// The arguments passed verbatim to the program, in order. Does *not*
@@ -91,7 +91,7 @@ impl Command {
     ///
     /// `program` is looked up on `PATH` (or used as a path if it contains a
     /// separator) by the operating system when the command is run.
-    pub(crate) fn new(program: impl Into<String>) -> Self {
+    pub fn new(program: impl Into<String>) -> Self {
         Self {
             program: program.into(),
             args: Vec::new(),
@@ -101,14 +101,14 @@ impl Command {
 
     /// Appends a single argument, returning the command for chaining.
     #[must_use]
-    pub(crate) fn arg(mut self, arg: impl Into<String>) -> Self {
+    pub fn arg(mut self, arg: impl Into<String>) -> Self {
         self.args.push(arg.into());
         self
     }
 
     /// Appends several arguments in order, returning the command for chaining.
     #[must_use]
-    pub(crate) fn args<I, S>(mut self, args: I) -> Self
+    pub fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -118,12 +118,12 @@ impl Command {
     }
 
     /// The program name this command will run.
-    pub(crate) fn program(&self) -> &str {
+    pub fn program(&self) -> &str {
         &self.program
     }
 
     /// The command's arguments, in order, excluding the program name.
-    pub(crate) fn args_slice(&self) -> &[String] {
+    pub fn args_slice(&self) -> &[String] {
         &self.args
     }
 
@@ -143,13 +143,13 @@ impl Command {
     /// forked. The timed wait and exit-status check still apply to the direct
     /// child, and the returned [`CommandOutput`] carries empty streams.
     #[must_use]
-    pub(crate) fn detached(mut self) -> Self {
+    pub fn detached(mut self) -> Self {
         self.detached = true;
         self
     }
 
     /// Whether this command is a detached launch (see [`Command::detached`]).
-    pub(crate) fn is_detached(&self) -> bool {
+    pub fn is_detached(&self) -> bool {
         self.detached
     }
 }
@@ -183,7 +183,7 @@ impl fmt::Display for Command {
 /// [`std::process::ExitStatus`] so the type is fully constructible in tests and
 /// carries no platform-specific state.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CommandOutput {
+pub struct CommandOutput {
     /// The process's exit code, or `None` when it was terminated by a signal
     /// without producing a code (Unix). `None` is never "success".
     code: Option<i32>,
@@ -197,22 +197,22 @@ impl CommandOutput {
     /// Whether the command reported success, i.e. exited with code `0`.
     ///
     /// A non-zero code or a signal termination (`code == None`) is a failure.
-    pub(crate) fn success(&self) -> bool {
+    pub fn success(&self) -> bool {
         self.code == Some(0)
     }
 
     /// The process's exit code, or `None` if it was killed by a signal.
-    pub(crate) fn code(&self) -> Option<i32> {
+    pub fn code(&self) -> Option<i32> {
         self.code
     }
 
     /// The bytes the process wrote to standard output.
-    pub(crate) fn stdout(&self) -> &[u8] {
+    pub fn stdout(&self) -> &[u8] {
         &self.stdout
     }
 
     /// The bytes the process wrote to standard error.
-    pub(crate) fn stderr(&self) -> &[u8] {
+    pub fn stderr(&self) -> &[u8] {
         &self.stderr
     }
 }
@@ -224,7 +224,7 @@ impl CommandOutput {
 /// Keeping them separate lets a caller propagate "the command could not run"
 /// with `?` while still inspecting the exit code of a command that did run.
 #[derive(Debug)]
-pub(crate) enum CommandError {
+pub enum CommandError {
     /// The program could not be started at all — most often because it is not
     /// on `PATH`, or the file is not executable. Carries the underlying OS
     /// error.
@@ -272,7 +272,7 @@ impl std::error::Error for CommandError {
 /// Making it a trait is what lets the Apply pipeline and reload table (tasks
 /// 4.4/4.5) be tested by asserting the exact command sequence against a
 /// recorder rather than actually mutating the running desktop (R6.1).
-pub(crate) trait CommandRunner {
+pub trait CommandRunner {
     /// Runs `command` to completion or until the timeout, returning its output.
     ///
     /// Returns `Ok(CommandOutput)` when the process ran to completion — check
@@ -291,14 +291,14 @@ pub(crate) trait CommandRunner {
 /// stdout and stderr are captured and the invocation plus its exit status is
 /// logged (R7.3). A child that overruns the timeout is killed.
 #[derive(Clone, Debug)]
-pub(crate) struct SystemCommandRunner {
+pub struct SystemCommandRunner {
     /// Wall-clock deadline applied to every command this runner spawns.
     timeout: Duration,
 }
 
 impl SystemCommandRunner {
     /// Creates a runner using the fixed production [`DEFAULT_TIMEOUT`] (5 s).
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             timeout: DEFAULT_TIMEOUT,
         }
@@ -526,13 +526,17 @@ fn log_stderr_excerpt(command: &Command, output: &CommandOutput) {
 /// State is held behind a [`std::sync::Mutex`] so the recorder can be shared
 /// (e.g. behind an `&dyn CommandRunner`) and observed after use while `run`
 /// takes `&self`.
-#[cfg(test)]
-pub(crate) struct MockCommandRunner {
+///
+/// Available to in-crate unit tests via `cfg(test)` and to the integration
+/// suites in `tests/` (separate crates, where `cfg(test)` does not reach) via
+/// the `testing` feature — never in a release build.
+#[cfg(any(test, feature = "testing"))]
+pub struct MockCommandRunner {
     inner: std::sync::Mutex<MockState>,
 }
 
 /// The interior, lock-guarded state of a [`MockCommandRunner`].
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 struct MockState {
     /// Every command passed to [`CommandRunner::run`], in call order.
     recorded: Vec<Command>,
@@ -541,11 +545,19 @@ struct MockState {
     outcomes: std::collections::VecDeque<Result<CommandOutput, CommandError>>,
 }
 
-#[cfg(test)]
+/// Equivalent to [`MockCommandRunner::new`]: records everything, answers success.
+#[cfg(any(test, feature = "testing"))]
+impl Default for MockCommandRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
 impl MockCommandRunner {
     /// Creates a recorder that returns success for every call (until/unless
     /// outcomes are queued).
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             inner: std::sync::Mutex::new(MockState {
                 recorded: Vec::new(),
@@ -556,7 +568,7 @@ impl MockCommandRunner {
 
     /// Creates a recorder pre-loaded with `outcomes`, returned one per call in
     /// order; further calls after the queue drains return success.
-    pub(crate) fn with_outcomes<I>(outcomes: I) -> Self
+    pub fn with_outcomes<I>(outcomes: I) -> Self
     where
         I: IntoIterator<Item = Result<CommandOutput, CommandError>>,
     {
@@ -569,7 +581,7 @@ impl MockCommandRunner {
     }
 
     /// Returns a snapshot of the commands recorded so far, in call order.
-    pub(crate) fn recorded(&self) -> Vec<Command> {
+    pub fn recorded(&self) -> Vec<Command> {
         self.lock().recorded.clone()
     }
 
@@ -585,7 +597,7 @@ impl MockCommandRunner {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl CommandRunner for MockCommandRunner {
     fn run(&self, command: &Command) -> Result<CommandOutput, CommandError> {
         let mut state = self.lock();
@@ -600,11 +612,11 @@ impl CommandRunner for MockCommandRunner {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl CommandOutput {
     /// Builds an outcome with the given exit code and empty output, for scripting
     /// [`MockCommandRunner`] and asserting on [`CommandOutput`] in tests.
-    pub(crate) fn fake(code: i32) -> Self {
+    pub fn fake(code: i32) -> Self {
         Self {
             code: Some(code),
             stdout: Vec::new(),
@@ -614,7 +626,7 @@ impl CommandOutput {
 
     /// Builds an outcome with the given exit code and captured streams, for
     /// tests that assert on captured output.
-    pub(crate) fn fake_with_streams(code: i32, stdout: &str, stderr: &str) -> Self {
+    pub fn fake_with_streams(code: i32, stdout: &str, stderr: &str) -> Self {
         Self {
             code: Some(code),
             stdout: stdout.as_bytes().to_vec(),

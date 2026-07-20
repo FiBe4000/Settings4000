@@ -89,14 +89,14 @@ use crate::core::model::{Backing, Category, SettingId, ValidationError, Value};
 /// come from a *single* read of the file, which is what lets the store baseline the
 /// freshness tracker against the exact bytes it parsed (see the module docs).
 #[derive(Debug)]
-pub(crate) struct FileValues {
+pub struct FileValues {
     /// The file's exact bytes at the moment it was read, used verbatim as the
     /// freshness baseline.
-    pub(crate) bytes: Vec<u8>,
+    pub bytes: Vec<u8>,
     /// The original values parsed from those bytes, each keyed by the setting it
     /// backs. A runtime-only [`SettingId`] appearing here is ignored (the store only
     /// tracks file-backed settings).
-    pub(crate) values: Vec<(SettingId, Value)>,
+    pub values: Vec<(SettingId, Value)>,
 }
 
 /// A closure that re-reads and re-parses a backing file into its current
@@ -109,14 +109,14 @@ pub(crate) struct FileValues {
 /// is [`Send`] so the store can be built on the startup worker thread and moved to
 /// the UI thread (architecture §8). It is boxed behind this alias so the store's
 /// method signatures stay readable.
-pub(crate) type FileReader = Box<dyn Fn(&Path) -> io::Result<FileValues> + Send>;
+pub type FileReader = Box<dyn Fn(&Path) -> io::Result<FileValues> + Send>;
 
 /// The outcome of a successful [`SettingsStore::stage`] call.
 ///
 /// Tells the caller whether the value was recorded as a pending file-backed edit or
 /// must be applied immediately because the setting is runtime-only (R5.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StageOutcome {
+pub enum StageOutcome {
     /// The value was recorded as a pending edit to a config file (R5.1). It will be
     /// written on Apply and shows as dirty until then (unless it equals the
     /// original).
@@ -129,7 +129,7 @@ pub(crate) enum StageOutcome {
 
 /// Why a [`SettingsStore::stage`] call was refused.
 #[derive(Debug)]
-pub(crate) enum StageError {
+pub enum StageError {
     /// The proposed value failed validation (R8.3); nothing was staged. This is the
     /// guard that also keeps a `NaN` float out of `staged` (see the module docs).
     Invalid(ValidationError),
@@ -164,7 +164,7 @@ impl std::error::Error for StageError {}
 /// The UI (task 5.3) uses this to warn the user that files were edited externally
 /// and to say which reloaded cleanly versus which could not be re-read.
 #[derive(Debug, Default)]
-pub(crate) struct RefreshReport {
+pub struct RefreshReport {
     /// Files that changed externally and whose originals were successfully reloaded
     /// from disk (and re-baselined for future conflict checks).
     reloaded: Vec<PathBuf>,
@@ -176,17 +176,17 @@ pub(crate) struct RefreshReport {
 
 impl RefreshReport {
     /// Whether no external changes were detected at all — the common, quiet case.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.reloaded.is_empty() && self.failed.is_empty()
     }
 
     /// The files whose originals were reloaded from disk.
-    pub(crate) fn reloaded(&self) -> &[PathBuf] {
+    pub fn reloaded(&self) -> &[PathBuf] {
         &self.reloaded
     }
 
     /// The files that changed but could not be reloaded.
-    pub(crate) fn failed(&self) -> &[PathBuf] {
+    pub fn failed(&self) -> &[PathBuf] {
         &self.failed
     }
 }
@@ -224,7 +224,7 @@ impl Entry {
 ///
 /// See the module documentation for the full model. Only file-backed settings are
 /// ever stored here; runtime-only settings bypass staging (R5.2).
-pub(crate) struct SettingsStore {
+pub struct SettingsStore {
     /// The `original`/`staged` pair for every loaded file-backed setting.
     ///
     /// A [`BTreeMap`] so iteration (dirty rollup, logs, tests) is deterministic by
@@ -238,9 +238,16 @@ pub(crate) struct SettingsStore {
     freshness: FreshnessTracker,
 }
 
+/// Equivalent to [`SettingsStore::new`]: an empty store with no loaded settings.
+impl Default for SettingsStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SettingsStore {
     /// Creates an empty store with no loaded settings.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             settings: BTreeMap::new(),
             reloaders: BTreeMap::new(),
@@ -263,12 +270,7 @@ impl SettingsStore {
     /// the file successfully; a read/parse failure is handled before this point by
     /// hiding the affected controls (R4.4), which is why loading itself is
     /// infallible.
-    pub(crate) fn load_file(
-        &mut self,
-        path: impl Into<PathBuf>,
-        initial: FileValues,
-        reader: FileReader,
-    ) {
+    pub fn load_file(&mut self, path: impl Into<PathBuf>, initial: FileValues, reader: FileReader) {
         let path = path.into();
         self.ingest(&path, initial);
         self.reloaders.insert(path, reader);
@@ -322,11 +324,7 @@ impl SettingsStore {
     /// file-backed setting's staged value is updated and reported as
     /// [`StageOutcome::Staged`]; staging a setting that was never loaded is a
     /// [`StageError::NotLoaded`] guard rather than a silent insert.
-    pub(crate) fn stage(
-        &mut self,
-        id: SettingId,
-        value: Value,
-    ) -> Result<StageOutcome, StageError> {
+    pub fn stage(&mut self, id: SettingId, value: Value) -> Result<StageOutcome, StageError> {
         id.validate(&value)?;
 
         if id.backing() == Backing::RuntimeOnly {
@@ -346,7 +344,7 @@ impl SettingsStore {
     }
 
     /// Discards every staged edit, returning the store to a clean state (R5.1).
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         for entry in self.settings.values_mut() {
             entry.staged = None;
         }
@@ -378,7 +376,7 @@ impl SettingsStore {
     ///    baselined as ours). A file absent from `written` keeps its prior baseline.
     ///
     /// This never fails: it only mutates in-memory state.
-    pub(crate) fn commit_apply(&mut self, written: &[(PathBuf, Vec<u8>)]) {
+    pub fn commit_apply(&mut self, written: &[(PathBuf, Vec<u8>)]) {
         for entry in self.settings.values_mut() {
             if let Some(staged) = entry.staged.take() {
                 entry.original = staged;
@@ -396,13 +394,13 @@ impl SettingsStore {
     /// Whether any file-backed setting has a pending edit differing from its original.
     ///
     /// Drives the suggested-action Apply button (R5.1).
-    pub(crate) fn is_dirty(&self) -> bool {
+    pub fn is_dirty(&self) -> bool {
         self.settings.values().any(Entry::is_dirty)
     }
 
     /// Whether any setting on `category`'s page is dirty — the per-page rollup that
     /// drives the sidebar's modified-dot markers (R5.1).
-    pub(crate) fn is_category_dirty(&self, category: Category) -> bool {
+    pub fn is_category_dirty(&self, category: Category) -> bool {
         self.settings
             .iter()
             .any(|(id, entry)| id.category() == category && entry.is_dirty())
@@ -412,7 +410,7 @@ impl SettingsStore {
     ///
     /// Useful for the Apply pipeline (task 4.5), which writes only the changed
     /// settings, and for asserting the rollup in tests.
-    pub(crate) fn dirty_ids(&self) -> Vec<SettingId> {
+    pub fn dirty_ids(&self) -> Vec<SettingId> {
         self.settings
             .iter()
             .filter(|(_, entry)| entry.is_dirty())
@@ -430,7 +428,7 @@ impl SettingsStore {
     /// format parser (§3) into one [`FileWrite`](crate::core::apply::FileWrite). A
     /// clean page yields an empty vector, so no write is produced. The returned values
     /// are cloned so the caller is free of the store's borrow while it builds the write.
-    pub(crate) fn dirty_in_category(&self, category: Category) -> Vec<(SettingId, Value)> {
+    pub fn dirty_in_category(&self, category: Category) -> Vec<(SettingId, Value)> {
         self.settings
             .iter()
             .filter(|(id, entry)| id.category() == category && entry.is_dirty())
@@ -440,13 +438,13 @@ impl SettingsStore {
 
     /// The value the UI should display for `id`: the staged edit if present, else the
     /// original. `None` if the setting has not been loaded.
-    pub(crate) fn value(&self, id: SettingId) -> Option<&Value> {
+    pub fn value(&self, id: SettingId) -> Option<&Value> {
         self.settings.get(&id).map(Entry::effective)
     }
 
     /// The on-disk baseline value for `id` (ignoring any staged edit). `None` if the
     /// setting has not been loaded. Primarily for the Apply pipeline and tests.
-    pub(crate) fn original(&self, id: SettingId) -> Option<&Value> {
+    pub fn original(&self, id: SettingId) -> Option<&Value> {
         self.settings.get(&id).map(|entry| &entry.original)
     }
 
@@ -461,7 +459,7 @@ impl SettingsStore {
     /// re-baselining after a successful apply happens through
     /// [`commit_apply`](Self::commit_apply), which the caller invokes with `&mut self`
     /// once the borrow returned here has ended.
-    pub(crate) fn freshness(&self) -> &FreshnessTracker {
+    pub fn freshness(&self) -> &FreshnessTracker {
         &self.freshness
     }
 
@@ -477,7 +475,7 @@ impl SettingsStore {
     /// [`RefreshReport`] tells the UI which files changed so it can warn the user. A
     /// file that changed but can no longer be read or parsed is reported as failed and
     /// keeps its last known originals; one bad file never aborts the others.
-    pub(crate) fn refresh(&mut self) -> RefreshReport {
+    pub fn refresh(&mut self) -> RefreshReport {
         let mut report = RefreshReport::default();
 
         // `check_conflicts` returns owned conflicts, so the freshness borrow ends

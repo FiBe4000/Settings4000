@@ -57,7 +57,7 @@ const APP_ID: &str = "org.settings4000.Settings4000";
 /// remote role (R8.4) and why only the program name is forwarded to GTK. A
 /// remote launch returns [`glib::ExitCode::SUCCESS`] after asking the primary to
 /// present its window.
-pub(crate) fn run() -> glib::ExitCode {
+pub fn run() -> glib::ExitCode {
     let app = Application::builder()
         .application_id(APP_ID)
         // The default flags are exactly what we want: a single primary instance

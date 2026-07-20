@@ -1,39 +1,15 @@
-//! Settings4000 — a native GTK4 settings GUI for a dotfiles-managed Hyprland
-//! desktop.
+//! The Settings4000 binary — a thin wrapper over the `settings4000` library.
 //!
-//! The application edits the underlying configuration files of a Hyprland
-//! desktop (display, sound, theme, input, notifications, power/idle, network)
-//! and triggers the matching live-reloads, replacing hand-editing for common
-//! user-facing settings. See `docs/requirements.md` for the numbered `R…`
-//! requirements and `docs/architecture.md` for the module layout.
-//!
-//! # Module layout (architecture §2)
-//!
-//! - [`core`] — GTK-free domain logic: staging, detection, apply pipeline,
-//!   typed settings model. Fully unit-testable headlessly (R6.2).
-//! - [`parsers`] — one module per config file format; surgical, lossless edits.
-//! - [`system`] — the side-effect boundary: command execution, file IO, logging.
-//! - [`ui`] — the thin Relm4/GTK layer that renders from and stages into `core`.
-//!
-//! # Layering rule (hard constraint)
-//!
-//! `core` and `parsers` never import `gtk`/`relm4`; all UI-independent logic
-//! lives there so it can be tested without a display. This is enforced by
-//! `tests/module_boundaries.rs`.
-
-// The `core` module deliberately shares its name with the `core` standard
-// library crate (per architecture §2). Within this crate `core::` resolves to
-// this module; the std crate remains reachable as `::core` on the rare occasion
-// it is needed. The names do not otherwise conflict.
-mod core;
-mod parsers;
-mod system;
-mod ui;
+//! All application logic lives in the library crate (see `src/lib.rs` for the
+//! module layout and layering rules); this entry point only parses the command
+//! line, initializes logging, and hands control to the GTK application
+//! bootstrap in [`settings4000::ui::app`].
 
 use clap::Parser;
 use gtk4::glib;
 
-use crate::system::logging::LogLevel;
+use settings4000::system::logging::LogLevel;
+use settings4000::{system, ui};
 
 /// Command-line interface for Settings4000 (R7.2).
 ///

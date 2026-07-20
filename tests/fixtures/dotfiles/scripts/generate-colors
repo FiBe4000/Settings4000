@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Fixture stand-in for the real dotfiles scripts/generate-colors.
+#
+# Capability detection only checks that this file exists at
+# <repo>/scripts/generate-colors (R3.2/R8.5); tests never execute it — the
+# Apply pipeline runs it through the CommandRunner seam, which tests replace
+# with MockCommandRunner. If a test ever runs it for real, that is a bug in the
+# test (it bypassed the mock seam), so fail loudly rather than pretend to
+# generate anything.
+echo "settings4000 fixture: generate-colors stub invoked for real" >&2
+exit 2

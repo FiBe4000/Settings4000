@@ -1,0 +1,11 @@
+/* Trimmed fixture stand-in for the real swaync style.css. The app never reads
+ * or writes this file — only its deployment symlink matters to the tests. It
+ * keeps the load-bearing shape: the generated palette import and a rule that
+ * uses the imported colors, like the real stylesheet. */
+@import 'colors.css';
+
+.notification {
+    background: alpha(@bg0, 0.85);
+    color: @fg0;
+    border: 2px solid @accent2;
+}

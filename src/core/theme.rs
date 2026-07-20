@@ -99,7 +99,7 @@ use crate::parsers::ini::IniFile;
 /// [`preview`](Self::preview) colors are parsed once at load from the file's swatch
 /// (task 3.7) so the UI can draw a small preview strip without re-reading the file.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Scheme {
+pub struct Scheme {
     /// The scheme's name — its file name under `colors/` (e.g. `nord`), which is also
     /// the argument passed to `generate-colors`.
     name: String,
@@ -111,12 +111,12 @@ pub(crate) struct Scheme {
 
 impl Scheme {
     /// The scheme's name (its `colors/` file name).
-    pub(crate) fn name(&self) -> &str {
+    pub fn name(&self) -> &str {
         &self.name
     }
 
     /// The scheme's preview colors as RGB components in `0.0..=1.0`.
-    pub(crate) fn preview(&self) -> &[(f64, f64, f64)] {
+    pub fn preview(&self) -> &[(f64, f64, f64)] {
         &self.preview
     }
 }
@@ -126,7 +126,7 @@ impl Scheme {
 /// Built by [`PaletteModel::load`] from the discovered palette source and folded into
 /// the window's Apply/Reset chrome as a second staging source (see the module docs).
 #[derive(Clone, Debug)]
-pub(crate) struct PaletteModel {
+pub struct PaletteModel {
     /// The switchable schemes discovered in `colors/`, sorted by name for a stable
     /// drop-down order.
     schemes: Vec<Scheme>,
@@ -153,7 +153,7 @@ impl PaletteModel {
     /// built against a temporary fixture in tests. Nothing here fails: an unreadable
     /// directory yields no schemes and an unrecognized header yields an unknown active
     /// scheme, both of which the UI renders as the read-only degrade.
-    pub(crate) fn load(
+    pub fn load(
         colors_dir: &Path,
         active_scheme_source: &Path,
         generate_colors: PathBuf,
@@ -176,13 +176,13 @@ impl PaletteModel {
     }
 
     /// The discovered schemes, in drop-down order.
-    pub(crate) fn schemes(&self) -> &[Scheme] {
+    pub fn schemes(&self) -> &[Scheme] {
         &self.schemes
     }
 
     /// The active scheme name detected from the generated header, or `None` when
     /// unknown (R3.2).
-    pub(crate) fn active(&self) -> Option<&str> {
+    pub fn active(&self) -> Option<&str> {
         self.active.as_deref()
     }
 
@@ -190,13 +190,13 @@ impl PaletteModel {
     ///
     /// `true` only when there are at least two schemes — with zero or one there is
     /// nothing to switch to, so the UI shows the active scheme read-only instead.
-    pub(crate) fn is_switchable(&self) -> bool {
+    pub fn is_switchable(&self) -> bool {
         self.schemes.len() >= 2
     }
 
     /// The effective selected scheme — the staged switch if one is pending, otherwise
     /// the active scheme — used to preselect the drop-down (R3.2).
-    pub(crate) fn selected(&self) -> Option<&str> {
+    pub fn selected(&self) -> Option<&str> {
         self.staged.as_deref().or(self.active.as_deref())
     }
 
@@ -206,7 +206,7 @@ impl PaletteModel {
     /// `None` when the selected scheme is not among the enumerated schemes — e.g. the
     /// active scheme's file is malformed or absent while others exist — in which case
     /// the UI leaves the drop-down at its default and stages nothing.
-    pub(crate) fn selected_index(&self) -> Option<usize> {
+    pub fn selected_index(&self) -> Option<usize> {
         let selected = self.selected()?;
         self.schemes
             .iter()
@@ -220,7 +220,7 @@ impl PaletteModel {
     /// edit. A name that is not among the enumerated schemes is ignored — the drop-down
     /// only offers real schemes, so this is a defensive guard against an out-of-band
     /// caller.
-    pub(crate) fn stage(&mut self, name: &str) {
+    pub fn stage(&mut self, name: &str) {
         if !self.schemes.iter().any(|scheme| scheme.name == name) {
             tracing::warn!(
                 scheme = name,
@@ -236,12 +236,12 @@ impl PaletteModel {
     }
 
     /// Whether a scheme switch is pending (R5.1).
-    pub(crate) fn is_dirty(&self) -> bool {
+    pub fn is_dirty(&self) -> bool {
         self.staged.is_some()
     }
 
     /// Discards a pending scheme switch, returning the page to clean (R5.1).
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.staged = None;
     }
 
@@ -252,7 +252,7 @@ impl PaletteModel {
     /// the switch applied. There is no on-disk baseline to re-record: the app does not
     /// write the generated `colors.conf` (the generator does), so it is not tracked for
     /// conflicts.
-    pub(crate) fn commit(&mut self) {
+    pub fn commit(&mut self) {
         if let Some(scheme) = self.staged.take() {
             self.active = Some(scheme);
         }
@@ -265,7 +265,7 @@ impl PaletteModel {
     /// so the pipeline runs the discovered `generate-colors <scheme>` as its last write
     /// step and then the palette reload chain. It carries no file write: a v1 palette
     /// switch edits no file directly.
-    pub(crate) fn apply_contribution(&self) -> Option<PaletteSwitch> {
+    pub fn apply_contribution(&self) -> Option<PaletteSwitch> {
         self.staged.as_ref().map(|scheme| PaletteSwitch {
             scheme: scheme.clone(),
             generate_colors: self.generate_colors.clone(),
@@ -399,16 +399,16 @@ const CURATED_CURSOR_SIZES: &[&str] = &["16", "24", "32", "48", "64"];
 /// startup loader fills them from the XDG environment (`~/.themes`, the data dirs,
 /// `/usr/share/...`).
 #[derive(Clone, Debug)]
-pub(crate) struct ThemeRoots {
+pub struct ThemeRoots {
     /// Directories that hold GTK theme directories (`~/.themes`,
     /// `~/.local/share/themes`, `/usr/share/themes`). A subdirectory is a GTK theme
     /// when it contains a `gtk-3.0/` or `gtk-4.0/` subdirectory (R3.3).
-    pub(crate) gtk_theme_dirs: Vec<PathBuf>,
+    pub gtk_theme_dirs: Vec<PathBuf>,
     /// Directories that hold icon and cursor theme directories (`~/.icons`,
     /// `~/.local/share/icons`, `/usr/share/icons`). A subdirectory with a `cursors/`
     /// subdirectory is a cursor theme; one with an `index.theme` (and no `cursors/`)
     /// is an icon theme (R3.4).
-    pub(crate) icon_dirs: Vec<PathBuf>,
+    pub icon_dirs: Vec<PathBuf>,
 }
 
 /// The live XDG paths of the four config files a theme/cursor change writes (R8.5).
@@ -418,15 +418,15 @@ pub(crate) struct ThemeRoots {
 /// to a plain one. The cursor is duplicated across all four; a GTK/icon theme change
 /// touches only the two `settings.ini` files (analysis §6.2, R3.4).
 #[derive(Clone, Debug)]
-pub(crate) struct ThemesPaths {
+pub struct ThemesPaths {
     /// `~/.config/gtk-3.0/settings.ini`.
-    pub(crate) gtk3_settings: PathBuf,
+    pub gtk3_settings: PathBuf,
     /// `~/.config/gtk-4.0/settings.ini`.
-    pub(crate) gtk4_settings: PathBuf,
+    pub gtk4_settings: PathBuf,
     /// `~/.config/hypr/hyprland.conf` (only its cursor `env =` lines are edited).
-    pub(crate) hyprland_conf: PathBuf,
+    pub hyprland_conf: PathBuf,
     /// `~/.config/uwsm/env` (the canonical cursor env copy).
-    pub(crate) uwsm_env: PathBuf,
+    pub uwsm_env: PathBuf,
 }
 
 /// Where an active `GTK_THEME` override was found, so the UI can name it in the banner
@@ -437,7 +437,7 @@ pub(crate) struct ThemesPaths {
 /// GTK-theme drop-down. The icon and cursor drop-downs stay enabled — `GTK_THEME`
 /// overrides only the GTK theme.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum GtkThemeOverrideSource {
+pub enum GtkThemeOverrideSource {
     /// `GTK_THEME` is set in the app's own process environment. On the target this
     /// happens because `scripts/launchhyprland.sh` exports it uncommented when it
     /// starts the session (analysis §6.3), so the app itself inherits it — the copy
@@ -459,7 +459,7 @@ impl GtkThemeOverrideSource {
 
     /// A human-readable banner message naming the override and where it comes from, so
     /// the user understands why the GTK-theme drop-down is disabled (R3.3).
-    pub(crate) fn banner_message(&self) -> String {
+    pub fn banner_message(&self) -> String {
         let source = match self {
             GtkThemeOverrideSource::AppEnvironment(_) => "the GTK_THEME environment variable",
             GtkThemeOverrideSource::UwsmEnv(_) => "GTK_THEME in uwsm/env",
@@ -579,7 +579,7 @@ struct BackingText {
 /// It stays GTK-free so discovery, staging, the multi-file write, the override
 /// decision, and the live-restyle gating are all unit-tested headlessly (R6.2); the
 /// layering guard in `tests/module_boundaries.rs` forbids any `gtk`/`relm4` import.
-pub(crate) struct ThemesModel {
+pub struct ThemesModel {
     /// The GTK theme drop-down.
     gtk_theme: Selection,
     /// The icon theme drop-down.
@@ -629,12 +629,12 @@ pub(crate) struct ThemesModel {
 /// never desync (R3.4); a GTK/icon theme change contributes only the two `settings.ini`
 /// writes. The reload parameters carry only the values that changed, so the reload
 /// table (task 4.4) emits `gsettings set` / `hyprctl setcursor` only for those.
-pub(crate) struct ThemesApply {
+pub struct ThemesApply {
     /// The atomic writes, one per changed backing file.
-    pub(crate) writes: Vec<FileWrite>,
+    pub writes: Vec<FileWrite>,
     /// The reload parameters for the changed theme/cursor values (the pipeline merges
     /// these into its plan-wide [`ReloadParams`]).
-    pub(crate) reload_params: ReloadParams,
+    pub reload_params: ReloadParams,
 }
 
 impl ThemesModel {
@@ -649,7 +649,7 @@ impl ThemesModel {
     /// file (its controls degrade — a settings.ini that cannot be read hides the theme
     /// rows via [`Self::themes_editable`], R4.4), and the current values are read from
     /// whichever `settings.ini` is present (with the cursor falling back to `uwsm/env`).
-    pub(crate) fn load(
+    pub fn load(
         roots: &ThemeRoots,
         paths: ThemesPaths,
         settings_portal_available: bool,
@@ -729,71 +729,71 @@ impl ThemesModel {
     /// edit and the rows are hidden (the page shows a note instead), matching the
     /// Display page's "hide the file-backed controls when the config is unreadable"
     /// rule.
-    pub(crate) fn themes_editable(&self) -> bool {
+    pub fn themes_editable(&self) -> bool {
         self.gtk3.is_some() || self.gtk4.is_some()
     }
 
     /// The GTK theme drop-down options (installed GTK themes plus the current value).
-    pub(crate) fn gtk_themes(&self) -> &[String] {
+    pub fn gtk_themes(&self) -> &[String] {
         &self.gtk_theme.options
     }
 
     /// The icon theme drop-down options.
-    pub(crate) fn icon_themes(&self) -> &[String] {
+    pub fn icon_themes(&self) -> &[String] {
         &self.icon_theme.options
     }
 
     /// The cursor theme drop-down options.
-    pub(crate) fn cursor_themes(&self) -> &[String] {
+    pub fn cursor_themes(&self) -> &[String] {
         &self.cursor_theme.options
     }
 
     /// The cursor size drop-down options (curated sizes plus the current value).
-    pub(crate) fn cursor_sizes(&self) -> &[String] {
+    pub fn cursor_sizes(&self) -> &[String] {
         &self.cursor_size.options
     }
 
     /// The preselected index of the GTK theme drop-down.
-    pub(crate) fn selected_gtk_index(&self) -> Option<usize> {
+    pub fn selected_gtk_index(&self) -> Option<usize> {
         self.gtk_theme.selected_index()
     }
 
     /// The preselected index of the icon theme drop-down.
-    pub(crate) fn selected_icon_index(&self) -> Option<usize> {
+    pub fn selected_icon_index(&self) -> Option<usize> {
         self.icon_theme.selected_index()
     }
 
     /// The preselected index of the cursor theme drop-down.
-    pub(crate) fn selected_cursor_index(&self) -> Option<usize> {
+    pub fn selected_cursor_index(&self) -> Option<usize> {
         self.cursor_theme.selected_index()
     }
 
     /// The preselected index of the cursor size drop-down.
-    pub(crate) fn selected_cursor_size_index(&self) -> Option<usize> {
+    pub fn selected_cursor_size_index(&self) -> Option<usize> {
         self.cursor_size.selected_index()
     }
 
     /// The active `GTK_THEME` override, or `None` (R3.3). When `Some`, the GTK-theme
     /// drop-down is disabled and a banner shown.
-    pub(crate) fn gtk_override(&self) -> Option<&GtkThemeOverrideSource> {
+    pub fn gtk_override(&self) -> Option<&GtkThemeOverrideSource> {
         self.gtk_override.as_ref()
     }
 
     /// Whether the GTK-theme drop-down must be disabled — a live `GTK_THEME` override
     /// is in force, which the app must not fight (R3.3).
-    pub(crate) fn gtk_dropdown_disabled(&self) -> bool {
+    pub fn gtk_dropdown_disabled(&self) -> bool {
         self.gtk_override.is_some()
     }
 
     /// Whether a live GTK-theme restyle can be claimed (a settings portal or dconf
     /// backend is available); otherwise a change takes effect at the next launch
     /// (R2.2).
-    pub(crate) fn live_restyle(&self) -> bool {
+    pub fn live_restyle(&self) -> bool {
         self.live_restyle
     }
 
     /// Stages a GTK theme switch (ignored when a `GTK_THEME` override is in force).
-    pub(crate) fn stage_gtk_theme(&mut self, name: &str) {
+    pub fn stage_gtk_theme(&mut self, name: &str) {
         if self.gtk_dropdown_disabled() {
             // The drop-down is disabled in the UI, so this is a defensive guard against
             // an out-of-band caller: never stage a GTK theme the override would fight.
@@ -806,23 +806,23 @@ impl ThemesModel {
     }
 
     /// Stages an icon theme switch.
-    pub(crate) fn stage_icon_theme(&mut self, name: &str) {
+    pub fn stage_icon_theme(&mut self, name: &str) {
         self.icon_theme.stage(name);
     }
 
     /// Stages a cursor theme switch.
-    pub(crate) fn stage_cursor_theme(&mut self, name: &str) {
+    pub fn stage_cursor_theme(&mut self, name: &str) {
         self.cursor_theme.stage(name);
     }
 
     /// Stages a cursor size switch (the value is a pixel size as a string).
-    pub(crate) fn stage_cursor_size(&mut self, size: &str) {
+    pub fn stage_cursor_size(&mut self, size: &str) {
         self.cursor_size.stage(size);
     }
 
     /// Whether any theme/cursor value has a pending change — the page's dirty state,
     /// which the window folds into the global Apply/Reset chrome (R5.1).
-    pub(crate) fn is_dirty(&self) -> bool {
+    pub fn is_dirty(&self) -> bool {
         self.gtk_theme.is_changed()
             || self.icon_theme.is_changed()
             || self.cursor_theme.is_changed()
@@ -830,7 +830,7 @@ impl ThemesModel {
     }
 
     /// Discards every staged theme/cursor change (R5.1).
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.gtk_theme.reset();
         self.icon_theme.reset();
         self.cursor_theme.reset();
@@ -844,7 +844,7 @@ impl ThemesModel {
     /// aborted and the model reloaded rather than clobbering the stale parse — the same
     /// discipline the Display page follows (the pipeline's own conflict check covers
     /// only the store's files, not these bespoke ones).
-    pub(crate) fn check_conflict(&self) -> bool {
+    pub fn check_conflict(&self) -> bool {
         !self.freshness.check_conflicts().is_empty()
     }
 
@@ -854,7 +854,7 @@ impl ThemesModel {
     /// Called after [`Self::check_conflict`] detects an external edit: the fresh model
     /// re-parses the current files (discarding the now-stale staged edits) so a
     /// subsequent Apply builds on the current contents.
-    pub(crate) fn reload(&self) -> ThemesModel {
+    pub fn reload(&self) -> ThemesModel {
         ThemesModel::load(
             &self.roots,
             self.paths.clone(),
@@ -871,7 +871,7 @@ impl ThemesModel {
     /// for both `settings.ini` files, `hyprland.conf`, and `uwsm/env` with the
     /// **identical** value (R3.4); a GTK/icon theme change produces only the two
     /// `settings.ini` writes.
-    pub(crate) fn apply_contribution(&self) -> Option<ThemesApply> {
+    pub fn apply_contribution(&self) -> Option<ThemesApply> {
         if !self.is_dirty() {
             return None;
         }
@@ -897,7 +897,7 @@ impl ThemesModel {
     /// Re-baselining is what stops the app's own write being mistaken for an external
     /// conflict on the next Apply; updating the backing text keeps the in-memory copy
     /// in step so a subsequent edit builds on the current bytes.
-    pub(crate) fn commit(&mut self) {
+    pub fn commit(&mut self) {
         // Re-render the writes (staged values still present) to capture the exact bytes
         // written, then re-baseline and update the stored text for each.
         for write in self.build_writes() {
@@ -1446,11 +1446,11 @@ impl PathField {
 /// tests; the writer follows symlinks, so a dotfiles-deployed file is handled
 /// identically to a plain one.
 #[derive(Clone, Debug)]
-pub(crate) struct WallpaperPaths {
+pub struct WallpaperPaths {
     /// `~/.config/hypr/hyprpaper.conf` (the wallpaper `path` and `fit_mode`).
-    pub(crate) hyprpaper_conf: PathBuf,
+    pub hyprpaper_conf: PathBuf,
     /// `~/.config/hypr/hyprlock.conf` (the lock-screen background `path`).
-    pub(crate) hyprlock_conf: PathBuf,
+    pub hyprlock_conf: PathBuf,
 }
 
 /// The wallpaper / lock-screen background staging model (task 6.5).
@@ -1484,7 +1484,7 @@ pub(crate) struct WallpaperPaths {
 /// It stays GTK-free so the read, staging, the surgical writes, and the reload decision
 /// are unit-tested headlessly (R6.2); the layering guard in
 /// `tests/module_boundaries.rs` forbids any `gtk`/`relm4` import.
-pub(crate) struct WallpaperModel {
+pub struct WallpaperModel {
     /// `hyprpaper.conf`, or `None` when it was unreadable (R4.4) — the wallpaper rows
     /// are then hidden.
     hyprpaper: Option<BackingText>,
@@ -1527,15 +1527,15 @@ pub(crate) struct WallpaperModel {
 /// or the override) contributes a `hyprlock.conf` write with **no** reload. The
 /// validations re-check the chosen image paths at apply time (R8.3), so a path deleted
 /// between staging and Apply is caught before any write.
-pub(crate) struct WallpaperApply {
+pub struct WallpaperApply {
     /// The atomic writes, one per changed backing file.
-    pub(crate) writes: Vec<FileWrite>,
+    pub writes: Vec<FileWrite>,
     /// The reload parameters — only the wallpaper path, and only when `hyprpaper.conf`
     /// is written (the pipeline merges these into its plan-wide [`ReloadParams`]).
-    pub(crate) reload_params: ReloadParams,
+    pub reload_params: ReloadParams,
     /// The chosen image paths to validate before writing (R8.3), reusing the
     /// [`SettingId`] image-path validator.
-    pub(crate) validations: Vec<(SettingId, Value)>,
+    pub validations: Vec<(SettingId, Value)>,
 }
 
 impl WallpaperModel {
@@ -1547,7 +1547,7 @@ impl WallpaperModel {
     /// simply yields no backing text (its controls degrade, R4.4). The override toggle
     /// starts on only when the lock-screen path already differs from the wallpaper path
     /// on disk (i.e. the two are not the unified default).
-    pub(crate) fn load(paths: WallpaperPaths, lock_available: bool) -> WallpaperModel {
+    pub fn load(paths: WallpaperPaths, lock_available: bool) -> WallpaperModel {
         let hyprpaper = read_backing(&paths.hyprpaper_conf);
         let hyprlock = read_backing(&paths.hyprlock_conf);
 
@@ -1607,40 +1607,40 @@ impl WallpaperModel {
 
     /// Whether the wallpaper rows should be shown: `hyprpaper.conf` was readable, so a
     /// path/fit edit can be written (R4.4).
-    pub(crate) fn wallpaper_editable(&self) -> bool {
+    pub fn wallpaper_editable(&self) -> bool {
         self.hyprpaper.is_some()
     }
 
     /// Whether the lock-screen override control should be shown: hyprlock is present and
     /// `hyprlock.conf` is readable, so an override can be written (R4.2/R4.4).
-    pub(crate) fn lock_editable(&self) -> bool {
+    pub fn lock_editable(&self) -> bool {
         self.lock_available && self.hyprlock.is_some()
     }
 
     /// The effective wallpaper image path (staged or current), or `None` when unset.
-    pub(crate) fn wallpaper_path(&self) -> Option<&str> {
+    pub fn wallpaper_path(&self) -> Option<&str> {
         self.wallpaper.effective()
     }
 
     /// The fit-mode drop-down options (the curated modes plus the current value).
-    pub(crate) fn fit_options(&self) -> &[String] {
+    pub fn fit_options(&self) -> &[String] {
         &self.fit.options
     }
 
     /// The preselected index of the fit-mode drop-down.
-    pub(crate) fn selected_fit_index(&self) -> Option<usize> {
+    pub fn selected_fit_index(&self) -> Option<usize> {
         self.fit.selected_index()
     }
 
     /// Whether the lock-screen override is on (a different image than the wallpaper).
-    pub(crate) fn override_on(&self) -> bool {
+    pub fn override_on(&self) -> bool {
         self.override_on
     }
 
     /// The effective lock-screen override image path (staged or current), or `None`.
     /// Only meaningful while [`Self::override_on`] is set; the UI shows it in the
     /// override chooser.
-    pub(crate) fn lock_path(&self) -> Option<&str> {
+    pub fn lock_path(&self) -> Option<&str> {
         self.lock.effective()
     }
 
@@ -1649,7 +1649,7 @@ impl WallpaperModel {
     /// The path must exist, be readable, and have an image extension; an invalid path is
     /// rejected (returned as an [`Err`] the UI surfaces) and nothing is staged, so a
     /// broken wallpaper can never be written.
-    pub(crate) fn stage_wallpaper(&mut self, path: &str) -> Result<(), ValidationError> {
+    pub fn stage_wallpaper(&mut self, path: &str) -> Result<(), ValidationError> {
         validate_image_path(Path::new(path))?;
         self.wallpaper.stage(path);
         Ok(())
@@ -1657,21 +1657,21 @@ impl WallpaperModel {
 
     /// Stages a lock-screen override image path after validating it (R8.3), like
     /// [`Self::stage_wallpaper`].
-    pub(crate) fn stage_lock(&mut self, path: &str) -> Result<(), ValidationError> {
+    pub fn stage_lock(&mut self, path: &str) -> Result<(), ValidationError> {
         validate_image_path(Path::new(path))?;
         self.lock.stage(path);
         Ok(())
     }
 
     /// Stages a fit mode (a value from the fit-mode drop-down; no path validation).
-    pub(crate) fn stage_fit(&mut self, fit: &str) {
+    pub fn stage_fit(&mut self, fit: &str) {
         self.fit.stage(fit);
     }
 
     /// Sets the lock-screen override toggle. Turning it off makes the lock screen follow
     /// the wallpaper again; turning it on makes it follow the (separately chosen) lock
     /// path.
-    pub(crate) fn set_override(&mut self, on: bool) {
+    pub fn set_override(&mut self, on: bool) {
         self.override_on = on;
     }
 
@@ -1705,12 +1705,12 @@ impl WallpaperModel {
 
     /// Whether any wallpaper / lock-background value has a pending change — the page's
     /// dirty state, which the window folds into the global Apply/Reset chrome (R5.1).
-    pub(crate) fn is_dirty(&self) -> bool {
+    pub fn is_dirty(&self) -> bool {
         self.hyprpaper_write_needed() || self.hyprlock_write_needed()
     }
 
     /// Discards every staged change, returning the toggle to its baseline (R5.1).
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.wallpaper.reset();
         self.fit.reset();
         self.lock.reset();
@@ -1724,19 +1724,19 @@ impl WallpaperModel {
     /// model reloaded rather than clobbering the stale parse — the same discipline the
     /// Display and GTK/icon/cursor models follow (the pipeline's own conflict check
     /// covers only the store's files, not these bespoke ones).
-    pub(crate) fn check_conflict(&self) -> bool {
+    pub fn check_conflict(&self) -> bool {
         !self.freshness.check_conflicts().is_empty()
     }
 
     /// Re-reads the backing files, returning a fresh model with a new freshness baseline
     /// (R5.6 "warn and re-load").
-    pub(crate) fn reload(&self) -> WallpaperModel {
+    pub fn reload(&self) -> WallpaperModel {
         WallpaperModel::load(self.paths.clone(), self.lock_available)
     }
 
     /// The Theme page's wallpaper / lock-background contribution to the Apply plan, or
     /// `None` when nothing changed (task 6.5).
-    pub(crate) fn apply_contribution(&self) -> Option<WallpaperApply> {
+    pub fn apply_contribution(&self) -> Option<WallpaperApply> {
         if !self.is_dirty() {
             return None;
         }
@@ -1759,7 +1759,7 @@ impl WallpaperModel {
     /// Commits the staged changes after a successful Apply: re-baselines each written
     /// file's freshness from the exact bytes written, updates the in-memory backing
     /// text, and promotes each staged value to its current value (R5.6).
-    pub(crate) fn commit(&mut self) {
+    pub fn commit(&mut self) {
         for write in self.build_writes() {
             self.freshness
                 .record_bytes(write.path.as_path(), &write.contents);

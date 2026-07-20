@@ -94,7 +94,7 @@ use std::fmt;
 /// Built by [`HyprlangFile::parse`]. See the module documentation for the token
 /// model and addressing schemes.
 #[derive(Clone, Debug)]
-pub(crate) struct HyprlangFile {
+pub struct HyprlangFile {
     /// The file's lines in original order. Concatenating every line's raw text
     /// reproduces the original input exactly (round-trip identity).
     lines: Vec<Line>,
@@ -165,7 +165,7 @@ enum LineKind {
 /// One step of a [`KeyPath`]: descend into a named section, choosing which
 /// occurrence when several siblings share the name.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SectionStep {
+pub struct SectionStep {
     /// The section name to descend into.
     name: String,
     /// Which occurrence (0-based) of `name` among its same-named siblings to
@@ -176,7 +176,7 @@ pub(crate) struct SectionStep {
 
 impl SectionStep {
     /// Selects the **first** section named `name` at the current level.
-    pub(crate) fn first(name: &str) -> Self {
+    pub fn first(name: &str) -> Self {
         SectionStep {
             name: name.to_string(),
             occurrence: 0,
@@ -186,7 +186,7 @@ impl SectionStep {
     /// Selects the `occurrence`-th (0-based) section named `name` among its
     /// same-named siblings — used to address one of several duplicate sections
     /// such as hypridle's `listener { }` blocks (task 6.8).
-    pub(crate) fn nth(name: &str, occurrence: usize) -> Self {
+    pub fn nth(name: &str, occurrence: usize) -> Self {
         SectionStep {
             name: name.to_string(),
             occurrence,
@@ -200,7 +200,7 @@ impl SectionStep {
 /// An empty section path addresses a top-level key (e.g. `splash` in
 /// `hyprpaper.conf`). See the module documentation for the overall scheme.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct KeyPath {
+pub struct KeyPath {
     /// Section steps from outermost to innermost; empty means top level.
     sections: Vec<SectionStep>,
     /// The key name within the innermost section.
@@ -209,7 +209,7 @@ pub(crate) struct KeyPath {
 
 impl KeyPath {
     /// Addresses a key at the top level (no enclosing section).
-    pub(crate) fn top_level(key: &str) -> Self {
+    pub fn top_level(key: &str) -> Self {
         KeyPath {
             sections: Vec::new(),
             key: key.to_string(),
@@ -219,7 +219,7 @@ impl KeyPath {
     /// Addresses a key by a section path, taking the **first** occurrence of
     /// each named section — the common case (e.g. `["input", "touchpad"]` +
     /// `natural_scroll`).
-    pub(crate) fn at(section_names: &[&str], key: &str) -> Self {
+    pub fn at(section_names: &[&str], key: &str) -> Self {
         KeyPath {
             sections: section_names
                 .iter()
@@ -232,7 +232,7 @@ impl KeyPath {
     /// Addresses a key by explicit section steps, allowing a specific occurrence
     /// per step (e.g. hypridle's second `listener` block via
     /// `SectionStep::nth("listener", 1)`).
-    pub(crate) fn new(sections: Vec<SectionStep>, key: &str) -> Self {
+    pub fn new(sections: Vec<SectionStep>, key: &str) -> Self {
         KeyPath {
             sections,
             key: key.to_string(),
@@ -261,7 +261,7 @@ impl fmt::Display for KeyPath {
 /// cause a panic). [`HyprlangFile::parse`] returns the collected warnings *and*
 /// logs each at `warn`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ParseWarning {
+pub struct ParseWarning {
     /// 1-based line number the warning concerns, for human-readable diagnostics.
     line: usize,
     /// What was wrong with the line.
@@ -270,12 +270,12 @@ pub(crate) struct ParseWarning {
 
 impl ParseWarning {
     /// The 1-based line number this warning concerns.
-    pub(crate) fn line(&self) -> usize {
+    pub fn line(&self) -> usize {
         self.line
     }
 
     /// What was wrong with the line.
-    pub(crate) fn kind(&self) -> &ParseWarningKind {
+    pub fn kind(&self) -> &ParseWarningKind {
         &self.kind
     }
 }
@@ -313,7 +313,7 @@ impl fmt::Display for ParseWarning {
 /// gracefully (a stray `}` closes nothing; an unclosed section still lets its
 /// keys be addressed).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ParseWarningKind {
+pub enum ParseWarningKind {
     /// The line is not blank, not a comment, not a section header, and not a
     /// `key = value` assignment (a whitespace-free key token before an `=`) — so
     /// it cannot be interpreted. It is kept byte-for-byte and ignored by edits.
@@ -333,7 +333,7 @@ pub(crate) enum ParseWarningKind {
 /// Every variant leaves the file completely unchanged: the check happens before
 /// any byte is spliced, so a rejected edit can never partially rewrite a value.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum EditError {
+pub enum EditError {
     /// The addressed section path does not resolve — some named section (or the
     /// requested occurrence of it) does not exist — so there is no section to
     /// edit a key in or to append to. The string is the rendered [`KeyPath`].
@@ -424,7 +424,7 @@ impl HyprlangFile {
     /// by line number) and additionally logged at `warn`; they are not errors and
     /// do not stop parsing. Warnings carry only line numbers and section names,
     /// never file contents (R7.3).
-    pub(crate) fn parse(input: &str) -> (Self, Vec<ParseWarning>) {
+    pub fn parse(input: &str) -> (Self, Vec<ParseWarning>) {
         let mut lines = Vec::new();
         let mut warnings = Vec::new();
 
@@ -459,7 +459,7 @@ impl HyprlangFile {
     ///
     /// After edits, the output is identical to the input except within the edited
     /// value spans and any lines appended by [`set_value`](Self::set_value).
-    pub(crate) fn emit(&self) -> String {
+    pub fn emit(&self) -> String {
         let mut out = String::new();
         for line in &self.lines {
             out.push_str(&line.raw);
@@ -472,7 +472,7 @@ impl HyprlangFile {
     /// The value excludes any trailing inline comment. Comment, blank, section,
     /// and malformed lines are never considered, so a commented-out assignment is
     /// never read as a value.
-    pub(crate) fn value(&self, path: &KeyPath) -> Option<&str> {
+    pub fn value(&self, path: &KeyPath) -> Option<&str> {
         match self.resolve_path(path) {
             Resolution::Entry(i) => self.entry_value(i),
             Resolution::Append(_) | Resolution::SectionMissing => None,
@@ -496,7 +496,7 @@ impl HyprlangFile {
     ///   (rejected before any byte changes, R8.3).
     /// - [`EditError::SectionNotFound`] if the addressed section path does not
     ///   exist, so there is nothing to edit or append into.
-    pub(crate) fn set_value(&mut self, path: &KeyPath, value: &str) -> Result<(), EditError> {
+    pub fn set_value(&mut self, path: &KeyPath, value: &str) -> Result<(), EditError> {
         reject_unsafe_value(value)?;
 
         match self.resolve_path(path) {
@@ -521,7 +521,7 @@ impl HyprlangFile {
     /// yields `Nordic-cursors`. Returns `None` if no such entry exists or the
     /// matched entry has no comma (no distinct value portion). Only top-level
     /// entries are considered, and commented-out lines never match.
-    pub(crate) fn repeatable_field_value(&self, key: &str, first_field: &str) -> Option<&str> {
+    pub fn repeatable_field_value(&self, key: &str, first_field: &str) -> Option<&str> {
         let i = self.find_repeatable(key, first_field)?;
         let value = self.entry_value(i)?;
         value_portion(value).map(|(start, end)| &value[start..end])
@@ -543,7 +543,7 @@ impl HyprlangFile {
     ///
     /// Unlike [`set_value`](Self::set_value), this never appends: a repeatable
     /// entry has no unambiguous append location, so a missing target is an error.
-    pub(crate) fn set_repeatable_field_value(
+    pub fn set_repeatable_field_value(
         &mut self,
         key: &str,
         first_field: &str,
@@ -748,7 +748,7 @@ impl HyprlangFile {
     /// without probing occurrence 0, 1, 2, … until a lookup fails. It composes
     /// with nesting: pass the parent path (with occurrences) to count children of
     /// a specific nested section.
-    pub(crate) fn section_count(&self, parent: &[SectionStep], name: &str) -> usize {
+    pub fn section_count(&self, parent: &[SectionStep], name: &str) -> usize {
         let mut frames: Vec<WalkFrame> = Vec::new();
         let mut root_counts: Vec<(String, usize)> = Vec::new();
         let mut count = 0;

@@ -2,9 +2,9 @@
 //! `core/` and `parsers/` modules must never depend on the GUI toolkit.
 //!
 //! Keeping those layers GTK-free is what makes the domain logic and the config
-//! parsers headlessly testable (R6.2). Because Settings4000 is a single binary
-//! crate (rather than a workspace with a separate GUI crate), the compiler does
-//! not enforce this for us — so this test scans the source of those two modules
+//! parsers headlessly testable (R6.2). Because Settings4000 is a single crate
+//! (a library plus a thin binary, rather than a workspace with a separate GUI
+//! crate), the compiler does not enforce this for us — so this test scans those two modules
 //! and fails if any file imports or otherwise references `gtk`, `gtk4`, or
 //! `relm4` (the latter re-exports GTK and would be an equivalent backdoor).
 //!

@@ -94,7 +94,7 @@ use std::fmt;
 /// input exactly; editing a value splices new bytes into a single line's value
 /// span and leaves every other line alone.
 #[derive(Clone, Debug)]
-pub(crate) struct EnvFile {
+pub struct EnvFile {
     /// The file's lines in original order. Concatenating every line's raw text
     /// reproduces the original input exactly (round-trip identity).
     lines: Vec<Line>,
@@ -172,7 +172,7 @@ enum LineKind {
 /// at `warn`, so the caller can both react programmatically and see them in the
 /// journal.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ParseWarning {
+pub struct ParseWarning {
     /// 1-based line number the warning concerns, for human-readable diagnostics.
     line: usize,
     /// What was wrong with the line.
@@ -181,12 +181,12 @@ pub(crate) struct ParseWarning {
 
 impl ParseWarning {
     /// The 1-based line number this warning concerns.
-    pub(crate) fn line(&self) -> usize {
+    pub fn line(&self) -> usize {
         self.line
     }
 
     /// What was wrong with the line.
-    pub(crate) fn kind(&self) -> &ParseWarningKind {
+    pub fn kind(&self) -> &ParseWarningKind {
         &self.kind
     }
 }
@@ -205,7 +205,7 @@ impl fmt::Display for ParseWarning {
 
 /// The specific reason a line produced a [`ParseWarning`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ParseWarningKind {
+pub enum ParseWarningKind {
     /// The line is not blank, not a comment, and not a recognized `KEY=value`
     /// assignment — so it cannot be interpreted. It is kept byte-for-byte and
     /// ignored by edits.
@@ -215,7 +215,7 @@ pub(crate) enum ParseWarningKind {
 /// Which action [`EnvFile::set_value`] took, for logging and for tests that need
 /// to distinguish an in-place edit from an append.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SetOutcome {
+pub enum SetOutcome {
     /// An assignment for the key already existed (in either the `export KEY=value`
     /// or the bare `KEY=value` form); its value span was rewritten in place. This
     /// is the common path on the dotfiles machine, where `XCURSOR_THEME`/
@@ -237,7 +237,7 @@ pub(crate) enum SetOutcome {
 /// that the line exists. In the dotfiles the line is deliberately commented out
 /// (analysis §6.3), so distinguishing the two is the whole point of this check.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum GtkThemeOverride {
+pub enum GtkThemeOverride {
     /// No `GTK_THEME` line at all, active or commented — no override from this
     /// file.
     Absent,
@@ -263,7 +263,7 @@ impl GtkThemeOverride {
     /// signal the Theme page keys off to disable its GTK-theme drop-down and show
     /// the banner (R3.3). Only [`GtkThemeOverride::Active`] returns `true`; a
     /// commented-out or absent line does not override anything.
-    pub(crate) fn is_active(&self) -> bool {
+    pub fn is_active(&self) -> bool {
         matches!(self, GtkThemeOverride::Active { .. })
     }
 }
@@ -273,7 +273,7 @@ impl GtkThemeOverride {
 /// Both variants leave the file completely unchanged: the check happens before
 /// any byte is written, so a rejected edit can never partially rewrite the file.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum EditError {
+pub enum EditError {
     /// The requested value contains a newline or carriage return, which would
     /// split the single assignment line into two and corrupt the file. Rejecting
     /// it upholds R8.3 — the app never writes a value that breaks a working config.
@@ -316,7 +316,7 @@ impl EnvFile {
     ///
     /// The returned warnings carry only line numbers — never the file's contents,
     /// which are not logged at any level (R7.3).
-    pub(crate) fn parse(input: &str) -> (Self, Vec<ParseWarning>) {
+    pub fn parse(input: &str) -> (Self, Vec<ParseWarning>) {
         let mut lines = Vec::new();
         let mut warnings = Vec::new();
 
@@ -348,7 +348,7 @@ impl EnvFile {
     /// After [`set_value`](Self::set_value) edits, the output is identical to the
     /// input except within edited value spans and any line appended by a new
     /// assignment.
-    pub(crate) fn emit(&self) -> String {
+    pub fn emit(&self) -> String {
         let mut out = String::new();
         for line in &self.lines {
             out.push_str(&line.raw);
@@ -366,7 +366,7 @@ impl EnvFile {
     /// `GTK_THEME` reads as absent here. The returned slice is the raw value span,
     /// so a quoted value is returned with its quotes (see the module's quoting
     /// note).
-    pub(crate) fn value(&self, key: &str) -> Option<&str> {
+    pub fn value(&self, key: &str) -> Option<&str> {
         // Iterate in reverse so the first hit is the last (shell-effective)
         // assignment.
         for line in self.lines.iter().rev() {
@@ -413,7 +413,7 @@ impl EnvFile {
     /// ([`EditError::InvalidValue`]); when appending, `key` must be a valid shell
     /// identifier ([`EditError::InvalidKey`]). Any rejected edit leaves the file
     /// completely unchanged (R8.3).
-    pub(crate) fn set_value(&mut self, key: &str, value: &str) -> Result<SetOutcome, EditError> {
+    pub fn set_value(&mut self, key: &str, value: &str) -> Result<SetOutcome, EditError> {
         reject_unsafe_value(value)?;
 
         // Target the LAST matching assignment: the shell resolves a repeated
@@ -458,7 +458,7 @@ impl EnvFile {
     /// exist the last is reported (matching the shell's last-assignment-wins rule
     /// for the active case). This method only *reads* — it never edits the file,
     /// so a commented-out line stays exactly as written.
-    pub(crate) fn gtk_theme_override(&self) -> GtkThemeOverride {
+    pub fn gtk_theme_override(&self) -> GtkThemeOverride {
         let mut active: Option<String> = None;
         let mut commented: Option<String> = None;
 

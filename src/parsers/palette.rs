@@ -56,7 +56,7 @@ use std::fmt;
 /// used only to report [missing keys](SchemaValidation::missing_keys) in a
 /// stable, human-recognizable order and does **not** constrain the order keys
 /// may appear in a file.
-pub(crate) const PALETTE_KEYS: [&str; 17] = [
+pub const PALETTE_KEYS: [&str; 17] = [
     "bg0", "bg1", "bg2", "bg3", "fg0", "fg1", "fg2", "accent0", "accent1", "accent2", "accent3",
     "red", "orange", "yellow", "green", "blue", "purple",
 ];
@@ -71,7 +71,7 @@ pub(crate) const PALETTE_KEYS: [&str; 17] = [
 /// a value splices new bytes into a single line's value span and updates that
 /// one span, leaving every other line's bytes alone.
 #[derive(Clone, Debug)]
-pub(crate) struct PaletteFile {
+pub struct PaletteFile {
     /// The file's lines in original order. Concatenating every line's raw text
     /// reproduces the original input exactly (round-trip identity).
     lines: Vec<Line>,
@@ -135,7 +135,7 @@ enum LineKind {
 /// log them itself (mirroring the sibling parsers), so a caller that probes arbitrary
 /// files while enumerating palette schemes can drop them without flooding the journal.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ParseWarning {
+pub struct ParseWarning {
     /// 1-based line number the warning concerns, for human-readable diagnostics.
     line: usize,
     /// What was wrong with the line.
@@ -144,12 +144,12 @@ pub(crate) struct ParseWarning {
 
 impl ParseWarning {
     /// The 1-based line number this warning concerns.
-    pub(crate) fn line(&self) -> usize {
+    pub fn line(&self) -> usize {
         self.line
     }
 
     /// What was wrong with the line.
-    pub(crate) fn kind(&self) -> &ParseWarningKind {
+    pub fn kind(&self) -> &ParseWarningKind {
         &self.kind
     }
 }
@@ -173,7 +173,7 @@ impl fmt::Display for ParseWarning {
 
 /// The specific reason a line produced a [`ParseWarning`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ParseWarningKind {
+pub enum ParseWarningKind {
     /// The line is not blank, not a comment, and not a `key=value` assignment
     /// with a valid identifier key — so it cannot be interpreted as a palette
     /// entry. It is kept byte-for-byte and simply ignored by edits and
@@ -204,7 +204,7 @@ pub(crate) enum ParseWarningKind {
 /// to appear exactly once and a duplicate would make [`PaletteFile::set_value`]'s
 /// first-match edit ambiguous.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct SchemaValidation {
+pub struct SchemaValidation {
     /// Entry keys present in the file that are **not** part of the 17-key
     /// schema, in first-seen order. A generator run would reject the file for
     /// carrying these.
@@ -223,24 +223,24 @@ pub(crate) struct SchemaValidation {
 impl SchemaValidation {
     /// Whether the palette conforms to the schema: all 17 keys present exactly
     /// once and no extras.
-    pub(crate) fn is_valid(&self) -> bool {
+    pub fn is_valid(&self) -> bool {
         self.unknown_keys.is_empty()
             && self.missing_keys.is_empty()
             && self.duplicate_keys.is_empty()
     }
 
     /// Entry keys outside the fixed 17-key schema.
-    pub(crate) fn unknown_keys(&self) -> &[String] {
+    pub fn unknown_keys(&self) -> &[String] {
         &self.unknown_keys
     }
 
     /// Schema keys with no entry in the file.
-    pub(crate) fn missing_keys(&self) -> &[&'static str] {
+    pub fn missing_keys(&self) -> &[&'static str] {
         &self.missing_keys
     }
 
     /// Keys that appear as an entry more than once.
-    pub(crate) fn duplicate_keys(&self) -> &[String] {
+    pub fn duplicate_keys(&self) -> &[String] {
         &self.duplicate_keys
     }
 }
@@ -250,7 +250,7 @@ impl SchemaValidation {
 /// Both variants leave the file completely unchanged: the check happens before
 /// any byte is spliced, so a rejected edit can never partially rewrite a value.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum SetValueError {
+pub enum SetValueError {
     /// No `key=value` entry with the requested key exists in the file. A key
     /// that appears only in a comment or a malformed line is *not* an entry and
     /// is reported here, so an edit can never accidentally target a commented-out
@@ -300,7 +300,7 @@ impl PaletteFile {
     /// every line it holds. The probe drops the warnings; a future per-key editor can
     /// log them. The returned warnings carry only line numbers and, for a bad value,
     /// the offending key/value — never the whole file's contents (R7.3).
-    pub(crate) fn parse(input: &str) -> (Self, Vec<ParseWarning>) {
+    pub fn parse(input: &str) -> (Self, Vec<ParseWarning>) {
         let mut lines = Vec::new();
         let mut warnings = Vec::new();
 
@@ -325,7 +325,7 @@ impl PaletteFile {
     ///
     /// After [`set_value`](Self::set_value) edits, the output is identical to the
     /// input except within the edited value spans.
-    pub(crate) fn emit(&self) -> String {
+    pub fn emit(&self) -> String {
         let mut out = String::new();
         for line in &self.lines {
             out.push_str(&line.raw);
@@ -337,7 +337,7 @@ impl PaletteFile {
     ///
     /// Reads the first entry with that key (a well-formed palette has at most
     /// one). Comment and malformed lines are never considered.
-    pub(crate) fn value(&self, key: &str) -> Option<&str> {
+    pub fn value(&self, key: &str) -> Option<&str> {
         for line in &self.lines {
             if let LineKind::Entry {
                 key: entry_key,
@@ -367,7 +367,7 @@ impl PaletteFile {
     /// every other line are left byte-identical. If a key somehow appears more
     /// than once (a schema violation [`validate`](Self::validate) would report),
     /// only the first occurrence is edited.
-    pub(crate) fn set_value(&mut self, key: &str, value: &str) -> Result<(), SetValueError> {
+    pub fn set_value(&mut self, key: &str, value: &str) -> Result<(), SetValueError> {
         if !is_bare_hex(value) {
             return Err(SetValueError::InvalidValue(value.to_string()));
         }
@@ -404,7 +404,7 @@ impl PaletteFile {
     /// valid only when all three are empty. This is independent of value-format
     /// validation — a present-but-non-hex value counts the key as present here
     /// and is flagged instead by a parse [`ParseWarningKind::InvalidHexValue`].
-    pub(crate) fn validate(&self) -> SchemaValidation {
+    pub fn validate(&self) -> SchemaValidation {
         // Count each entry key's occurrences, preserving first-seen order for
         // stable, readable reports.
         let mut counts: Vec<(String, usize)> = Vec::new();
@@ -542,7 +542,7 @@ fn is_key_char(c: char) -> bool {
 /// color": the typed settings model's hex validator ([`crate::core::model`], task
 /// 4.1, R8.3) reuses it so the parser's write guard and the pipeline's pre-write
 /// validation cannot disagree about what a valid color is.
-pub(crate) fn is_bare_hex(value: &str) -> bool {
+pub fn is_bare_hex(value: &str) -> bool {
     value.len() == 6 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 

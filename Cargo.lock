@@ -948,6 +948,7 @@ dependencies = [
  "nix",
  "relm4",
  "serde_json",
+ "settings4000",
  "tempfile",
  "tracing",
  "tracing-journald",
