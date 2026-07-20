@@ -36,6 +36,14 @@ struct Cli {
 /// [`glib::ExitCode`] becomes the process exit status: on a relaunch that
 /// activates an already-running instance it is success (0), per R8.4.
 fn main() -> glib::ExitCode {
+    // Captured before anything else runs, so the startup benchmark mark (task
+    // 7.3) measures the whole process — CLI parsing, logging setup, GTK init,
+    // and window construction — against the R8.1 cold-start budget. The UI
+    // layer logs the elapsed time when the window's first frame is painted
+    // (see `ui::app`); the small pre-`main` runtime setup (dynamic linking,
+    // crt0) is the only part of the process this cannot see.
+    let process_started = std::time::Instant::now();
+
     let cli = Cli::parse();
 
     let backend = system::logging::init(cli.log_level);
@@ -46,7 +54,7 @@ fn main() -> glib::ExitCode {
         "settings4000 starting"
     );
 
-    ui::app::run()
+    ui::app::run(process_started)
 }
 
 #[cfg(test)]
