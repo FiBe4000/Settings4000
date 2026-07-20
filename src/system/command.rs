@@ -64,6 +64,12 @@ const STDERR_LOG_LIMIT: usize = 512;
 /// [`Command::arg`]/[`Command::args`] builder, e.g.
 /// `Command::new("hyprctl").arg("reload")`.
 ///
+/// A command that hands off to a long-lived, independent process (a `setsid
+/// --fork …` launcher) is marked [`detached`](Command::detached); see that method
+/// for what changes. The flag participates in equality, so a
+/// [`MockCommandRunner`] assertion on the recorded commands also verifies that a
+/// launch really was detached.
+///
 /// The type deliberately shares its short name with [`std::process::Command`];
 /// within this crate it refers to this value type, and the standard library's
 /// builder is reached as `std::process::Command` in the runner's implementation.
@@ -74,6 +80,10 @@ pub(crate) struct Command {
     /// The arguments passed verbatim to the program, in order. Does *not*
     /// include the program name itself (unlike C `argv`).
     args: Vec<String>,
+    /// Whether this command detaches a long-lived child (see
+    /// [`Command::detached`]): output streams are discarded instead of captured,
+    /// so the runner never waits on anything the direct child hands its pipes to.
+    detached: bool,
 }
 
 impl Command {
@@ -85,6 +95,7 @@ impl Command {
         Self {
             program: program.into(),
             args: Vec::new(),
+            detached: false,
         }
     }
 
@@ -114,6 +125,32 @@ impl Command {
     /// The command's arguments, in order, excluding the program name.
     pub(crate) fn args_slice(&self) -> &[String] {
         &self.args
+    }
+
+    /// Marks this command as a detached launch, returning it for chaining.
+    ///
+    /// Use this for a command that hands off to a long-lived, independent
+    /// process — in this app always `setsid --fork <tool>…`, where `setsid`
+    /// forks the tool into its own session and exits immediately. The subtlety
+    /// this flag exists for: exiting immediately is **not** enough on its own.
+    /// A capturing runner pipes stdout/stderr, and the forked grandchild
+    /// *inherits those pipe write ends*; after reaping `setsid`, the runner's
+    /// pipe readers block in `read_to_end` until the grandchild eventually
+    /// exits — so a "detached" GUI launch would stall the caller for the tool's
+    /// whole lifetime. A detached command is therefore spawned with its output
+    /// streams pointed at `/dev/null` and nothing captured: the runner returns
+    /// as soon as the direct child (`setsid`) exits, regardless of what it
+    /// forked. The timed wait and exit-status check still apply to the direct
+    /// child, and the returned [`CommandOutput`] carries empty streams.
+    #[must_use]
+    pub(crate) fn detached(mut self) -> Self {
+        self.detached = true;
+        self
+    }
+
+    /// Whether this command is a detached launch (see [`Command::detached`]).
+    pub(crate) fn is_detached(&self) -> bool {
+        self.detached
     }
 }
 
@@ -240,7 +277,10 @@ pub(crate) trait CommandRunner {
     ///
     /// Returns `Ok(CommandOutput)` when the process ran to completion — check
     /// [`CommandOutput::success`] for the exit result — and `Err` when it could
-    /// not (spawn failure or timeout). Implementations must not invoke a shell.
+    /// not (spawn failure or timeout). For a [detached](Command::detached)
+    /// command the output streams are discarded rather than captured (the
+    /// returned streams are empty), so the call never waits on anything the
+    /// direct child forked off. Implementations must not invoke a shell.
     fn run(&self, command: &Command) -> Result<CommandOutput, CommandError>;
 }
 
@@ -287,11 +327,26 @@ impl CommandRunner for SystemCommandRunner {
         // than blocking until it hits the timeout) and both output streams
         // piped so they can be captured. No shell is involved: the program and
         // arguments go straight to the OS `exec` (architecture §10).
+        //
+        // A detached command instead discards its output streams. This is
+        // load-bearing, not cosmetic: a `setsid --fork <tool>` launcher exits
+        // immediately, but the forked grandchild inherits any pipe write ends,
+        // so after reaping `setsid` the pipe readers below would block in
+        // `read_to_end` until the *tool* exits — stalling the caller (the GTK
+        // main thread, for the Network launcher) for the tool's whole lifetime.
+        // With `Stdio::null()` there is no pipe to hold open: the readers get
+        // `None` handles and return empty at once, and the call completes as
+        // soon as the direct child exits.
+        let (stdout_cfg, stderr_cfg) = if command.detached {
+            (Stdio::null(), Stdio::null())
+        } else {
+            (Stdio::piped(), Stdio::piped())
+        };
         let spawn_result = ProcessCommand::new(&command.program)
             .args(&command.args)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(stdout_cfg)
+            .stderr(stderr_cfg)
             .spawn();
 
         let mut child = match spawn_result {
@@ -322,7 +377,10 @@ impl CommandRunner for SystemCommandRunner {
         // out of the child so the reader thread owns it; the thread reaches EOF
         // when the child closes its write end, which happens both on a normal
         // exit and when we `kill()` it below. Both handles are joined on every
-        // return path, so no reader thread ever outlives the call.
+        // return path, so no reader thread ever outlives the call. For a
+        // detached command there are no pipes (`Stdio::null()` above), so both
+        // readers receive `None` and return empty immediately — the joins are
+        // then trivially non-blocking even while the detached tool lives on.
         let stdout_reader = spawn_pipe_reader(child.stdout.take());
         let stderr_reader = spawn_pipe_reader(child.stderr.take());
 
@@ -587,6 +645,21 @@ mod tests {
     }
 
     #[test]
+    fn detached_flag_is_off_by_default_and_participates_in_equality() {
+        // The flag must distinguish otherwise-identical commands: a mock-runner
+        // assertion on recorded commands is what verifies a launch really was
+        // detached, so an accidental capture-mode launch must fail the equality.
+        let capturing = Command::new("setsid").args(["--fork", "nmtui"]);
+        assert!(!capturing.is_detached(), "capture mode is the default");
+        let detached = Command::new("setsid").args(["--fork", "nmtui"]).detached();
+        assert!(detached.is_detached());
+        assert_ne!(
+            capturing, detached,
+            "the detached flag must participate in equality"
+        );
+    }
+
+    #[test]
     fn command_output_success_is_exit_zero_only() {
         assert!(CommandOutput::fake(0).success());
         assert!(!CommandOutput::fake(1).success());
@@ -839,6 +912,43 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(4),
             "a large-output command must not stall near the timeout, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_runner_returns_promptly_from_a_detached_long_lived_child() {
+        use std::time::Instant;
+
+        // S1 regression (task 6.9 review): `setsid --fork` exits immediately, but
+        // the process it forks *inherits the parent's pipe write ends*. Through
+        // the capturing path the pipe readers then block in `read_to_end` until
+        // the forked child exits — empirically, a capturing `setsid --fork sleep 2`
+        // takes the full ~2 s wall time despite `setsid` returning instantly,
+        // which is exactly how the Network launcher froze the GUI for the
+        // launched tool's lifetime. A detached command has no pipes to hold open,
+        // so the call must return as soon as `setsid` itself exits. `sleep 30`
+        // far outlasts any acceptable bound (and the 5 s timeout), so a prompt
+        // successful return proves nothing waited on the forked child. The
+        // stray detached `sleep` is inert and expires on its own.
+        let start = Instant::now();
+        let output = SystemCommandRunner::new()
+            .run(
+                &Command::new("setsid")
+                    .args(["--fork", "sleep", "30"])
+                    .detached(),
+            )
+            .expect("`setsid --fork` should run to completion at once");
+        let elapsed = start.elapsed();
+
+        assert!(output.success());
+        assert!(
+            output.stdout().is_empty() && output.stderr().is_empty(),
+            "a detached launch captures no output"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "a detached launch must return as soon as setsid exits, took {elapsed:?}"
         );
     }
 }

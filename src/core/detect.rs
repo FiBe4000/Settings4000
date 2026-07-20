@@ -103,6 +103,12 @@ pub(crate) enum Binary {
     Hyprlock,
     /// NetworkManager's CLI — gates the read-only Network page (R3.1).
     Nmcli,
+    /// NetworkManager's GUI connection editor — the preferred tool behind the
+    /// Network page's "Open Network Settings" button (task 6.9, R3.1). It gates
+    /// only that button's *choice* of tool, never a page: when absent the button
+    /// falls back to `kitty -e nmtui`, and only with kitty also absent is the
+    /// button itself hidden.
+    NmConnectionEditor,
     /// The dconf CLI, taken as a proxy for the dconf GSettings backend that lets
     /// GTK pick up a live theme change (R2.2). Scanned only for
     /// [`Capabilities::settings_portal_available`]; it gates no page directly.
@@ -123,6 +129,7 @@ impl Binary {
         Binary::Hypridle,
         Binary::Hyprlock,
         Binary::Nmcli,
+        Binary::NmConnectionEditor,
         Binary::Dconf,
     ];
 
@@ -140,6 +147,7 @@ impl Binary {
             Binary::Hypridle => "hypridle",
             Binary::Hyprlock => "hyprlock",
             Binary::Nmcli => "nmcli",
+            Binary::NmConnectionEditor => "nm-connection-editor",
             Binary::Dconf => "dconf",
         }
     }
@@ -586,6 +594,16 @@ fn log_binary_results(present: &BTreeSet<Binary>) {
             tracing::debug!(
                 binary = name,
                 "dconf not on PATH; relying on the portal-process signal for live restyle"
+            );
+        } else if binary == Binary::NmConnectionEditor {
+            // nm-connection-editor gates no page — it only decides which tool the
+            // Network page's launcher button spawns, and `kitty -e nmtui` is the
+            // fallback — so its absence hides nothing by itself. Log at debug rather
+            // than as a hidden item. (kitty, whose absence *can* hide the button,
+            // falls through to the generic hidden-item branch below.)
+            tracing::debug!(
+                binary = name,
+                "nm-connection-editor not on PATH; the Network launcher falls back to kitty+nmtui"
             );
         } else if binary == Binary::Pactl {
             // pactl gates no page in v1: the Sound page speaks only wpctl/pw-dump, so an

@@ -93,6 +93,16 @@ pub mod display;
 // wiring (`ui::window`), so its public surface is exercised in a non-test build too.
 pub mod input;
 
+// The Network-page domain model (task 6.9; R3.1, R4.2). It reads the active
+// NetworkManager connections from terse `nmcli` output into a plain status the
+// read-only Network page renders, and decides + runs the detached "Open Network
+// Settings" launcher (`setsid --fork nm-connection-editor`, else `setsid --fork
+// kitty -e nmtui`, per the detected capabilities). It is runtime-backed: nothing is
+// staged and the store/Apply pipeline are never involved. It is consumed by the
+// Network page UI glue (`ui::network`) and the window, so its public surface is
+// exercised in a non-test build too.
+pub mod network;
+
 // The Notifications-page domain logic (task 6.7; R4.2, R4.4, R5.2, R5.6). It provides the
 // store-`SettingId` -> `swaync/config.json` write glue (rendering the store's dirty
 // position/timeout settings into one `FileWrite` through the swaync JSON adapter, position

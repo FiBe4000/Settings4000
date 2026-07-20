@@ -116,6 +116,7 @@ use crate::ui::category::{SidebarCategory, visible_categories};
 use crate::ui::chrome::{self, ApplyResponse, Toast};
 use crate::ui::display::{self, DisplayPage};
 use crate::ui::input;
+use crate::ui::network::{self, NetworkPage};
 use crate::ui::notifications::{self, NotificationsPage};
 use crate::ui::page::{self, PageMsg, PagePlan, SettingsPage};
 use crate::ui::row::visible_rows;
@@ -212,6 +213,12 @@ struct Shell {
     /// category is not visible. It is runtime-only, so — unlike the store and the Display
     /// model — it feeds neither the Apply/Reset chrome nor a dirty marker (R5.2).
     sound_page: Rc<RefCell<Option<SoundPage>>>,
+    /// The mounted Network page (task 6.9), retained so the window can re-read the
+    /// connection status when the page is re-shown. Rebuilt by [`Shell::populate`];
+    /// `None` when the Network category is not visible. It is read-only and
+    /// runtime-backed (R3.1), so — like the Sound page — it feeds neither the
+    /// Apply/Reset chrome nor a dirty marker.
+    network_page: Rc<RefCell<Option<NetworkPage>>>,
     /// The Theme page's palette-scheme model (task 6.3), shared with the Theme glue.
     /// `None` until the startup worker builds it, or when there is no dotfiles palette
     /// source. Like the Display model it is a staging source alongside the store: its
@@ -302,6 +309,9 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     let power: Rc<RefCell<Option<PowerModel>>> = Rc::new(RefCell::new(None));
     // The Sound page (task 6.2) — a runtime-only bespoke page rebuilt by `populate`.
     let sound_page: Rc<RefCell<Option<SoundPage>>> = Rc::new(RefCell::new(None));
+    // The Network page (task 6.9) — a read-only, runtime-backed bespoke page rebuilt by
+    // `populate`.
+    let network_page: Rc<RefCell<Option<NetworkPage>>> = Rc::new(RefCell::new(None));
     // The Theme page's palette model and mounted page (task 6.3) — a staging source
     // folded into the chrome and the Apply pipeline, like the Display model. Both start
     // empty; the worker fills the model and `populate` builds the page.
@@ -415,6 +425,7 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
         notifications_page,
         power,
         sound_page,
+        network_page,
         palette,
         themes,
         wallpaper,
@@ -432,6 +443,7 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     shell.wire_refresh(&refresh_button);
     shell.wire_sound_page_entry();
     shell.wire_notifications_page_entry();
+    shell.wire_network_page_entry();
 
     // Initial (disabled) chrome state, then kick off the worker.
     (shell.update_chrome)();
@@ -565,13 +577,14 @@ impl Shell {
             self.stack.remove(&child);
         }
         self.marked.borrow_mut().clear();
-        // Drop any retained Display/Sound/Notifications/Theme pages from a previous
-        // populate; their `populate_*` helpers re-set them when the categories are
-        // (re)built below.
+        // Drop any retained Display/Sound/Notifications/Theme/Network pages from a
+        // previous populate; their `populate_*` helpers re-set them when the categories
+        // are (re)built below.
         *self.display_page.borrow_mut() = None;
         *self.sound_page.borrow_mut() = None;
         *self.notifications_page.borrow_mut() = None;
         *self.theme_page.borrow_mut() = None;
+        *self.network_page.borrow_mut() = None;
 
         // Build one page per visible category, in sidebar order (R4.2).
         let mut controllers = Vec::new();
@@ -610,6 +623,13 @@ impl Shell {
             // add the bespoke switch.
             if category == SidebarCategory::Notifications {
                 self.populate_notifications(category, &mut controllers);
+                continue;
+            }
+            // Network is bespoke too (task 6.9): it is read-only, runtime-backed status
+            // (R3.1) with no store-backed settings, so it does not use the declarative
+            // framework. Build it directly from the live nmcli status.
+            if category == SidebarCategory::Network {
+                self.populate_network(category);
                 continue;
             }
             match page::plan_category(category, &caps) {
@@ -788,6 +808,33 @@ impl Shell {
         *self.sound_page.borrow_mut() = Some(page);
     }
 
+    /// Builds the Network category's page (task 6.9).
+    ///
+    /// Mounts the bespoke [`network`] page, which shows the active NetworkManager
+    /// connections and offers the "Open Network Settings" launcher button. Which
+    /// tool that button spawns is decided here from the current capabilities
+    /// (nm-connection-editor preferred, else kitty+nmtui, else no button — R4.2). No
+    /// dirty marker is registered: the page is read-only and runtime-backed, so it
+    /// never feeds the Apply/Reset chrome (R3.1). The category is only reached when
+    /// `nmcli` is present (task 5.1).
+    ///
+    /// Building runs no `nmcli`: the first status read is deferred to the page's
+    /// first entry (the [`Self::wire_network_page_entry`] hook), so a wedged
+    /// NetworkManager can never stall populate — and with it every category's
+    /// appearance — against the R8.1 startup budget. The handle is stored *before*
+    /// the page is added to the stack: adding the first page makes it the visible
+    /// child, which fires the entry hook immediately, and that hook must already
+    /// find the page or (with Network as the only visible category) the first read
+    /// would silently never happen.
+    fn populate_network(&self, category: SidebarCategory) {
+        let launcher = crate::core::network::launcher(&self.capabilities.borrow());
+        let page = network::build(launcher);
+        let root = page.root().clone();
+        *self.network_page.borrow_mut() = Some(page);
+        self.stack
+            .add_titled(&root, Some(category.stack_name()), category.title());
+    }
+
     /// Builds the Theme category's page (tasks 6.3/6.4).
     ///
     /// The page hosts three independent sections, each present when its model was built
@@ -864,6 +911,29 @@ impl Shell {
             {
                 if let Some(page) = notifications_page.borrow().as_ref() {
                     page.refresh_dnd();
+                }
+            }
+        });
+    }
+
+    /// Re-reads the NetworkManager connection status whenever the Network page becomes
+    /// the visible stack child (task 6.9), so the read-only rows reflect the live state
+    /// on page entry (R3.1) — picking up a connection change made while the app was on
+    /// another page. This same hook also performs the page's deferred *first* read:
+    /// [`network::build`] deliberately runs no `nmcli` (see [`Self::populate_network`]),
+    /// so the page shows its placeholder until this fires on first entry.
+    ///
+    /// The handler is connected once to the persistent stack (never rebuilt) and reads
+    /// the current [`Self::network_page`] on each change, so it survives every
+    /// repopulate without accumulating handlers — the same pattern as
+    /// [`Self::wire_sound_page_entry`].
+    fn wire_network_page_entry(&self) {
+        let network_page = self.network_page.clone();
+        self.stack.connect_visible_child_name_notify(move |stack| {
+            if stack.visible_child_name().as_deref() == Some(SidebarCategory::Network.stack_name())
+            {
+                if let Some(page) = network_page.borrow().as_ref() {
+                    page.refresh();
                 }
             }
         });

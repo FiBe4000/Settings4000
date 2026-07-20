@@ -47,6 +47,12 @@
 //!   framework (the settings are ordinary file-backed [`crate::core::model::SettingId`]s);
 //!   only the runtime candidate list and the curated keyboard-option switches need this
 //!   thin glue. The store→`input.conf` write itself lives in [`crate::core::input`].
+//! - [`network`] — the Network page's bespoke glue (task 6.9): a read-only list of the
+//!   active NetworkManager connections plus the "Open Network Settings" button that
+//!   launches the management tool detached, rendered from the runtime
+//!   [`crate::core::network`] status. It is bespoke rather than declarative because the
+//!   page is read-only and runtime-backed (R3.1) — it has no store-backed settings at
+//!   all.
 //! - [`notifications`] — the Notifications page's bespoke Do-Not-Disturb glue (task 6.7):
 //!   the position/timeout controls are ordinary store-backed framework rows (built via
 //!   [`page`]), so this module supplies only the runtime-only DND switch, which reads and
@@ -61,6 +67,7 @@ mod category;
 mod chrome;
 mod display;
 mod input;
+mod network;
 mod notifications;
 mod page;
 mod row;

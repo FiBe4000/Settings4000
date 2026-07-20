@@ -535,12 +535,17 @@ fn reload_kitty(signaller: &dyn ProcessSignaller) -> Result<(), ReloadError> {
 /// two paths are chosen correctly.
 ///
 /// The respawn is `setsid --fork <hypridle>` run through the normal
-/// [`CommandRunner::run`]: `setsid --fork` forks hypridle into a new session and the
-/// `setsid` process itself exits immediately, so `run` reaps `setsid` (no zombie is
-/// leaked) while the daemon is reparented to init and survives the app's exit. This
-/// reuses the existing reaping/timeout machinery rather than a hand-rolled detached
-/// spawn. The old and new hypridle may briefly overlap while the terminated one
-/// shuts down; that race is benign and this is a best-effort fallback.
+/// [`CommandRunner::run`] as a [detached](Command::detached) command: `setsid
+/// --fork` forks hypridle into a new session and the `setsid` process itself exits
+/// immediately, so `run` reaps `setsid` (no zombie is leaked) while the daemon is
+/// reparented to init and survives the app's exit. The detached marker matters (S1,
+/// task 6.9 review): the forked hypridle inherits any capture-pipe write ends, so a
+/// *capturing* run would block draining them until the daemon exits — stalling the
+/// Apply that triggered the restart for as long as hypridle lives. Detached mode
+/// captures nothing, so `run` returns as soon as `setsid` exits. This reuses the
+/// existing reaping/timeout machinery rather than a hand-rolled detached spawn. The
+/// old and new hypridle may briefly overlap while the terminated one shuts down;
+/// that race is benign and this is a best-effort fallback.
 fn restart_hypridle(
     runner: &dyn CommandRunner,
     signaller: &dyn ProcessSignaller,
@@ -572,7 +577,10 @@ fn restart_hypridle(
     tracing::info!(?killed, "sent SIGTERM to hypridle before respawn");
     run_and_check(
         runner,
-        Command::new("setsid").arg("--fork").arg(HYPRIDLE_PROCESS),
+        Command::new("setsid")
+            .arg("--fork")
+            .arg(HYPRIDLE_PROCESS)
+            .detached(),
     )?;
     tracing::info!("respawned hypridle detached via `setsid --fork`");
     Ok(())
@@ -1189,9 +1197,12 @@ mod tests {
             runner.recorded(),
             vec![
                 Command::new("systemctl").args(["--user", "is-active", "--quiet", "hypridle"]),
-                Command::new("setsid").args(["--fork", "hypridle"]),
+                Command::new("setsid")
+                    .args(["--fork", "hypridle"])
+                    .detached(),
             ],
-            "the inactive unit is not restarted; hypridle is respawned via setsid --fork"
+            "the inactive unit is not restarted; hypridle is respawned via a detached \
+             setsid --fork (detached so the runner never drains pipes the daemon inherits)"
         );
         assert_eq!(
             signaller.calls(),
@@ -1222,7 +1233,9 @@ mod tests {
             runner.recorded(),
             vec![
                 Command::new("systemctl").args(["--user", "is-active", "--quiet", "hypridle"]),
-                Command::new("setsid").args(["--fork", "hypridle"]),
+                Command::new("setsid")
+                    .args(["--fork", "hypridle"])
+                    .detached(),
             ]
         );
         assert_eq!(
