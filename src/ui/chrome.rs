@@ -138,10 +138,13 @@ pub(crate) fn respond_to_apply(outcome: &ApplyOutcome) -> ApplyResponse {
             let mut detail =
                 String::from("Some values could not be applied, so nothing was written:");
             for setting in invalid {
-                // TODO(§6): prefix each line with a user-facing setting label — those
-                // labels live with the §6 category pages. Until then show only the
-                // validation message (which describes the value problem), never the
-                // raw `SettingId` Debug string, which is an internal Rust name.
+                // Each line shows only the validation message, which is written to be
+                // self-describing (it names the expected format or range in user
+                // terms) — never the raw `SettingId` Debug string, an internal Rust
+                // name. There is no per-setting user-facing label to prefix here: the
+                // labels live in the per-page row descriptors and bespoke pages, and
+                // pulling them into this pure chrome helper is not worth the coupling
+                // while the messages stand on their own.
                 detail.push_str(&format!("\n• {}", setting.error));
             }
             ApplyResponse::Warn {

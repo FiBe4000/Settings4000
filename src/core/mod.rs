@@ -39,11 +39,12 @@ pub mod model;
 // the window's Apply chrome drains it into the Apply pipeline.
 pub mod store;
 
-// The reload command table (task 4.4; architecture §6). It maps each changed
-// backing file to the ordered, capability-gated reload actions its change requires
-// and runs each action through the `CommandRunner`/`ProcessSignaller` seams. It is
-// consumed by the Apply pipeline (task 4.5), which orders it after the file writes
-// and decides how to surface reload failures.
+// The reload command table (task 4.4; architecture §6; R5.5). It maps each changed
+// backing file to the ordered, capability-gated reload actions its change requires —
+// "reload only the components that changed and are running" — and runs each action
+// through the `CommandRunner`/`ProcessSignaller` seams (no shell, arg vectors only).
+// It is consumed by the Apply pipeline (`apply`), which orders the reloads after the
+// file writes and decides how to surface reload failures.
 pub mod reload;
 
 // The Apply pipeline orchestrator (task 4.5; architecture §6; R5.3–R5.6, R8.3). It

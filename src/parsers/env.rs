@@ -865,7 +865,7 @@ export QT_QPA_PLATFORMTHEME=gtk3
 
     #[test]
     fn a_bare_assignment_is_recognized_edited_and_not_flagged() {
-        // S1: uwsm sources this file with allexport, so a bare `KEY=value` is an
+        // uwsm sources this file with allexport, so a bare `KEY=value` is an
         // exported variable, semantically identical to `export KEY=value`. It must
         // round-trip WITHOUT a warning and be editable value-only, preserving the
         // lack of the `export` keyword.
@@ -965,7 +965,7 @@ export QT_QPA_PLATFORMTHEME=gtk3
 
     #[test]
     fn a_bare_uncommented_gtk_theme_is_an_active_override() {
-        // S1 / R3.3: because a bare `KEY=value` is exported under allexport, a bare
+        // R3.3: because a bare `KEY=value` is exported under allexport, a bare
         // `GTK_THEME=…` (no `export`) is a LIVE override too. Before this was
         // recognized it would have read as Absent, leaving the drop-down enabled
         // and fighting the override — which CLAUDE.md's R3.3 rule forbids.
@@ -1076,7 +1076,7 @@ export GTK_THEME=LiveValue
 
     #[test]
     fn an_active_override_wins_over_a_later_commented_line() {
-        // N3: order-independence — an active export appearing BEFORE a commented-out
+        // Order-independence: an active export appearing BEFORE a commented-out
         // line still wins (the reverse of the commented-then-active case above).
         let input = "\
 export GTK_THEME=LiveValue

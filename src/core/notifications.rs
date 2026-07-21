@@ -119,8 +119,8 @@ impl std::error::Error for SwayncRenderError {
 }
 
 /// Why [`NotificationsModel::swaync_config_write`] could not produce a write despite there
-/// being dirty Notifications settings to apply (task 6.7, mirroring the Input page's
-/// review-M1 contract).
+/// being dirty Notifications settings to apply (task 6.7, the same abort-not-skip
+/// contract as the Input page's `InputWriteError`).
 ///
 /// This is distinct from "nothing was dirty" (a plain `Ok(None)`): when the user *has*
 /// pending Notifications edits but the write cannot be rendered, the Apply must **abort**
@@ -456,7 +456,7 @@ mod tests {
             decompose_position("bottom-center"),
             Some(("bottom", "center"))
         );
-        // swaync's vertical `center` half decomposes like top/bottom (review S1); the
+        // swaync's vertical `center` half decomposes like top/bottom; the
         // `center-center` "dead centre" splits cleanly on the first hyphen.
         assert_eq!(
             decompose_position("center-right"),
@@ -472,7 +472,7 @@ mod tests {
 
     #[test]
     fn a_center_position_edit_writes_position_y_center_and_the_x_key() {
-        // Review S1: a `center-*` token decomposes to `positionY: center` + the X key — a
+        // A `center-*` token decomposes to `positionY: center` + the X key — a
         // JSON round-trip that changes exactly those two keys, so a live `center` config
         // both preselects (page.rs) and round-trips (here).
         let edit = render_swaync_config(
@@ -632,7 +632,7 @@ mod tests {
 
     #[test]
     fn swaync_config_write_errors_when_dirty_but_the_file_is_unreadable() {
-        // M1-style: a dirty Notifications edit against a missing file is an error (the
+        // A dirty Notifications edit against a missing file is an error (the
         // Apply aborts), never a silent skip that would let commit_apply promote an
         // unwritten value.
         let dir = tempfile::tempdir().expect("temp dir");

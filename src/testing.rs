@@ -337,13 +337,13 @@ pub fn load_into_store(
 }
 
 /// Builds the base [`ApplyPlan`] from the store's dirty edits, through the app's real
-/// plan builder (`ui::window::interim_apply_plan`, task 5.3/7.2).
+/// plan builder (`ui::window::base_apply_plan`, task 5.3/7.2).
 ///
 /// The suites then fold in the per-page writes exactly as the window's Apply handler
 /// does — the store-driven `FileWrite`s from the page models, plus the Display/Theme
 /// contributions — so the plan a suite runs is assembled by the same code the app runs.
 pub fn base_apply_plan(store: &SettingsStore) -> ApplyPlan {
-    crate::ui::window::interim_apply_plan(store)
+    crate::ui::window::base_apply_plan(store)
 }
 
 /// Unwraps an [`ApplyOutcome::Applied`], returning its reload failures and written

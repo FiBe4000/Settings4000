@@ -421,7 +421,7 @@ fn a_wallpaper_change_dual_writes_hyprpaper_and_hyprlock_and_reloads() {
 #[test]
 fn a_tilde_shaped_wallpaper_original_is_replaced_surgically() {
     // The real machine's configs use a tilde path (`~/Pictures/…`), not the
-    // fixture's anonymized absolute one (the task-7.1 review flag): rewrite the
+    // fixture's anonymized absolute one: rewrite the
     // installed originals to the tilde form, then prove a staged absolute path
     // still applies as a surgical value-span edit in both files. Only the staged
     // (new) path is validated (R8.3) — the tilde original never has to resolve.

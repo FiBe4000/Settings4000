@@ -233,7 +233,7 @@ impl Inner {
                 // GTK silently defaults an unset drop-down selection to index 0,
                 // which would misleadingly present the first scheme as the active
                 // one; this note tells the user the current scheme is indeterminate
-                // so the index-0 default is not mistaken for it (task 6.3 review S2).
+                // so the index-0 default is not mistaken for it.
                 section.append(&note("Current colour scheme could not be determined."));
             }
         } else {

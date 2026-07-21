@@ -270,7 +270,7 @@ mod tests {
         assert!(SidebarCategory::Sound.is_visible(&with_wpctl));
 
         // pactl present but no wpctl -> hidden: a pactl-only host must not render a
-        // dead, inert Sound page (R4.2). This is the S1 review fix.
+        // dead, inert Sound page (R4.2).
         let pactl_only = Capabilities::for_tests(&[Binary::Pactl], &[], false);
         assert!(!SidebarCategory::Sound.is_visible(&pactl_only));
 

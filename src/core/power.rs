@@ -149,8 +149,8 @@ pub struct HypridleConfEdit {
 }
 
 /// Why [`PowerModel::hypridle_conf_write`] could not produce a write despite there being
-/// dirty Power & Idle settings to apply (task 6.8, mirroring the Input page's review-M1
-/// contract).
+/// dirty Power & Idle settings to apply (task 6.8, the same abort-not-skip contract as
+/// the Input page's `InputWriteError`).
 ///
 /// This is distinct from "nothing was dirty" (a plain `Ok(None)`): when the user *has*
 /// pending Power & Idle edits but the write cannot be rendered, the Apply must **abort**
@@ -563,7 +563,7 @@ listener {
 
     #[test]
     fn hypridle_conf_write_rejects_an_unsafe_lock_command_defense_in_depth() {
-        // N3: even though the stage-time validator (task 6.8 review S1) now rejects a lock
+        // Defense in depth: even though the stage-time validator rejects a lock
         // command containing `#`/newline before it can be staged, the writer keeps its own
         // `reject_unsafe_value` guard — a lock command with a `#` surfaces as a
         // `PowerWriteError::Render` here, so a value that somehow reached this point

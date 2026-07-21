@@ -67,7 +67,7 @@ const ROW_SPACING: i32 = 8;
 const VOLUME_PERCENT_MAX: f64 = 100.0;
 
 /// How long after the last volume-slider movement the `wpctl set-volume` command is
-/// actually run (N3 review fix).
+/// actually run.
 ///
 /// A slider drag emits a `value-changed` for every 1% step, so applying on each would
 /// spawn ~100 short-lived `wpctl` processes back-to-back on the UI thread. Instead each
@@ -115,7 +115,7 @@ struct Inner {
     /// stages nothing (R5.2).
     state: RefCell<SoundState>,
     /// The pending, debounced volume-apply timer, if a slider was moved within the last
-    /// [`VOLUME_DEBOUNCE`] (N3). Held so a subsequent movement can cancel and re-arm it,
+    /// [`VOLUME_DEBOUNCE`]. Held so a subsequent movement can cancel and re-arm it,
     /// coalescing a drag into a single `wpctl set-volume`.
     volume_timeout: RefCell<Option<glib::SourceId>>,
 }
@@ -222,7 +222,7 @@ impl Inner {
         scale.connect_value_changed(move |scale| {
             if let Some(inner) = weak.upgrade() {
                 // Debounced: a drag re-arms one timer rather than spawning `wpctl` per
-                // 1% step (N3). See `schedule_volume`.
+                // 1% step. See `schedule_volume`.
                 inner.schedule_volume(id, scale.value() / VOLUME_PERCENT_MAX);
             }
         });
@@ -262,7 +262,7 @@ impl Inner {
     }
 
     /// (Re)arms the debounced volume-apply timer for device `id` at the `wpctl`-scale
-    /// `volume` (N3), cancelling any pending one so only the latest value is applied.
+    /// `volume`, cancelling any pending one so only the latest value is applied.
     ///
     /// The one-shot timer fires [`VOLUME_DEBOUNCE`] after the last movement, so a drag —
     /// which emits a change per 1% step — collapses into a single `wpctl set-volume`

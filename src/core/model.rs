@@ -1133,7 +1133,7 @@ mod tests {
 
     #[test]
     fn keyboard_layouts_require_at_least_one_entry() {
-        // R8.3 (task 6.6 review S1): a non-empty layout list validates, but an empty one
+        // R8.3: a non-empty layout list validates, but an empty one
         // — the user removed every entry — is rejected so the framework's invalid-edit
         // path reverts the control rather than writing a bare `kb_layout=` (which
         // Hyprland silently replaces with its default, losing the config).

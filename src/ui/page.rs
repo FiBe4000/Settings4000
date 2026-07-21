@@ -883,7 +883,7 @@ fn category_rows(category: SidebarCategory) -> Vec<RowDescriptor> {
                     // every one is offered here as the combined `<positionY>-<positionX>`
                     // token the store carries. Covering all nine is what lets a live
                     // `positionY: center` config preselect correctly rather than falling
-                    // back to index 0 (task 6.7 review S1). Ordered top→centre→bottom for
+                    // back to index 0. Ordered top→centre→bottom for
                     // natural vertical reading; the order is cosmetic (preselect matches by
                     // token, not index).
                     options: vec![
@@ -1232,7 +1232,7 @@ mod tests {
 
     #[test]
     fn notifications_position_covers_all_nine_swaync_positions_and_preselects() {
-        // Review S1: the position drop-down must offer swaync's full positionY × positionX
+        // The position drop-down must offer swaync's full positionY × positionX
         // grid (top/center/bottom × left/center/right = 9 combinations), so a live
         // `positionY: center` config preselects the matching option rather than silently
         // falling back to index 0 ("Top right").

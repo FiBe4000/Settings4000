@@ -818,7 +818,7 @@ mod tests {
 
     #[test]
     fn staging_nan_is_rejected_and_leaves_state_well_behaved() {
-        // Dirty-robustness (the 4.1 review): a NaN float is rejected on stage, so it
+        // Dirty-robustness: a NaN float is rejected on stage, so it
         // never enters `staged`. An earlier valid edit is untouched by the rejection,
         // and reset still returns the store to clean.
         let dir = tempfile::tempdir().expect("temp dir should be creatable");
@@ -889,7 +889,7 @@ mod tests {
 
     #[test]
     fn staging_an_empty_keyboard_layout_list_is_rejected() {
-        // Task 6.6 review S1 (R8.3): removing every layout stages `KeyboardLayouts = ""`,
+        // R8.3: removing every layout stages `KeyboardLayouts = ""`,
         // which must be refused on stage — so the framework's invalid-edit path reverts
         // the control rather than letting a bare `kb_layout=` reach Apply.
         let dir = tempfile::tempdir().expect("temp dir should be creatable");
@@ -935,7 +935,7 @@ mod tests {
 
     #[test]
     fn staging_an_unsafe_lock_command_is_rejected_and_reverts() {
-        // Task 6.8 review S1 (R8.3): the hypridle lock command is free text typed into an
+        // R8.3: the hypridle lock command is free text typed into an
         // Entry, but is written into a hyprlang value — a `#` would be read as a comment
         // and truncate it. Staging such a value must be refused so the framework's
         // invalid-edit path reverts the control on the offending keystroke, rather than the

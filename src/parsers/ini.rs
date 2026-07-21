@@ -55,12 +55,13 @@
 //!
 //! The [create-from-scratch path](IniFile::set_value) produces the *bytes* of a
 //! new file (a `[Settings]` section with the set keys), but this module does not
-//! touch the filesystem. The atomic writer (task 2.2, `system::writer`) currently
-//! only rewrites files that already exist — it `fs::canonicalize`s the target, so
-//! creating an absent `settings.ini` on disk is a writer/Apply concern for tasks
-//! 4.5 / 6.4, not this parser. On the target dotfiles machine the files are
-//! already present, so the edit-existing path is what actually runs; the create
-//! path exists and is tested for the no-dotfiles fallback and for future use.
+//! touch the filesystem — and no caller creates a `settings.ini` on disk today.
+//! The atomic writer (task 2.2, `system::writer`) `fs::canonicalize`s its target,
+//! so it only rewrites files that already exist, and the Theme model reads
+//! whichever of the two GTK files is present rather than creating an absent one.
+//! On the target dotfiles machine both files exist, so the edit-existing path is
+//! what actually runs; the create path stays implemented and tested so the
+//! parser's parse/edit/emit surface is complete for a host missing one of them.
 
 use std::fmt;
 

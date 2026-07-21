@@ -941,7 +941,8 @@ impl Shell {
 
     /// Wires the Apply button to run the pipeline and handle its outcome (R5.3–R5.6).
     ///
-    /// See the module docs: the plan is interim (validations only, no writes yet), the
+    /// See the module docs: the handler starts from [`base_apply_plan`] (the store's
+    /// dirty settings as validations) and folds in the per-page file writes, the
     /// pipeline is given the store's real freshness tracker so its conflict check
     /// measures against the loaded baselines (R5.6), the outcome is dispatched through
     /// [`chrome::respond_to_apply`], and an
@@ -1037,7 +1038,7 @@ impl Shell {
                 return;
             }
 
-            let mut plan = interim_apply_plan(&shell.store.borrow());
+            let mut plan = base_apply_plan(&shell.store.borrow());
 
             // Fold the store-backed Input settings into one surgical `input.conf` write
             // (task 6.6) — the first store-driven page to produce a real FileWrite. Done
@@ -1059,8 +1060,8 @@ impl Shell {
                 // The user has pending Input edits but the write could not be prepared
                 // (input.conf unreadable, or the writer rejected an edit). Abort the whole
                 // Apply and keep the staged edits — never proceed to commit, which would
-                // promote the Input values against an unchanged file and desync the store
-                // (task 6.6 review M1). Near-unreachable in practice.
+                // promote the Input values against an unchanged file and desync the
+                // store. Near-unreachable in practice.
                 Err(error) => {
                     tracing::error!(%error, "aborting apply: could not prepare the input.conf write");
                     chrome::show_warning(
@@ -1097,8 +1098,9 @@ impl Shell {
                 // Pending Notifications edits but the write could not be prepared
                 // (config.json unreadable, or no longer valid JSON). Abort the whole Apply
                 // and keep the staged edits — never proceed to commit, which would promote
-                // the values against an unchanged file and desync the store (task 6.7,
-                // mirroring the Input review-M1 contract). Near-unreachable in practice.
+                // the values against an unchanged file and desync the store (the same
+                // abort-not-skip contract as the Input write above). Near-unreachable in
+                // practice.
                 Err(error) => {
                     tracing::error!(%error, "aborting apply: could not prepare the swaync config.json write");
                     chrome::show_warning(
@@ -1138,8 +1140,8 @@ impl Shell {
                 // (hypridle.conf unreadable, or the writer rejected an edit — e.g. a `#` in
                 // the lock command). Abort the whole Apply and keep the staged edits — never
                 // proceed to commit, which would promote the values against an unchanged file
-                // and desync the store (mirroring the Input/Notifications review-M1
-                // contract). Near-unreachable in practice.
+                // and desync the store (the same abort-not-skip contract as the
+                // Input/Notifications writes above). Near-unreachable in practice.
                 Err(error) => {
                     tracing::error!(%error, "aborting apply: could not prepare the hypridle.conf write");
                     chrome::show_warning(
@@ -1402,16 +1404,15 @@ impl Shell {
 /// gate re-checks them, R8.3). It produces **no** `writes` itself: turning a staged
 /// [`Value`](crate::core::model::Value) into concrete file bytes goes through the format
 /// parsers and is per-page glue. [`Shell::wire_apply`] folds those writes into the plan
-/// after building it — the Input page's `input.conf` write from the store's dirty Input
-/// settings (task 6.6), and the Display/Theme models' writes from their own staging — so
-/// this stays a thin shared starting point — the Notifications page (task 6.7) folds in
-/// its swaync `config.json` write the same way as Input, and the remaining store-backed
-/// §6 pages will do likewise.
+/// after building it — the store-driven `input.conf` (task 6.6), swaync `config.json`
+/// (task 6.7), and `hypridle.conf` (task 6.8) writes rendered from the store's dirty
+/// settings, plus the Display/Theme models' writes from their own staging — so this
+/// stays a thin shared starting point.
 ///
 /// Crate-visible so `crate::testing` can re-expose it to the integration suites (task
 /// 7.2), which assemble their Apply plans through this exact function rather than a
 /// test re-implementation.
-pub(crate) fn interim_apply_plan(store: &SettingsStore) -> ApplyPlan {
+pub(crate) fn base_apply_plan(store: &SettingsStore) -> ApplyPlan {
     let validations = store
         .dirty_ids()
         .into_iter()

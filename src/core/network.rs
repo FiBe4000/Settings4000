@@ -438,8 +438,7 @@ mod tests {
         // capability combination and assert the exact setsid arg vector. The
         // expected commands carry the detached marker — equality includes it, so
         // this also proves the launch goes through the runner's no-capture mode
-        // (the S1 review fix: a capturing launch would freeze the GUI until the
-        // tool exits).
+        // (a capturing launch would freeze the GUI until the tool exits).
         let editor_caps =
             Capabilities::for_tests(&[Binary::Nmcli, Binary::NmConnectionEditor], &[], false);
         let runner = MockCommandRunner::new();

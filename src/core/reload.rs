@@ -538,8 +538,8 @@ fn reload_kitty(signaller: &dyn ProcessSignaller) -> Result<(), ReloadError> {
 /// [`CommandRunner::run`] as a [detached](Command::detached) command: `setsid
 /// --fork` forks hypridle into a new session and the `setsid` process itself exits
 /// immediately, so `run` reaps `setsid` (no zombie is leaked) while the daemon is
-/// reparented to init and survives the app's exit. The detached marker matters (S1,
-/// task 6.9 review): the forked hypridle inherits any capture-pipe write ends, so a
+/// reparented to init and survives the app's exit. The detached marker matters:
+/// the forked hypridle inherits any capture-pipe write ends, so a
 /// *capturing* run would block draining them until the daemon exits — stalling the
 /// Apply that triggered the restart for as long as hypridle lives. Detached mode
 /// captures nothing, so `run` returns as soon as `setsid` exits. This reuses the

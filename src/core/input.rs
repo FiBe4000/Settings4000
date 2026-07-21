@@ -59,7 +59,7 @@ use crate::core::reload::BackingFile;
 use crate::parsers::hyprlang::{EditError, HyprlangFile, KeyPath};
 
 /// Why [`InputModel::input_conf_write`] could not produce a write despite there being
-/// dirty Input settings to apply (task 6.6 review M1).
+/// dirty Input settings to apply (task 6.6).
 ///
 /// This is distinct from "nothing was dirty" (which is a plain `Ok(None)`): when the
 /// user *has* pending Input edits but the write cannot be rendered, the Apply must
@@ -385,7 +385,7 @@ impl InputModel {
     ///   cannot be produced (the file is unreadable, or the writer rejects an edit). The
     ///   caller must **abort the Apply** in this case rather than skip the write, since
     ///   the store would otherwise commit the staged values against an unchanged file and
-    ///   desync (task 6.6 review M1). Both failure modes are near-unreachable in practice.
+    ///   desync. Both failure modes are near-unreachable in practice.
     pub fn input_conf_write(
         &self,
         dirty: &[(SettingId, Value)],
@@ -761,7 +761,7 @@ input {
 
     #[test]
     fn input_conf_write_errors_when_dirty_but_the_section_is_missing() {
-        // M1: dirty Input settings but the writer cannot apply them (no `input {}`
+        // Dirty Input settings but the writer cannot apply them (no `input {}`
         // section) must surface as an error, so the Apply aborts rather than skipping the
         // write and letting the store commit an unwritten value against an unchanged file.
         let dir = tempfile::tempdir().expect("temp dir");
@@ -780,7 +780,7 @@ input {
 
     #[test]
     fn input_conf_write_errors_when_dirty_but_the_file_is_unreadable() {
-        // M1: a dirty Input edit against a missing file is an error (the Apply aborts),
+        // A dirty Input edit against a missing file is an error (the Apply aborts),
         // never a silent skip that would let commit_apply promote an unwritten value.
         let dir = tempfile::tempdir().expect("temp dir");
         let model = InputModel::load(dir.path().join("gone.conf"), Path::new("/nonexistent-xkb"));
@@ -857,7 +857,7 @@ input {
 
     #[test]
     fn a_second_apply_after_commit_is_not_a_self_conflict_through_the_real_glue() {
-        // S2: proves the window's fold-before-`store_writes`-capture plus
+        // Proves the window's fold-before-`store_writes`-capture plus
         // `commit_apply`'s re-baseline of input.conf work through the REAL renderer (not
         // apply.rs's hand-built write). Load input.conf into a real store, stage an Input
         // edit, build the write via `input_conf_write`, run `apply::run` over the store's

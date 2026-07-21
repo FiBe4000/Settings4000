@@ -1648,7 +1648,7 @@ bind = $mainMod, Return, exec, $terminal
 
     #[test]
     fn live_hyprland_conf_classifies_dotted_and_variable_keys_as_entries() {
-        // M1: real hyprland lines must not misfire as malformed. Round-trip is
+        // Real hyprland lines must not misfire as malformed. Round-trip is
         // byte-identical, there are zero parse warnings, and dotted keys and
         // `$variable` declarations are addressable ordinary entries.
         let (file, warnings) = HyprlangFile::parse(HYPRLAND_CONF);
@@ -1676,7 +1676,7 @@ bind = $mainMod, Return, exec, $terminal
 
     #[test]
     fn repeatable_key_edit_preserves_whitespace_after_the_comma() {
-        // N3: the production cursor-env line may have a space after the comma;
+        // The production cursor-env line may have a space after the comma;
         // only the value portion after the comma+whitespace is read and rewritten.
         let input = "env = XCURSOR_THEME, Nordic-cursors\n";
         let (mut file, _) = HyprlangFile::parse(input);

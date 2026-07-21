@@ -2065,7 +2065,7 @@ purple=d699b6
 
     #[test]
     fn an_undetectable_active_scheme_preselects_nothing() {
-        // Degraded path (task 6.3 review S2): the generated header does not name a
+        // Degraded path: the generated header does not name a
         // recognizable scheme, so detection degrades to `Unknown`. With no active
         // scheme there is nothing to preselect even though the schemes exist — the
         // UI must NOT fall back to GTK's index-0 default and present the first scheme
@@ -2095,7 +2095,7 @@ purple=d699b6
 
     #[test]
     fn an_active_scheme_absent_from_colors_preselects_nothing() {
-        // Degraded path (task 6.3 review S2): the generated header names a scheme
+        // Degraded path: the generated header names a scheme
         // that is not among the enumerated `colors/` files (e.g. its source file was
         // deleted or renamed). The active name is still reported, but it maps to no
         // drop-down index, so the UI preselects nothing rather than the first scheme.

@@ -932,7 +932,7 @@ mod tests {
     fn real_runner_returns_promptly_from_a_detached_long_lived_child() {
         use std::time::Instant;
 
-        // S1 regression (task 6.9 review): `setsid --fork` exits immediately, but
+        // Regression guard: `setsid --fork` exits immediately, but
         // the process it forks *inherits the parent's pipe write ends*. Through
         // the capturing path the pipe readers then block in `read_to_end` until
         // the forked child exits — empirically, a capturing `setsid --fork sleep 2`
