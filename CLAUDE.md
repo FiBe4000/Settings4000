@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-**This repo is in the planning stage — no code exists yet.** There is no `Cargo.toml`, no `src/`, and no commits; the only content is design docs under `docs/`. The first implementation task is scaffolding the crate (see `docs/tasks.md` §1.1). Until then, "commands" below describe the intended toolchain, not something you can run today.
+**All planned implementation (`docs/tasks.md` §1–§8) is complete and pushed**: the crate builds, the three CI gates run green, and the app is installed and verified on the target Hyprland session. The open backlog lives in `docs/tasks.md` as unchecked tasks — §9 (post-review fixes from the 2026-07-21 full-project review) and §10 (additional features). Note that on two points (the swaync `-R` config-reload flag and the hyprlang last-occurrence duplicate-key rule) the specs are deliberately ahead of the code until tasks 9.8/9.9 land.
 
 The authoritative specs, in order of use:
 - `docs/requirements.md` — what to build (numbered **R…** requirements, referenced everywhere).
@@ -18,7 +18,7 @@ When implementing, treat the R-numbers as the contract and update `docs/tasks.md
 
 Settings4000 is a native GTK4 GUI (Rust + Relm4) that edits the config files of a `~/.dotfiles`-managed Hyprland desktop and triggers the right live-reloads — replacing manual config editing for common user-facing settings (display, sound, theme, input, notifications, power/idle, network).
 
-## Commands (once scaffolded)
+## Commands
 
 ```
 cargo build
