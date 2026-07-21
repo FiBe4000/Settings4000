@@ -218,6 +218,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn desktop_entry_icon_and_installer_carry_the_application_id() {
+        // Task 8.2: on Wayland, GTK sets every window's app_id to `APP_ID`, and
+        // compositors/launchers associate that window (and its icon) with the
+        // desktop file named `<app-id>.desktop`. The desktop entry's file name,
+        // its `StartupWMClass`/`Icon` values, the installed icon's file name,
+        // and install.sh's own copy of the ID (a shell script cannot read the
+        // Rust constant, so it hardcodes one) must therefore all equal the
+        // GApplication ID — if `APP_ID` is ever changed, this guard fails
+        // headlessly until `data/` and `install.sh` move with it.
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let data_dir = manifest_dir.join("data");
+
+        let desktop_path = data_dir.join(format!("{APP_ID}.desktop"));
+        let desktop = std::fs::read_to_string(&desktop_path).unwrap_or_else(|error| {
+            panic!(
+                "the desktop entry must live at {} (freedesktop convention: \
+                 named after the application ID): {error}",
+                desktop_path.display()
+            )
+        });
+        for key in ["StartupWMClass", "Icon"] {
+            let expected = format!("{key}={APP_ID}");
+            assert!(
+                desktop.lines().any(|line| line == expected),
+                "{} must contain the line `{expected}`",
+                desktop_path.display()
+            );
+        }
+
+        let icon_path = data_dir.join(format!("{APP_ID}.svg"));
+        assert!(
+            icon_path.is_file(),
+            "the icon must live at {} so GTK's by-app-id icon lookup finds it",
+            icon_path.display()
+        );
+
+        // install.sh derives every install path from its `app_id` variable, so
+        // pin that assignment line to the constant to complete the guard.
+        let installer_path = manifest_dir.join("install.sh");
+        let installer = std::fs::read_to_string(&installer_path).unwrap_or_else(|error| {
+            panic!(
+                "the installer must live at {}: {error}",
+                installer_path.display()
+            )
+        });
+        let expected = format!("app_id=\"{APP_ID}\"");
+        assert!(
+            installer.lines().any(|line| line == expected),
+            "{} must contain the line `{expected}`",
+            installer_path.display()
+        );
+    }
+
+    #[test]
     fn app_id_is_a_valid_gapplication_id() {
         // Single-instance activation (R8.4) depends on registering this exact ID
         // on the session bus; an invalid ID would make registration fail at

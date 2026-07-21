@@ -1,0 +1,34 @@
+# Desktop entry for Settings4000 (task 8.2; freedesktop Desktop Entry spec).
+#
+# The file name, StartupWMClass, and Icon all carry the fixed GApplication ID
+# (`org.settings4000.Settings4000`, declared in src/ui/app.rs). On Wayland the
+# association is by name: GTK sets each window's app_id to the GApplication ID,
+# and compositors/launchers match it against the desktop file named
+# `<app-id>.desktop`. StartupWMClass only serves the X11/XWayland fallback,
+# where the window *class* — not an app_id — is matched. Keeping all three
+# values identical covers both paths; a unit test in src/ui/app.rs guards the
+# equality.
+#
+# `Exec` is a template value: the Exec key performs no `~`/`$HOME` expansion,
+# so install.sh rewrites this line to the absolute installed binary path
+# (~/.local/bin/settings4000) when it copies the file into
+# ~/.local/share/applications. The bare command here still works for anyone
+# who installs the binary onto $PATH by other means.
+[Desktop Entry]
+Type=Application
+Name=Settings4000
+GenericName=Desktop Settings
+Comment=Settings for a dotfiles-managed Hyprland desktop
+Exec=settings4000
+Icon=org.settings4000.Settings4000
+Terminal=false
+Categories=Settings;GTK;
+Keywords=hyprland;dotfiles;display;monitor;theme;wallpaper;cursor;input;keyboard;touchpad;notifications;power;idle;network;
+StartupWMClass=org.settings4000.Settings4000
+# Spec 1.5: tells launchers the app manages a single main window (R8.4), so
+# they may offer "focus" instead of "launch again" semantics where supported.
+SingleMainWindow=true
+# The app supports startup notification: GTK4 completes it via xdg-activation
+# (or the X11 protocol under XWayland) when the first window is presented, so
+# launchers get clean launch feedback and focus handoff.
+StartupNotify=true

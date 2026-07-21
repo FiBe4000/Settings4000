@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Application icon for Settings4000 (task 8.2). An original drawing made for
+  this project: three horizontal slider tracks with offset knobs - the
+  universal "settings" motif - on a rounded dark square. The palette is a
+  hand-picked dark-blue/cyan/off-white triple chosen to sit comfortably next
+  to the Nord-themed desktop the app manages, without copying any third-party
+  artwork or palette file.
+
+  Installed to ~/.local/share/icons/hicolor/scalable/apps/ under the fixed
+  GApplication ID (org.settings4000.Settings4000.svg) so GTK's icon lookup
+  finds it by the same name the .desktop file and the Wayland app_id use.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- Rounded-square plate, sized to the common 128 px grid with an 8 px margin. -->
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="#232a33"/>
+  <!-- Three slider tracks. -->
+  <g stroke="#4fa8c7" stroke-width="9" stroke-linecap="round">
+    <line x1="30" y1="41" x2="98" y2="41"/>
+    <line x1="30" y1="64" x2="98" y2="64"/>
+    <line x1="30" y1="87" x2="98" y2="87"/>
+  </g>
+  <!-- Slider knobs, deliberately at different positions so the icon reads as
+       "adjustable settings" rather than a list. The plate-colored outline
+       visually separates each knob from its track. -->
+  <g fill="#f2f4f8" stroke="#232a33" stroke-width="5">
+    <circle cx="78" cy="41" r="11"/>
+    <circle cx="46" cy="64" r="11"/>
+    <circle cx="88" cy="87" r="11"/>
+  </g>
+</svg>
