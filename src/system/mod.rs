@@ -17,25 +17,25 @@
 //! [`crate::core::freshness`], not here — it only reads files to compare them,
 //! which needs no side-effect abstraction.
 
-// The command-execution boundary and the atomic file writer are foundational
-// infrastructure: they are consumed by the reload command table (task 4.4) and
-// the Apply pipeline (task 4.5). The writer is not wired into the app yet, so in a
-// non-test binary build its public surface is exercised only by its own tests and
-// would otherwise trip the `dead_code` lint. Scope the allowance to `not(test)` so
-// the lint stays fully active in test builds (where the surface is used); the
-// allowance can be removed once 4.5 lands.
-#[cfg_attr(not(test), allow(dead_code))]
+// The command-execution boundary: the `CommandRunner` trait and its production
+// implementation. Every subprocess the app spawns goes through it as an arg
+// vector with a 5 s timeout (R6.1) — the reload command table
+// (`core::reload`), the Apply pipeline's `generate-colors` step, the
+// runtime-only page controls (sound, network, notifications DND,
+// laptop-display toggle), and the startup loader's probes.
 pub mod command;
 pub mod logging;
 
-// The process-signal boundary (task 4.4): the `ProcessSignaller` trait through
-// which the reload table sends SIGUSR1 to kitty and SIGTERM to hypridle. It is
-// consumed by `core/reload.rs`, whose executor is in turn driven by the Apply
-// pipeline (task 4.5) — not yet wired into the app — so in a non-test build its
-// surface is exercised only by its own tests. Scope the allowance to `not(test)`
-// so the lint stays active in test builds; remove it once 4.5 wires reloads in.
-#[cfg_attr(not(test), allow(dead_code))]
+// The process-signal boundary: the `ProcessSignaller` trait through which the
+// reload table (`core::reload`) sends SIGUSR1 to kitty and SIGTERM to hypridle
+// — the reloads delivered as signals to already-running processes rather than
+// as subprocesses. The Apply pipeline drives the reload executor after the
+// file writes.
 pub mod signal;
 
-#[cfg_attr(not(test), allow(dead_code))]
+// The atomic file writer (R8.5): it canonicalizes the target first — so a file
+// symlinked into the dotfiles repo has its real target rewritten with the link
+// preserved — then writes temp-file-beside → fsync → atomic rename. The Apply
+// pipeline (`core::apply`) is its sole consumer; every staged `FileWrite`
+// reaches disk through it.
 pub mod writer;

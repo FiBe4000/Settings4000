@@ -11,71 +11,48 @@
 //! `relm4` — parsers are pure, display-free, and independently testable
 //! (enforced by `tests/module_boundaries.rs`).
 
-// The palette parser (task 3.1) will be consumed by the SettingsStore (task 4.2,
-// which reads and stages `colors/<scheme>` for the theme page) and the theme
-// palette page (task 6.3) — neither of which exists yet. Until they wire it in,
-// its public surface is exercised only by its own tests, so a non-test build
-// would flag every item as dead code. Scope the allowance to `not(test)` so the
-// `dead_code` lint stays fully active in test builds (where the surface is used);
-// remove it once 4.2/6.3 consume the parser.
-#[cfg_attr(not(test), allow(dead_code))]
+// The palette `key=hex` parser (task 3.1; R3.2). The generated-file readers
+// (`generated`) parse a scheme file through it to read the 17 schema colors
+// for the Theme page's swatches, and `core::model` reuses its bare-hex
+// validator. The app never writes `colors/<scheme>` itself — a scheme switch
+// runs `generate-colors` — so the surgical `set_value` surface is exercised
+// only by tests; it is kept because every parser honors the same lossless
+// parse/edit/emit contract (architecture §3).
 pub mod palette;
 
-// The hyprlang parser (task 3.2) will be consumed by the SettingsStore (task 4.2)
-// and the input (6.6), power/idle (6.8), wallpaper/lock (6.5), and cursor-env
-// (6.4) pages — none of which exist yet. Until they wire it in, its public
-// surface is exercised only by its own tests, so a non-test build would flag
-// every item as dead code. Scope the allowance to `not(test)` so the `dead_code`
-// lint stays active in test builds; remove it once those tasks consume it.
-#[cfg_attr(not(test), allow(dead_code))]
+// The hyprlang parser (task 3.2) — the highest-risk parser (nested sections,
+// `source=`, repeatable keys). The startup loader reads the hypr config files
+// through it, and the input (`core::input`), power/idle (`core::power`), and
+// wallpaper/lock + cursor-env (`core::theme`) write glue renders its surgical
+// edits with it.
 pub mod hyprlang;
 
-// The monitors.conf record parser (task 3.3) will be consumed by the
-// SettingsStore (task 4.2) and the Display page (task 6.1) — neither of which
-// exists yet. Until they wire it in, its public surface is exercised only by its
-// own tests, so a non-test build would flag every item as dead code. Scope the
-// allowance to `not(test)` so the `dead_code` lint stays active in test builds;
-// remove it once 4.2/6.1 consume the parser.
-#[cfg_attr(not(test), allow(dead_code))]
+// The monitors.conf record parser (task 3.3). The Display-page domain model
+// (`core::display`) reads the `monitor=` records through it and renders the
+// staged mode/scale edits back, keeping the file parseable by the dotfiles'
+// `hypr-display-profile.sh` (which derives eDP mode/scale from it).
 pub mod monitors;
 
-// The swaync JSON adapter (task 3.4) will be consumed by the SettingsStore
-// (task 4.2) and the Notifications page (task 6.7, which edits position,
-// timeouts, and a do-not-disturb toggle) — neither of which exists yet. Until
-// they wire it in, its public surface is exercised only by its own tests, so a
-// non-test build would flag every item as dead code. Scope the allowance to
-// `not(test)` so the `dead_code` lint stays active in test builds; remove it
-// once 4.2/6.7 consume the adapter.
-#[cfg_attr(not(test), allow(dead_code))]
+// The swaync JSON adapter (task 3.4). The startup loader reads
+// `swaync/config.json` through it into the store, and the Notifications-page
+// write glue (`core::notifications`) renders the staged position/timeout
+// edits back.
 pub mod swaync;
 
-// The GTK settings.ini editor (task 3.5) will be consumed by the SettingsStore
-// (task 4.2) and the Theme page (task 6.4, which writes the same theme/icon/
-// cursor values into both gtk-3.0 and gtk-4.0 settings.ini) — neither of which
-// exists yet. Until they wire it in, its public surface is exercised only by its
-// own tests, so a non-test build would flag every item as dead code. Scope the
-// allowance to `not(test)` so the `dead_code` lint stays active in test builds;
-// remove it once 4.2/6.4 consume the editor.
-#[cfg_attr(not(test), allow(dead_code))]
+// The GTK settings.ini editor (task 3.5). The Themes model (`core::theme`)
+// writes the same theme/icon/cursor values into both `gtk-3.0` and `gtk-4.0`
+// `settings.ini` through it (R3.4: every duplicated copy is written
+// identically).
 pub mod ini;
 
-// The uwsm/env editor (task 3.6) will be consumed by the SettingsStore (task 4.2)
-// and the Theme page (task 6.4): it writes the `uwsm/env` copy of the cursor
-// theme/size and reads the `GTK_THEME` override that gates the GTK-theme drop-down
-// (R3.3) — neither of which exists yet. Until they wire it in, its public surface
-// is exercised only by its own tests, so a non-test build would flag every item
-// as dead code. Scope the allowance to `not(test)` so the `dead_code` lint stays
-// active in test builds; remove it once 4.2/6.4 consume the editor.
-#[cfg_attr(not(test), allow(dead_code))]
+// The uwsm/env editor (task 3.6). The Themes model (`core::theme`) writes the
+// `uwsm/env` copy of the cursor theme/size through it and reads the
+// `GTK_THEME` override that gates the GTK-theme drop-down (R3.3).
 pub mod env;
 
-// The generated-file readers (task 3.7) will be consumed by capabilities
-// detection (task 4.3, active-scheme detection) and the palette theme page
-// (task 6.3, active-scheme preselect + per-scheme swatches) — neither of which
-// exists yet. Until they wire it in, its public surface is exercised only by its
-// own tests, so a non-test build would flag every item as dead code. Scope the
-// allowance to `not(test)` so the `dead_code` lint stays active in test builds;
-// remove it once 4.3/6.3 consume the readers. Unlike the sibling modules this one
-// is read-only — the generated files must never be written by the app.
-#[cfg_attr(not(test), allow(dead_code))]
+// The generated-file readers (task 3.7). The palette-scheme model
+// (`core::theme`) detects and preselects the active scheme from the
+// `# Generated from …` header and reads the per-scheme swatches for the Theme
+// page's palette previews. Unlike the sibling modules this one is read-only —
+// the generated files must never be written by the app.
 pub mod generated;
