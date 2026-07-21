@@ -486,6 +486,18 @@ impl SettingsStore {
         &self.freshness
     }
 
+    /// Whether `path` is a backing file this store already tracks, i.e. one that was
+    /// loaded through [`load_file`](Self::load_file).
+    ///
+    /// The manual-refresh flow (R4.3) uses this to split the files a fresh load pass
+    /// found into two classes: a tracked file's external changes go through
+    /// [`refresh`](Self::refresh) (reload with staged edits preserved, plus a conflict
+    /// report the UI can warn from, R5.6), while a file that appeared since the last
+    /// load has no baseline to conflict with and is simply loaded fresh.
+    pub fn is_tracked(&self, path: &Path) -> bool {
+        self.reloaders.contains_key(path)
+    }
+
     /// Re-reads the tracked backing files and reloads the originals of any that were
     /// edited externally since the store last read them (R5.6).
     ///

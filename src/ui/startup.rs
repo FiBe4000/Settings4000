@@ -28,6 +28,17 @@
 //! still comes up with whatever loaded. A file that is present but simply lacks a
 //! given key contributes only the settings it does hold.
 //!
+//! # Refresh re-runs the same pass (R4.3)
+//!
+//! The manual Refresh button re-runs [`load`] on the worker too — detection *and* the
+//! backing files *and* the bespoke page models must all be rebuilt together, or the
+//! refreshed capabilities and the rendered content diverge (e.g. installing hyprpaper
+//! and clicking Refresh must make the wallpaper section appear, not wait for an app
+//! restart). What differs from startup is how the result is merged into live state:
+//! [`merge_refreshed_files`] preserves staged store edits and reports external file
+//! edits (R5.6), and [`adopt_refreshed_model`] keeps a bespoke model that holds staged
+//! edits rather than clobbering the user's in-progress work.
+//!
 //! # Scope: the settings defined so far (§6 extends this)
 //!
 //! The full `SettingId` ↔ file ↔ parser ↔ key mapping grows with the §6 category
@@ -59,7 +70,7 @@ use crate::core::input::{InputModel, default_xkb_registry};
 use crate::core::model::{SettingId, Value};
 use crate::core::notifications::NotificationsModel;
 use crate::core::power::{PowerModel, power_key_path};
-use crate::core::store::{FileReader, FileValues};
+use crate::core::store::{FileReader, FileValues, RefreshReport, SettingsStore};
 use crate::core::theme::{
     PaletteModel, ThemeRoots, ThemesModel, ThemesPaths, WallpaperModel, WallpaperPaths,
 };
@@ -206,6 +217,89 @@ pub(crate) fn load() -> StartupLoad {
         palette,
         themes,
         wallpaper,
+    }
+}
+
+/// Folds the backing files a manual-refresh [`load`] pass read into the store
+/// (task 9.3; R4.3, R5.6).
+///
+/// A refresh pass returns two classes of file, handled differently:
+///
+/// - **Files the store already tracks.** Their external changes go through
+///   [`SettingsStore::refresh`]: each changed file is re-read against its freshness
+///   baseline, its originals are reloaded with pending staged edits preserved, and it
+///   is named in the returned [`RefreshReport`] so the window can warn (R5.6). The
+///   worker's own re-read of a tracked file is deliberately discarded — `refresh`
+///   reads the file's *current* bytes, so ingesting the worker's slightly older read
+///   could re-baseline behind an edit that landed in between.
+/// - **Files that appeared since the last load** (e.g. a `hypridle.conf` created
+///   mid-session). These have no baseline to conflict with, so they are loaded exactly
+///   like a startup file, making their settings available to the repopulated pages.
+///
+/// Kept GTK-free here, next to the load it merges, so the refresh contract is
+/// headlessly testable (R6.2).
+pub(crate) fn merge_refreshed_files(
+    store: &mut SettingsStore,
+    files: Vec<LoadedFile>,
+) -> RefreshReport {
+    let report = store.refresh();
+    for file in files {
+        if !store.is_tracked(&file.path) {
+            tracing::info!(
+                path = %file.path.display(),
+                "backing config appeared since the last load; now tracking it (R4.3)"
+            );
+            store.load_file(file.path, file.initial, file.reader);
+        }
+    }
+    report
+}
+
+/// Decides which instance of a bespoke page model survives a manual refresh
+/// (task 9.3; R4.3).
+///
+/// `fresh` is what a new [`load`] pass built against the refreshed
+/// [`Capabilities`]; `current` is the model the window holds (a staging source with
+/// its own dirty state — Display, palette, GTK/icon/cursor themes, or wallpaper).
+/// Three rules, in order:
+///
+/// - **`fresh` is `None`** → the model's capability is gone (its app was uninstalled,
+///   or its source removed), so the model is dropped and its section hides (R4.2).
+///   Any staged edits it held could no longer be applied or reloaded anyway.
+/// - **`current` has staged edits** → keep it wholesale. This mirrors the store's
+///   refresh contract (pending edits are never silently discarded, R5.6): replacing
+///   the model would drop the user's in-progress work the moment they click Refresh.
+///   Its originals stay stale until the next clean Refresh, which is safe for each
+///   model on its own terms: the file-writing models (Display, GTK/icon/cursor
+///   themes, wallpaper) re-check their backing files at Apply time (re-read + hash),
+///   so a stale model still cannot clobber an external edit; and the palette model
+///   writes no file itself — its apply runs `scripts/generate-colors`, which
+///   regenerates from the *current* on-disk palette sources — so staleness there at
+///   worst means an outdated scheme list in the drop-down.
+/// - **Otherwise** → adopt `fresh`, so changes to the model's sources since the last
+///   load (newly installed themes, an externally switched palette, a hand-edited
+///   `monitors.conf`) are reflected in the rebuilt page.
+///
+/// Generic over the model with an explicit `is_dirty` accessor because the four
+/// staging models share no trait; a plain `fn` pointer keeps the call sites to a
+/// method reference like `DisplayModel::is_dirty`.
+pub(crate) fn adopt_refreshed_model<M>(
+    current: &mut Option<M>,
+    fresh: Option<M>,
+    is_dirty: fn(&M) -> bool,
+) {
+    match fresh {
+        None => *current = None,
+        Some(fresh) => {
+            if current.as_ref().is_some_and(is_dirty) {
+                tracing::debug!(
+                    "keeping a page model with staged edits across a refresh; its sources \
+                     re-sync on the next clean refresh (R4.3/R5.6)"
+                );
+            } else {
+                *current = Some(fresh);
+            }
+        }
     }
 }
 
@@ -1005,6 +1099,219 @@ mod tests {
         assert!(
             load_wallpaper(&caps).is_none(),
             "no hyprpaper -> no wallpaper model -> wallpaper section hidden"
+        );
+    }
+
+    #[test]
+    fn refresh_merge_tracks_a_new_file_and_preserves_staged_edits() {
+        // The task-9.3 refresh contract end to end at the headless seam: between the
+        // startup load and a manual Refresh, one backing file appears (hypridle.conf)
+        // and one tracked file is edited externally (input.conf), while the user has a
+        // staged edit pending. The merge must (a) start tracking the new file so its
+        // settings become available, (b) reload the edited file's originals and report
+        // it (R5.6), and (c) keep the staged edit (R5.1).
+        let dir = tempfile::tempdir().expect("temp dir");
+        let paths = BackingPaths {
+            input_conf: dir.path().join("input.conf"),
+            swaync_config: dir.path().join("no-swaync.json"),
+            hypridle_conf: dir.path().join("hypridle.conf"),
+        };
+        std::fs::write(&paths.input_conf, b"input {\n    sensitivity = 0.3\n}\n")
+            .expect("write input.conf");
+
+        // Startup: only input.conf exists; the user stages a sensitivity edit.
+        let mut store = store_from(load_files(&paths));
+        store
+            .stage(SettingId::MouseSensitivity, Value::Float(0.8))
+            .expect("stage a valid sensitivity");
+
+        // Between load and Refresh: hypridle.conf appears, input.conf is edited
+        // externally (sensitivity 0.3 -> 0.1).
+        std::fs::write(&paths.hypridle_conf, b"listener {\n    timeout = 120\n}\n")
+            .expect("write hypridle.conf");
+        std::fs::write(&paths.input_conf, b"input {\n    sensitivity = 0.1\n}\n")
+            .expect("rewrite input.conf");
+
+        // Refresh: re-run the same loader pass and merge it into the live store.
+        let report = merge_refreshed_files(&mut store, load_files(&paths));
+
+        assert_eq!(
+            report.reloaded(),
+            std::slice::from_ref(&paths.input_conf),
+            "the externally edited tracked file is reloaded and reported (R5.6)"
+        );
+        assert!(
+            store.is_tracked(&paths.hypridle_conf),
+            "the file that appeared since startup is now tracked"
+        );
+        assert_eq!(
+            store.value(SettingId::DimTimeout),
+            Some(&Value::Integer(120)),
+            "the new file's settings are available to the repopulated pages"
+        );
+        assert_eq!(
+            store.original(SettingId::MouseSensitivity),
+            Some(&Value::Float(0.1)),
+            "the edited file's originals were reloaded from disk"
+        );
+        assert_eq!(
+            store.value(SettingId::MouseSensitivity),
+            Some(&Value::Float(0.8)),
+            "the pending staged edit survives the refresh (R5.1/R5.6)"
+        );
+    }
+
+    #[test]
+    fn refresh_merge_is_quiet_when_nothing_changed() {
+        // The common case: no file appeared or changed between load and Refresh, so
+        // the merge reports nothing (no conflict warning) and staged edits stay put.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let paths = BackingPaths {
+            input_conf: dir.path().join("input.conf"),
+            swaync_config: dir.path().join("no-swaync.json"),
+            hypridle_conf: dir.path().join("no-hypridle.conf"),
+        };
+        std::fs::write(&paths.input_conf, b"input {\n    sensitivity = 0.3\n}\n")
+            .expect("write input.conf");
+
+        let mut store = store_from(load_files(&paths));
+        store
+            .stage(SettingId::MouseSensitivity, Value::Float(-0.5))
+            .expect("stage a valid sensitivity");
+
+        let report = merge_refreshed_files(&mut store, load_files(&paths));
+        assert!(report.is_empty(), "unchanged files raise no warning");
+        assert_eq!(
+            store.value(SettingId::MouseSensitivity),
+            Some(&Value::Float(-0.5)),
+            "the staged edit is untouched by a no-op refresh"
+        );
+    }
+
+    #[test]
+    fn refresh_rebuilds_a_model_when_its_capability_appears_or_disappears() {
+        // The task-9.3 accept scenario at the capability seam: swaync is installed
+        // between startup and a Refresh. The startup pass built no Notifications model
+        // (category hidden, R4.2); the refresh pass runs the *same* loader against the
+        // new capabilities, builds the model, and the category becomes visible.
+        use crate::ui::category::{SidebarCategory, visible_categories};
+
+        let before = Capabilities::for_tests(&[], &[], false);
+        let mut current = load_notifications(&before);
+        assert!(current.is_none(), "absent at startup");
+        assert!(
+            !visible_categories(&before).contains(&SidebarCategory::Notifications),
+            "the category is hidden while the capability is absent (R4.2)"
+        );
+
+        // swaync installed -> Refresh: the loader now builds the model and the
+        // adoption swaps it in (no staged edits to protect).
+        let after = Capabilities::for_tests(&[Binary::Swaync], &[], false);
+        adopt_refreshed_model(&mut current, load_notifications(&after), |_| false);
+        assert!(current.is_some(), "the model is rebuilt on Refresh (R4.3)");
+        assert!(
+            visible_categories(&after).contains(&SidebarCategory::Notifications),
+            "the category appears with the refreshed capabilities"
+        );
+
+        // swaync uninstalled -> Refresh: the fresh pass yields None and the model is
+        // dropped so the section hides again (R4.2).
+        adopt_refreshed_model(&mut current, load_notifications(&before), |_| false);
+        assert!(
+            current.is_none(),
+            "the model is dropped when its app is gone"
+        );
+    }
+
+    #[test]
+    fn a_dirty_model_survives_a_refresh_and_a_clean_one_is_replaced() {
+        // The three adopt_refreshed_model rules, on a stand-in staging model (the four
+        // real staging models share no trait; the rule is model-agnostic).
+        struct Staging {
+            label: &'static str,
+            dirty: bool,
+        }
+        fn is_dirty(model: &Staging) -> bool {
+            model.dirty
+        }
+
+        // Clean -> the fresh rebuild wins, so external source changes are reflected.
+        let mut current = Some(Staging {
+            label: "stale",
+            dirty: false,
+        });
+        adopt_refreshed_model(
+            &mut current,
+            Some(Staging {
+                label: "fresh",
+                dirty: false,
+            }),
+            is_dirty,
+        );
+        assert_eq!(current.as_ref().map(|m| m.label), Some("fresh"));
+
+        // Dirty -> the user's staged edits are kept; the rebuild is discarded (R5.6).
+        let mut current = Some(Staging {
+            label: "dirty",
+            dirty: true,
+        });
+        adopt_refreshed_model(
+            &mut current,
+            Some(Staging {
+                label: "fresh",
+                dirty: false,
+            }),
+            is_dirty,
+        );
+        assert_eq!(current.as_ref().map(|m| m.label), Some("dirty"));
+
+        // Capability gone -> dropped even while dirty, so the section hides (R4.2).
+        adopt_refreshed_model(&mut current, None, is_dirty);
+        assert!(current.is_none());
+    }
+
+    #[test]
+    fn a_real_wallpaper_model_keeps_its_staged_edit_across_a_refresh() {
+        // The dirty-keep rule on a real staging model (not a stand-in): a staged
+        // fit-mode edit on a fixture-backed WallpaperModel must survive adoption of
+        // the clean model a refresh pass rebuilds from the same sources — this is the
+        // exact wiring `apply_refresh_load` runs for the four staging models.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let hyprpaper_conf = dir.path().join("hyprpaper.conf");
+        std::fs::write(
+            &hyprpaper_conf,
+            b"wallpaper {\n    path = /tmp/wallpaper.jpg\n    fit_mode = cover\n}\n",
+        )
+        .expect("write hyprpaper.conf fixture");
+        // Both loads read the same fixture paths, exactly like startup and a later
+        // Refresh reading the same live config (hyprlock.conf is simply absent).
+        let paths = || WallpaperPaths {
+            hyprpaper_conf: hyprpaper_conf.clone(),
+            hyprlock_conf: dir.path().join("hyprlock.conf"),
+        };
+
+        let mut model = WallpaperModel::load(paths(), false);
+        model.stage_fit("contain");
+        assert!(
+            model.is_dirty(),
+            "the staged fit mode marks the model dirty"
+        );
+        let mut current = Some(model);
+
+        // Refresh: adoption must keep the dirty model so the staged edit is not
+        // silently discarded (R5.6), discarding the clean rebuild.
+        adopt_refreshed_model(
+            &mut current,
+            Some(WallpaperModel::load(paths(), false)),
+            WallpaperModel::is_dirty,
+        );
+        let kept = current.expect("the dirty model survives the refresh");
+        assert!(kept.is_dirty(), "the staged edit is still pending");
+        let fit_index = kept.selected_fit_index().expect("a fit mode is selected");
+        assert_eq!(
+            kept.fit_options()[fit_index],
+            "contain",
+            "the kept model still carries the staged fit mode"
         );
     }
 

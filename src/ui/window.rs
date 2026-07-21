@@ -89,7 +89,7 @@
 //! styling the active theme already provides rather than shipping our own; the rule is
 //! enforced by `tests/no_custom_css.rs`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -101,7 +101,7 @@ use gtk4::{
 use relm4::{ComponentController, Controller};
 
 use crate::core::apply::{self, ApplyPlan};
-use crate::core::detect::{Capabilities, DetectionInputs};
+use crate::core::detect::Capabilities;
 use crate::core::display::DisplayModel;
 use crate::core::input::InputModel;
 use crate::core::model::Category;
@@ -244,6 +244,19 @@ struct Shell {
     theme_page: Rc<RefCell<Option<ThemePage>>>,
     /// The most recent detection result, replaced on a manual refresh (R4.3).
     capabilities: Rc<RefCell<Capabilities>>,
+    /// Whether a load pass ([`spawn_load`] — the startup load or a manual refresh) is
+    /// currently running on the worker (task 9.3).
+    ///
+    /// Consulted by [`Shell::update_chrome`], which disables chrome while it is set:
+    /// **Refresh**, so at most one pass is ever in flight — a refresh clicked during
+    /// the initial startup load could otherwise land first and be clobbered when
+    /// [`Shell::apply_startup_load`] assigns the models wholesale and re-baselines
+    /// the store from the (by then stale) startup snapshot; and **Apply/Reset**, so a
+    /// commit cannot land between the worker snapshotting the files and the merge of
+    /// its result — [`Shell::apply_refresh_load`] would otherwise adopt clean,
+    /// pre-Apply models and visibly revert the UI. Set by whichever code spawns a
+    /// load, cleared when its result is handled.
+    load_in_flight: Rc<Cell<bool>>,
     /// The retained page controllers, so the window can send them [`PageMsg::Rerender`]
     /// and so their widgets stay alive while mounted in the stack. Replaced by
     /// [`Shell::populate`].
@@ -340,9 +353,13 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
 
     let marked: Rc<RefCell<Vec<(Category, Widget)>>> = Rc::new(RefCell::new(Vec::new()));
 
-    // Re-derives all chrome from the store: Apply/Reset enablement and each page's
-    // dirty marker (R5.1). Captures the persistent stack + marked, so it is built once
-    // and reused across repopulates.
+    // Whether a worker load pass is in flight (task 9.3; see the Shell field docs).
+    // Starts false; `start_load` sets it (and re-derives the chrome) before spawning.
+    let load_in_flight = Rc::new(Cell::new(false));
+
+    // Re-derives all chrome from the store: Apply/Reset/Refresh enablement and each
+    // page's dirty marker (R5.1). Captures the persistent stack + marked, so it is
+    // built once and reused across repopulates.
     let update_chrome: Rc<dyn Fn()> = {
         let store = store.clone();
         let display = display.clone();
@@ -351,6 +368,8 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
         let wallpaper = wallpaper.clone();
         let apply_button = apply_button.clone();
         let reset_button = reset_button.clone();
+        let refresh_button = refresh_button.clone();
+        let load_in_flight = load_in_flight.clone();
         let stack = stack.clone();
         let marked = marked.clone();
         Rc::new(move || {
@@ -375,8 +394,15 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
                 .is_some_and(WallpaperModel::is_dirty);
             let theme_dirty = palette_dirty || themes_dirty || wallpaper_dirty;
             let enabled = chrome::actions_enabled(&store) || display_dirty || theme_dirty;
-            apply_button.set_sensitive(enabled);
-            reset_button.set_sensitive(enabled);
+            // While a worker load pass runs, all three chrome actions disable (task
+            // 9.3): Refresh so only one pass is ever in flight, and Apply/Reset so a
+            // commit cannot race the worker's file snapshot (see the `load_in_flight`
+            // field docs). The dirty markers below still update — staged edits remain
+            // visible, they just cannot be acted on until the pass lands.
+            let in_flight = load_in_flight.get();
+            apply_button.set_sensitive(enabled && !in_flight);
+            reset_button.set_sensitive(enabled && !in_flight);
+            refresh_button.set_sensitive(!in_flight);
             for (category, child) in marked.borrow().iter() {
                 // Display reads its own model; Theme ORs its two bespoke models (palette +
                 // GTK/icon/cursor) with any store-backed Theme setting so it stays correct
@@ -431,6 +457,7 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
         wallpaper,
         theme_page,
         capabilities,
+        load_in_flight,
         controllers,
         stack,
         marked,
@@ -445,39 +472,60 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     shell.wire_notifications_page_entry();
     shell.wire_network_page_entry();
 
-    // Initial (disabled) chrome state, then kick off the worker.
+    // Initial (disabled) chrome state, then kick off the worker — `start_load` marks
+    // the pass in flight and re-derives the chrome again, so Refresh is already
+    // disabled by the time the window is presented (task 9.3).
     (shell.update_chrome)();
     shell.start_load();
 
     window
 }
 
+/// Runs one full [`startup::load`] pass — detection, backing-file parsing, and the
+/// bespoke page models — on relm4's blocking pool, handing the result to `on_done` on
+/// the main thread (architecture §8).
+///
+/// Shared by the cold-start load (task 5.4) and the manual Refresh (R4.3), which must
+/// run the *same* loader path so refreshed capabilities and rebuilt models never
+/// diverge; only what each does with the result differs. GTK is single-threaded, so
+/// the worker only gathers data — `on_done` is where widgets may be touched. It
+/// receives `None` when the worker finished without delivering a result (the window
+/// closed while it ran), which every caller treats as harmless.
+fn spawn_load(on_done: impl FnOnce(Option<StartupLoad>) + 'static) {
+    let (sender, receiver) = relm4::channel::<StartupLoad>();
+    relm4::spawn_blocking(move || {
+        // A send failure only means the receiver was dropped — the window closed
+        // before the load finished, which is harmless, so it is not an error.
+        if sender.send(startup::load()).is_err() {
+            tracing::debug!("load discarded; window closed before it completed");
+        }
+    });
+    relm4::spawn_local(async move { on_done(receiver.recv().await) });
+}
+
 impl Shell {
     /// Runs detection + config parsing on a worker thread and applies the result on the
     /// main thread when it completes (task 5.4, architecture §8; R4.3, R8.1).
     ///
-    /// The blocking work goes to relm4's shared blocking pool ([`relm4::spawn_blocking`])
-    /// so it runs concurrently with the main thread returning to the GTK loop; the parsed
-    /// [`StartupLoad`] is delivered back over a [`relm4::channel`] and awaited on the main
-    /// thread by a local future ([`relm4::spawn_local`]), which then populates the store
-    /// and builds the pages — GTK is only ever touched on the main thread. If the worker
-    /// finishes without delivering a result (e.g. the window closed first), the stack is
-    /// still populated (empty, from the absent capabilities) so the user has a working
-    /// Refresh (R4.3).
+    /// The blocking work goes through [`spawn_load`] so it runs concurrently with the
+    /// main thread returning to the GTK loop, which then populates the store and builds
+    /// the pages — GTK is only ever touched on the main thread. While the pass runs the
+    /// `load_in_flight` guard keeps Refresh disabled, so a user-initiated refresh can
+    /// never interleave with the startup pass (task 9.3; the guard clears — and the
+    /// chrome re-arms via `populate`'s chrome refresh — when the result is handled).
+    /// If the worker finishes without delivering a result (e.g. the window closed
+    /// first), the stack is still populated (empty, from the absent capabilities) so
+    /// the user has a working Refresh (R4.3).
     fn start_load(&self) {
-        let (sender, receiver) = relm4::channel::<StartupLoad>();
-        relm4::spawn_blocking(move || {
-            let load = startup::load();
-            // A send failure only means the receiver was dropped — the window closed
-            // before the load finished, which is harmless, so it is not an error.
-            if sender.send(load).is_err() {
-                tracing::debug!("startup load discarded; window closed before it completed");
-            }
-        });
+        // Mark the pass in flight and re-derive the chrome so Refresh/Apply/Reset
+        // disable before the window is even presented (see the field docs).
+        self.load_in_flight.set(true);
+        (self.update_chrome)();
 
         let shell = self.clone();
-        relm4::spawn_local(async move {
-            match receiver.recv().await {
+        spawn_load(move |load| {
+            shell.load_in_flight.set(false);
+            match load {
                 Some(load) => shell.apply_startup_load(load),
                 None => {
                     tracing::warn!(
@@ -1333,35 +1381,111 @@ impl Shell {
         });
     }
 
-    /// Wires the Refresh button to re-run detection, repopulate, and warn on conflicts
-    /// (R4.3/R5.6).
+    /// Wires the Refresh button to re-run the full startup load — detection, the
+    /// backing files, and the bespoke page models — and repopulate from the result
+    /// (task 9.3; R4.3/R5.6).
     ///
-    /// It re-detects capabilities, re-reads the tracked files (surfacing external edits
-    /// as a conflict warning via [`chrome::refresh_conflict_warning`]), then repopulates
-    /// the stack so categories/rows that appeared or disappeared are reflected. Detection
-    /// is re-run synchronously here — unlike the cold-start path (task 5.4) it is a
-    /// user-initiated action off the startup budget, and re-reading the already-tracked
-    /// files is quick.
+    /// Refresh must rebuild the same state startup built, not just re-run detection:
+    /// [`Shell::populate`] renders the Display/Theme sections and the Input candidates
+    /// from the worker-built models, so refreshed capabilities without refreshed models
+    /// would leave e.g. a newly installed hyprpaper's wallpaper section hidden until an
+    /// app restart. The pass runs on the worker exactly like cold start ([`spawn_load`])
+    /// — it probes `hyprctl` and scans the theme roots, too slow for the main thread —
+    /// under the shared `load_in_flight` guard: while it runs, Refresh disables (loads
+    /// can never overlap, including with the startup pass) and Apply/Reset disable (a
+    /// commit cannot land between the worker's file snapshot and the merge — the merge
+    /// would otherwise adopt clean pre-Apply models and visibly revert the UI). On
+    /// completion [`Shell::apply_refresh_load`] merges the result and repopulates.
     fn wire_refresh(&self, refresh_button: &Button) {
         let shell = self.clone();
         refresh_button.connect_clicked(move |_| {
-            // R4.3: re-run detection over freshly gathered inputs.
-            let inputs = DetectionInputs::from_system(Vec::new());
-            *shell.capabilities.borrow_mut() = Capabilities::detect(&inputs);
+            // Mark the pass in flight and re-derive the chrome so Refresh/Apply/Reset
+            // disable until the result is handled (see the `load_in_flight` docs).
+            shell.load_in_flight.set(true);
+            (shell.update_chrome)();
 
-            // R5.6: re-read the tracked files; an external edit reloads originals
-            // (keeping pending edits) and is reported for the warning below.
-            let report = shell.store.borrow_mut().refresh();
-
-            // Repopulate the stack for the new capabilities (categories/rows may appear
-            // or disappear).
-            shell.populate();
-
-            if let Some(warning) = chrome::refresh_conflict_warning(&report) {
-                chrome::show_warning(&shell.window, &warning.heading, &warning.detail);
-            }
-            tracing::info!("manual detection refresh + external-edit check complete (R4.3/R5.6)");
+            let shell = shell.clone();
+            spawn_load(move |load| {
+                shell.load_in_flight.set(false);
+                match load {
+                    Some(load) => shell.apply_refresh_load(load),
+                    // No result only happens while the window is closing; re-derive
+                    // the chrome anyway so the buttons re-arm regardless.
+                    None => (shell.update_chrome)(),
+                }
+            });
         });
+    }
+
+    /// Applies a completed manual-refresh pass on the main thread: merge the re-read
+    /// files into the store, adopt the new capabilities and page models, repopulate the
+    /// stack, and warn about external edits (task 9.3; R4.3/R5.6).
+    ///
+    /// The refresh counterpart of [`Shell::apply_startup_load`], differing in what it
+    /// must preserve. The store keeps its pending staged edits:
+    /// [`startup::merge_refreshed_files`] reloads externally-changed tracked files
+    /// through [`SettingsStore::refresh`] (reporting them for the warning below) and
+    /// only *newly appeared* files are loaded fresh. The staging models (Display,
+    /// palette, GTK/icon/cursor themes, wallpaper) go through
+    /// [`startup::adopt_refreshed_model`], which keeps a model holding staged edits
+    /// rather than clobbering in-progress work. The Input/Notifications/Power helpers
+    /// hold no staged state (their settings stage in the shared store), so they are
+    /// simply replaced.
+    fn apply_refresh_load(&self, load: StartupLoad) {
+        let StartupLoad {
+            capabilities,
+            files,
+            display,
+            input,
+            notifications,
+            power,
+            palette,
+            themes,
+            wallpaper,
+        } = load;
+
+        // R5.6: reload externally-changed tracked files (keeping pending edits) and
+        // start tracking files that appeared since the last load.
+        let report = startup::merge_refreshed_files(&mut self.store.borrow_mut(), files);
+
+        // R4.3: adopt the refreshed capabilities and models before `populate` rebuilds
+        // the pages from them.
+        *self.capabilities.borrow_mut() = capabilities;
+        startup::adopt_refreshed_model(
+            &mut self.display.borrow_mut(),
+            display,
+            DisplayModel::is_dirty,
+        );
+        *self.input.borrow_mut() = input;
+        *self.notifications.borrow_mut() = notifications;
+        *self.power.borrow_mut() = power;
+        startup::adopt_refreshed_model(
+            &mut self.palette.borrow_mut(),
+            palette,
+            PaletteModel::is_dirty,
+        );
+        startup::adopt_refreshed_model(
+            &mut self.themes.borrow_mut(),
+            themes,
+            ThemesModel::is_dirty,
+        );
+        startup::adopt_refreshed_model(
+            &mut self.wallpaper.borrow_mut(),
+            wallpaper,
+            WallpaperModel::is_dirty,
+        );
+
+        // Repopulate the stack for the new capabilities and models (categories,
+        // sections, and rows may appear or disappear).
+        self.populate();
+
+        if let Some(warning) = chrome::refresh_conflict_warning(&report) {
+            chrome::show_warning(&self.window, &warning.heading, &warning.detail);
+        }
+        tracing::info!(
+            "manual refresh complete: detection, backing files, and page models re-read \
+             (R4.3/R5.6)"
+        );
     }
 
     /// Sends every retained page controller a [`PageMsg::Rerender`] so its controls
