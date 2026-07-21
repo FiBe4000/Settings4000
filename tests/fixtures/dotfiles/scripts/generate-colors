@@ -4,8 +4,14 @@
 # Capability detection only checks that this file exists at
 # <repo>/scripts/generate-colors (R3.2/R8.5); tests never execute it — the
 # Apply pipeline runs it through the CommandRunner seam, which tests replace
-# with MockCommandRunner. If a test ever runs it for real, that is a bug in the
+# with MockCommandRunner. If a *test* runs it for real, that is a bug in the
 # test (it bypassed the mock seam), so fail loudly rather than pretend to
 # generate anything.
+#
+# One sanctioned exception: examples/logging_walkthrough.rs (task 8.1) runs
+# this stub for real through the real SystemCommandRunner as deliberate
+# failure injection — the non-zero exit drives the Apply pipeline's
+# write-failure, rollback, and command-exit logging. The `exit 2` below is
+# load-bearing for that walkthrough (it asserts GenerateColorsExit code 2).
 echo "settings4000 fixture: generate-colors stub invoked for real" >&2
 exit 2

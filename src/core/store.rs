@@ -294,6 +294,18 @@ impl SettingsStore {
     /// key on Apply — rather than dropping the setting from the UI mid-session.
     fn ingest(&mut self, path: &Path, values: FileValues) {
         self.freshness.record_bytes(path, &values.bytes);
+        // R7.3: the parsed values belong in the journal at `debug` — each typed
+        // (setting, value) pair the file yielded. This is the one choke point
+        // every load path shares (initial load and conflict reload alike), and
+        // it logs a handful of parsed settings, never the file's raw contents.
+        // Logged before the loop below filters runtime-only pairs out, so the
+        // message says "offered": a runtime-only pair may appear here yet never
+        // enter the store (its skip is logged separately).
+        tracing::debug!(
+            path = %path.display(),
+            values = ?values.values,
+            "parsed values offered to the store"
+        );
         for (id, value) in values.values {
             if id.backing() != Backing::FileBacked {
                 tracing::debug!(?id, "ignoring runtime-only setting offered to the store");
@@ -336,7 +348,18 @@ impl SettingsStore {
         match self.settings.get_mut(&id) {
             Some(entry) => {
                 entry.staged = Some(value);
-                tracing::debug!(?id, dirty = entry.is_dirty(), "staged edit");
+                // R7.3: the staged diff belongs in the journal at `debug` — the
+                // on-disk baseline next to the pending value, so an Apply cycle's
+                // log shows *what* each edit changed, not merely that one happened.
+                // Settings values are non-sensitive (theme names, timeouts, image
+                // paths), so logging them at `debug` is within the R7.3 rules.
+                tracing::debug!(
+                    ?id,
+                    original = ?entry.original,
+                    staged = ?entry.staged,
+                    dirty = entry.is_dirty(),
+                    "staged edit"
+                );
                 Ok(StageOutcome::Staged)
             }
             None => Err(StageError::NotLoaded(id)),

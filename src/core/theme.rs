@@ -233,6 +233,15 @@ impl PaletteModel {
         } else {
             self.staged = Some(name.to_string());
         }
+        // R7.3: the staged diff at `debug`. A palette switch writes no file
+        // directly (the generator regenerates the read-only partials), so no
+        // parser edit log ever names the pending scheme — without this line it
+        // would first appear in the journal at Apply time.
+        tracing::debug!(
+            active = ?self.active,
+            staged = ?self.staged,
+            "staged palette scheme switch"
+        );
     }
 
     /// Whether a scheme switch is pending (R5.1).
