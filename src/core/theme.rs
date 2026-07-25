@@ -403,6 +403,46 @@ const HYPR_ENV_KEY: &str = "env";
 /// on-disk value stays selectable — mirroring the Display page's scale drop-down.
 const CURATED_CURSOR_SIZES: &[&str] = &["16", "24", "32", "48", "64"];
 
+/// GTK theme names that are always offered because GTK carries the stylesheet inside
+/// the library rather than in a theme directory (R3.3: "installed theme dirs … plus the
+/// built-in Adwaita variants").
+///
+/// A built-in theme need not exist under `~/.themes` / `/usr/share/themes` to be
+/// selectable, so a directory scan alone can miss it: on a system whose GTK packages
+/// ship no `Adwaita` directory (which is the case on plain GTK 4 installs — the
+/// stylesheet lives in the library's compiled-in GResource bundle), Adwaita would
+/// silently vanish from the drop-down even though setting `gtk-theme-name=Adwaita`
+/// works. Merging these names into the scan results keeps the promise of R3.3
+/// regardless of packaging.
+///
+/// Why exactly these two — checked against the GTK versions on the target system
+/// (GTK 3.24 and GTK 4.22) by loading each name through GTK's named-theme CSS loader:
+///
+/// - `Adwaita` is the long-standing light built-in. GTK 3 ships it as the GResource
+///   theme `Adwaita`; GTK 4.22 renamed its bundled resource to `Default`, and loading
+///   `Adwaita` there yields byte-identical CSS to `Default`, so the name still selects
+///   the built-in look on both. GTK treats these names as deliberate aliases rather
+///   than leaving it to chance — `gtk_css_provider_load_named` in GTK's
+///   `gtk/gtkcssprovider.c` states that it "accept[s] the names HighContrast,
+///   HighContrastInverse, Adwaita and Adwaita-dark as aliases for the variants of the
+///   Default theme". Worth re-checking against that function if a future GTK changes
+///   the bundled theme's name again.
+///   `Adwaita` alone reaches the built-in through the loader's generic
+///   unknown-name fallback (the same path a typo takes), so it resolves correctly but
+///   is not pinned by a name-specific branch the way the dark variant is.
+/// - `Adwaita-dark` selects the dark built-in on GTK 4, whose loader maps that name onto
+///   the built-in theme's dark variant (its CSS differs from the light built-in's).
+///   Note the asymmetry: GTK 3 has no `Adwaita-dark` resource and falls back to light
+///   Adwaita, unless the distribution installs an `Adwaita-dark` theme directory (some
+///   do, via `gnome-themes-extra`) — in which case the scan finds it anyway and the name
+///   collapses with the built-in entry. Either way the app writes the chosen name
+///   verbatim to `gsettings` and both `settings.ini` files, so the copies never desync
+///   (R3.3); it is GTK, not this app, that decides how a name resolves.
+///
+/// Kept sorted here for readability only; ordering in the drop-down comes from the
+/// sorted set the discovery scan builds.
+const BUILTIN_GTK_THEMES: &[&str] = &["Adwaita", "Adwaita-dark"];
+
 /// The filesystem roots scanned for installed themes (R3.3/R3.4).
 ///
 /// Injected rather than hardcoded so discovery is unit-tested against a fixture tree
@@ -1469,18 +1509,23 @@ fn resolve_gtk_override(
     None
 }
 
-/// Discovers installed GTK themes under `dirs` (R3.3).
+/// Discovers the GTK themes the drop-down offers: those installed under `dirs`, plus
+/// GTK's built-in ones (R3.3).
 ///
 /// A subdirectory is a GTK theme when it contains a `gtk-3.0/` or `gtk-4.0/`
-/// subdirectory. Names are de-duplicated across the roots (a theme in `~/.themes`
-/// shadows a system one of the same name — only the name matters, since that is what
-/// `gsettings`/`settings.ini` store) and returned sorted for a stable drop-down.
+/// subdirectory. The [`BUILTIN_GTK_THEMES`] names are added unconditionally because they
+/// are selectable without any theme directory (see that constant for why). Names are
+/// de-duplicated (a theme in `~/.themes` shadows a system one of the same name, and a
+/// scanned `Adwaita` directory collapses with the built-in entry — only the name
+/// matters, since that is what `gsettings`/`settings.ini` store) and returned sorted for
+/// a stable drop-down, built-ins and scan results interleaved in one order.
 fn discover_gtk_themes(dirs: &[PathBuf]) -> Vec<String> {
-    collect_theme_dirs(dirs, |path| {
+    let mut found = collect_theme_dirs(dirs, |path| {
         path.join("gtk-3.0").is_dir() || path.join("gtk-4.0").is_dir()
-    })
-    .into_iter()
-    .collect()
+    });
+    // The set both de-duplicates against the scan and keeps the single sort order.
+    found.extend(BUILTIN_GTK_THEMES.iter().map(|name| (*name).to_string()));
+    found.into_iter().collect()
 }
 
 /// Discovers installed icon and cursor themes under `dirs` in a single scan (R3.4).
@@ -2724,15 +2769,23 @@ export XCURSOR_SIZE=16
         let tmp = tempfile::tempdir().expect("temp dir");
         let themes = tmp.path().join("themes");
         fs::create_dir_all(themes.join("Everforest-Green-Dark").join("gtk-4.0")).unwrap();
-        fs::create_dir_all(themes.join("Adwaita").join("gtk-3.0")).unwrap();
+        // Named Arc rather than Adwaita so this still proves the gtk-3.0 branch found it:
+        // the built-in variants are merged in regardless of what the scan returns.
+        fs::create_dir_all(themes.join("Arc").join("gtk-3.0")).unwrap();
         fs::create_dir_all(themes.join("NotATheme")).unwrap(); // no gtk-*/ -> skipped
         fs::create_dir_all(themes.join(".hidden").join("gtk-4.0")).unwrap(); // dotfile skipped
 
         let gtk = discover_gtk_themes(std::slice::from_ref(&themes));
         assert_eq!(
             gtk,
-            vec!["Adwaita".to_string(), "Everforest-Green-Dark".to_string()],
-            "GTK themes are the dirs with a gtk-3.0/ or gtk-4.0/, sorted; dotfiles/non-themes skipped"
+            vec![
+                "Adwaita".to_string(),
+                "Adwaita-dark".to_string(),
+                "Arc".to_string(),
+                "Everforest-Green-Dark".to_string()
+            ],
+            "GTK themes are the dirs with a gtk-3.0/ or gtk-4.0/ plus the built-ins, sorted; \
+             dotfiles/non-themes skipped"
         );
 
         let icons = write_icon_root(tmp.path());
@@ -2764,13 +2817,59 @@ export XCURSOR_SIZE=16
         let tmp = tempfile::tempdir().expect("temp dir");
         let system = tmp.path().join("system");
         let user = tmp.path().join("user");
-        fs::create_dir_all(system.join("Adwaita").join("gtk-4.0")).unwrap();
-        fs::create_dir_all(user.join("Adwaita").join("gtk-4.0")).unwrap();
+        // Deliberately not named Adwaita: the built-in variants are merged into every
+        // result, so a fixture using those names would still pass even if the directory
+        // scan returned nothing at all.
+        fs::create_dir_all(system.join("Nordic").join("gtk-4.0")).unwrap();
+        fs::create_dir_all(user.join("Nordic").join("gtk-4.0")).unwrap();
         let gtk = discover_gtk_themes(&[user, system]);
         assert_eq!(
             gtk,
-            vec!["Adwaita".to_string()],
-            "the duplicate name collapses"
+            vec![
+                "Adwaita".to_string(),
+                "Adwaita-dark".to_string(),
+                "Nordic".to_string()
+            ],
+            "the duplicate name collapses to one entry alongside the built-in variants"
+        );
+    }
+
+    #[test]
+    fn builtin_gtk_themes_are_offered_without_a_theme_dir_and_are_never_duplicated() {
+        // R3.3 requires the built-in Adwaita variants alongside the installed theme
+        // dirs. GTK carries their stylesheets in the library, so a system can offer
+        // Adwaita with no /usr/share/themes/Adwaita directory at all — a directory scan
+        // alone would silently drop it (task 9.7).
+        let tmp = tempfile::tempdir().expect("temp dir");
+
+        // A root with an unrelated theme and deliberately no Adwaita directory.
+        let without = tmp.path().join("without-adwaita");
+        fs::create_dir_all(without.join("Nordic").join("gtk-3.0")).unwrap();
+        assert_eq!(
+            discover_gtk_themes(std::slice::from_ref(&without)),
+            vec![
+                "Adwaita".to_string(),
+                "Adwaita-dark".to_string(),
+                "Nordic".to_string()
+            ],
+            "the built-in variants are offered even though no Adwaita dir exists, merged \
+             into the scan's single sort order"
+        );
+
+        // The same roots plus an on-disk Adwaita (e.g. gnome-themes-extra installing
+        // both variants): the names must appear once each, not twice.
+        let with = tmp.path().join("with-adwaita");
+        fs::create_dir_all(with.join("Adwaita").join("gtk-3.0")).unwrap();
+        fs::create_dir_all(with.join("Adwaita-dark").join("gtk-3.0")).unwrap();
+        let scanned = discover_gtk_themes(&[with, without]);
+        assert_eq!(
+            scanned,
+            vec![
+                "Adwaita".to_string(),
+                "Adwaita-dark".to_string(),
+                "Nordic".to_string()
+            ],
+            "a scanned Adwaita dir collapses with the built-in entry of the same name"
         );
     }
 
