@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-**All planned implementation (`docs/tasks.md` §1–§8) is complete and pushed**: the crate builds, the three CI gates run green, and the app is installed and verified on the target Hyprland session. The open backlog lives in `docs/tasks.md` as unchecked tasks — §9 (post-review fixes from the 2026-07-21 full-project review) and §10 (additional features). Note that on two points (the swaync `-R` config-reload flag and the hyprlang last-occurrence duplicate-key rule) the specs are deliberately ahead of the code until tasks 9.8/9.9 land.
+**All planned implementation (`docs/tasks.md` §1–§8) is complete and pushed**: the crate builds, the three CI gates run green, and the app is installed and verified on the target Hyprland session. The open backlog lives in `docs/tasks.md` as unchecked tasks — §9 (post-review fixes from the 2026-07-21 full-project review) and §10 (additional features). Note that on one point (the swaync `-R` config-reload flag) the specs are deliberately ahead of the code until task 9.9 lands; the hyprlang last-occurrence duplicate-key rule the specs describe is implemented as of task 9.8.
 
 The authoritative specs, in order of use:
 - `docs/requirements.md` — what to build (numbered **R…** requirements, referenced everywhere).

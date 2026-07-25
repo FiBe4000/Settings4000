@@ -76,6 +76,62 @@
 //!   edited, leaving the field name and everything else byte-identical. This is
 //!   what the cursor-env writer (task 6.4) uses.
 //!
+//! # Duplicated keys, and why sections are not merged
+//!
+//! Hyprlang applies a file top to bottom, so when a section assigns the same key
+//! twice the **last** assignment is the value the daemon ends up holding. Both
+//! [`HyprlangFile::value`] and [`HyprlangFile::set_value`] therefore address the
+//! **last** matching entry inside the addressed section: the app reads the value
+//! that is actually in effect and edits the copy that decides it, instead of
+//! rewriting an earlier copy the daemon ignores (task 9.8, architecture §3). An
+//! earlier, shadowed copy is left byte-identical. The `uwsm/env` and
+//! `settings.ini` writers target the last assignment for the same reason.
+//!
+//! The **repeatable-key** scheme is unaffected by that rule and cannot conflict
+//! with it, because it addresses a different thing: repeated top-level keys such
+//! as `exec-once` are *meant* to occur many times, each line being its own
+//! directive rather than a copy shadowing the previous one, so a line is picked
+//! by identity (key plus first comma-field), not by position. Two lines *can*
+//! still share the same first field — a degenerate `env = XCURSOR_THEME,…`
+//! written twice — and that case is knowingly unhandled: both reading and
+//! writing resolve to the **first** such line. They agree, so the app never
+//! displays one copy while editing another, but hyprland's own `env` handling
+//! applies each line in turn and ends up with the *later* one's value, so an edit
+//! to the first line would not take effect. All the parser does about it is log a
+//! `warn` naming the key, the field, and the duplicated line numbers; that
+//! reaches the journal only — nothing tells the person at the screen. Task 9.31
+//! tracks surfacing it (and the duplicated-category case below) where the user
+//! can see it.
+//!
+//! Sections are deliberately **not** merged: a [`KeyPath`] always names one
+//! section instance, by occurrence. That is required because a repeated block can
+//! be a distinct object rather than a continuation — hypridle's three
+//! `listener { }` blocks are three separate listeners (hyprlang calls these
+//! "anonymous special categories"), so folding them together would let one
+//! listener's `timeout` overwrite another's. The trade-off is that when a plain
+//! category is written twice in one file, hyprlang merges the blocks and the
+//! later block's assignment wins, whereas this parser edits whichever occurrence
+//! the caller addressed — so an edit to the first block can still be shadowed by
+//! a second (also tracked by task 9.31). All four behaviours behind these rules
+//! were verified against libhyprlang 0.6.8: two `kb_layout` lines in one
+//! `input { }` block resolve to the second; a `sensitivity` set in a second
+//! `input { }` block overrides the first; two anonymous `listener { }` blocks
+//! become two instances; and a `timeout` doubled *inside* one such block resolves
+//! to the second, so the last-occurrence rule is right there too.
+//!
+//! Which risk applies depends on the category, and nothing in the file text says
+//! which kind a block is. Of the categories this app addresses, `input { }` (with
+//! its nested `touchpad { }`) and hypridle's `general { }` are plain,
+//! single-instance categories: those are the ones a duplicate declaration in a
+//! hand-edited file could shadow. The blocks the app addresses positionally exist
+//! once per object by design — hypridle's `listener { }` (one per idle timeout),
+//! hyprlock's `label { }` (one per on-screen text, so a lock screen usually
+//! declares several), and the `monitor =`-carrying `background { }` /
+//! `wallpaper { }` blocks (the shape of a per-monitor instance) — so for those the
+//! occurrence *is* part of the address, and merging them would be the bug. The
+//! files this app owns declare each plain category once, so callers keep naming
+//! the occurrence they mean.
+//!
 //! # Appending
 //!
 //! [`HyprlangFile::set_value`] on a key that does not yet exist **appends** a new
@@ -471,7 +527,9 @@ impl HyprlangFile {
     ///
     /// The value excludes any trailing inline comment. Comment, blank, section,
     /// and malformed lines are never considered, so a commented-out assignment is
-    /// never read as a value.
+    /// never read as a value. When the addressed section assigns the key more
+    /// than once, this reads the **last** assignment — the one hyprlang resolves
+    /// the key to, and the same one [`set_value`](Self::set_value) edits.
     pub fn value(&self, path: &KeyPath) -> Option<&str> {
         match self.resolve_path(path) {
             Resolution::Entry(i) => self.entry_value(i),
@@ -488,8 +546,10 @@ impl HyprlangFile {
     /// inline comment, the line terminator, and every other line are left
     /// byte-identical. When several siblings share a section name, the default
     /// path takes the first occurrence; use [`SectionStep::nth`] for a specific
-    /// one. When a key appears more than once in the same section, the first
-    /// occurrence is edited.
+    /// one. When a key appears more than once in the same section, the **last**
+    /// occurrence is edited — hyprlang resolves the key to that one, so editing
+    /// an earlier, shadowed copy would silently have no effect (task 9.8); the
+    /// shadowed copies stay byte-identical.
     ///
     /// Errors:
     /// - [`EditError::InvalidValue`] if `value` contains a newline or `#`
@@ -521,6 +581,12 @@ impl HyprlangFile {
     /// yields `Nordic-cursors`. Returns `None` if no such entry exists or the
     /// matched entry has no comma (no distinct value portion). Only top-level
     /// entries are considered, and commented-out lines never match.
+    ///
+    /// If several entries share the key *and* the first field, the **first** of
+    /// them is read — the same one
+    /// [`set_repeatable_field_value`](Self::set_repeatable_field_value) edits, and
+    /// not necessarily the one hyprland ends up applying. See the module section
+    /// "Duplicated keys, and why sections are not merged".
     pub fn repeatable_field_value(&self, key: &str, first_field: &str) -> Option<&str> {
         let i = self.find_repeatable(key, first_field)?;
         let value = self.entry_value(i)?;
@@ -535,6 +601,14 @@ impl HyprlangFile {
     /// This is how the cursor-env writer edits `hyprland.conf`'s
     /// `env = XCURSOR_THEME,…` / `env = XCURSOR_SIZE,…` lines (task 6.4) without
     /// disturbing sibling `env` lines, `source` lines, or comments.
+    ///
+    /// If several entries share the key *and* the first field, the **first** of
+    /// them is rewritten (matching what
+    /// [`repeatable_field_value`](Self::repeatable_field_value) reads) and a `warn`
+    /// records the ambiguity. Unlike a duplicated key inside a section, this is
+    /// *not* resolved to the last occurrence: see the module section "Duplicated
+    /// keys, and why sections are not merged" for why, and for what hyprland does
+    /// with such a file.
     ///
     /// Errors:
     /// - [`EditError::InvalidValue`] if `value` contains a newline or `#`.
@@ -624,6 +698,12 @@ impl HyprlangFile {
     /// Resolves a [`KeyPath`] to an existing entry, an append location, or a
     /// missing section, by walking the lines while tracking the open-section
     /// stack and per-section occurrence counts.
+    ///
+    /// A duplicated key resolves to its **last** assignment within the addressed
+    /// section (see the module documentation), so the walk cannot stop at the
+    /// first match: it continues to the section's closing `}`, or to end-of-file
+    /// for a top-level key or a target section the file never closes, and reports
+    /// the match it saw last.
     fn resolve_path(&self, path: &KeyPath) -> Resolution {
         let target = &path.sections;
         let target_top_level = target.is_empty();
@@ -635,6 +715,10 @@ impl HyprlangFile {
         let mut frames: Vec<WalkFrame> = Vec::new();
         let mut root_counts: Vec<(String, usize)> = Vec::new();
 
+        // The latest assignment of the addressed key seen so far in the target
+        // section; the one still recorded when the section ends is the effective
+        // (last) occurrence.
+        let mut matched_entry: Option<usize> = None;
         // The last direct-child assignment of the target section (for copying
         // append style) and the target section's header line, discovered lazily.
         let mut last_child_entry: Option<usize> = None;
@@ -664,30 +748,41 @@ impl HyprlangFile {
                     let closing_target = !target_top_level && path_matches(&frames, target);
                     frames.pop();
                     if closing_target {
-                        // Reached the end of the target section without finding
-                        // the key (a match would have returned already), so this
-                        // closing brace is where a new assignment is appended.
-                        return Resolution::Append(AppendPlan {
-                            insert_index: i,
-                            sibling_entry: last_child_entry,
-                            section_open: target_open,
-                            at_eof: false,
-                        });
+                        // The whole target section has been walked, so any
+                        // recorded match is its last assignment of the key.
+                        return match matched_entry {
+                            Some(index) => Resolution::Entry(index),
+                            // The key is absent from the section, so this closing
+                            // brace is where a new assignment is appended.
+                            None => Resolution::Append(AppendPlan {
+                                insert_index: i,
+                                sibling_entry: last_child_entry,
+                                section_open: target_open,
+                                at_eof: false,
+                            }),
+                        };
                     }
                 }
                 LineKind::Entry { key, .. } => {
                     if path_matches(&frames, target) {
                         if key == &path.key {
-                            return Resolution::Entry(i);
+                            // Keep looking: a later assignment of the same key
+                            // shadows this one.
+                            matched_entry = Some(i);
+                        } else {
+                            last_child_entry = Some(i);
                         }
-                        last_child_entry = Some(i);
                     }
                 }
                 LineKind::Blank | LineKind::Comment | LineKind::Malformed => {}
             }
         }
 
-        if target_top_level {
+        // The walk ran to end-of-file: either the target is a top-level key, or
+        // the target section was never closed.
+        if let Some(index) = matched_entry {
+            Resolution::Entry(index)
+        } else if target_top_level {
             // A top-level key that does not exist is appended at end-of-file.
             Resolution::Append(AppendPlan {
                 insert_index: self.lines.len(),
@@ -716,7 +811,15 @@ impl HyprlangFile {
     /// comments never match. The nesting is tracked by a simple depth counter
     /// because repeatable keys (`env`, `exec-once`, `source`) live at the top
     /// level.
+    ///
+    /// The whole file is scanned rather than stopped at the first hit so that an
+    /// ambiguous address — several entries sharing the key *and* the first field,
+    /// which for `env` means the app's edit would be shadowed by the later line
+    /// (see the module docs) — can be logged. The first match is still the one
+    /// returned, so read and write stay in agreement; only the journal gains the
+    /// ambiguity. Making it visible to the user is task 9.31.
     fn find_repeatable(&self, key: &str, first_field: &str) -> Option<usize> {
+        let mut matches: Vec<usize> = Vec::new();
         let mut depth = 0usize;
         for (i, line) in self.lines.iter().enumerate() {
             match &line.kind {
@@ -731,13 +834,26 @@ impl HyprlangFile {
                     let value = &line.raw[*value_start..*value_end];
                     let field = value.split(',').next().unwrap_or_default().trim();
                     if field == first_field {
-                        return Some(i);
+                        matches.push(i);
                     }
                 }
                 _ => {}
             }
         }
-        None
+
+        if matches.len() > 1 {
+            // The key and field are caller-supplied identifiers and the line
+            // numbers are positions, so this carries no file contents (R7.3).
+            let lines: Vec<usize> = matches.iter().map(|index| index + 1).collect();
+            tracing::warn!(
+                key,
+                first_field,
+                ?lines,
+                "several hyprlang entries share this key and first field; using the first"
+            );
+        }
+
+        matches.first().copied()
     }
 
     /// Counts the direct child sections named `name` within the section
@@ -1623,14 +1739,265 @@ bind = $mainMod, Return, exec, $terminal
     }
 
     #[test]
-    fn edits_only_the_first_occurrence_of_a_duplicate_key_in_a_section() {
-        // Two keys with the same name in one section: set_value edits the first
-        // and leaves the second byte-identical (documented first-match behavior).
+    fn edits_the_last_occurrence_of_a_duplicate_key_in_a_section() {
+        // Hyprlang applies a file top to bottom, so a key assigned twice in one
+        // section resolves to the second assignment. Reading and editing both
+        // target that one (task 9.8) and the shadowed first copy stays
+        // byte-identical, so the app never displays or rewrites a value the
+        // daemon ignores.
         let input = "s {\n    k = one\n    k = two\n}\n";
         let (mut file, _) = HyprlangFile::parse(input);
-        file.set_value(&KeyPath::at(&["s"], "k"), "edited")
-            .expect("first k is editable");
-        assert_eq!(file.emit(), "s {\n    k = edited\n    k = two\n}\n");
+        let path = KeyPath::at(&["s"], "k");
+        assert_eq!(
+            file.value(&path),
+            Some("two"),
+            "the effective (last) value is read"
+        );
+
+        file.set_value(&path, "edited").expect("last k is editable");
+        assert_eq!(file.emit(), "s {\n    k = one\n    k = edited\n}\n");
+    }
+
+    #[test]
+    fn a_duplicated_top_level_key_resolves_to_the_last() {
+        // The same rule outside any section, where the walk runs to end-of-file
+        // instead of stopping at a closing brace.
+        let input = "splash = false\nipc = on\nsplash = true\n";
+        let (mut file, _) = HyprlangFile::parse(input);
+        let path = KeyPath::top_level("splash");
+        assert_eq!(file.value(&path), Some("true"));
+
+        file.set_value(&path, "false")
+            .expect("last splash is editable");
+        assert_eq!(file.emit(), "splash = false\nipc = on\nsplash = false\n");
+    }
+
+    #[test]
+    fn the_last_key_rule_stays_inside_the_addressed_section() {
+        // A `KeyPath` names one section *instance*, so a key repeated in another
+        // occurrence of the same section name is not treated as a shadowing copy:
+        // editing occurrence 0 rewrites the last `k` inside that block and leaves
+        // the second block byte-identical. This is deliberate — a repeated block
+        // can be a distinct object (hypridle's `listener { }` blocks), which
+        // merging would corrupt — even though hyprlang itself merges two plain
+        // `s { }` blocks and lets the later one win (see the module docs).
+        let input = "s {\n    k = one\n    k = two\n}\ns {\n    k = three\n}\n";
+        let (mut file, _) = HyprlangFile::parse(input);
+        let first_block = KeyPath::new(vec![SectionStep::nth("s", 0)], "k");
+        assert_eq!(file.value(&first_block), Some("two"));
+        assert_eq!(
+            file.value(&KeyPath::new(vec![SectionStep::nth("s", 1)], "k")),
+            Some("three")
+        );
+
+        file.set_value(&first_block, "edited")
+            .expect("the first block's last k is editable");
+        assert_eq!(
+            file.emit(),
+            "s {\n    k = one\n    k = edited\n}\ns {\n    k = three\n}\n"
+        );
+    }
+
+    #[test]
+    fn a_nested_key_does_not_shadow_its_parents_key() {
+        // A same-named key in a child block belongs to the child, so it must
+        // neither be read as, nor edited instead of, the parent section's own last
+        // assignment (the last-occurrence walk only considers direct children).
+        let input = "input {\n    k = outer\n    touchpad {\n        k = inner\n    }\n}\n";
+        let (mut file, _) = HyprlangFile::parse(input);
+        let parent = KeyPath::at(&["input"], "k");
+        assert_eq!(file.value(&parent), Some("outer"));
+        assert_eq!(
+            file.value(&KeyPath::at(&["input", "touchpad"], "k")),
+            Some("inner")
+        );
+
+        file.set_value(&parent, "edited")
+            .expect("the parent's k is editable");
+        assert_eq!(
+            file.emit(),
+            "input {\n    k = edited\n    touchpad {\n        k = inner\n    }\n}\n"
+        );
+
+        // The `input.conf`-shaped case where the two rules interact: the parent's
+        // *last* assignment comes after the child block has closed, so descending
+        // into the child and coming back out must not lose track of the parent
+        // level. The old first-match walk answered `one` here.
+        let interleaved =
+            "input {\n    k = one\n    touchpad {\n        k = inner\n    }\n    k = two\n}\n";
+        let (mut file, _) = HyprlangFile::parse(interleaved);
+        assert_eq!(file.value(&parent), Some("two"));
+
+        file.set_value(&parent, "edited")
+            .expect("the parent's last k is editable");
+        assert_eq!(
+            file.emit(),
+            "input {\n    k = one\n    touchpad {\n        k = inner\n    }\n    k = edited\n}\n"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_key_in_an_unclosed_section_resolves_to_the_last() {
+        // A file whose target section is never closed still addresses its keys
+        // (the parser tolerates the imbalance and only warns), so the
+        // last-occurrence walk must apply on the end-of-file path too, and the
+        // missing terminator must survive the edit.
+        let input = "s {\n    k = one\n    k = two\n";
+        let (mut file, warnings) = HyprlangFile::parse(input);
+        assert_eq!(
+            warnings,
+            vec![ParseWarning {
+                line: 1,
+                kind: ParseWarningKind::UnclosedSection {
+                    name: "s".to_string()
+                },
+            }]
+        );
+
+        let path = KeyPath::at(&["s"], "k");
+        assert_eq!(file.value(&path), Some("two"));
+
+        file.set_value(&path, "edited").expect("last k is editable");
+        assert_eq!(file.emit(), "s {\n    k = one\n    k = edited\n");
+    }
+
+    #[test]
+    fn a_duplicate_key_inside_one_listener_resolves_to_the_last() {
+        // The shape of the highest-risk consumer (`core/power.rs`, task 6.8):
+        // hypridle's `listener { }` blocks are addressed positionally, and a
+        // duplicated `timeout` *within* one block resolves to that block's last
+        // assignment. Pins both rules at once — the second listener is edited (not
+        // the first or third), at its second `timeout` (not its first).
+        let input = "listener {\n    timeout = 150\n}\n\nlistener {\n    timeout = 300\n    timeout = 330\n}\n";
+        let (mut file, _) = HyprlangFile::parse(input);
+        let second = KeyPath::new(vec![SectionStep::nth("listener", 1)], "timeout");
+        assert_eq!(file.value(&second), Some("330"));
+        assert_eq!(
+            file.value(&KeyPath::new(
+                vec![SectionStep::nth("listener", 0)],
+                "timeout"
+            )),
+            Some("150"),
+            "the first listener is unaffected by the second's duplicate"
+        );
+
+        file.set_value(&second, "600")
+            .expect("the second listener's last timeout is editable");
+        assert_eq!(
+            file.emit(),
+            "listener {\n    timeout = 150\n}\n\nlistener {\n    timeout = 300\n    timeout = 600\n}\n"
+        );
+    }
+
+    #[test]
+    fn a_doubled_repeatable_field_uses_the_first_line_and_warns() {
+        // Two `env` lines sharing the same first field are an ambiguous address:
+        // the parser resolves both reading and writing to the first line — so it
+        // never displays one copy while editing another — and logs a `warn`, which
+        // is all it does today (the module docs and task 9.31 say so; hyprland
+        // itself would apply the *later* line). This test pins that documented
+        // behaviour, including the log the docs promise.
+        use std::sync::{Arc, Mutex};
+        use tracing::Level;
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct LogCapture {
+            events: Arc<Mutex<Vec<(Level, String)>>>,
+        }
+
+        struct MessageVisitor<'a>(&'a mut String);
+        impl tracing::field::Visit for MessageVisitor<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+                if field.name() == "message" {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, "{value:?}");
+                }
+            }
+        }
+
+        impl<S: tracing::Subscriber> Layer<S> for LogCapture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut message = String::new();
+                event.record(&mut MessageVisitor(&mut message));
+                self.events
+                    .lock()
+                    .expect("log capture mutex should not be poisoned")
+                    .push((*event.metadata().level(), message));
+            }
+        }
+
+        let input =
+            "env = XCURSOR_THEME,First\nenv = XCURSOR_SIZE,16\nenv = XCURSOR_THEME,Second\n";
+        let (mut file, _) = HyprlangFile::parse(input);
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        with_default(subscriber, || {
+            // `tracing` caches each callsite's interest process-globally, so a
+            // parallel test that reached this `warn!` under the no-op default
+            // subscriber could have cached it as "never" and suppressed the event.
+            // Touch the callsite once, rebuild the cache so it is re-evaluated
+            // against this thread's subscriber, then measure (the same guard
+            // `core::detect`'s log test uses).
+            let _ = file.repeatable_field_value("env", "XCURSOR_THEME");
+            tracing::callsite::rebuild_interest_cache();
+            capture
+                .events
+                .lock()
+                .expect("log capture mutex should not be poisoned")
+                .clear();
+
+            assert_eq!(
+                file.repeatable_field_value("env", "XCURSOR_THEME"),
+                Some("First"),
+                "the first of the two matching lines is read"
+            );
+            file.set_repeatable_field_value("env", "XCURSOR_THEME", "Edited")
+                .expect("the first matching line is editable");
+            // The ordinary shape the cursor-env writer works on — one line per
+            // first field — must stay silent, so the warning cannot become noise
+            // on a healthy file.
+            assert_eq!(
+                file.repeatable_field_value("env", "XCURSOR_SIZE"),
+                Some("16"),
+                "an unambiguous field reads normally"
+            );
+        });
+
+        assert_eq!(
+            file.emit(),
+            "env = XCURSOR_THEME,Edited\nenv = XCURSOR_SIZE,16\nenv = XCURSOR_THEME,Second\n",
+            "only the first matching line changed"
+        );
+
+        let events = capture
+            .events
+            .lock()
+            .expect("log capture mutex should not be poisoned");
+        let warnings: Vec<&String> = events
+            .iter()
+            .filter(|(level, _)| *level == Level::WARN)
+            .map(|(_, message)| message)
+            .collect();
+        assert_eq!(
+            warnings.len(),
+            2,
+            "exactly the ambiguous read and the ambiguous write warn — the \
+             unambiguous XCURSOR_SIZE read must not — got {events:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .all(|message| message.contains("share this key and first field")),
+            "the warning names the ambiguity, got {warnings:?}"
+        );
     }
 
     #[test]
