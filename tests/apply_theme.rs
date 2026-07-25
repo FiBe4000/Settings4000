@@ -520,7 +520,11 @@ fn a_generate_colors_failure_rolls_back_the_theme_writes_and_reloads_nothing() {
         true,
     );
     let freshness = FreshnessTracker::new();
-    let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake(1))]);
+    let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake_with_streams(
+        1,
+        "",
+        "generate-colors: theme/fonts is missing or incomplete; aborting\n",
+    ))]);
     let signaller = MockProcessSignaller::with_running([("kitty".to_string(), vec![77])]);
     let outcome = apply::run(&plan, &freshness, &caps, &runner, &signaller);
 
@@ -529,9 +533,20 @@ fn a_generate_colors_failure_rolls_back_the_theme_writes_and_reloads_nothing() {
             assert!(
                 matches!(
                     failure.cause,
-                    WriteFailureCause::GenerateColorsExit { code: Some(1) }
+                    WriteFailureCause::GenerateColorsExit { code: Some(1), .. }
                 ),
                 "the cause is the generator's non-zero exit, got {:?}",
+                failure.cause
+            );
+            // Task 9.10: the generator's own reason — here the documented
+            // missing/incomplete `theme/fonts` abort — reaches the message the user is
+            // shown, not just its exit code.
+            assert!(
+                failure
+                    .cause
+                    .to_string()
+                    .contains("theme/fonts is missing or incomplete"),
+                "the failure message must carry the generator's diagnostic, got {}",
                 failure.cause
             );
             // Both already-written files are rolled back (resolved repo targets,

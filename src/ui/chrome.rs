@@ -384,13 +384,14 @@ mod tests {
     use super::*;
     use crate::core::apply::{
         self, ApplyPlan, FileWrite, InvalidSetting, WriteFailure, WriteFailureCause,
+        WriteValidation,
     };
     use crate::core::detect::Capabilities;
     use crate::core::freshness::FreshnessTracker;
     use crate::core::model::{SettingId, Value};
     use crate::core::reload::{BackingFile, ReloadParams};
     use crate::core::store::{FileReader, FileValues, SettingsStore};
-    use crate::system::command::MockCommandRunner;
+    use crate::system::command::{CommandOutput, MockCommandRunner};
     use crate::system::signal::MockProcessSignaller;
 
     /// A store loaded with `originals` under a synthetic key, with a reader that simply
@@ -543,7 +544,10 @@ mod tests {
     #[test]
     fn a_write_failure_warns_with_the_cause() {
         let outcome = ApplyOutcome::WriteFailed(WriteFailure {
-            cause: WriteFailureCause::GenerateColorsExit { code: Some(1) },
+            cause: WriteFailureCause::GenerateColorsExit {
+                code: Some(1),
+                stderr_excerpt: None,
+            },
             rolled_back: Vec::new(),
             rollback_failures: Vec::new(),
         });
@@ -555,6 +559,40 @@ mod tests {
                     "the warning explains the cause: {detail}"
                 );
             }
+            other => panic!("expected Warn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_generate_colors_failure_warning_carries_the_generators_own_diagnostic() {
+        // Task 9.10, failure injection end to end: run the pipeline with a generator
+        // that exits non-zero after explaining itself, then assert the *rendered*
+        // warning the window shows carries that explanation. Without it the dialog
+        // would say only "exited with status 2", leaving the user nothing to act on.
+        let plan = ApplyPlan {
+            validations: Vec::new(),
+            writes: Vec::new(),
+            palette: Some(apply::PaletteSwitch {
+                scheme: "nord".to_string(),
+                generate_colors: PathBuf::from("/fake/repo/scripts/generate-colors"),
+            }),
+            reload_params: ReloadParams::default(),
+        };
+        let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake_with_streams(
+            2,
+            "",
+            "generate-colors: theme/fonts is missing or incomplete; aborting\n",
+        ))]);
+        let signaller = MockProcessSignaller::new();
+        // No capabilities: the write phase fails before any reload is planned anyway.
+        let caps = Capabilities::for_tests(&[], &[], false);
+        let outcome = apply::run(&plan, &FreshnessTracker::new(), &caps, &runner, &signaller);
+
+        match respond_to_apply(&outcome) {
+            ApplyResponse::Warn { detail, .. } => assert!(
+                detail.contains("theme/fonts is missing or incomplete"),
+                "the warning must show the generator's own message: {detail}"
+            ),
             other => panic!("expected Warn, got {other:?}"),
         }
     }
@@ -578,6 +616,7 @@ mod tests {
                 contents: b"kb_layout = us,se\n".to_vec(),
                 changed_keys: vec!["kb_layout".to_string()],
                 backing: BackingFile::InputConf,
+                validation: WriteValidation::InPlan,
             }],
             palette: None,
             reload_params: ReloadParams::default(),

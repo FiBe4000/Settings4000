@@ -84,7 +84,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use crate::core::apply::{FileWrite, PaletteSwitch};
+use crate::core::apply::{FileWrite, PaletteSwitch, WriteValidation};
 use crate::core::freshness::FreshnessTracker;
 use crate::core::model::{SettingId, ValidationError, Value, validate_image_path};
 use crate::core::reload::{BackingFile, CursorValue, ReloadParams};
@@ -1218,6 +1218,12 @@ impl ThemesModel {
                 contents: ini.emit().into_bytes(),
                 changed_keys,
                 backing: BackingFile::GtkSettings,
+                // Task 9.10: every value here is a theme name or cursor size chosen from
+                // a list this model discovered on disk (or the fixed size list), and
+                // `ThemesApply` carries no validations at all — so this write is
+                // validation-free by design. Task 9.27 will give these values their own
+                // validations; this declaration becomes `InPlan` when it does.
+                validation: WriteValidation::NotNeeded,
             }),
             record,
         )
@@ -1315,6 +1321,9 @@ impl ThemesModel {
                 contents: file.emit().into_bytes(),
                 changed_keys,
                 backing: BackingFile::HyprlandConf,
+                // The cursor copy of the same discovered values as the `settings.ini`
+                // write above, so validation-free by design for the same reason.
+                validation: WriteValidation::NotNeeded,
             }),
             record,
         )
@@ -1376,6 +1385,9 @@ impl ThemesModel {
                 contents: file.emit().into_bytes(),
                 changed_keys,
                 backing: BackingFile::UwsmEnv,
+                // The `uwsm/env` copy of the same discovered cursor values, so
+                // validation-free by design for the same reason.
+                validation: WriteValidation::NotNeeded,
             }),
             record,
         )
@@ -2203,6 +2215,17 @@ impl WallpaperModel {
                 contents: file.emit().into_bytes(),
                 changed_keys,
                 backing: BackingFile::HyprpaperConf,
+                // Task 9.10: this write carries a validated value only when it carries
+                // the wallpaper *path* — [`Self::validations`] re-checks that path (it
+                // must still exist and be readable, R8.3) under the same condition that
+                // put it in this write. A fit-only change carries just a mode from a
+                // fixed list, and deliberately does not drag the unchanged path into
+                // validation, so such a write is validation-free by design.
+                validation: if written.wallpaper {
+                    WriteValidation::InPlan
+                } else {
+                    WriteValidation::NotNeeded
+                },
             }),
             written,
         )
@@ -2224,6 +2247,10 @@ impl WallpaperModel {
                 contents: file.emit().into_bytes(),
                 changed_keys: vec!["lock background path".to_string()],
                 backing: BackingFile::HyprlockConf,
+                // This write exists only when there is an effective lock path, which is
+                // exactly the condition under which [`Self::validations`] re-checks that
+                // path (R8.3) — so its value is always covered by the plan.
+                validation: WriteValidation::InPlan,
             }),
             Err(error) => {
                 tracing::warn!(%error, "could not set the lock background path in hyprlock.conf");
@@ -2912,6 +2939,19 @@ export XCURSOR_SIZE=16
         assert!(contribution.reload_params.gtk_theme.is_none());
         assert!(contribution.reload_params.icon_theme.is_none());
 
+        // Task 9.10: `ThemesApply` carries no validations, so all four cursor copies must
+        // declare themselves validation-free. Asserted here as well as on the GTK-theme
+        // path because this is the only test that renders the hyprland.conf and uwsm/env
+        // copies: without it, either of those two sites could drift to `InPlan` on its own
+        // and silently make the plan-drift guard warn on every cursor change.
+        assert!(
+            contribution
+                .writes
+                .iter()
+                .all(|write| write.validation == WriteValidation::NotNeeded),
+            "every cursor copy declares that the plan validates nothing for it"
+        );
+
         // Run the writes + reloads through the real pipeline.
         let plan = ApplyPlan {
             validations: Vec::new(),
@@ -2998,6 +3038,17 @@ export XCURSOR_SIZE=16
                 .writes
                 .iter()
                 .all(|write| write.backing == BackingFile::GtkSettings)
+        );
+        // Task 9.10: `ThemesApply` carries no validations at all, so every write it
+        // produces must declare itself validation-free — otherwise the Apply pipeline's
+        // plan-drift guard would warn on every theme change. Task 9.27, which gives these
+        // values validations of their own, is what should flip this to `InPlan`.
+        assert!(
+            contribution
+                .writes
+                .iter()
+                .all(|write| write.validation == WriteValidation::NotNeeded),
+            "theme writes are validation-free by design until task 9.27"
         );
         assert_eq!(
             contribution.reload_params.gtk_theme,
@@ -3709,13 +3760,22 @@ label {
             2,
             "both hyprpaper.conf and hyprlock.conf are written (same path to both)"
         );
-        // The chosen paths are re-validated at apply time (R8.3).
+        // The chosen paths are re-validated at apply time (R8.3), and both writes say so
+        // (task 9.10) — the counterpart to the fit-only case below, where the same
+        // hyprpaper.conf write is validation-free.
         assert_eq!(
             contribution.validations,
             vec![
                 (SettingId::WallpaperPath, Value::String(wall.clone())),
                 (SettingId::LockBackgroundPath, Value::String(wall.clone())),
             ]
+        );
+        assert!(
+            contribution
+                .writes
+                .iter()
+                .all(|write| write.validation == WriteValidation::InPlan),
+            "a path-carrying write's values are validated by the plan"
         );
 
         let plan = ApplyPlan {
@@ -3793,6 +3853,15 @@ label {
         assert!(
             contribution.validations.is_empty(),
             "a fit-only change re-validates no path (the wallpaper is unchanged)"
+        );
+        // Task 9.10: because this legitimate apply has writes and no validations, the
+        // write must declare itself validation-free — otherwise the Apply pipeline's
+        // plan-drift guard would warn "the caller dropped its validations" on every
+        // fit-only change.
+        assert_eq!(
+            contribution.writes[0].validation,
+            WriteValidation::NotNeeded,
+            "a fit-only write carries nothing to validate and must say so"
         );
         assert_eq!(
             contribution.reload_params.wallpaper.as_deref(),

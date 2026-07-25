@@ -44,7 +44,8 @@ use wait_timeout::ChildExt;
 /// shorter limit to exercise the timeout path quickly.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Upper bound, in bytes, on how much captured stderr is emitted to the logs.
+/// Upper bound, in bytes, on how much of a command's captured stderr is ever
+/// surfaced — to the journal here, and to the user by callers that quote it.
 ///
 /// Captured output is kept in full on the returned [`CommandOutput`] (callers
 /// may need all of it — e.g. surfacing a `generate-colors` failure), but only a
@@ -52,7 +53,15 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// keeps a chatty command from flooding the log while still leaving enough of
 /// the message to diagnose a failure. Per R7.3/R8.1, full output is never
 /// logged at `info`.
-const STDERR_LOG_LIMIT: usize = 512;
+///
+/// It is `pub` because the Apply pipeline bounds the `generate-colors` stderr
+/// excerpt it shows the user by the same limit
+/// ([`core::apply`](crate::core::apply)'s `stderr_excerpt`). Sharing the constant
+/// rather than repeating the number keeps the two in step: the excerpt in a
+/// warning dialog and the excerpt in the journal are then always the same slice
+/// of the same output. The two *functions* stay separate, because only the
+/// user-facing one trims and marks truncation.
+pub const STDERR_EXCERPT_LIMIT: usize = 512;
 
 /// A shell-free process invocation: a program name plus its argument vector.
 ///
@@ -498,16 +507,16 @@ fn join_pipe_reader(handle: thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
 /// Kept separate from the `info` invocation log so that full output never
 /// appears at `info` (R7.3): operators see the command and its exit status at
 /// `info`, and only opt into the stderr excerpt by raising the level to
-/// `debug`. The excerpt is capped at [`STDERR_LOG_LIMIT`] bytes.
+/// `debug`. The excerpt is capped at [`STDERR_EXCERPT_LIMIT`] bytes.
 fn log_stderr_excerpt(command: &Command, output: &CommandOutput) {
     if output.stderr.is_empty() {
         return;
     }
-    let end = output.stderr.len().min(STDERR_LOG_LIMIT);
+    let end = output.stderr.len().min(STDERR_EXCERPT_LIMIT);
     let excerpt = String::from_utf8_lossy(&output.stderr[..end]);
     tracing::debug!(
         program = %command.program,
-        truncated = output.stderr.len() > STDERR_LOG_LIMIT,
+        truncated = output.stderr.len() > STDERR_EXCERPT_LIMIT,
         stderr = %excerpt,
         "command stderr"
     );

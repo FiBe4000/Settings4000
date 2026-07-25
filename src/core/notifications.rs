@@ -49,7 +49,7 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
-use crate::core::apply::FileWrite;
+use crate::core::apply::{FileWrite, WriteValidation};
 use crate::core::model::{SettingId, Value};
 use crate::core::reload::BackingFile;
 use crate::parsers::swaync::{ParseError, SwayncConfigFile};
@@ -318,6 +318,9 @@ impl NotificationsModel {
             contents: edit.contents,
             changed_keys: edit.changed_keys,
             backing: BackingFile::SwayncConfig,
+            // Rendered from the store's dirty Notifications settings, which the plan
+            // carries as its validations (both come from the same `dirty_ids()`).
+            validation: WriteValidation::InPlan,
         }))
     }
 }

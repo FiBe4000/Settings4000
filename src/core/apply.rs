@@ -74,8 +74,10 @@
 //! - **`writes`**: one [`FileWrite`] per changed backing file, each carrying the
 //!   file's live XDG path, the *complete* new bytes the page produced by applying
 //!   its staged edits through the relevant parser (surgical, span-preserving —
-//!   §3), the changed-key labels for logging, and the [`BackingFile`] the file
-//!   maps to (which drives its reload).
+//!   §3), the changed-key labels for logging, the [`BackingFile`] the file
+//!   maps to (which drives its reload), and a [`WriteValidation`] declaring whether
+//!   the write's values are among the `validations` above (read only by the
+//!   plan-drift guard, [`warn_on_missing_validations`]).
 //! - **`palette`**: `Some` only for a color-scheme switch, carrying the scheme
 //!   name and the `scripts/generate-colors` path discovered from the capabilities
 //!   palette source (R8.5). A v1 palette switch edits no file directly — it runs
@@ -120,7 +122,7 @@ use crate::core::detect::Capabilities;
 use crate::core::freshness::{Conflict, FreshnessTracker};
 use crate::core::model::{SettingId, ValidationError, Value};
 use crate::core::reload::{BackingFile, ReloadError, ReloadParams, plan_reloads};
-use crate::system::command::{Command, CommandError, CommandRunner};
+use crate::system::command::{Command, CommandError, CommandRunner, STDERR_EXCERPT_LIMIT};
 use crate::system::signal::ProcessSignaller;
 use crate::system::writer::{FileSnapshot, WriteError, write_atomic};
 
@@ -145,6 +147,37 @@ pub struct FileWrite {
     /// The reload concern this file drives, used to plan the post-write reloads
     /// (task 4.4).
     pub backing: BackingFile,
+    /// Where the values in this write get their R8.3 validation — declared by whoever
+    /// built the write, and read only by the plan-drift guard
+    /// ([`warn_on_missing_validations`]). See [`WriteValidation`].
+    pub validation: WriteValidation,
+}
+
+/// Whether a [`FileWrite`]'s values are covered by its plan's
+/// [`validations`](ApplyPlan::validations) — the provenance signal the plan-drift guard
+/// reads (task 9.10).
+///
+/// The pipeline cannot work this out for itself: a [`FileWrite`] is opaque bytes plus
+/// labels, so nothing in it says which [`SettingId`] produced it. Only the code that
+/// *built* the write knows, so it declares it here. The distinction is per **write**
+/// rather than per file or per page because the same backing file can carry either kind
+/// depending on which value changed — a `hyprpaper.conf` write carries a user-chosen
+/// image path (validated: it must still exist and be readable) when the wallpaper
+/// changed, but carries only a fit mode picked from a fixed list when the user changed
+/// just the fit, and validating the *unchanged* wallpaper path in that second case could
+/// abort an apply over a file the user never touched.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteValidation {
+    /// The plan's `validations` re-check the value(s) this write carries, so an empty
+    /// `validations` list alongside this write means the caller dropped them (the drift
+    /// the guard warns about).
+    InPlan,
+    /// This write carries nothing for step 1 to check, so its absence from `validations`
+    /// is correct rather than a bug. Two cases exist today, both documented where they
+    /// are declared: a change confined to values chosen from a list the app itself
+    /// discovered or defined (the GTK/icon/cursor theme names and sizes — see task 9.27,
+    /// which will give those validations of their own — and the wallpaper fit mode).
+    NotNeeded,
 }
 
 /// A palette (color-scheme) switch — the last write step (the palette gotcha, §6
@@ -175,7 +208,9 @@ pub struct PaletteSwitch {
 /// validations from `dirty_ids()`/`value()`, the writes from rendering those same
 /// staged values through the parsers. The two are independent fields (the pipeline
 /// treats them separately), so a buggy caller could let them drift; the contract is
-/// that every dirty setting appears in both.
+/// that every dirty setting appears in both. [`run`] guards the most damaging drift —
+/// writes with no validations at all, which would let step 1's R8.3 gate pass
+/// vacuously — by logging a `warn`; see [`warn_on_missing_validations`].
 #[derive(Clone, Debug)]
 pub struct ApplyPlan {
     /// The dirty staged values to re-validate before any write (step 1, R8.3),
@@ -214,10 +249,18 @@ pub enum WriteFailureCause {
     /// The palette generator ran but exited non-zero (step 4). This is the failure
     /// path that also covers a missing/incomplete `theme/fonts`, since
     /// `generate-colors` aborts on it. Carries the exit code, or `None` if it was
-    /// terminated by a signal.
+    /// terminated by a signal, plus what the generator wrote to standard error.
     GenerateColorsExit {
         /// The generator's exit code, or `None` on a signal termination.
         code: Option<i32>,
+        /// A bounded, presentable excerpt of what the generator wrote to standard
+        /// error, or `None` when it wrote nothing. This is the actionable half of
+        /// the failure — the exit code alone says only *that* the palette could not
+        /// be regenerated, whereas the generator's own message says *why* (e.g. that
+        /// `theme/fonts` is missing or incomplete), so it is carried into the
+        /// [`Display`](std::fmt::Display) message the UI shows. See
+        /// [`stderr_excerpt`] for how it is bounded.
+        stderr_excerpt: Option<String>,
     },
     /// The palette generator could not be run at all — a spawn failure (not on
     /// `PATH`) or a timeout (step 4).
@@ -230,10 +273,23 @@ impl fmt::Display for WriteFailureCause {
             WriteFailureCause::File { path, error } => {
                 write!(f, "failed to write {}: {error}", path.display())
             }
-            WriteFailureCause::GenerateColorsExit { code } => match code {
-                Some(code) => write!(f, "generate-colors exited with status {code}"),
-                None => write!(f, "generate-colors was terminated by a signal"),
-            },
+            WriteFailureCause::GenerateColorsExit {
+                code,
+                stderr_excerpt,
+            } => {
+                match code {
+                    Some(code) => write!(f, "generate-colors exited with status {code}")?,
+                    None => f.write_str("generate-colors was terminated by a signal")?,
+                }
+                // Append the generator's own diagnostic when there is one: it is what
+                // tells the user which of the generator's preconditions failed. The
+                // excerpt is passed through verbatim (see `stderr_excerpt`), so the
+                // message the user reads is the one the generator wrote.
+                match stderr_excerpt {
+                    Some(excerpt) => write!(f, ": {excerpt}"),
+                    None => Ok(()),
+                }
+            }
             WriteFailureCause::GenerateColorsUnrunnable(error) => {
                 write!(f, "generate-colors could not be run: {error}")
             }
@@ -325,6 +381,11 @@ pub fn run(
     runner: &dyn CommandRunner,
     signaller: &dyn ProcessSignaller,
 ) -> ApplyOutcome {
+    // Caller-drift guard, run before the gate it protects: a plan carrying file writes
+    // with nothing to validate would sail through step 1 vacuously (see `ApplyPlan`'s
+    // docs on the two fields being derived from the same dirty settings).
+    warn_on_missing_validations(plan);
+
     // --- Step 1: validate all staged values before touching anything (R8.3) ---
     let invalid = validate_all(&plan.validations);
     if !invalid.is_empty() {
@@ -398,6 +459,66 @@ fn validate_all(validations: &[(SettingId, Value)]) -> Vec<InvalidSetting> {
     invalid
 }
 
+/// The writes in `plan` that claim their values are validated by it, when it validates
+/// nothing at all — the [`ApplyPlan`] drift guard's predicate (R8.3).
+///
+/// Returns an empty vector for a consistent plan. Two things narrow it deliberately:
+///
+/// - Only a plan with *no* `validations` whatsoever is flagged. That is the drift the
+///   pipeline can actually detect; it cannot tell which setting a given [`FileWrite`]'s
+///   bytes came from, so a plan that validates some of its writes' values but not others
+///   is accepted as-is.
+/// - Only writes declaring [`WriteValidation::InPlan`] count. A write that declares
+///   [`WriteValidation::NotNeeded`] is validation-free by design (a theme-name change, a
+///   wallpaper fit-only change), so flagging it would make the warning fire on ordinary,
+///   correct applies — the fastest way to make a diagnostic worth ignoring.
+fn writes_without_validations(plan: &ApplyPlan) -> Vec<&FileWrite> {
+    if !plan.validations.is_empty() {
+        return Vec::new();
+    }
+    plan.writes
+        .iter()
+        .filter(|write| write.validation == WriteValidation::InPlan)
+        .collect()
+}
+
+/// Logs a `warn` when `plan` has file writes but nothing to validate, so a drifted
+/// caller cannot let step 1's R8.3 gate pass vacuously and unnoticed.
+///
+/// **Why a `warn` rather than a `debug_assert!`.** The condition catches a *developer*
+/// wiring mistake, which is the usual argument for a debug assertion, but all three
+/// consequences of asserting are worse here:
+///
+/// - a `debug_assert!` is compiled out of the release build the user runs, so the one
+///   place a plan assembled at runtime could actually drift unseen is the one place it
+///   would be silent;
+/// - panicking mid-Apply is a bad response to a *suspicion*: the plan's writes may be
+///   perfectly valid, and taking down the app on a heuristic is exactly the "never
+///   break a working desktop" failure R8.3 is about;
+/// - the pipeline's own tests deliberately build minimal plans (a write, no
+///   validations) to exercise one step in isolation, so an assertion would fail a dozen
+///   tests that document no defect.
+///
+/// A `warn` always fires, in every build, and lands in the journal beside the rest of
+/// the apply record (R7.3) where the changed-key labels name the writes involved.
+fn warn_on_missing_validations(plan: &ApplyPlan) {
+    let unvalidated = writes_without_validations(plan);
+    if unvalidated.is_empty() {
+        return;
+    }
+    let keys: Vec<&str> = unvalidated
+        .iter()
+        .flat_map(|write| write.changed_keys.iter().map(String::as_str))
+        .collect();
+    tracing::warn!(
+        writes = unvalidated.len(),
+        keys = ?keys,
+        "apply plan carries file writes but no values to validate, so the validation \
+         gate passed vacuously; the caller that assembled this plan has most likely \
+         dropped its validations (R8.3)"
+    );
+}
+
 /// A write-phase failure paired with the snapshots taken before it, so the caller
 /// can roll those back.
 ///
@@ -455,9 +576,13 @@ fn write_phase(plan: &ApplyPlan, runner: &dyn CommandRunner) -> Result<(), Write
                 tracing::info!(scheme = %palette.scheme, "regenerated palette via generate-colors");
             }
             Ok(output) => {
+                // Carry the generator's stderr, not just its exit code: it is the only
+                // thing that says *why* the palette could not be regenerated, and the
+                // runner captures it in full for exactly this caller.
                 return Err(WritePhaseFailure {
                     cause: WriteFailureCause::GenerateColorsExit {
                         code: output.code(),
+                        stderr_excerpt: stderr_excerpt(output.stderr()),
                     },
                     written: snapshots,
                 });
@@ -472,6 +597,49 @@ fn write_phase(plan: &ApplyPlan, runner: &dyn CommandRunner) -> Result<(), Write
     }
 
     Ok(())
+}
+
+/// Turns raw captured stderr into the bounded, presentable excerpt
+/// [`WriteFailureCause::GenerateColorsExit`] carries, or `None` when the command wrote
+/// nothing worth showing.
+///
+/// The four decisions behind the shape, since a user reads the result in a warning
+/// dialog:
+///
+/// - **Bounded first, decoded second.** The leading [`STDERR_EXCERPT_LIMIT`] bytes are
+///   taken and only then decoded, so the bound holds whatever the encoding; a
+///   multi-byte character cut in half by the boundary simply decodes to the U+FFFD
+///   replacement character.
+/// - **Lossy decoding.** A script's diagnostic is not guaranteed to be UTF-8 (a
+///   filename in another encoding is enough), and losing the whole message over one
+///   stray byte would defeat the point, so invalid bytes become U+FFFD rather than an
+///   error.
+/// - **Trailing whitespace trimmed, and an ellipsis only when something was really
+///   lost.** Practically every diagnostic ends in a newline, which would otherwise render
+///   as a trailing blank line; the appended `…` tells the reader there was more output
+///   than is shown. The marker is suppressed when everything past the cut is whitespace,
+///   so a message of exactly the limit plus its trailing newline is not advertised as
+///   truncated — it is complete, matching the trim applied to the kept text.
+/// - **Otherwise verbatim.** The text is not re-wrapped, re-cased, re-ordered, or
+///   interpreted — it is the generator's own message about its own failure, which is
+///   what makes it actionable. Note this stays within R7.3: what must never be echoed
+///   is *config file contents*, and a tool's error output about itself is not that.
+fn stderr_excerpt(stderr: &[u8]) -> Option<String> {
+    let end = stderr.len().min(STDERR_EXCERPT_LIMIT);
+    let mut excerpt = String::from_utf8_lossy(&stderr[..end])
+        .trim_end()
+        .to_string();
+    if excerpt.is_empty() {
+        return None;
+    }
+    // Only whitespace beyond the cut means nothing the reader would have wanted was
+    // dropped (`is_ascii_whitespace` covers the newlines, tabs and spaces a diagnostic
+    // ends with; any other byte counts as content, so the marker errs towards honesty).
+    let lost_content = stderr[end..].iter().any(|byte| !byte.is_ascii_whitespace());
+    if lost_content {
+        excerpt.push('…');
+    }
+    Some(excerpt)
 }
 
 /// Restores each snapshot, reporting which files were rolled back and which restores
@@ -602,6 +770,7 @@ mod tests {
                 contents: b"monitor=eDP-1,preferred,auto,1.25\n".to_vec(),
                 changed_keys: vec!["monitor:eDP-1 scale".to_string()],
                 backing: BackingFile::MonitorsConf,
+                validation: WriteValidation::InPlan,
             }],
             palette: None,
             reload_params: ReloadParams::default(),
@@ -725,6 +894,7 @@ mod tests {
                 contents: b"preload = /new.png\n".to_vec(),
                 changed_keys: vec!["preload".to_string()],
                 backing: BackingFile::HyprpaperConf,
+                validation: WriteValidation::InPlan,
             }],
             palette: None,
             reload_params: ReloadParams::default(),
@@ -778,6 +948,7 @@ mod tests {
                 contents: b"kb_layout = us,se\n".to_vec(),
                 changed_keys: vec!["kb_layout".to_string()],
                 backing: BackingFile::InputConf,
+                validation: WriteValidation::InPlan,
             }],
             palette: None,
             reload_params: ReloadParams::default(),
@@ -823,12 +994,14 @@ mod tests {
                     contents: b"new input\n".to_vec(),
                     changed_keys: vec!["kb_layout".to_string()],
                     backing: BackingFile::InputConf,
+                    validation: WriteValidation::InPlan,
                 },
                 FileWrite {
                     path: missing.clone(),
                     contents: b"new monitors\n".to_vec(),
                     changed_keys: vec!["monitor".to_string()],
                     backing: BackingFile::MonitorsConf,
+                    validation: WriteValidation::InPlan,
                 },
             ],
             palette: None,
@@ -885,6 +1058,7 @@ mod tests {
                 contents: b"monitor=eDP-1,preferred,auto,1.25\n".to_vec(),
                 changed_keys: vec!["monitor:eDP-1 scale".to_string()],
                 backing: BackingFile::MonitorsConf,
+                validation: WriteValidation::InPlan,
             }],
             palette: Some(PaletteSwitch {
                 scheme: "nord".to_string(),
@@ -909,10 +1083,20 @@ mod tests {
                 assert!(
                     matches!(
                         failure.cause,
-                        WriteFailureCause::GenerateColorsExit { code: Some(1) }
+                        // This generator printed nothing, so there is no excerpt to
+                        // carry — the message must then be the bare exit-code one,
+                        // with no dangling separator (asserted below).
+                        WriteFailureCause::GenerateColorsExit {
+                            code: Some(1),
+                            stderr_excerpt: None
+                        }
                     ),
                     "the cause must be a non-zero generate-colors exit, got {:?}",
                     failure.cause
+                );
+                assert_eq!(
+                    failure.cause.to_string(),
+                    "generate-colors exited with status 1"
                 );
                 assert_eq!(
                     failure.rolled_back,
@@ -940,6 +1124,115 @@ mod tests {
     }
 
     #[test]
+    fn a_generate_colors_failure_carries_the_generators_stderr_into_its_message() {
+        // Task 9.10: the exit code alone does not say *why* the palette could not be
+        // regenerated. Inject the documented `theme/fonts` abort — the generator exits
+        // non-zero after printing the reason — and assert the reason survives into the
+        // rendered failure message, which is what the user is shown.
+        let plan = ApplyPlan {
+            validations: Vec::new(),
+            writes: Vec::new(),
+            palette: Some(PaletteSwitch {
+                scheme: "nord".to_string(),
+                generate_colors: PathBuf::from("/fake/repo/scripts/generate-colors"),
+            }),
+            reload_params: ReloadParams::default(),
+        };
+        let tracker = FreshnessTracker::new();
+        let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake_with_streams(
+            1,
+            "",
+            "generate-colors: theme/fonts is missing or incomplete; aborting\n",
+        ))]);
+        let signaller = MockProcessSignaller::new();
+
+        let outcome = run(
+            &plan,
+            &tracker,
+            &palette_capabilities(),
+            &runner,
+            &signaller,
+        );
+
+        match outcome {
+            ApplyOutcome::WriteFailed(failure) => {
+                assert_eq!(
+                    failure.cause.to_string(),
+                    "generate-colors exited with status 1: generate-colors: theme/fonts is \
+                     missing or incomplete; aborting",
+                    "the rendered message must carry the generator's own diagnostic, \
+                     trailing newline trimmed"
+                );
+            }
+            other => panic!("expected WriteFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_stderr_excerpt_is_byte_bounded_lossy_and_trimmed() {
+        // The excerpt is what a user reads in a warning dialog, so each bound matters:
+        // it must not grow without limit, must survive non-UTF-8 output, and must not
+        // end in the newline practically every diagnostic carries.
+        assert_eq!(
+            stderr_excerpt(b"missing theme/fonts\n"),
+            Some("missing theme/fonts".to_string()),
+            "the trailing newline is trimmed"
+        );
+        assert_eq!(
+            stderr_excerpt(b""),
+            None,
+            "a silent generator carries no excerpt"
+        );
+        assert_eq!(
+            stderr_excerpt(b"\n \n"),
+            None,
+            "whitespace-only output carries no excerpt either, so the message cannot \
+             end in a dangling separator"
+        );
+
+        // Exactly the limit plus its trailing newline: the only thing past the cut is
+        // whitespace, which the trim would have removed anyway, so the excerpt is
+        // complete and must not be advertised as truncated.
+        let mut exact = vec![b'z'; STDERR_EXCERPT_LIMIT];
+        exact.push(b'\n');
+        assert_eq!(
+            stderr_excerpt(&exact),
+            Some("z".repeat(STDERR_EXCERPT_LIMIT)),
+            "cutting only trailing whitespace is not a truncation"
+        );
+
+        // Over the limit: bounded to STDERR_EXCERPT_LIMIT bytes plus the one-character
+        // truncation marker, never the whole flood.
+        let flood = vec![b'x'; STDERR_EXCERPT_LIMIT * 3];
+        let excerpt = stderr_excerpt(&flood).expect("a chatty generator carries an excerpt");
+        assert_eq!(
+            excerpt,
+            format!("{}…", "x".repeat(STDERR_EXCERPT_LIMIT)),
+            "the excerpt is capped and marked as truncated"
+        );
+
+        // Invalid UTF-8 must not cost the user the message: the bad byte is replaced.
+        let mut invalid = b"bad byte: ".to_vec();
+        invalid.push(0xff);
+        assert_eq!(
+            stderr_excerpt(&invalid),
+            Some("bad byte: \u{fffd}".to_string()),
+            "non-UTF-8 output decodes lossily rather than being dropped"
+        );
+
+        // A multi-byte character split by the byte boundary must not panic, and the
+        // bound must still hold (the split character decodes to one replacement char).
+        let mut split = vec![b'y'; STDERR_EXCERPT_LIMIT - 1];
+        split.extend_from_slice("é".as_bytes());
+        let excerpt = stderr_excerpt(&split).expect("an excerpt is produced");
+        assert_eq!(
+            excerpt,
+            format!("{}\u{fffd}…", "y".repeat(STDERR_EXCERPT_LIMIT - 1)),
+            "a character cut in half by the byte bound becomes a replacement char"
+        );
+    }
+
+    #[test]
     fn a_generate_colors_spawn_failure_rolls_back_and_surfaces_a_command_error() {
         // A `generate-colors` that cannot be run at all (not on PATH) is likewise a
         // write failure that rolls back the earlier writes, surfaced distinctly so
@@ -955,6 +1248,7 @@ mod tests {
                 contents: b"monitor=eDP-1,preferred,auto,1.25\n".to_vec(),
                 changed_keys: vec!["monitor:eDP-1 scale".to_string()],
                 backing: BackingFile::MonitorsConf,
+                validation: WriteValidation::InPlan,
             }],
             palette: Some(PaletteSwitch {
                 scheme: "nord".to_string(),
@@ -1011,6 +1305,7 @@ mod tests {
                 contents: b"monitor=eDP-1,preferred,auto,1.25\n".to_vec(),
                 changed_keys: vec!["monitor:eDP-1 scale".to_string()],
                 backing: BackingFile::MonitorsConf,
+                validation: WriteValidation::InPlan,
             }],
             palette: None,
             reload_params: ReloadParams::default(),
@@ -1133,6 +1428,7 @@ mod tests {
                 contents: b"monitor=eDP-1,preferred,auto,1.25\n".to_vec(),
                 changed_keys: vec!["monitor:eDP-1 scale".to_string()],
                 backing: BackingFile::MonitorsConf,
+                validation: WriteValidation::InPlan,
             }],
             palette: Some(PaletteSwitch {
                 scheme: "nord".to_string(),
@@ -1207,6 +1503,7 @@ mod tests {
                 contents: b"{\n  \"positionX\": \"left\"\n}\n".to_vec(),
                 changed_keys: vec!["positionX".to_string()],
                 backing: BackingFile::SwayncConfig,
+                validation: WriteValidation::InPlan,
             }],
             palette: Some(PaletteSwitch {
                 scheme: "nord".to_string(),
@@ -1324,8 +1621,14 @@ mod tests {
                     source: io::Error::from(io::ErrorKind::NotFound),
                 },
             },
-            WriteFailureCause::GenerateColorsExit { code: Some(1) },
-            WriteFailureCause::GenerateColorsExit { code: None },
+            WriteFailureCause::GenerateColorsExit {
+                code: Some(1),
+                stderr_excerpt: None,
+            },
+            WriteFailureCause::GenerateColorsExit {
+                code: None,
+                stderr_excerpt: Some("killed while writing colors.conf".to_string()),
+            },
             WriteFailureCause::GenerateColorsUnrunnable(CommandError::Timeout {
                 limit: std::time::Duration::from_secs(5),
             }),
@@ -1336,6 +1639,269 @@ mod tests {
                 "every WriteFailureCause must render a message, got empty for {cause:?}"
             );
         }
+    }
+
+    // --- The caller-drift guard on writes without validations (task 9.10) --------
+
+    /// A plan with one write per `(backing, validation)` pair and no `validations` at
+    /// all — the shape the drift guard reacts to.
+    fn plan_with_writes(writes: &[(BackingFile, WriteValidation)]) -> ApplyPlan {
+        ApplyPlan {
+            validations: Vec::new(),
+            writes: writes
+                .iter()
+                .map(|(backing, validation)| FileWrite {
+                    path: PathBuf::from("/fake/target.conf"),
+                    contents: b"contents\n".to_vec(),
+                    changed_keys: vec![format!("{backing:?} key")],
+                    backing: *backing,
+                    validation: *validation,
+                })
+                .collect(),
+            palette: None,
+            reload_params: ReloadParams::default(),
+        }
+    }
+
+    /// Captures the `tracing` events `measured` emits, discarding those from `warm_up`.
+    ///
+    /// `warm_up` must reach the same callsites as `measured`: `tracing` caches each
+    /// callsite's interest process-globally and cross-thread, so a parallel test that
+    /// reached the guard's `warn!` under the no-op default subscriber could have cached
+    /// it as "never" and suppressed the event here. Touching the callsites once,
+    /// rebuilding the interest cache, then clearing before measuring is the same guard
+    /// `core::detect`'s and `parsers::hyprlang`'s log tests use. The subscriber is
+    /// installed for this thread only, so no global logging state is touched.
+    fn captured_events(
+        warm_up: impl FnOnce(),
+        measured: impl FnOnce(),
+    ) -> Vec<(tracing::Level, String)> {
+        use std::sync::{Arc, Mutex};
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        /// Collects each event's level and its rendered fields.
+        #[derive(Clone, Default)]
+        struct LogCapture {
+            events: Arc<Mutex<Vec<(tracing::Level, String)>>>,
+        }
+
+        /// Renders every field of an event into one string — the message *and* the
+        /// structured fields, since the changed-key labels are recorded as a field.
+        struct FieldVisitor<'a>(&'a mut String);
+        impl tracing::field::Visit for FieldVisitor<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+                use std::fmt::Write as _;
+                let _ = write!(self.0, " {}={value:?}", field.name());
+            }
+        }
+
+        impl<S: tracing::Subscriber> Layer<S> for LogCapture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut rendered = String::new();
+                event.record(&mut FieldVisitor(&mut rendered));
+                self.events
+                    .lock()
+                    .expect("log capture mutex should not be poisoned")
+                    .push((*event.metadata().level(), rendered));
+            }
+        }
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        with_default(subscriber, || {
+            warm_up();
+            tracing::callsite::rebuild_interest_cache();
+            capture
+                .events
+                .lock()
+                .expect("log capture mutex should not be poisoned")
+                .clear();
+            measured();
+        });
+        capture
+            .events
+            .lock()
+            .expect("log capture mutex should not be poisoned")
+            .clone()
+    }
+
+    /// The `WARN`-level events among `events`, which is all the drift guard emits.
+    fn warnings(events: &[(tracing::Level, String)]) -> Vec<&str> {
+        events
+            .iter()
+            .filter(|(level, _)| *level == tracing::Level::WARN)
+            .map(|(_, rendered)| rendered.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_plan_with_writes_and_no_validations_is_flagged_as_drifted() {
+        // The drift the guard exists for: a caller rendered a write whose values it
+        // claims the plan validates, but dropped them from `validations` — so step 1's
+        // R8.3 gate would pass vacuously.
+        let plan = plan_with_writes(&[(BackingFile::MonitorsConf, WriteValidation::InPlan)]);
+        let flagged = writes_without_validations(&plan);
+        assert_eq!(flagged.len(), 1, "the unvalidated write must be flagged");
+        assert_eq!(flagged[0].backing, BackingFile::MonitorsConf);
+
+        // Supplying the validation clears it — a consistent plan is never flagged.
+        let mut validated =
+            plan_with_writes(&[(BackingFile::MonitorsConf, WriteValidation::InPlan)]);
+        validated
+            .validations
+            .push((SettingId::MonitorScale, Value::Float(1.25)));
+        assert!(writes_without_validations(&validated).is_empty());
+    }
+
+    #[test]
+    fn a_by_design_validation_free_plan_is_not_flagged_but_a_mixed_one_is() {
+        // The declaration that keeps the guard honest. Two real applies reach the
+        // pipeline with writes and no validations by design: a theme-only change (the
+        // GTK/icon/cursor model carries no validations at all — task 9.27) and a
+        // wallpaper *fit-only* change, which must not drag the unchanged wallpaper path
+        // into validation. Both must stay quiet, or the warning fires on ordinary applies
+        // and becomes worth ignoring.
+        let by_design = plan_with_writes(&[
+            (BackingFile::GtkSettings, WriteValidation::NotNeeded),
+            (BackingFile::UwsmEnv, WriteValidation::NotNeeded),
+            (BackingFile::HyprlandConf, WriteValidation::NotNeeded),
+            (BackingFile::HyprpaperConf, WriteValidation::NotNeeded),
+        ]);
+        assert!(
+            writes_without_validations(&by_design).is_empty(),
+            "writes that declare themselves validation-free must not be flagged"
+        );
+
+        // A write that does claim plan validation, alongside by-design ones, is still
+        // flagged — and only it: the declaration must not launder a genuine drift.
+        let mixed = plan_with_writes(&[
+            (BackingFile::GtkSettings, WriteValidation::NotNeeded),
+            (BackingFile::HypridleConf, WriteValidation::InPlan),
+        ]);
+        let flagged = writes_without_validations(&mixed);
+        assert_eq!(flagged.len(), 1);
+        assert_eq!(flagged[0].backing, BackingFile::HypridleConf);
+
+        // A palette-only apply has no writes at all, so there is nothing to flag.
+        let palette_only = ApplyPlan {
+            validations: Vec::new(),
+            writes: Vec::new(),
+            palette: Some(PaletteSwitch {
+                scheme: "nord".to_string(),
+                generate_colors: PathBuf::from("/fake/generate-colors"),
+            }),
+            reload_params: ReloadParams::default(),
+        };
+        assert!(writes_without_validations(&palette_only).is_empty());
+    }
+
+    #[test]
+    fn a_drifted_plan_logs_a_warning_naming_the_unvalidated_keys() {
+        // The guard's whole effect is the log line (it deliberately does not abort the
+        // apply — see `warn_on_missing_validations` on warn vs debug_assert), so pin that
+        // the line is emitted at `warn` and names the write's changed keys, which is what
+        // makes it actionable in the journal (R7.3).
+        let mut plan = plan_with_writes(&[(BackingFile::HypridleConf, WriteValidation::InPlan)]);
+        plan.writes[0].changed_keys = vec!["listener:timeout".to_string()];
+        let by_design = plan_with_writes(&[(BackingFile::GtkSettings, WriteValidation::NotNeeded)]);
+
+        let events = captured_events(
+            || warn_on_missing_validations(&plan),
+            || {
+                warn_on_missing_validations(&plan);
+                // The by-design plan must add nothing at all to the journal.
+                warn_on_missing_validations(&by_design);
+            },
+        );
+
+        let warnings = warnings(&events);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "exactly the drifted plan warns; the by-design one is silent: {events:?}"
+        );
+        assert!(
+            warnings[0].contains("listener:timeout"),
+            "the warning names the unvalidated write's changed keys: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn run_warns_about_a_drifted_plan_through_the_pipeline_entry_point() {
+        // The guard is only worth anything if it is actually wired into `run`: the test
+        // above exercises the helper, this one goes through the real entry point the UI
+        // calls, so deleting the call from `run` fails the suite rather than merely
+        // tripping the dead-code lint. It also pins that the guard *only* warns — the
+        // apply proceeds and the write stands, because a suspicion must never abort an
+        // otherwise valid apply (R8.3).
+        let dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let hypridle = write_file(&dir, "hypridle.conf", b"general {\n    lock_cmd = old\n}\n");
+        let new_bytes = b"general {\n    lock_cmd = new\n}\n".to_vec();
+
+        // A drifted plan: a write claiming plan-validated values, with none supplied.
+        let plan = ApplyPlan {
+            validations: Vec::new(),
+            writes: vec![FileWrite {
+                path: hypridle.clone(),
+                contents: new_bytes.clone(),
+                changed_keys: vec!["general:lock_cmd".to_string()],
+                backing: BackingFile::HypridleConf,
+                validation: WriteValidation::InPlan,
+            }],
+            palette: None,
+            reload_params: ReloadParams::default(),
+        };
+        // hypridle absent, so the reload plan is empty: the only command-related logging
+        // is gone and any WARN captured below must come from the guard itself.
+        let caps = Capabilities::for_tests(&[], &[], false);
+        let runner = MockCommandRunner::new();
+        let signaller = MockProcessSignaller::new();
+
+        let mut outcome = None;
+        let events = captured_events(
+            || {
+                let tracker = record_baseline(&[&hypridle]);
+                let _ = run(&plan, &tracker, &caps, &runner, &signaller);
+            },
+            || {
+                // Re-baseline: the warm-up run above already rewrote the file, so a
+                // tracker recorded before it would now report a (self-inflicted) conflict.
+                let tracker = record_baseline(&[&hypridle]);
+                outcome = Some(run(&plan, &tracker, &caps, &runner, &signaller));
+            },
+        );
+
+        let warnings = warnings(&events);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "`run` must emit the drift warning exactly once: {events:?}"
+        );
+        assert!(
+            warnings[0].contains("general:lock_cmd"),
+            "the warning from `run` names the unvalidated write: {}",
+            warnings[0]
+        );
+        assert!(
+            matches!(outcome, Some(ApplyOutcome::Applied { .. })),
+            "the guard must warn without aborting the apply, got {outcome:?}"
+        );
+        assert_eq!(
+            fs::read(&hypridle).expect("read the written file"),
+            new_bytes,
+            "the write still stands: the guard is a diagnostic, not a gate"
+        );
+        assert!(
+            runner.recorded().is_empty(),
+            "no reload is planned for an absent hypridle, so no command noise"
+        );
     }
 
     // --- The store's freshness tracker wired into apply (task 5.4) ---------------
@@ -1386,6 +1952,7 @@ mod tests {
                 contents: new_bytes.clone(),
                 changed_keys: vec!["input:sensitivity".to_string()],
                 backing: BackingFile::InputConf,
+                validation: WriteValidation::InPlan,
             }],
             palette: None,
             reload_params: ReloadParams::default(),

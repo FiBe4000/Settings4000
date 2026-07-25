@@ -205,9 +205,20 @@ fn main() {
             assert!(
                 matches!(
                     failure.cause,
-                    WriteFailureCause::GenerateColorsExit { code: Some(2) }
+                    WriteFailureCause::GenerateColorsExit { code: Some(2), .. }
                 ),
                 "the fixture stub exits 2, got {:?}",
+                failure.cause
+            );
+            // Task 9.10: the stub also prints to stderr, so this real-subprocess cycle
+            // additionally demonstrates the generator's own diagnostic reaching the
+            // failure message (and hence the journal line logged from it).
+            assert!(
+                failure
+                    .cause
+                    .to_string()
+                    .contains("generate-colors stub invoked for real"),
+                "the stub's stderr must reach the failure message, got {}",
                 failure.cause
             );
             assert!(

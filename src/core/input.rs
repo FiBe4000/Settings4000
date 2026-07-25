@@ -53,7 +53,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::core::apply::FileWrite;
+use crate::core::apply::{FileWrite, WriteValidation};
 use crate::core::model::{SettingId, Value};
 use crate::core::reload::BackingFile;
 use crate::parsers::hyprlang::{EditError, HyprlangFile, KeyPath};
@@ -420,6 +420,9 @@ impl InputModel {
             contents: edit.contents,
             changed_keys: edit.changed_keys,
             backing: BackingFile::InputConf,
+            // Rendered from the store's dirty Input settings, which the plan carries as
+            // its validations (the window builds both from the same `dirty_ids()`).
+            validation: WriteValidation::InPlan,
         }))
     }
 }
