@@ -168,7 +168,8 @@ pub enum Daemon {
     Kitty,
     /// The eww bar daemon (`eww reload`).
     Eww,
-    /// The swaync notification daemon (`swaync-client -rs`).
+    /// The swaync notification daemon (`swaync-client -R` for a config change,
+    /// `-rs` for a stylesheet change).
     Swaync,
     /// The hyprpaper wallpaper daemon (`hyprctl hyprpaper …`).
     Hyprpaper,

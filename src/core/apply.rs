@@ -1188,6 +1188,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_palette_switch_plus_a_swaync_config_write_runs_both_swaync_reloads_in_order() {
+        // Task 9.9: swaync's config reload (`-R`) and its CSS reload (`-rs`) are two
+        // different commands, so an Apply that both switched the palette and edited
+        // `swaync/config.json` must execute both — the config reload before the CSS
+        // reload — with nothing duplicated. Asserting it here, at the pipeline level,
+        // pins the executed command sequence end to end; `core::reload` covers the
+        // planning and the individual arg vectors.
+        let dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let config = write_file(&dir, "config.json", b"{\n  \"positionX\": \"right\"\n}\n");
+        let tracker = record_baseline(&[&config]);
+
+        let plan = ApplyPlan {
+            validations: Vec::new(),
+            writes: vec![FileWrite {
+                path: config.clone(),
+                contents: b"{\n  \"positionX\": \"left\"\n}\n".to_vec(),
+                changed_keys: vec!["positionX".to_string()],
+                backing: BackingFile::SwayncConfig,
+            }],
+            palette: Some(PaletteSwitch {
+                scheme: "nord".to_string(),
+                generate_colors: PathBuf::from("/fake/repo/scripts/generate-colors"),
+            }),
+            reload_params: ReloadParams::default(),
+        };
+        let runner = MockCommandRunner::new();
+        let signaller = MockProcessSignaller::with_running([("kitty".to_string(), vec![11])]);
+
+        let outcome = run(
+            &plan,
+            &tracker,
+            &palette_capabilities(),
+            &runner,
+            &signaller,
+        );
+
+        match outcome {
+            ApplyOutcome::Applied {
+                reload_failures,
+                written,
+            } => {
+                assert!(reload_failures.is_empty());
+                assert_eq!(written, vec![config.clone()]);
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        assert_eq!(
+            runner.recorded(),
+            vec![
+                Command::new("/fake/repo/scripts/generate-colors").arg("nord"),
+                Command::new("hyprctl").arg("reload"),
+                Command::new("eww").arg("reload"),
+                Command::new("swaync-client").arg("-R"),
+                Command::new("swaync-client").arg("-rs"),
+            ],
+            "both swaync reloads must run, config before CSS, each exactly once"
+        );
+        assert_eq!(
+            signaller.calls(),
+            vec![SignalCall {
+                process_name: "kitty".to_string(),
+                signal: Signal::SIGUSR1,
+                pids: vec![11],
+            }]
+        );
+    }
+
     // --- The rollback-restore-itself-failing path --------------------------------
 
     #[cfg(unix)]

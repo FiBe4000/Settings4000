@@ -34,7 +34,7 @@ Findings from exploring `~/.dotfiles` (2026-07-06). Reference for designing a na
 - **Hyprland**: `hyprctl reload` (rereads `hyprland.conf` + all `source=`d files). Granular live changes possible via `hyprctl keyword ...` (see `scripts/hypr-monitor-hotplug`).
 - **eww**: `eww reload` (recompiles SCSS). Bars launched per-monitor by `scripts/launch-eww-bars`.
 - **kitty**: no `allow_remote_control` configured, so reload requires `kill -SIGUSR1 $(pidof kitty)`. Enabling remote control + a listen socket would allow flicker-free `kitten @ set-colors`.
-- **swaync**: `swaync-client -rs` (reloads CSS + config; `"cssPriority": "user"` is set).
+- **swaync**: `swaync-client -rs` reloads the **CSS only** (`--reload-css`; `"cssPriority": "user"` is set) — enough for a palette switch, which regenerates `colors.css`. A `config.json` change needs `swaync-client -R` (`--reload-config`) instead, and the app issues each as its own invocation (corrected in task 9.9 — the earlier "reloads CSS + config" note here was wrong).
 - **rofi**: launched on demand — reads configs fresh each invocation, no reload needed.
 - **zsh**: new shells or `source ~/.zsh_colors`; no daemon.
 - **hyprpaper**: reads config at start; drive live via `hyprctl hyprpaper ...`. **hypridle**: restart to pick up changes. **hyprlock**: reads config at launch.

@@ -93,7 +93,7 @@ On **Apply**, `core/apply.rs` executes a fixed-order plan:
 |---|---|
 | Hyprland | `hyprctl reload` (child process; hyprctl speaks the IPC socket for us). Simple live tweaks may additionally use `hyprctl keyword ...` for flicker-free effect |
 | eww | `eww reload` |
-| swaync | `swaync-client -R` for a `config.json` change (`--reload-config`; per `swaync-client(1)`, `-rs`/`--reload-css` reloads CSS only). The palette chain keeps `-rs`, since `generate-colors` rewrites `swaync/colors.css`. Flags to be verified against the running swaync (task 9.9) |
+| swaync | `swaync-client -R` for a `config.json` change (`--reload-config`; per `swaync-client(1)`, `-rs`/`--reload-css` reloads the stylesheet only). The palette chain keeps `-rs`, since `generate-colors` rewrites `swaync/colors.css` (imported by `style.css`) and no config key. Each class needs only its own flag, so the two are independent actions and an Apply that changed both issues `-R` then `-rs` as separate invocations — which also works on clients older than upstream PR #580, where several flags on one command line performed only one reload (issue #534). Implemented in task 9.9 |
 | kitty | `SIGUSR1` to all kitty PIDs (sent directly via `nix::kill`, no shell). Remote control is now enabled in the dotfiles (`allow_remote_control socket-only` + per-instance socket, analysis §6.1), so a later switch to flicker-free `kitten @ set-colors` is unblocked; v1 keeps SIGUSR1 |
 | hyprpaper | `hyprctl hyprpaper preload/wallpaper ...` |
 | hypridle | restart: `systemctl --user try-restart hypridle` if unit exists, else kill + respawn detached |

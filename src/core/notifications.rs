@@ -13,10 +13,12 @@
 //!   **store-`SettingId` → `swaync/config.json` write glue**: [`render_swaync_config`]
 //!   applies the store's dirty Notifications settings to the JSON through the task-3.4
 //!   adapter, producing one [`FileWrite`] the shared Apply pipeline runs (mirroring
-//!   [`crate::core::input::render_input_conf`]). The pipeline then reloads swaync with
-//!   `swaync-client -rs` (task 4.4). Because `config.json` is store-loaded (baselined by
-//!   the store, whose tracker `apply::run` conflict-checks and which `commit_apply`
-//!   re-baselines), conflict-safety (R5.6) needs no bespoke tracker here — like Input.
+//!   [`crate::core::input::render_input_conf`]). The pipeline then reloads swaync's
+//!   config with `swaync-client -R` (task 4.4; `-rs` reloads only the stylesheet, so it
+//!   would not pick a position/timeout edit up — task 9.9). Because `config.json` is
+//!   store-loaded (baselined by the store, whose tracker `apply::run` conflict-checks and
+//!   which `commit_apply` re-baselines), conflict-safety (R5.6) needs no bespoke tracker
+//!   here — like Input.
 //!
 //! - **Do Not Disturb is *not* a persisted config setting.** swaync's DND is **runtime
 //!   daemon state**, toggled through `swaync-client`; the on-disk `config.json` has no
@@ -717,8 +719,8 @@ mod tests {
         // The end-to-end store-SettingId -> FileWrite glue (task 6.7): a dirty position +
         // timeout edit renders a surgical config.json FileWrite (JSON round-trip, stable
         // key order, only the edited keys changed), and applying it through the shared
-        // pipeline writes that file and triggers exactly `swaync-client -rs` — the swaync
-        // config reload (task 4.4) — and nothing else (R5.3).
+        // pipeline writes that file and triggers exactly `swaync-client -R` — swaync's
+        // config reload (task 4.4/9.9) — and nothing else (R5.3).
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("config.json");
         fs::write(&path, CONFIG_JSON).expect("write config.json");
@@ -757,7 +759,7 @@ mod tests {
             palette: None,
             reload_params: ReloadParams::default(),
         };
-        // swaync-client -rs is gated on the swaync daemon being live; no hyprctl is needed.
+        // The swaync reload is gated on the swaync daemon being live; no hyprctl is needed.
         let caps = Capabilities::for_tests(&[], &[Daemon::Swaync], false);
         let runner = MockCommandRunner::new();
         let signaller = MockProcessSignaller::new();
@@ -782,10 +784,12 @@ mod tests {
             .replace("\"timeout\": 10", "\"timeout\": 30");
         assert_eq!(on_disk, expected);
 
-        // The Notifications change reloads only via `swaync-client -rs`.
+        // The Notifications change reloads only via `swaync-client -R` — swaync's config
+        // reload. The CSS-only `-rs` must not appear: it would leave the position and
+        // timeout edits inert until swaync restarts (task 9.9).
         assert_eq!(
             runner.recorded(),
-            vec![Command::new("swaync-client").arg("-rs")]
+            vec![Command::new("swaync-client").arg("-R")]
         );
         assert!(signaller.calls().is_empty());
     }

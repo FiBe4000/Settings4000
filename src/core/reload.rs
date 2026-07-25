@@ -22,6 +22,23 @@
 //! `gtk`/`relm4` import. Side effects are reached only through the two `system/`
 //! traits.
 //!
+//! # The two swaync reloads are different commands
+//!
+//! `swaync-client` reloads its config and its stylesheet through *separate* flags:
+//! `-R`/`--reload-config` re-reads `config.json`, while `-rs`/`--reload-css` re-reads
+//! the CSS only. They are therefore two distinct actions here
+//! ([`ReloadAction::SwayncReloadConfig`] and [`ReloadAction::SwayncReloadCss`]) rather
+//! than one: a Notifications change (position/timeout in `config.json`) needs `-R`,
+//! and a palette switch — whose `generate-colors` run rewrites `swaync/colors.css` and
+//! nothing else swaync reads — needs only `-rs`. Because each change class needs just
+//! its own flag, neither action ever has to combine them, and each runs as its own
+//! `swaync-client` invocation — which also keeps the reloads working on clients older
+//! than SwayNotificationCenter PR #580, where several flags on one command line were
+//! parsed as a single command so only one reload happened (its issue #534). Current
+//! clients accept a combined `-R -rs` (v0.12.6's `src/client.vala` loops over the
+//! arguments its command parser has not consumed), so keeping the invocations separate
+//! is a compatibility choice, not a limitation of the client.
+//!
 //! # Kept in sync with `scripts/apply-theme`
 //!
 //! For a palette (color-scheme) change the reload set mirrors the dotfiles'
@@ -110,8 +127,10 @@ pub enum BackingFile {
     /// `config/hypr/hyprpaper.conf` — the wallpaper; applied live with
     /// `hyprctl hyprpaper preload`/`wallpaper` (task 6.5).
     HyprpaperConf,
-    /// `config/swaync/config.json` — notification settings; `swaync-client -rs`
-    /// (task 6.7).
+    /// `config/swaync/config.json` — notification settings; reloaded with
+    /// `swaync-client -R` (`--reload-config`), task 6.7. Not `-rs`, which reloads
+    /// swaync's CSS only and would leave a position/timeout change inert until swaync
+    /// restarts.
     SwayncConfig,
     /// The GTK 3/4 `settings.ini` files — GTK/icon/cursor theme; applied live with
     /// `gsettings set` (+ `hyprctl setcursor` for the cursor), task 6.4.
@@ -146,7 +165,10 @@ impl BackingFile {
             BackingFile::HypridleConf => vec![ReloadAction::HypridleRestart],
             // hyprlock intentionally has no reload (see the variant docs).
             BackingFile::HyprlockConf => Vec::new(),
-            BackingFile::SwayncConfig => vec![ReloadAction::SwayncReload],
+            // A `config.json` change needs swaync's *config* reload (`-R`). It
+            // deliberately does not also reload the CSS: the stylesheet is untouched by
+            // a position/timeout edit.
+            BackingFile::SwayncConfig => vec![ReloadAction::SwayncReloadConfig],
             BackingFile::HyprpaperConf => match &params.wallpaper {
                 Some(path) => vec![ReloadAction::HyprpaperWallpaper {
                     path: path.clone(),
@@ -165,11 +187,13 @@ impl BackingFile {
             BackingFile::GtkSettings => theme_and_cursor_actions(params, true),
             BackingFile::UwsmEnv => theme_and_cursor_actions(params, false),
             // A palette switch reloads every component whose colors were regenerated,
-            // in the apply-theme order (analysis §6.1).
+            // in the apply-theme order (analysis §6.1). swaync gets the *CSS* reload
+            // (`-rs`) only: `generate-colors` rewrites `swaync/colors.css`, which
+            // `style.css` imports, and never touches `config.json`.
             BackingFile::Palette => vec![
                 ReloadAction::HyprctlReload,
                 ReloadAction::EwwReload,
-                ReloadAction::SwayncReload,
+                ReloadAction::SwayncReloadCss,
                 ReloadAction::KittyColors,
             ],
         }
@@ -272,8 +296,13 @@ pub enum ReloadAction {
     HyprctlReload,
     /// `eww reload` — recompile and reload the eww bars.
     EwwReload,
-    /// `swaync-client -rs` — reload swaync's config and CSS.
-    SwayncReload,
+    /// `swaync-client -R` (`--reload-config`) — swaync re-reads `config.json`, so an
+    /// edited notification position or timeout takes effect live (R5.3).
+    SwayncReloadConfig,
+    /// `swaync-client -rs` (`--reload-css`) — swaync re-reads its stylesheet only. This
+    /// is the palette chain's swaync step, because `generate-colors` regenerates
+    /// `swaync/colors.css`; it does **not** pick up `config.json` changes.
+    SwayncReloadCss,
     /// SIGUSR1 to every running kitty, which re-reads its config (v1 has no kitty
     /// remote-control reload; analysis §6.1).
     KittyColors,
@@ -331,7 +360,9 @@ impl ReloadAction {
                 capabilities.hyprland_reloadable() && capabilities.is_daemon_live(Daemon::Hyprpaper)
             }
             ReloadAction::EwwReload => capabilities.is_daemon_live(Daemon::Eww),
-            ReloadAction::SwayncReload => capabilities.is_daemon_live(Daemon::Swaync),
+            ReloadAction::SwayncReloadConfig | ReloadAction::SwayncReloadCss => {
+                capabilities.is_daemon_live(Daemon::Swaync)
+            }
             ReloadAction::KittyColors => capabilities.is_daemon_live(Daemon::Kitty),
             ReloadAction::HypridleRestart => capabilities.is_daemon_live(Daemon::Hypridle),
             ReloadAction::GsettingsSet { .. } => capabilities.has_binary(Binary::Gsettings),
@@ -342,9 +373,11 @@ impl ReloadAction {
     ///
     /// Used by [`plan_reloads`] to sort the merged action list so a combined change
     /// always reloads in the same sequence, and so a palette change's chain comes
-    /// out in the apply-theme order (`hyprctl reload` → `eww reload` →
-    /// `swaync-client -rs` → kitty; analysis §6.1). The second element sub-orders the
-    /// several `gsettings set` keys deterministically.
+    /// out in the apply-theme order (`hyprctl reload` → `eww reload` → swaync's CSS
+    /// reload → kitty; analysis §6.1). The second element sub-orders the
+    /// several `gsettings set` keys deterministically, and — for an Apply that changed
+    /// both `config.json` and the palette — puts swaync's config reload before its CSS
+    /// reload, so the stylesheet is the last thing swaync re-reads.
     fn order_key(&self) -> (u8, u8) {
         match self {
             ReloadAction::HyprctlReload => (0, 0),
@@ -353,7 +386,8 @@ impl ReloadAction {
             ReloadAction::HyprpaperWallpaper { .. } => (3, 0),
             ReloadAction::HypridleRestart => (4, 0),
             ReloadAction::EwwReload => (5, 0),
-            ReloadAction::SwayncReload => (6, 0),
+            ReloadAction::SwayncReloadConfig => (6, 0),
+            ReloadAction::SwayncReloadCss => (6, 1),
             ReloadAction::KittyColors => (7, 0),
         }
     }
@@ -376,7 +410,14 @@ impl ReloadAction {
                 run_and_check(runner, Command::new("hyprctl").arg("reload"))
             }
             ReloadAction::EwwReload => run_and_check(runner, Command::new("eww").arg("reload")),
-            ReloadAction::SwayncReload => {
+            // One flag per invocation. Each change class needs only its own reload, so
+            // the flags never have to be combined — and keeping them separate also works
+            // on `swaync-client` builds older than SwayNotificationCenter PR #580, which
+            // parsed several flags on one command line as a single command (issue #534).
+            ReloadAction::SwayncReloadConfig => {
+                run_and_check(runner, Command::new("swaync-client").arg("-R"))
+            }
+            ReloadAction::SwayncReloadCss => {
                 run_and_check(runner, Command::new("swaync-client").arg("-rs"))
             }
             ReloadAction::HyprpaperWallpaper { path, fit } => {
@@ -727,9 +768,11 @@ mod tests {
             }],
             "hyprpaper.conf maps to the hyprpaper wallpaper action carrying the fit"
         );
+        // Task 9.9: a `config.json` change maps to swaync's *config* reload, never the
+        // CSS-only one (which would leave the change inert until swaync restarts).
         assert_eq!(
             BackingFile::SwayncConfig.reload_actions(&params),
-            vec![ReloadAction::SwayncReload]
+            vec![ReloadAction::SwayncReloadConfig]
         );
     }
 
@@ -737,13 +780,38 @@ mod tests {
     fn palette_change_maps_to_the_apply_theme_chain_in_order() {
         // Accept criterion: a palette change is the broad apply-theme chain, in the
         // canonical order (analysis §6.1) — hyprctl reload, eww reload, swaync -rs,
-        // kitty SIGUSR1.
+        // kitty SIGUSR1. swaync's step is the CSS reload: `generate-colors` rewrites
+        // `swaync/colors.css` and no swaync config key (task 9.9).
         assert_eq!(
             BackingFile::Palette.reload_actions(&ReloadParams::default()),
             vec![
                 ReloadAction::HyprctlReload,
                 ReloadAction::EwwReload,
-                ReloadAction::SwayncReload,
+                ReloadAction::SwayncReloadCss,
+                ReloadAction::KittyColors,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_combined_palette_and_notifications_change_issues_both_swaync_reloads_once() {
+        // Task 9.9: the two swaync reloads are distinct change classes, so an Apply that
+        // both switched the palette and edited `config.json` must issue each exactly
+        // once — the config reload first, then the CSS reload — with the rest of the
+        // apply-theme chain unchanged around them. Dedup must not collapse the two into
+        // one (they are different commands), and neither may appear twice.
+        let planned = plan_reloads(
+            &[BackingFile::Palette, BackingFile::SwayncConfig],
+            &ReloadParams::default(),
+            &all_capabilities(),
+        );
+        assert_eq!(
+            planned,
+            vec![
+                ReloadAction::HyprctlReload,
+                ReloadAction::EwwReload,
+                ReloadAction::SwayncReloadConfig,
+                ReloadAction::SwayncReloadCss,
                 ReloadAction::KittyColors,
             ]
         );
@@ -889,7 +957,7 @@ mod tests {
         let planned = plan_reloads(&[BackingFile::Palette], &ReloadParams::default(), &caps);
         assert_eq!(
             planned,
-            vec![ReloadAction::HyprctlReload, ReloadAction::SwayncReload],
+            vec![ReloadAction::HyprctlReload, ReloadAction::SwayncReloadCss],
             "eww reload and kitty SIGUSR1 are dropped when those daemons are not live"
         );
     }
@@ -918,7 +986,7 @@ mod tests {
             plan_reloads(&[BackingFile::Palette], &ReloadParams::default(), &caps),
             vec![
                 ReloadAction::EwwReload,
-                ReloadAction::SwayncReload,
+                ReloadAction::SwayncReloadCss,
                 ReloadAction::KittyColors,
             ]
         );
@@ -953,6 +1021,23 @@ mod tests {
     }
 
     #[test]
+    fn plan_drops_the_swaync_config_reload_when_the_daemon_is_dead() {
+        // The config reload is gated on swaync being live just like the CSS one: a
+        // Notifications apply on a host where swaync is installed but stopped writes
+        // the file and issues no command at all (R4.2/R5.5).
+        let caps = Capabilities::for_tests(&[Binary::Hyprctl], &[Daemon::Eww], true);
+        assert!(
+            plan_reloads(
+                &[BackingFile::SwayncConfig],
+                &ReloadParams::default(),
+                &caps
+            )
+            .is_empty(),
+            "the swaync config reload is dropped when swaync is not live"
+        );
+    }
+
+    #[test]
     fn plan_drops_hypridle_when_the_daemon_is_absent() {
         // A hypridle.conf change plans no restart when hypridle is not running.
         let caps = Capabilities::for_tests(&[Binary::Hyprctl], &[Daemon::Eww], true);
@@ -982,9 +1067,12 @@ mod tests {
         ReloadAction::EwwReload
             .execute(&runner, &signaller)
             .expect("eww reload succeeds");
-        ReloadAction::SwayncReload
+        ReloadAction::SwayncReloadConfig
             .execute(&runner, &signaller)
-            .expect("swaync reload succeeds");
+            .expect("swaync config reload succeeds");
+        ReloadAction::SwayncReloadCss
+            .execute(&runner, &signaller)
+            .expect("swaync CSS reload succeeds");
         ReloadAction::GsettingsSet {
             key: GSETTINGS_GTK_THEME,
             value: "Everforest-Green-Dark".to_string(),
@@ -1003,6 +1091,9 @@ mod tests {
             vec![
                 Command::new("hyprctl").arg("reload"),
                 Command::new("eww").arg("reload"),
+                // Task 9.9: one flag per invocation — `-R` reloads swaync's config,
+                // `-rs` only its CSS.
+                Command::new("swaync-client").arg("-R"),
                 Command::new("swaync-client").arg("-rs"),
                 Command::new("gsettings").args([
                     "set",

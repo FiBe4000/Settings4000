@@ -7,7 +7,7 @@
 //! (the combined position token decomposing to `positionY`+`positionX` on
 //! write, task 6.7), and [`apply::run`] executes the plan with mocks — so the
 //! suite asserts the exact resulting JSON bytes (stable key order) at the
-//! deployed path and the exact `swaync-client -rs` reload. It also hosts the
+//! deployed path and the exact `swaync-client -R` config reload. It also hosts the
 //! shared **rollback-on-write-failure** injection (R5.4): a two-category plan
 //! (Input + Notifications) whose second write fails mid-plan must restore the
 //! already-written first file byte-exactly. (Do Not Disturb is runtime-only
@@ -54,7 +54,7 @@ impl Drop for RestoreWritable<'_> {
     }
 }
 
-/// A Notifications change reloads via `swaync-client -rs`, gated on the swaync
+/// A Notifications change reloads via `swaync-client -R`, gated on the swaync
 /// daemon being live (task 4.4).
 fn caps() -> Capabilities {
     Capabilities::for_tests(&[Binary::Swaync], &[Daemon::Swaync], false)
@@ -125,10 +125,12 @@ fn position_and_timeout_apply_byte_exactly_and_reload_swaync() {
         "the write must land in the repo target behind the deployment symlink"
     );
 
-    // (b) The exact reload list; DND is runtime-only, so no other command appears.
+    // (b) The exact reload list: swaync's config reload `-R`, so the new position and
+    // timeout take effect live (task 9.9 — the CSS-only `-rs` would not). DND is
+    // runtime-only, so no other command appears.
     assert_eq!(
         runner.recorded(),
-        vec![Command::new("swaync-client").arg("-rs")]
+        vec![Command::new("swaync-client").arg("-R")]
     );
     assert!(signaller.calls().is_empty());
 
