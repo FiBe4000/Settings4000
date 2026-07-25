@@ -72,6 +72,7 @@
 //! eDP `monitor=` record and are edited like any other monitor (the single-source
 //! gotcha) — only its enablement is runtime.
 
+use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 
@@ -81,9 +82,10 @@ use crate::core::apply::FileWrite;
 use crate::core::freshness::FreshnessTracker;
 use crate::core::model::{
     SCALE_RANGE, SettingId, Value, validate_float_range, validate_monitor_mode,
+    validate_monitor_position,
 };
 use crate::core::reload::BackingFile;
-use crate::parsers::monitors::{MonitorField, MonitorState, MonitorsFile};
+use crate::parsers::monitors::{EditError, MonitorField, MonitorState, MonitorsFile};
 use crate::system::command::{Command, CommandRunner};
 
 /// The hotplug state-file path the laptop-display toggle writes/removes (analysis
@@ -231,13 +233,51 @@ pub struct DisplayModel {
     freshness: FreshnessTracker,
 }
 
+/// Why [`DisplayModel::apply_contribution`] could not produce a write despite there
+/// being dirty monitor edits to apply (task 9.5).
+///
+/// This is distinct from "nothing was dirty" (which is a plain `Ok(None)`): when the
+/// user *has* pending monitor edits but the write cannot be rendered, the Apply must
+/// **abort** rather than skip the write and let the model [`commit`](DisplayModel::commit)
+/// the staged values — that would promote them and re-baseline `monitors.conf`'s
+/// freshness against bytes no write ever produced, desyncing the model from disk. The
+/// store-backed pages ([`InputModel::input_conf_write`](crate::core::input::InputModel::input_conf_write)
+/// and its Notifications/Power siblings) return an error in exactly this case for the
+/// same reason.
+///
+/// Unlike those siblings there is no read-failure variant: this model holds
+/// `monitors.conf` parsed from the startup load rather than re-reading it per Apply, and
+/// a file that was unreadable *then* leaves the page in its documented degraded state
+/// (R4.4 — the page hides the file-backed rows, so nothing can be staged from the UI),
+/// which stays a plain `Ok(None)`.
+#[derive(Debug)]
+pub enum DisplayWriteError {
+    /// The `monitors.conf` writer rejected an edit — a value it cannot represent
+    /// without breaking the record's positional structure, or a record shape it cannot
+    /// edit in place (e.g. a hand-written record with no scale field).
+    Render(EditError),
+}
+
+impl fmt::Display for DisplayWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DisplayWriteError::Render(error) => {
+                write!(f, "the monitors.conf edit could not be applied: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DisplayWriteError {}
+
 /// The Display page's contribution to an [`ApplyPlan`](crate::core::apply::ApplyPlan):
 /// the single `monitors.conf` write plus the value validations to re-check (R8.3).
+#[derive(Debug)]
 pub struct DisplayApply {
     /// The atomic write rewriting only the changed `monitor=` records.
     pub write: FileWrite,
-    /// The staged monitor values to validate before writing (mode strings, scale
-    /// ranges), reusing the model validators (R8.3).
+    /// The staged monitor values to validate before writing (mode strings, positions,
+    /// scale ranges), reusing the model validators (R8.3).
     pub validations: Vec<(SettingId, Value)>,
 }
 
@@ -516,8 +556,21 @@ impl DisplayModel {
         self.clear_if_unchanged(index);
     }
 
-    /// Stages a new position for monitor `index`.
+    /// Stages a new position for monitor `index`, rejecting a malformed position (R8.3)
+    /// so the drop-down snaps back rather than writing a record neither Hyprland nor
+    /// `scripts/hypr-display-profile.sh`'s awk could parse.
+    ///
+    /// The check is here, in the model, rather than being left to the curated
+    /// [`Self::position_options`] drop-down that feeds it today: the model is the
+    /// enforcement layer, so a future free-text position control — or a position picked
+    /// up from a hand-edited `monitors.conf` — cannot bypass it. See
+    /// [`validate_monitor_position`] for what a position may look like and why a comma
+    /// or `#` in one would break the record.
     pub fn stage_position(&mut self, index: usize, position: String) {
+        if validate_monitor_position(&position).is_err() {
+            tracing::warn!(position = %position, "rejecting a malformed monitor position (R8.3)");
+            return;
+        }
         self.ensure_staged(index).position = position;
         self.clear_if_unchanged(index);
     }
@@ -603,32 +656,50 @@ impl DisplayModel {
         }
     }
 
-    /// The Display page's contribution to the Apply plan, or `None` when there is
-    /// nothing to write (no dirty edit, or `monitors.conf` was unreadable).
+    /// The Display page's contribution to the Apply plan.
     ///
     /// It clones the parsed file, applies each dirty monitor's edits through the
     /// surgical [`monitors`](crate::parsers::monitors) parser (so only the targeted
     /// records change and stay awk-parseable), and emits the complete new bytes as a
     /// [`FileWrite`] for the shared pipeline, alongside the value validations (R8.3).
-    /// A parser edit error (which should not occur for validated values) is logged and
-    /// yields `None` rather than a partial write.
-    pub fn apply_contribution(&self) -> Option<DisplayApply> {
+    ///
+    /// Returns:
+    /// - `Ok(None)` when there is nothing to write — no monitor is dirty (the common
+    ///   clean case); `monitors.conf` was unreadable at load, so there is no parse to
+    ///   edit and the page hides the file-backed rows anyway (R4.4); or the dirty edits
+    ///   render no change to the file (see the inline comment on that branch);
+    /// - `Ok(Some(contribution))` with the rendered write and its validations;
+    /// - `Err(DisplayWriteError)` when there *are* dirty monitor edits but the write
+    ///   cannot be produced. The caller must **abort the Apply** in this case rather
+    ///   than skip the write, since [`Self::commit`] would otherwise promote the staged
+    ///   monitor values and re-baseline the file's freshness against bytes that were
+    ///   never written (see [`DisplayWriteError`]). Near-unreachable in practice: staged
+    ///   values are validated (R8.3), so this needs an unusual on-disk record shape.
+    pub fn apply_contribution(&self) -> Result<Option<DisplayApply>, DisplayWriteError> {
         if !self.is_dirty() {
-            return None;
+            return Ok(None);
         }
-        let mut file = self.records.clone()?;
-        let changed_keys = match apply_edits(&mut file, &self.monitors) {
-            Ok(keys) => keys,
-            Err(error) => {
-                tracing::error!(%error, "failed to render a monitors.conf edit; skipping the display write");
-                return None;
-            }
+        let Some(mut file) = self.records.clone() else {
+            return Ok(None);
         };
+        let changed_keys = apply_edits(&mut file, &self.monitors).map_err(|error| {
+            tracing::error!(%error, "failed to render a monitors.conf edit; aborting the apply (R8.3)");
+            DisplayWriteError::Render(error)
+        })?;
+        // A dirty monitor does not always render an edit: if its record is in the
+        // `,disable` form on disk, the staged and original `enabled` flags are both
+        // false and `apply_edits` writes no field (see its `else if staged.enabled`
+        // guard), so a staged mode/scale edit on such an output leaves `changed_keys`
+        // empty. That is reachable through this model's API — the Display page hides the
+        // mode/scale rows of a disabled output, so it cannot happen from the UI today.
+        // `Ok(None)` is the right answer: nothing is written, so the window commits
+        // nothing and the staged edit simply stays pending (no desync), which is
+        // preferable to emitting a byte-identical no-op write.
         if changed_keys.is_empty() {
-            return None;
+            return Ok(None);
         }
 
-        Some(DisplayApply {
+        Ok(Some(DisplayApply {
             write: FileWrite {
                 path: self.monitors_conf_path.clone(),
                 contents: file.emit().into_bytes(),
@@ -636,7 +707,7 @@ impl DisplayModel {
                 backing: BackingFile::MonitorsConf,
             },
             validations: self.staged_validations(),
-        })
+        }))
     }
 
     /// Commits the staged edits after a successful Apply: applies them to the in-memory
@@ -685,8 +756,11 @@ impl DisplayModel {
     }
 
     /// The value validations for the staged edits (R8.3): each enabled, edited monitor
-    /// contributes its mode and scale to be re-checked by the pipeline before any
-    /// write, reusing the [`SettingId`] validators.
+    /// contributes its mode, position, and scale to be re-checked by the pipeline before
+    /// any write, reusing the [`SettingId`] validators.
+    ///
+    /// The whole staged record is validated, not only the field the user touched, because
+    /// every field of it is about to be written into the same `monitor=` line.
     fn staged_validations(&self) -> Vec<(SettingId, Value)> {
         let mut validations = Vec::new();
         for monitor in &self.monitors {
@@ -698,6 +772,10 @@ impl DisplayModel {
                 continue;
             }
             validations.push((SettingId::MonitorMode, Value::Enum(config.mode.clone())));
+            validations.push((
+                SettingId::MonitorPosition,
+                Value::Enum(config.position.clone()),
+            ));
             if let Ok(scale) = config.scale.parse::<f64>() {
                 validations.push((SettingId::MonitorScale, Value::Float(scale)));
             }
@@ -856,9 +934,6 @@ fn active_state(config: &MonitorConfig) -> MonitorState {
         scale: config.scale.clone(),
     }
 }
-
-/// The parser edit error type, re-exported locally for [`apply_edits`]'s signature.
-type EditError = crate::parsers::monitors::EditError;
 
 /// A monitor as reported by `hyprctl monitors -j`, before merging with the records.
 struct LiveMonitor {
@@ -1124,6 +1199,21 @@ monitor=desc:AU Optronics 0x2036,2560x1440,auto,1.066667
 monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
 ";
 
+    /// The rendered Apply contribution of a dirty model, failing the test if the write
+    /// could not be prepared. The abort path itself (a rendering failure, task 9.5) has
+    /// its own test below.
+    fn rendered_contribution(model: &DisplayModel) -> DisplayApply {
+        model
+            .apply_contribution()
+            .expect("the monitors.conf write renders")
+            .expect("a dirty edit produces a write")
+    }
+
+    /// The bytes a dirty model's contribution would write, as text.
+    fn rendered_text(model: &DisplayModel) -> String {
+        String::from_utf8(rendered_contribution(model).write.contents).expect("utf-8")
+    }
+
     /// Builds a laptop-only model with an injected (nonexistent) state file, from the
     /// canned sources — the merge under test.
     fn laptop_model(dir: &std::path::Path) -> DisplayModel {
@@ -1233,7 +1323,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         );
         // Even a staged edit produces no write when there is no file to edit.
         model.stage_scale(0, "1.5".to_string());
-        assert!(model.apply_contribution().is_none());
+        assert!(matches!(model.apply_contribution(), Ok(None)));
     }
 
     #[test]
@@ -1248,9 +1338,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         model.stage_scale(0, "1.25".to_string());
         assert!(model.is_dirty());
 
-        let contribution = model
-            .apply_contribution()
-            .expect("a dirty edit produces a write");
+        let contribution = rendered_contribution(&model);
         assert_eq!(contribution.write.backing, BackingFile::MonitorsConf);
         let emitted = String::from_utf8(contribution.write.contents).expect("utf-8");
 
@@ -1273,11 +1361,22 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         assert_eq!(fields[1], "2560x1440", "field 2 is the mode");
         assert_eq!(fields[3], "1.25", "field 4 is the scale");
 
-        // The validations re-check the mode and scale (R8.3).
+        // The validations re-check the whole staged record — mode, position, and scale
+        // (R8.3) — since all three fields are written into the same line.
         assert!(
             contribution
                 .validations
                 .contains(&(SettingId::MonitorScale, Value::Float(1.25)))
+        );
+        assert!(
+            contribution
+                .validations
+                .contains(&(SettingId::MonitorMode, Value::Enum("2560x1440".to_string())))
+        );
+        assert!(
+            contribution
+                .validations
+                .contains(&(SettingId::MonitorPosition, Value::Enum("auto".to_string())))
         );
     }
 
@@ -1298,8 +1397,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         );
 
         model.stage_resolution(0, "1920x1200".to_string());
-        let contribution = model.apply_contribution().expect("a write");
-        let emitted = String::from_utf8(contribution.write.contents).expect("utf-8");
+        let emitted = rendered_text(&model);
         assert_eq!(
             emitted, "monitor=eDP-1,1920x1200@60,auto,1.333333,bitdepth,10\n",
             "the mode changed to the new resolution@refresh; scale and the bitdepth extras are preserved"
@@ -1319,7 +1417,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             !model.is_dirty(),
             "editing back to the original clears dirty"
         );
-        assert!(model.apply_contribution().is_none());
+        assert!(matches!(model.apply_contribution(), Ok(None)));
     }
 
     #[test]
@@ -1351,8 +1449,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         // A subsequent write renders from the committed records: only the scale differs
         // from the committed state.
         model.stage_position(0, "0x0".to_string());
-        let emitted =
-            String::from_utf8(model.apply_contribution().expect("write").write.contents).unwrap();
+        let emitted = rendered_text(&model);
         assert!(emitted.contains("monitor=desc:AU Optronics 0x2036,2560x1440,0x0,1.5"));
     }
 
@@ -1363,6 +1460,136 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         let mut model = laptop_model(dir.path());
         model.stage_scale(0, "9".to_string());
         assert!(!model.is_dirty(), "an out-of-range scale must not stage");
+    }
+
+    #[test]
+    fn a_malformed_position_is_rejected_but_a_valid_one_stages() {
+        // Task 9.5 / R8.3: `stage_position` validates like every other staging path, so
+        // a value that would break the `monitor=` record never becomes staged state. The
+        // model is the enforcement layer — these values cannot come from the curated
+        // drop-down today, but nothing may rely on that.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut model = laptop_model(dir.path());
+
+        for malformed in [
+            // A comma would add a positional field and desync the awk parse in
+            // scripts/hypr-display-profile.sh (analysis §6.2).
+            "1920,0",
+            // A `#` would turn the rest of the record into a hyprlang inline comment.
+            "0x0 # here",
+            "left",
+            "1920",
+            "1920.5x0",
+        ] {
+            model.stage_position(0, malformed.to_string());
+            assert!(
+                !model.is_dirty(),
+                "`{malformed}` must not stage as a position"
+            );
+            assert_eq!(
+                model.effective_position(0),
+                "auto",
+                "the rejected value must leave the shown position untouched"
+            );
+        }
+
+        // A well-formed coordinate pair still stages, and reaches the record.
+        model.stage_position(0, "-1920x0".to_string());
+        assert!(model.is_dirty());
+        assert!(
+            rendered_text(&model)
+                .contains("monitor=desc:AU Optronics 0x2036,2560x1440,-1920x0,1.066667")
+        );
+    }
+
+    #[test]
+    fn an_empty_position_field_on_disk_makes_the_plan_fail_validation() {
+        // Task 9.5, documenting a deliberate consequence of validating the whole staged
+        // record: a record whose position field is *empty* (`monitor=DP-1,preferred,,1`,
+        // which Hyprland cannot place either) contributes an invalid position, so the
+        // pipeline's validate-everything-first step (R8.3) aborts the Apply even though
+        // the user only changed the scale.
+        //
+        // Rejecting is the intended behaviour, for two reasons. The mode field is
+        // validated the same unconditional way, so this is one rule rather than a special
+        // case for positions; and the (re-)enable/first-configure path writes a whole
+        // record body from the staged values, which would otherwise put the empty
+        // position into a record the app itself wrote. The user is told which value is
+        // wrong and fixes the record.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conf = "monitor=DP-1,preferred,,1\n";
+        let hyprctl = r#"[{"name":"DP-1","description":"Ext","width":1920,"height":1080,"refreshRate":60.0,"x":0,"y":0,"scale":1.0,"disabled":false,"availableModes":["1920x1080@60.00Hz"]}]"#;
+        let mut model = DisplayModel::from_sources(
+            Some(conf),
+            hyprctl,
+            dir.path().join("monitors.conf"),
+            dir.path().join("forced"),
+        );
+        assert_eq!(
+            model.effective_position(0),
+            "",
+            "the empty position field is read as an empty value"
+        );
+
+        model.stage_scale(0, "1.25".to_string());
+        let contribution = rendered_contribution(&model);
+        // The scale edit itself renders (the record has a scale field to rewrite)…
+        assert!(
+            String::from_utf8(contribution.write.contents.clone())
+                .expect("utf-8")
+                .contains("monitor=DP-1,preferred,,1.25")
+        );
+        // …but the plan carries the invalid position, which the pipeline rejects before
+        // touching the file.
+        let position = contribution
+            .validations
+            .iter()
+            .find(|(id, _)| *id == SettingId::MonitorPosition)
+            .expect("the staged record's position is validated");
+        assert!(
+            position.0.validate(&position.1).is_err(),
+            "an empty position field must fail validation, aborting the Apply"
+        );
+    }
+
+    #[test]
+    fn a_render_failure_aborts_the_apply_and_keeps_the_staged_edit() {
+        // Task 9.5: when the writer cannot render a dirty edit, the contribution is an
+        // Err — not an `Ok(None)` the window would read as "nothing to write" and follow
+        // with a commit, promoting values that reached no file (R8.3).
+        //
+        // The injected failure is a hand-written record with only a name and a mode: it
+        // is enabled (so edits go through the surgical in-place `set_field` path) but has
+        // no scale field to rewrite, which the monitors parser reports as an edit error.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conf = "monitor=DP-1,1920x1080\n";
+        let hyprctl = r#"[{"name":"DP-1","description":"Ext","width":1920,"height":1080,"refreshRate":60.0,"x":0,"y":0,"scale":1.0,"disabled":false,"availableModes":["1920x1080@60.00Hz"]}]"#;
+        let mut model = DisplayModel::from_sources(
+            Some(conf),
+            hyprctl,
+            dir.path().join("monitors.conf"),
+            dir.path().join("forced"),
+        );
+
+        model.stage_scale(0, "1.25".to_string());
+        assert!(model.is_dirty());
+
+        let error = model
+            .apply_contribution()
+            .expect_err("an unrenderable edit must abort the apply, not look like a no-op");
+        assert!(
+            matches!(error, DisplayWriteError::Render(_)),
+            "the failure is a writer rejection, reported as such: {error}"
+        );
+
+        // The staged edit survives the aborted Apply, so the user can fix the record and
+        // try again.
+        assert!(model.is_dirty(), "the staged edit must be retained");
+        assert_eq!(model.effective_scale(0), "1.25");
+        // Nothing was promoted: dropping the staged edit restores the on-disk baseline,
+        // proving the model was never re-baselined against unwritten bytes.
+        model.reset();
+        assert_eq!(model.effective_scale(0), "1");
     }
 
     #[test]
@@ -1381,8 +1608,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         assert!(model.effective_enabled(0));
 
         model.stage_enabled(0, false);
-        let emitted =
-            String::from_utf8(model.apply_contribution().expect("write").write.contents).unwrap();
+        let emitted = rendered_text(&model);
         assert!(
             emitted.contains("monitor=desc:Lenovo Group Limited P24q-10 U4P00001,disable"),
             "the external monitor's record collapses to the disable form:\n{emitted}"
@@ -1501,9 +1727,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             .expect("the probe succeeded");
 
         model.stage_scale(0, "1.25".to_string());
-        let contribution = model
-            .apply_contribution()
-            .expect("a dirty edit produces a write");
+        let contribution = rendered_contribution(&model);
         // Mimic the pipeline writing the produced bytes to disk, then commit.
         std::fs::write(&conf_path, &contribution.write.contents).expect("apply writes the file");
         model.commit();
@@ -1594,8 +1818,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         // Editing appends a specific DP-5 record after the last monitor= line, leaving
         // the catch-all and eDP lines untouched.
         model.stage_scale(0, "1.25".to_string());
-        let emitted =
-            String::from_utf8(model.apply_contribution().expect("write").write.contents).unwrap();
+        let emitted = rendered_text(&model);
         assert_eq!(
             emitted,
             "monitor=,preferred,auto,1\nmonitor=eDP-1,2880x1800@120,auto,1.333333\nmonitor=DP-5,1920x1080@60,0x0,1.25\n",
@@ -1630,8 +1853,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
 
         // Re-enabling writes a full record sourced from those live values.
         model.stage_enabled(0, true);
-        let emitted =
-            String::from_utf8(model.apply_contribution().expect("write").write.contents).unwrap();
+        let emitted = rendered_text(&model);
         assert!(
             emitted.contains("monitor=desc:Ext Vendor Model,3440x1440@100,0x0,1"),
             "re-enable writes the live-sourced mode/position/scale via set_state:\n{emitted}"
@@ -1660,8 +1882,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         // Second edit: must edit the appended record in place, so there is exactly one
         // DP-7 record (no duplicate append).
         model.stage_scale(0, "1.5".to_string());
-        let emitted =
-            String::from_utf8(model.apply_contribution().expect("write").write.contents).unwrap();
+        let emitted = rendered_text(&model);
         assert_eq!(
             emitted.matches("monitor=DP-7,").count(),
             1,

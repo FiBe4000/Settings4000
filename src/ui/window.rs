@@ -1315,15 +1315,36 @@ impl Shell {
             // Fold in the Display page's `monitors.conf` write + validations (task 6.1)
             // — the first real file write in the app. The immutable borrow ends here,
             // before the commit below borrows the model mutably.
-            let has_display_write = {
+            let display_write = {
                 let display = shell.display.borrow();
-                match display.as_ref().and_then(DisplayModel::apply_contribution) {
-                    Some(contribution) => {
-                        plan.writes.push(contribution.write);
-                        plan.validations.extend(contribution.validations);
-                        true
-                    }
-                    None => false,
+                match display.as_ref() {
+                    Some(model) => model.apply_contribution(),
+                    None => Ok(None),
+                }
+            };
+            let has_display_write = match display_write {
+                Ok(Some(contribution)) => {
+                    plan.writes.push(contribution.write);
+                    plan.validations.extend(contribution.validations);
+                    true
+                }
+                Ok(None) => false,
+                // Pending monitor edits but the write could not be rendered. Abort the
+                // whole Apply and keep the staged edits — never proceed, which would
+                // commit the Display model against a file that was never written and
+                // desync it from disk (the same abort-not-skip contract as the
+                // Input/Notifications/Power writes above). Near-unreachable in practice.
+                Err(error) => {
+                    tracing::error!(%error, "aborting apply: could not prepare the monitors.conf write");
+                    chrome::show_warning(
+                        &shell.window,
+                        "Could not prepare the display changes",
+                        &format!(
+                            "Settings4000 could not update monitors.conf, so nothing was written: \
+                             {error}. Your display changes were kept — fix the problem and try again."
+                        ),
+                    );
+                    return;
                 }
             };
 

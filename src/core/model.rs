@@ -136,6 +136,13 @@ pub enum SettingId {
     MonitorMode,
     /// A monitor's fractional scale factor (e.g. `1.333333`).
     MonitorScale,
+    /// A monitor's position in the multi-monitor layout: either an `auto…` token
+    /// (Hyprland places the output relative to the others) or an explicit `XxY`
+    /// pixel coordinate pair, e.g. `0x0` or `-1920x0`. A [`ValueKind::Enum`] because
+    /// the Display page offers it as a drop-down, but validated as a position string
+    /// all the same — the model, not the drop-down's option list, is the layer that
+    /// guarantees a writable value (R8.3).
+    MonitorPosition,
     /// Whether the laptop's internal display is enabled. Runtime-only (R5.2): the
     /// toggle drives the existing hotplug mechanism (the
     /// `/tmp/hypr-laptop-display-forced` state file, task 6.1) and applies
@@ -209,7 +216,9 @@ impl SettingId {
     /// UI/store use it to build the right widget and coerce input.
     pub fn kind(&self) -> ValueKind {
         match self {
-            SettingId::MonitorMode | SettingId::NotificationPosition => ValueKind::Enum,
+            SettingId::MonitorMode
+            | SettingId::MonitorPosition
+            | SettingId::NotificationPosition => ValueKind::Enum,
             SettingId::MonitorScale | SettingId::MouseSensitivity => ValueKind::Float,
             SettingId::NotificationTimeout
             | SettingId::DimTimeout
@@ -233,9 +242,10 @@ impl SettingId {
     /// per-page "modified" marker.
     pub fn category(&self) -> Category {
         match self {
-            SettingId::MonitorMode | SettingId::MonitorScale | SettingId::LaptopDisplayEnabled => {
-                Category::Display
-            }
+            SettingId::MonitorMode
+            | SettingId::MonitorScale
+            | SettingId::MonitorPosition
+            | SettingId::LaptopDisplayEnabled => Category::Display,
             SettingId::PaletteColor | SettingId::WallpaperPath | SettingId::LockBackgroundPath => {
                 Category::Theme
             }
@@ -271,6 +281,7 @@ impl SettingId {
             // Everything else is written to a config file and staged until Apply.
             SettingId::MonitorMode
             | SettingId::MonitorScale
+            | SettingId::MonitorPosition
             | SettingId::PaletteColor
             | SettingId::WallpaperPath
             | SettingId::LockBackgroundPath
@@ -312,6 +323,7 @@ impl SettingId {
                 validate_image_path(Path::new(text))
             }
             (SettingId::MonitorMode, Value::Enum(token)) => validate_monitor_mode(token),
+            (SettingId::MonitorPosition, Value::Enum(token)) => validate_monitor_position(token),
             (SettingId::MonitorScale, Value::Float(scale)) => {
                 validate_float_range(*scale, &SCALE_RANGE)
             }
@@ -523,6 +535,14 @@ pub enum ValidationError {
         /// A human-readable explanation of what is wrong with it.
         detail: String,
     },
+    /// A monitor position string is neither one of Hyprland's `auto…` placement
+    /// tokens nor an `XxY` pixel coordinate pair within the plausible range.
+    InvalidMonitorPosition {
+        /// The offending position string as supplied.
+        value: String,
+        /// A human-readable explanation of what is wrong with it.
+        detail: String,
+    },
     /// A numeric value falls outside the setting's allowed range. The bounds are
     /// pre-formatted so an integer setting reports `1`/`86400` and a float setting
     /// reports `0.5`/`3` without spurious decimals.
@@ -583,6 +603,9 @@ impl fmt::Display for ValidationError {
             ),
             ValidationError::InvalidMonitorMode { value, detail } => {
                 write!(f, "`{value}` is not a valid display mode: {detail}")
+            }
+            ValidationError::InvalidMonitorPosition { value, detail } => {
+                write!(f, "`{value}` is not a valid display position: {detail}")
             }
             ValidationError::OutOfRange { value, min, max } => {
                 write!(f, "{value} is outside the allowed range {min} to {max}")
@@ -652,6 +675,37 @@ const REFRESH_HZ_RANGE: RangeInclusive<f64> = 1.0..=1_000.0;
 /// the mode validator accepts them verbatim rather than trying to parse them as a
 /// resolution.
 const SPECIAL_MODE_TOKENS: &[&str] = &["preferred", "highres", "highrr"];
+
+/// The placement tokens Hyprland accepts in a `monitor=` rule's position field in
+/// place of explicit `XxY` coordinates, per its monitor documentation: plain `auto`
+/// (place the output next to the existing ones, anchored at their top-left corners),
+/// the four directional forms, and the four centre-anchored forms.
+///
+/// The Display page (task 6.1) only *offers* `auto` and `0x0`, but a hand-written
+/// `monitors.conf` may legitimately carry any of these — and an edit to any field of a
+/// monitor re-validates its whole staged record — so the position validator must accept
+/// them all rather than fail an Apply over a value the app never chose.
+const MONITOR_POSITION_TOKENS: &[&str] = &[
+    "auto",
+    "auto-right",
+    "auto-left",
+    "auto-up",
+    "auto-down",
+    "auto-center-right",
+    "auto-center-left",
+    "auto-center-up",
+    "auto-center-down",
+];
+
+/// Plausible pixel coordinates for one axis of a monitor position. A position may be
+/// negative (an output placed left of or above the origin), and the layout canvas can
+/// legitimately be several 8K panels wide, so this is a generous sanity bound whose
+/// only job is to reject an implausible typo — not to encode a hardware limit.
+///
+/// The bound is an [`i64`] range so that a wildly out-of-range coordinate is reported by
+/// this check (with the range in the message) rather than by the axis parser as a
+/// spurious "not a whole number".
+const POSITION_AXIS_RANGE: RangeInclusive<i64> = -32_768..=32_768;
 
 /// File extensions accepted for a wallpaper/lock-background image (matched
 /// case-insensitively).
@@ -814,6 +868,69 @@ fn parse_dimension(text: &str) -> Option<u32> {
     text.parse::<u32>().ok()
 }
 
+/// Validates a monitor position field (R8.3).
+///
+/// Accepts either one of the [`MONITOR_POSITION_TOKENS`] verbatim, or an explicit
+/// `XxY` coordinate pair whose axes are whole numbers (optionally negative) within
+/// [`POSITION_AXIS_RANGE`] — `0x0`, `2880x0`, `-1920x-1080`.
+///
+/// Two properties matter beyond "Hyprland understands it". The position is written
+/// into a `monitor=` record whose positional fields are comma-separated and which
+/// `scripts/hypr-display-profile.sh` parses with `awk` to derive the laptop panel's
+/// mode and scale (analysis §6.2): a comma in the value would shift every later field
+/// and desync that script, and a `#` would turn the rest of the line into a hyprlang
+/// inline comment, truncating the record. Both are impossible for a value that passes
+/// this check, so validating the *format* is what upholds the awk-parseability
+/// guarantee. The [`monitors`](crate::parsers::monitors) writer keeps its own
+/// character guard as defense in depth; catching the value here means the Display
+/// page's control reverts at **stage** time instead of the whole Apply aborting.
+pub fn validate_monitor_position(value: &str) -> Result<(), ValidationError> {
+    if MONITOR_POSITION_TOKENS.contains(&value) {
+        return Ok(());
+    }
+
+    // Builds an `InvalidMonitorPosition` carrying the offending value and a specific
+    // explanation; used at each failure point below.
+    let bad = |detail: &str| ValidationError::InvalidMonitorPosition {
+        value: value.to_string(),
+        detail: detail.to_string(),
+    };
+
+    let Some((x, y)) = value.split_once('x') else {
+        return Err(bad("expected `auto` or XxY coordinates, for example 0x0"));
+    };
+    let x =
+        parse_axis(x).ok_or_else(|| bad("the X coordinate must be a whole number of pixels"))?;
+    let y =
+        parse_axis(y).ok_or_else(|| bad("the Y coordinate must be a whole number of pixels"))?;
+    if !POSITION_AXIS_RANGE.contains(&x) || !POSITION_AXIS_RANGE.contains(&y) {
+        return Err(bad(&format!(
+            "position {x}x{y} is outside the plausible range ({} to {} pixels per axis)",
+            POSITION_AXIS_RANGE.start(),
+            POSITION_AXIS_RANGE.end()
+        )));
+    }
+    Ok(())
+}
+
+/// Parses one position axis: a whole number with an optional leading `-` and nothing
+/// else — no `+`, whitespace, decimal point, or thousands separator. Returns `None` only
+/// when the text is not a whole number at all, leaving the caller to raise a specific
+/// error.
+///
+/// The width is [`i64`] so that "is it a number?" and "is it in range?" stay separate
+/// questions: a coordinate far outside [`POSITION_AXIS_RANGE`] still parses here and is
+/// rejected by the range check, which can name the bounds, instead of being misreported
+/// as not a number. Digits beyond [`i64`]'s own range are the one remaining overflow
+/// case, and they are so far out of range that either message is accurate.
+fn parse_axis(text: &str) -> Option<i64> {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse::<i64>().ok()
+}
+
 /// Validates that a fractional `value` lies within the inclusive `range` (R8.3).
 ///
 /// A non-finite value (`NaN`, infinity) is outside every finite range and so is
@@ -913,6 +1030,7 @@ mod tests {
     const ALL_SETTING_IDS: &[SettingId] = &[
         SettingId::MonitorMode,
         SettingId::MonitorScale,
+        SettingId::MonitorPosition,
         SettingId::LaptopDisplayEnabled,
         SettingId::PaletteColor,
         SettingId::WallpaperPath,
@@ -937,6 +1055,7 @@ mod tests {
         match id {
             SettingId::MonitorMode
             | SettingId::MonitorScale
+            | SettingId::MonitorPosition
             | SettingId::LaptopDisplayEnabled
             | SettingId::PaletteColor
             | SettingId::WallpaperPath
@@ -961,6 +1080,7 @@ mod tests {
         match id {
             SettingId::MonitorMode => Value::Enum("2880x1800@120".to_string()),
             SettingId::MonitorScale => Value::Float(1.333_333),
+            SettingId::MonitorPosition => Value::Enum("0x0".to_string()),
             SettingId::LaptopDisplayEnabled => Value::Bool(true),
             SettingId::PaletteColor => Value::String("83c092".to_string()),
             // A path validity test needs a real file, so these two are exercised
@@ -1267,6 +1387,96 @@ mod tests {
     }
 
     #[test]
+    fn monitor_position_validator_accepts_auto_tokens_and_coordinate_pairs() {
+        for valid in [
+            // Every placement token Hyprland documents; a hand-written monitors.conf
+            // may carry any of them (see MONITOR_POSITION_TOKENS).
+            "auto",
+            "auto-right",
+            "auto-left",
+            "auto-up",
+            "auto-down",
+            "auto-center-right",
+            "auto-center-left",
+            "auto-center-up",
+            "auto-center-down",
+            // Explicit coordinates, including the negative axes a monitor placed left
+            // of or above the origin needs.
+            "0x0",
+            "2880x0",
+            "-1920x0",
+            "-1920x-1080",
+        ] {
+            assert!(
+                validate_monitor_position(valid).is_ok(),
+                "`{valid}` should be a valid position"
+            );
+        }
+    }
+
+    #[test]
+    fn monitor_position_validator_rejects_malformed_positions() {
+        // R8.3: anything that is neither a known token nor an integer `XxY` pair is
+        // rejected, each as an InvalidMonitorPosition echoing the offending value. The
+        // comma and `#` cases are the load-bearing ones: either would break the
+        // `monitor=` record's positional structure (see validate_monitor_position).
+        for invalid in [
+            "0,0",           // a comma would add a field and desync the record's awk parse
+            "0x0 # comment", // a `#` would truncate the record as a hyprlang comment
+            "auto ",         // stray whitespace is not the `auto` token
+            "autoo",         // a typo, not a placement token
+            "",              // empty
+            "0x",            // missing Y
+            "x0",            // missing X
+            "1920",          // no axis separator
+            "1920.5x0",      // fractional axis
+            "+1920x0",       // an explicit plus sign is not accepted
+        ] {
+            let error = validate_monitor_position(invalid)
+                .expect_err(&format!("`{invalid}` must be rejected"));
+            match error {
+                ValidationError::InvalidMonitorPosition { value, .. } => {
+                    assert_eq!(value, invalid, "the error must echo the offending value");
+                }
+                other => panic!("expected InvalidMonitorPosition for `{invalid}`, got {other:?}"),
+            }
+        }
+
+        // A well-formed but implausible coordinate must be reported as out of range,
+        // naming the bounds — not as "not a whole number", which it plainly is. This is
+        // why the axis parser is wider (i64) than the range it is checked against.
+        for out_of_range in ["99999x0", "0x-99999", "99999999999x0"] {
+            let error = validate_monitor_position(out_of_range)
+                .expect_err(&format!("`{out_of_range}` must be rejected"));
+            match error {
+                ValidationError::InvalidMonitorPosition { value, detail } => {
+                    assert_eq!(value, out_of_range);
+                    assert!(
+                        detail.contains("outside the plausible range"),
+                        "`{out_of_range}` must report a range problem, got: {detail}"
+                    );
+                }
+                other => {
+                    panic!("expected InvalidMonitorPosition for `{out_of_range}`, got {other:?}")
+                }
+            }
+        }
+
+        // Dispatch: MonitorPosition is an Enum-kind setting forwarded to this
+        // validator, so a staged position is re-checked by the Apply pipeline (R8.3).
+        assert!(
+            SettingId::MonitorPosition
+                .validate(&Value::Enum("0x0".to_string()))
+                .is_ok()
+        );
+        assert!(
+            SettingId::MonitorPosition
+                .validate(&Value::Enum("0,0".to_string()))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn sensitivity_range_covers_boundaries_and_rejects_outside() {
         // Boundaries are inclusive; just outside on either side is rejected; NaN is
         // outside every range.
@@ -1483,6 +1693,10 @@ mod tests {
             },
             ValidationError::InvalidMonitorMode {
                 value: "bad".to_string(),
+                detail: "nope".to_string(),
+            },
+            ValidationError::InvalidMonitorPosition {
+                value: "1920,0".to_string(),
                 detail: "nope".to_string(),
             },
             ValidationError::OutOfRange {

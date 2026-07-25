@@ -83,6 +83,7 @@ fn caps() -> Capabilities {
 fn plan_from(model: &DisplayModel) -> ApplyPlan {
     let contribution = model
         .apply_contribution()
+        .expect("the monitors.conf write renders")
         .expect("dirty monitor edits produce a contribution");
     ApplyPlan {
         validations: contribution.validations,
@@ -187,6 +188,50 @@ fn a_failed_hyprctl_reload_is_non_fatal_and_the_write_stands() {
         ),
         "the file keeps its new bytes despite the reload failure (R5.5)"
     );
+}
+
+#[test]
+fn an_unrenderable_record_aborts_the_contribution_leaving_the_file_untouched() {
+    // Failure injection (4), task 9.5: when the writer cannot render a dirty edit, the
+    // contribution is an Err the window aborts on — so the pipeline never runs and
+    // `monitors.conf` keeps its bytes. Without that (a bare `None`), the window would
+    // read "nothing to write", apply successfully, and commit the Display model against
+    // a file it never wrote.
+    let fx = FixtureDotfiles::install();
+    let path = fx.config_path("hypr/monitors.conf");
+
+    // The injected shape: the eDP record shortened to just a name and a mode. It is
+    // enabled, so an edit takes the surgical in-place `set_field` path, but it has no
+    // scale field to rewrite. Written through the deployed symlink before the load, so
+    // the model parses it as its baseline.
+    let shortened = replace_once(
+        &fs::read_to_string(&path).expect("read the fixture monitors.conf"),
+        EDP_RECORD,
+        "monitor=eDP-1,2880x1800@120",
+    );
+    fs::write(&path, &shortened).expect("install the shortened record");
+    let before = repo_snapshot(&fx);
+
+    let mut model = load_model(&fx);
+    model.stage_scale(0, "1.25".to_string());
+    assert!(model.is_dirty());
+
+    let error = model
+        .apply_contribution()
+        .expect_err("an unrenderable edit must abort the apply, not look like a no-op");
+    assert!(
+        error.to_string().contains("monitors.conf"),
+        "the message must name the file the user has to fix: {error}"
+    );
+
+    // Nothing reached the disk, and the staged edit is still pending for a retry.
+    assert_eq!(
+        fs::read_to_string(&path).expect("read the file"),
+        shortened,
+        "an aborted contribution must leave monitors.conf byte-identical"
+    );
+    assert_repo_untouched_except(&fx, &before, &[]);
+    assert!(model.is_dirty(), "the staged edit must be retained");
 }
 
 #[test]
