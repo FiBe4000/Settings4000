@@ -96,7 +96,7 @@ use std::rc::Rc;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, HeaderBar, Label, Orientation,
-    Overlay, ScrolledWindow, Spinner, Stack, StackSidebar, Widget,
+    Overlay, ScrolledWindow, Spinner, Stack, StackSidebar, Widget, glib,
 };
 use relm4::{ComponentController, Controller};
 
@@ -208,10 +208,11 @@ struct Shell {
     /// the store's dirty Power & Idle settings into the `hypridle.conf` write on Apply,
     /// which the pipeline follows with a hypridle restart (see [`Shell::wire_apply`]).
     power: Rc<RefCell<Option<PowerModel>>>,
-    /// The mounted Sound page (task 6.2), retained so the window can re-enumerate it when
-    /// the page is re-shown. Rebuilt by [`Shell::populate`]; `None` when the Sound
-    /// category is not visible. It is runtime-only, so — unlike the store and the Display
-    /// model — it feeds neither the Apply/Reset chrome nor a dirty marker (R5.2).
+    /// The mounted Sound page (task 6.2), retained so the window can enumerate it when the
+    /// page is shown — both its deferred first enumeration and every later page entry
+    /// (task 9.4). Rebuilt by [`Shell::populate`]; `None` when the Sound category is not
+    /// visible. It is runtime-only, so — unlike the store and the Display model — it feeds
+    /// neither the Apply/Reset chrome nor a dirty marker (R5.2).
     sound_page: Rc<RefCell<Option<SoundPage>>>,
     /// The mounted Network page (task 6.9), retained so the window can re-read the
     /// connection status when the page is re-shown. Rebuilt by [`Shell::populate`];
@@ -503,6 +504,78 @@ fn spawn_load(on_done: impl FnOnce(Option<StartupLoad>) + 'static) {
     relm4::spawn_local(async move { on_done(receiver.recv().await) });
 }
 
+/// Connects a page-entry hook that runs `probe` on the page currently held in `page`
+/// whenever the stack child named `stack_name` becomes visible — but from the GTK main
+/// loop's **idle queue**, not from the notification itself (task 9.4).
+///
+/// # Why the idle hop
+///
+/// The runtime-backed pages (Sound, Network) read their live state by spawning a
+/// short-lived command, so the probe must never sit on the populate path: a wedged
+/// PipeWire or NetworkManager holds one for the full 5 s command timeout
+/// ([`CommandRunner`](crate::system::command::CommandRunner)), which would delay every
+/// later category's appearance against the R8.1 cold-start budget. Deferring the *first*
+/// read out of the page's `build` is not enough on its own, because
+/// [`Stack::add_titled`] makes the first page added the
+/// visible one and emits `notify::visible-child-name` **synchronously**: when the page
+/// belongs to the first visible category (e.g. Sound on a host without `hyprctl`, where
+/// the sidebar starts at Sound), a probe run straight from the handler would execute
+/// inside [`Shell::populate`] after all. Handing it to the idle queue guarantees
+/// `populate` returns — and the page's placeholder paints — before anything is spawned.
+/// It also means the widget tree is never mutated from inside `add_titled`.
+///
+/// # What the callback re-checks
+///
+/// Everything, because the world can change between the notification and the idle run: a
+/// repopulate may have replaced or dropped the page (the callback reads whatever handle
+/// `page` holds *then*), and the user may have moved to another category, in which case
+/// there is nothing to probe. Both handles are held weakly, so a pending callback cannot
+/// keep the window alive after it closes. While one callback is outstanding no second is
+/// queued — flipping to the page and back before the idle runs must not spawn two probes.
+///
+/// The notification handler itself is connected once, to the stack the window keeps for
+/// its whole lifetime, so it survives every repopulate without handlers accumulating.
+fn wire_deferred_page_entry<P: 'static>(
+    stack: &Stack,
+    page: &Rc<RefCell<Option<P>>>,
+    stack_name: &'static str,
+    probe: fn(&P),
+) {
+    // Set while an idle callback for this page is queued, so repeated entries coalesce.
+    let queued = Rc::new(Cell::new(false));
+    let page = Rc::downgrade(page);
+
+    stack.connect_visible_child_name_notify(move |stack| {
+        if stack.visible_child_name().as_deref() != Some(stack_name) {
+            return;
+        }
+        if queued.replace(true) {
+            return;
+        }
+
+        let stack = stack.downgrade();
+        let page = page.clone();
+        let queued = queued.clone();
+        glib::idle_add_local_once(move || {
+            queued.set(false);
+            let Some(stack) = stack.upgrade() else {
+                return;
+            };
+            // The user may have left the page again while this callback waited; a probe
+            // for a page nobody is looking at is exactly what the deferral avoids.
+            if stack.visible_child_name().as_deref() != Some(stack_name) {
+                return;
+            }
+            let Some(page) = page.upgrade() else {
+                return;
+            };
+            if let Some(page) = page.borrow().as_ref() {
+                probe(page);
+            }
+        });
+    });
+}
+
 impl Shell {
     /// Runs detection + config parsing on a worker thread and applies the result on the
     /// main thread when it completes (task 5.4, architecture §8; R4.3, R8.1).
@@ -619,20 +692,28 @@ impl Shell {
     fn populate(&self) {
         let caps = self.capabilities.borrow().clone();
 
+        // Drop any retained Display/Sound/Notifications/Theme/Network pages from a
+        // previous populate; their `populate_*` helpers re-set them when the categories
+        // are (re)built below.
+        //
+        // This happens *before* the stack is torn down on purpose: removing the visible
+        // page makes GTK pick another child as the visible one, which fires the
+        // page-entry hooks ([`Self::wire_sound_page_entry`] and its siblings). With the
+        // handles already cleared those hooks find no page to refresh, so tearing the
+        // stack down can never run a `pw-dump`/`nmcli`/`swaync-client` probe for a page
+        // that is on its way out (task 9.4).
+        *self.display_page.borrow_mut() = None;
+        *self.sound_page.borrow_mut() = None;
+        *self.notifications_page.borrow_mut() = None;
+        *self.theme_page.borrow_mut() = None;
+        *self.network_page.borrow_mut() = None;
+
         // Remove every current stack page (the loading placeholder, and any pages from a
         // previous populate).
         while let Some(child) = self.stack.first_child() {
             self.stack.remove(&child);
         }
         self.marked.borrow_mut().clear();
-        // Drop any retained Display/Sound/Notifications/Theme/Network pages from a
-        // previous populate; their `populate_*` helpers re-set them when the categories
-        // are (re)built below.
-        *self.display_page.borrow_mut() = None;
-        *self.sound_page.borrow_mut() = None;
-        *self.notifications_page.borrow_mut() = None;
-        *self.theme_page.borrow_mut() = None;
-        *self.network_page.borrow_mut() = None;
 
         // Build one page per visible category, in sidebar order (R4.2).
         let mut controllers = Vec::new();
@@ -830,6 +911,12 @@ impl Shell {
         // that applies immediately and never stages/dirties (task 6.7 gotcha, R5.2).
         let dnd = notifications::build_dnd_section();
         root.append(dnd.widget());
+        // Stored before the page joins the stack, like the Sound and Network handles:
+        // adding the first page makes it the visible child and fires the page-entry hooks
+        // synchronously, and this page's hook re-queries the daemon straight away — with
+        // the handle still empty it would find no page and the switch would keep the state
+        // it was built with (task 9.4).
+        *self.notifications_page.borrow_mut() = Some(dnd);
 
         self.stack
             .add_titled(&root, Some(category.stack_name()), category.title());
@@ -839,21 +926,30 @@ impl Shell {
             .borrow_mut()
             .push((Category::Notifications, root.upcast()));
         controllers.push(controller);
-        *self.notifications_page.borrow_mut() = Some(dnd);
     }
 
     /// Builds the Sound category's page (task 6.2).
     ///
-    /// Mounts the bespoke [`sound`] page, which enumerates the live PipeWire devices on
-    /// entry and renders the runtime-only output/input controls. No dirty marker is
-    /// registered: the page stages nothing and never feeds the Apply/Reset chrome
-    /// (R5.2). The category is only reached here when the Sound gate found `wpctl`
-    /// present (task 5.1), so the enumeration and controls have their client.
+    /// Mounts the bespoke [`sound`] page, which enumerates the live PipeWire devices and
+    /// renders the runtime-only output/input controls. No dirty marker is registered: the
+    /// page stages nothing and never feeds the Apply/Reset chrome (R5.2). The category is
+    /// only reached here when the Sound gate found `wpctl` present (task 5.1), so the
+    /// enumeration and controls have their client.
+    ///
+    /// Building runs no `pw-dump`/`wpctl`: the first enumeration is deferred to the page's
+    /// first entry (the [`Self::wire_sound_page_entry`] hook, which runs it from the idle
+    /// queue), so a wedged PipeWire can never stall populate — and with it every
+    /// category's appearance — against the R8.1 startup budget (task 9.4). As on the
+    /// Network and Notifications pages the handle is stored *before* the page is added to
+    /// the stack: adding the first page makes it the visible child, which fires the entry
+    /// hooks synchronously, and every hook is written to find the page it is about to
+    /// refresh.
     fn populate_sound(&self, category: SidebarCategory) {
         let page = sound::build();
-        self.stack
-            .add_titled(page.root(), Some(category.stack_name()), category.title());
+        let root = page.root().clone();
         *self.sound_page.borrow_mut() = Some(page);
+        self.stack
+            .add_titled(&root, Some(category.stack_name()), category.title());
     }
 
     /// Builds the Network category's page (task 6.9).
@@ -866,14 +962,13 @@ impl Shell {
     /// never feeds the Apply/Reset chrome (R3.1). The category is only reached when
     /// `nmcli` is present (task 5.1).
     ///
-    /// Building runs no `nmcli`: the first status read is deferred to the page's
-    /// first entry (the [`Self::wire_network_page_entry`] hook), so a wedged
-    /// NetworkManager can never stall populate — and with it every category's
-    /// appearance — against the R8.1 startup budget. The handle is stored *before*
-    /// the page is added to the stack: adding the first page makes it the visible
-    /// child, which fires the entry hook immediately, and that hook must already
-    /// find the page or (with Network as the only visible category) the first read
-    /// would silently never happen.
+    /// Building runs no `nmcli`: the first status read is deferred to the page's first
+    /// entry (the [`Self::wire_network_page_entry`] hook, which runs it from the idle
+    /// queue), so a wedged NetworkManager can never stall populate — and with it every
+    /// category's appearance — against the R8.1 startup budget. The handle is stored
+    /// *before* the page is added to the stack: adding the first page makes it the visible
+    /// child, which fires the entry hooks synchronously, and every hook is written to find
+    /// the page it is about to refresh.
     fn populate_network(&self, category: SidebarCategory) {
         let launcher = crate::core::network::launcher(&self.capabilities.borrow());
         let page = network::build(launcher);
@@ -927,20 +1022,22 @@ impl Shell {
 
     /// Re-enumerates the Sound page whenever it becomes the visible stack child (task
     /// 6.2), so the controls reflect the live audio state on page entry (R3.1) — picking
-    /// up volume/device changes made elsewhere while the app was on another page.
+    /// up volume/device changes made elsewhere while the app was on another page. This
+    /// same hook also performs the page's deferred *first* enumeration:
+    /// [`sound::build`] deliberately runs no `pw-dump` (see [`Self::populate_sound`]), so
+    /// the page shows its placeholder until this fires on first entry.
     ///
-    /// The handler is connected once to the persistent stack (never rebuilt) and reads
-    /// the current [`Self::sound_page`] on each change, so it survives every repopulate
-    /// without accumulating handlers.
+    /// A repopulate therefore does not re-enumerate a Sound page nobody is viewing:
+    /// [`Self::populate`] rebuilds it in its placeholder state and this hook enumerates
+    /// when the user next opens it (task 9.4). The enumeration itself is handed to the
+    /// idle queue — see [`wire_deferred_page_entry`] for why that matters.
     fn wire_sound_page_entry(&self) {
-        let sound_page = self.sound_page.clone();
-        self.stack.connect_visible_child_name_notify(move |stack| {
-            if stack.visible_child_name().as_deref() == Some(SidebarCategory::Sound.stack_name()) {
-                if let Some(page) = sound_page.borrow().as_ref() {
-                    page.refresh();
-                }
-            }
-        });
+        wire_deferred_page_entry(
+            &self.stack,
+            &self.sound_page,
+            SidebarCategory::Sound.stack_name(),
+            SoundPage::refresh,
+        );
     }
 
     /// Re-queries swaync's do-not-disturb state whenever the Notifications page becomes the
@@ -950,7 +1047,11 @@ impl Shell {
     ///
     /// The handler is connected once to the persistent stack (never rebuilt) and reads the
     /// current [`Self::notifications_page`] on each change, so it survives every repopulate
-    /// without accumulating handlers — the same pattern as [`Self::wire_sound_page_entry`].
+    /// without accumulating handlers — the same connect-once discipline as
+    /// [`Self::wire_sound_page_entry`]. Unlike that hook it queries the daemon *directly*
+    /// from the notification rather than from the idle queue, because the DND switch is
+    /// also given its initial state synchronously while the page is built; deferring only
+    /// this half would not take any `swaync-client` call off the populate path.
     fn wire_notifications_page_entry(&self) {
         let notifications_page = self.notifications_page.clone();
         self.stack.connect_visible_child_name_notify(move |stack| {
@@ -971,20 +1072,15 @@ impl Shell {
     /// [`network::build`] deliberately runs no `nmcli` (see [`Self::populate_network`]),
     /// so the page shows its placeholder until this fires on first entry.
     ///
-    /// The handler is connected once to the persistent stack (never rebuilt) and reads
-    /// the current [`Self::network_page`] on each change, so it survives every
-    /// repopulate without accumulating handlers — the same pattern as
-    /// [`Self::wire_sound_page_entry`].
+    /// Like the Sound hook, the read is handed to the idle queue so it can never run on
+    /// the populate path — see [`wire_deferred_page_entry`].
     fn wire_network_page_entry(&self) {
-        let network_page = self.network_page.clone();
-        self.stack.connect_visible_child_name_notify(move |stack| {
-            if stack.visible_child_name().as_deref() == Some(SidebarCategory::Network.stack_name())
-            {
-                if let Some(page) = network_page.borrow().as_ref() {
-                    page.refresh();
-                }
-            }
-        });
+        wire_deferred_page_entry(
+            &self.stack,
+            &self.network_page,
+            SidebarCategory::Network.stack_name(),
+            NetworkPage::refresh,
+        );
     }
 
     /// Wires the Apply button to run the pipeline and handle its outcome (R5.3–R5.6).

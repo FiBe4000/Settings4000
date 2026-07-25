@@ -30,13 +30,17 @@
 //!
 //! [`build`] runs no `nmcli` at all — the status frame starts with a placeholder
 //! and the first real read happens when the page first becomes the visible stack
-//! child, through the same window hook that re-reads on every later entry. This
-//! differs from the Sound page (which enumerates in `build`) for a startup-budget
-//! reason: `build` runs inside the window's populate on the main thread, and a
-//! wedged NetworkManager would hold a synchronous `nmcli` for the full 5 s command
-//! timeout — stalling *every* category's appearance against the R8.1 cold-start
-//! budget for a page the user is not even looking at. Deferring costs nothing: the
-//! placeholder is visible at most for the instant before the entry hook fires.
+//! child, through the same window hook that re-reads on every later entry, which
+//! runs it from the GTK idle queue. The reason is the R8.1 cold-start budget: the
+//! page is built inside the window's populate pass on the main thread, and a wedged
+//! NetworkManager would hold a synchronous `nmcli` for the full 5 s command timeout
+//! — stalling *every* category's appearance for a page the user is not even looking
+//! at. The idle hop closes the remaining gap: adding the first page to the stack
+//! makes it visible and fires the entry hook synchronously, so for the first visible
+//! category an immediate read would still land inside populate (see
+//! `wire_deferred_page_entry` in [`super::window`]). The Sound page defers its first
+//! `pw-dump` enumeration the same way (task 9.4). Deferring costs nothing: the
+//! placeholder is visible at most for the instant before the idle callback runs.
 //!
 //! # Synchronous on the GTK main thread (deliberate)
 //!
