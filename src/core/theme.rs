@@ -90,7 +90,9 @@ use crate::core::model::{SettingId, ValidationError, Value, validate_image_path}
 use crate::core::reload::{BackingFile, CursorValue, ReloadParams};
 use crate::parsers::env::{EnvFile, GtkThemeOverride};
 use crate::parsers::generated;
-use crate::parsers::hyprlang::{HyprlangFile, KeyPath};
+// Aliased because each parser module has its own `EditError`; only hyprlang's variants are
+// matched here (to tell an *absent* config line from one that refused the value).
+use crate::parsers::hyprlang::{EditError as HyprlangEditError, HyprlangFile, KeyPath};
 use crate::parsers::ini::IniFile;
 
 /// One discovered, switchable palette scheme.
@@ -566,6 +568,110 @@ impl Selection {
     }
 }
 
+/// One of the four theme values the Theme page stages, used to record a per-value render
+/// outcome without repeating the four names at every call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThemeValue {
+    /// The GTK theme name (`settings.ini` only).
+    GtkTheme,
+    /// The icon theme name (`settings.ini` only).
+    IconTheme,
+    /// The cursor theme name (duplicated across four files, R3.4).
+    CursorTheme,
+    /// The cursor size in pixels (duplicated across four files, R3.4).
+    CursorSize,
+}
+
+/// A flag per theme value, used for the two per-value render outcomes tracked in
+/// [`ThemeRenderRecord`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ThemeValueFlags {
+    /// The flag for the GTK theme.
+    gtk_theme: bool,
+    /// The flag for the icon theme.
+    icon_theme: bool,
+    /// The flag for the cursor theme.
+    cursor_theme: bool,
+    /// The flag for the cursor size.
+    cursor_size: bool,
+}
+
+impl ThemeValueFlags {
+    /// A mutable handle on one value's flag, so a render can flag the value it is
+    /// currently writing without a four-way `match` at each call site.
+    fn flag(&mut self, value: ThemeValue) -> &mut bool {
+        match value {
+            ThemeValue::GtkTheme => &mut self.gtk_theme,
+            ThemeValue::IconTheme => &mut self.icon_theme,
+            ThemeValue::CursorTheme => &mut self.cursor_theme,
+            ThemeValue::CursorSize => &mut self.cursor_size,
+        }
+    }
+
+    /// Folds another set in (per-value logical OR).
+    fn merge(&mut self, other: ThemeValueFlags) {
+        self.gtk_theme |= other.gtk_theme;
+        self.icon_theme |= other.icon_theme;
+        self.cursor_theme |= other.cursor_theme;
+        self.cursor_size |= other.cursor_size;
+    }
+
+    /// The values flagged here but *not* in `other` (per-value logical AND NOT).
+    fn without(self, other: ThemeValueFlags) -> ThemeValueFlags {
+        ThemeValueFlags {
+            gtk_theme: self.gtk_theme && !other.gtk_theme,
+            icon_theme: self.icon_theme && !other.icon_theme,
+            cursor_theme: self.cursor_theme && !other.cursor_theme,
+            cursor_size: self.cursor_size && !other.cursor_size,
+        }
+    }
+}
+
+/// What rendering the staged theme edits achieved for each of the four values, so
+/// [`ThemesModel::commit`] promotes only the ones that truly landed.
+///
+/// A surgical parser edit can fail for a single key on its own — the value contains a
+/// character that would break the file, or the addressed line/section does not exist — in
+/// which case that key is skipped and logged while the remaining keys are still written.
+/// Promoting a skipped value would leave the model claiming something the config does not
+/// hold, and since it would no longer look changed, no later Apply would write it.
+///
+/// The two flag sets distinguish the two ways a copy can be skipped, which need opposite
+/// treatment:
+///
+/// - **absent copy** — the file simply does not carry this value (the only real case is a
+///   `hyprland.conf` without an `env = XCURSOR_*` line: the hyprlang repeatable-key
+///   writer edits such lines but never *appends* one, see
+///   [`ThemesModel::render_hyprland_env`]). Nothing on disk then disagrees with the value,
+///   so this must not block promotion — otherwise the cursor would stay dirty forever on
+///   such a host, with every later Apply pointlessly rewriting the other three copies.
+/// - **refused copy** — the file carries the value but the writer would not put the new
+///   one there (e.g. hyprlang rejects a `#`, which it would otherwise read as the start of
+///   an inline comment, while the `settings.ini` and `uwsm/env` writers accept it). This
+///   *does* block promotion: the copies on disk now genuinely differ, and R3.4 requires
+///   every copy to hold the identical value, so the page must stay dirty rather than look
+///   applied while one copy lags behind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ThemeRenderRecord {
+    /// Values that reached at least one of the files carrying them.
+    written: ThemeValueFlags,
+    /// Values that a file which *does* carry them refused, so the copies on disk diverge.
+    diverged: ThemeValueFlags,
+}
+
+impl ThemeRenderRecord {
+    /// Folds one file's render result into the page-wide record.
+    fn merge(&mut self, other: ThemeRenderRecord) {
+        self.written.merge(other.written);
+        self.diverged.merge(other.diverged);
+    }
+
+    /// The values [`ThemesModel::commit`] may promote: written somewhere, refused nowhere.
+    fn promotable(self) -> ThemeValueFlags {
+        self.written.without(self.diverged)
+    }
+}
+
 /// One backing config file kept for surgical editing: its live path and current text.
 #[derive(Clone, Debug)]
 struct BackingText {
@@ -884,7 +990,7 @@ impl ThemesModel {
         if !self.is_dirty() {
             return None;
         }
-        let writes = self.build_writes();
+        let (writes, _) = self.render_writes();
         if writes.is_empty() {
             // Dirty but nothing could be written — e.g. both settings.ini files were
             // unreadable. Nothing to apply; the page stays dirty for a retry.
@@ -901,49 +1007,72 @@ impl ThemesModel {
 
     /// Commits the staged changes after a successful Apply: re-baselines each written
     /// file's freshness from the exact bytes written, updates the in-memory backing
-    /// text, and promotes each staged selection to its current value (R5.6).
+    /// text, and promotes the staged selections **that actually reached a file** to
+    /// their current value (R5.6).
     ///
     /// Re-baselining is what stops the app's own write being mistaken for an external
     /// conflict on the next Apply; updating the backing text keeps the in-memory copy
     /// in step so a subsequent edit builds on the current bytes.
+    ///
+    /// Promotion is derived from the rendered writes rather than from the dirty flags:
+    /// a selection that reached no file, or that one of the files carrying it refused
+    /// (see [`ThemeRenderRecord`]), is left staged, so the page stays dirty and the user
+    /// can retry. Promoting it would leave the model claiming a value the config does not
+    /// hold — a silent model-vs-disk divergence that no later Apply would repair, because
+    /// the selection would no longer look changed.
     pub fn commit(&mut self) {
         // Re-render the writes (staged values still present) to capture the exact bytes
-        // written, then re-baseline and update the stored text for each.
-        for write in self.build_writes() {
+        // written, then re-baseline and update the stored text for each. Rendering is
+        // deterministic and the backing texts are unchanged since the Apply, so this
+        // reproduces both the bytes that were written and which keys were skipped.
+        let (writes, record) = self.render_writes();
+        for write in writes {
             self.freshness
                 .record_bytes(write.path.as_path(), &write.contents);
             if let Ok(text) = String::from_utf8(write.contents.clone()) {
                 self.set_backing_text(&write.path, text);
             }
         }
-        self.gtk_theme.commit();
-        self.icon_theme.commit();
-        self.cursor_theme.commit();
-        self.cursor_size.commit();
+        let promotable = record.promotable();
+        if promotable.gtk_theme {
+            self.gtk_theme.commit();
+        }
+        if promotable.icon_theme {
+            self.icon_theme.commit();
+        }
+        if promotable.cursor_theme {
+            self.cursor_theme.commit();
+        }
+        if promotable.cursor_size {
+            self.cursor_size.commit();
+        }
     }
 
-    /// Renders the file writes for the current staged changes (used by both
-    /// [`Self::apply_contribution`] and [`Self::commit`]).
-    fn build_writes(&self) -> Vec<FileWrite> {
+    /// Renders the file writes for the current staged changes, together with the per-value
+    /// record of what each render achieved (used by both [`Self::apply_contribution`],
+    /// which needs only the writes, and [`Self::commit`], which needs the record to decide
+    /// what may be promoted).
+    fn render_writes(&self) -> (Vec<FileWrite>, ThemeRenderRecord) {
         let gtk_changed = self.gtk_theme.is_changed();
         let icon_changed = self.icon_theme.is_changed();
         let cursor_theme_changed = self.cursor_theme.is_changed();
         let cursor_size_changed = self.cursor_size.is_changed();
 
         let mut writes = Vec::new();
+        let mut record = ThemeRenderRecord::default();
 
         // Every theme/cursor key lives in settings.ini, so any change writes both files.
         if gtk_changed || icon_changed || cursor_theme_changed || cursor_size_changed {
             for backing in [&self.gtk3, &self.gtk4].into_iter().flatten() {
-                if let Some(write) = self.render_settings_ini(
+                let (write, file_record) = self.render_settings_ini(
                     backing,
                     gtk_changed,
                     icon_changed,
                     cursor_theme_changed,
                     cursor_size_changed,
-                ) {
-                    writes.push(write);
-                }
+                );
+                record.merge(file_record);
+                writes.extend(write);
             }
         }
 
@@ -951,25 +1080,33 @@ impl ThemesModel {
         // uwsm/env; write the identical value there whenever the cursor changed (R3.4).
         if cursor_theme_changed || cursor_size_changed {
             if let Some(backing) = &self.hyprland {
-                if let Some(write) =
-                    self.render_hyprland_env(backing, cursor_theme_changed, cursor_size_changed)
-                {
-                    writes.push(write);
-                }
+                let (write, file_record) =
+                    self.render_hyprland_env(backing, cursor_theme_changed, cursor_size_changed);
+                record.merge(file_record);
+                writes.extend(write);
             }
             if let Some(backing) = &self.uwsm {
-                if let Some(write) =
-                    self.render_uwsm_env(backing, cursor_theme_changed, cursor_size_changed)
-                {
-                    writes.push(write);
-                }
+                let (write, file_record) =
+                    self.render_uwsm_env(backing, cursor_theme_changed, cursor_size_changed);
+                record.merge(file_record);
+                writes.extend(write);
             }
         }
 
-        writes
+        (writes, record)
     }
 
-    /// Renders one `settings.ini` write, editing only the keys that changed.
+    /// Renders one `settings.ini` write, editing only the keys that changed, and reports
+    /// which of those keys the edit actually landed for.
+    ///
+    /// A key whose `set_value` fails is skipped and logged; the remaining keys are still
+    /// written, and the returned [`ThemeRenderRecord`] tells [`Self::commit`] which
+    /// selections may be promoted. A failure here is always a *refusal* by a file that
+    /// carries the key, never an absent copy — the INI writer appends the key, and even
+    /// the `[Settings]` group, when it is missing — so it blocks promotion. (In practice a
+    /// value the INI writer rejects, i.e. one containing a newline, is rejected by the env
+    /// and hyprlang writers too, so nothing is written anywhere; the flag is what keeps
+    /// that conclusion from depending on the three writers agreeing.)
     fn render_settings_ini(
         &self,
         backing: &BackingText,
@@ -977,46 +1114,73 @@ impl ThemesModel {
         icon_changed: bool,
         cursor_theme_changed: bool,
         cursor_size_changed: bool,
-    ) -> Option<FileWrite> {
+    ) -> (Option<FileWrite>, ThemeRenderRecord) {
         let (mut ini, _) = IniFile::parse(&backing.text);
         let mut changed_keys = Vec::new();
+        let mut record = ThemeRenderRecord::default();
 
-        let mut set = |key: &str, value: Option<&str>, label: &str| {
-            if let Some(value) = value {
-                match ini.set_value(SETTINGS_GROUP, key, value) {
-                    Ok(_) => changed_keys.push(label.to_string()),
-                    Err(error) => {
-                        tracing::warn!(key, %error, "could not set a settings.ini theme key");
-                    }
+        let mut set = |value_id: ThemeValue, key: &str, value: Option<&str>, label: &str| {
+            let Some(value) = value else {
+                return;
+            };
+            match ini.set_value(SETTINGS_GROUP, key, value) {
+                Ok(_) => {
+                    changed_keys.push(label.to_string());
+                    *record.written.flag(value_id) = true;
+                }
+                Err(error) => {
+                    tracing::warn!(key, %error, "could not set a settings.ini theme key");
+                    *record.diverged.flag(value_id) = true;
                 }
             }
         };
         if gtk_changed {
-            set(KEY_GTK_THEME, self.gtk_theme.effective(), "GTK theme");
+            set(
+                ThemeValue::GtkTheme,
+                KEY_GTK_THEME,
+                self.gtk_theme.effective(),
+                "GTK theme",
+            );
         }
         if icon_changed {
-            set(KEY_ICON_THEME, self.icon_theme.effective(), "icon theme");
+            set(
+                ThemeValue::IconTheme,
+                KEY_ICON_THEME,
+                self.icon_theme.effective(),
+                "icon theme",
+            );
         }
         if cursor_theme_changed {
             set(
+                ThemeValue::CursorTheme,
                 KEY_CURSOR_THEME,
                 self.cursor_theme.effective(),
                 "cursor theme",
             );
         }
         if cursor_size_changed {
-            set(KEY_CURSOR_SIZE, self.cursor_size.effective(), "cursor size");
+            set(
+                ThemeValue::CursorSize,
+                KEY_CURSOR_SIZE,
+                self.cursor_size.effective(),
+                "cursor size",
+            );
         }
 
         if changed_keys.is_empty() {
-            return None;
+            // Nothing was set, so this file contributes no write — only whatever refusals
+            // were recorded above.
+            return (None, record);
         }
-        Some(FileWrite {
-            path: backing.path.clone(),
-            contents: ini.emit().into_bytes(),
-            changed_keys,
-            backing: BackingFile::GtkSettings,
-        })
+        (
+            Some(FileWrite {
+                path: backing.path.clone(),
+                contents: ini.emit().into_bytes(),
+                changed_keys,
+                backing: BackingFile::GtkSettings,
+            }),
+            record,
+        )
     }
 
     /// Renders the `hyprland.conf` cursor-env write, editing only the repeatable
@@ -1029,70 +1193,126 @@ impl ThemesModel {
     /// abandoned wholesale, keeping it from drifting out of step with the other copies.
     /// Returns `None` only when neither field could be written (the app-owned invariant
     /// is that both lines are present, so this partial path is a robustness measure).
+    ///
+    /// The two skip reasons are recorded differently in the returned
+    /// [`ThemeRenderRecord`], because hyprlang's value rule is stricter than the
+    /// `settings.ini` and `uwsm/env` ones (it also rejects `#`, which it would otherwise
+    /// read as the start of an inline comment):
+    ///
+    /// - a missing line ([`HyprlangEditError::RepeatableKeyNotFound`]) means this file
+    ///   carries no such copy, so there is nothing to diverge from and the value may still
+    ///   be promoted on the strength of the other copies;
+    /// - the other two variants this call can return mean the copy must **not** be
+    ///   promoted (R3.4), so the page stays dirty instead of looking applied while
+    ///   `hyprland.conf` lags behind: [`HyprlangEditError::InvalidValue`] leaves the
+    ///   existing line holding its old value, and [`HyprlangEditError::NoValuePortion`]
+    ///   means the line is malformed (an `env = XCURSOR_THEME` with no comma). The
+    ///   malformed case is deliberately treated as a refusal even though there is no old
+    ///   value to lag behind: hyprland still reads the line, so writing the other copies
+    ///   while leaving it alone is a divergence the user should see.
+    ///
+    /// [`HyprlangEditError::SectionNotFound`] cannot arise here — `set_repeatable_field_value`
+    /// addresses top-level repeatable keys, not sections.
     fn render_hyprland_env(
         &self,
         backing: &BackingText,
         cursor_theme_changed: bool,
         cursor_size_changed: bool,
-    ) -> Option<FileWrite> {
+    ) -> (Option<FileWrite>, ThemeRenderRecord) {
         let (mut file, _) = HyprlangFile::parse(&backing.text);
         let mut changed_keys = Vec::new();
+        let mut record = ThemeRenderRecord::default();
 
-        if cursor_theme_changed {
-            if let Some(value) = self.cursor_theme.effective() {
-                match file.set_repeatable_field_value(HYPR_ENV_KEY, ENV_CURSOR_THEME, value) {
-                    Ok(()) => changed_keys.push("cursor theme (hyprland.conf env)".to_string()),
-                    Err(error) => {
-                        tracing::debug!(%error, "no XCURSOR_THEME env line in hyprland.conf; skipping that field");
-                    }
+        let mut set = |value_id: ThemeValue, field: &str, value: Option<&str>, label: &str| {
+            let Some(value) = value else {
+                return;
+            };
+            match file.set_repeatable_field_value(HYPR_ENV_KEY, field, value) {
+                Ok(()) => {
+                    changed_keys.push(label.to_string());
+                    *record.written.flag(value_id) = true;
                 }
-            }
-        }
-        if cursor_size_changed {
-            if let Some(value) = self.cursor_size.effective() {
-                match file.set_repeatable_field_value(HYPR_ENV_KEY, ENV_CURSOR_SIZE, value) {
-                    Ok(()) => changed_keys.push("cursor size (hyprland.conf env)".to_string()),
-                    Err(error) => {
-                        tracing::debug!(%error, "no XCURSOR_SIZE env line in hyprland.conf; skipping that field");
-                    }
+                Err(HyprlangEditError::RepeatableKeyNotFound { .. }) => {
+                    tracing::debug!(
+                        field,
+                        "no such env line in hyprland.conf; skipping that field"
+                    );
                 }
-            }
-        }
-
-        if changed_keys.is_empty() {
-            return None;
-        }
-        Some(FileWrite {
-            path: backing.path.clone(),
-            contents: file.emit().into_bytes(),
-            changed_keys,
-            backing: BackingFile::HyprlandConf,
-        })
-    }
-
-    /// Renders the `uwsm/env` cursor-env write, editing (or appending) the
-    /// `XCURSOR_*` exports.
-    fn render_uwsm_env(
-        &self,
-        backing: &BackingText,
-        cursor_theme_changed: bool,
-        cursor_size_changed: bool,
-    ) -> Option<FileWrite> {
-        let (mut file, _) = EnvFile::parse(&backing.text);
-        let mut changed_keys = Vec::new();
-
-        let mut set = |key: &str, value: Option<&str>, label: &str| {
-            if let Some(value) = value {
-                match file.set_value(key, value) {
-                    Ok(_) => changed_keys.push(label.to_string()),
-                    Err(error) => {
-                        tracing::warn!(key, %error, "could not set a uwsm/env cursor variable");
-                    }
+                Err(error) => {
+                    tracing::warn!(
+                        field,
+                        %error,
+                        "hyprland.conf's env line refused the value, so its copy now differs \
+                         from the others (R3.4); not promoting the change"
+                    );
+                    *record.diverged.flag(value_id) = true;
                 }
             }
         };
         if cursor_theme_changed {
             set(
+                ThemeValue::CursorTheme,
+                ENV_CURSOR_THEME,
+                self.cursor_theme.effective(),
+                "cursor theme (hyprland.conf env)",
+            );
+        }
+        if cursor_size_changed {
+            set(
+                ThemeValue::CursorSize,
+                ENV_CURSOR_SIZE,
+                self.cursor_size.effective(),
+                "cursor size (hyprland.conf env)",
+            );
+        }
+
+        if changed_keys.is_empty() {
+            return (None, record);
+        }
+        (
+            Some(FileWrite {
+                path: backing.path.clone(),
+                contents: file.emit().into_bytes(),
+                changed_keys,
+                backing: BackingFile::HyprlandConf,
+            }),
+            record,
+        )
+    }
+
+    /// Renders the `uwsm/env` cursor-env write, editing (or appending) the
+    /// `XCURSOR_*` exports, and reports which fields the edit landed for.
+    ///
+    /// Like the `settings.ini` render, a failure here is a refusal by a file that carries
+    /// the value (the env writer appends a missing export), so it blocks promotion.
+    fn render_uwsm_env(
+        &self,
+        backing: &BackingText,
+        cursor_theme_changed: bool,
+        cursor_size_changed: bool,
+    ) -> (Option<FileWrite>, ThemeRenderRecord) {
+        let (mut file, _) = EnvFile::parse(&backing.text);
+        let mut changed_keys = Vec::new();
+        let mut record = ThemeRenderRecord::default();
+
+        let mut set = |value_id: ThemeValue, key: &str, value: Option<&str>, label: &str| {
+            let Some(value) = value else {
+                return;
+            };
+            match file.set_value(key, value) {
+                Ok(_) => {
+                    changed_keys.push(label.to_string());
+                    *record.written.flag(value_id) = true;
+                }
+                Err(error) => {
+                    tracing::warn!(key, %error, "could not set a uwsm/env cursor variable");
+                    *record.diverged.flag(value_id) = true;
+                }
+            }
+        };
+        if cursor_theme_changed {
+            set(
+                ThemeValue::CursorTheme,
                 ENV_CURSOR_THEME,
                 self.cursor_theme.effective(),
                 "cursor theme (uwsm/env)",
@@ -1100,6 +1320,7 @@ impl ThemesModel {
         }
         if cursor_size_changed {
             set(
+                ThemeValue::CursorSize,
                 ENV_CURSOR_SIZE,
                 self.cursor_size.effective(),
                 "cursor size (uwsm/env)",
@@ -1107,14 +1328,17 @@ impl ThemesModel {
         }
 
         if changed_keys.is_empty() {
-            return None;
+            return (None, record);
         }
-        Some(FileWrite {
-            path: backing.path.clone(),
-            contents: file.emit().into_bytes(),
-            changed_keys,
-            backing: BackingFile::UwsmEnv,
-        })
+        (
+            Some(FileWrite {
+                path: backing.path.clone(),
+                contents: file.emit().into_bytes(),
+                changed_keys,
+                backing: BackingFile::UwsmEnv,
+            }),
+            record,
+        )
     }
 
     /// The reload parameters for the changed values (task 4.4): a value is set only
@@ -1462,6 +1686,44 @@ pub struct WallpaperPaths {
     pub hyprlock_conf: PathBuf,
 }
 
+/// Which of the wallpaper page's staged values a render actually managed to write into a
+/// file — the wallpaper model's counterpart of [`ThemeRenderRecord`], and used for the
+/// same reason.
+///
+/// A hyprlang edit can fail per key (the addressed `wallpaper { }` / `background { }`
+/// section does not exist in the user's file, or the chosen image path contains a `#`,
+/// which hyprlang would read as an inline comment and silently truncate). The skipped key
+/// is logged and the other keys are still written, so [`WallpaperModel::commit`] promotes
+/// only the values flagged here: a value that reached no file stays staged, keeping the
+/// page dirty and retryable instead of re-baselining the model to something the disk
+/// never received.
+///
+/// Unlike the theme values, these need no separate "a copy refused it" record. With the
+/// override off the wallpaper path *is* written to `hyprlock.conf` as well, so it is not
+/// quite true that each value lives in one file — but that second copy has its own
+/// baseline (`lock.original`), so a copy that refused the value keeps showing up through
+/// [`WallpaperModel::hyprlock_write_needed`] and stays retryable. A cursor value has no
+/// such per-copy baseline: one model value covers four files, which is why the theme
+/// record has to track divergence explicitly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WrittenWallpaperValues {
+    /// The wallpaper image path reached the `hyprpaper.conf` write.
+    wallpaper: bool,
+    /// The fit mode reached the `hyprpaper.conf` write.
+    fit: bool,
+    /// The lock-screen background path reached the `hyprlock.conf` write.
+    lock: bool,
+}
+
+impl WrittenWallpaperValues {
+    /// Folds one file's render result into the page-wide record.
+    fn merge(&mut self, other: WrittenWallpaperValues) {
+        self.wallpaper |= other.wallpaper;
+        self.fit |= other.fit;
+        self.lock |= other.lock;
+    }
+}
+
 /// The wallpaper / lock-screen background staging model (task 6.5).
 ///
 /// Built by [`WallpaperModel::load`] from the backing [`WallpaperPaths`]. It owns the
@@ -1547,6 +1809,21 @@ pub struct WallpaperApply {
     pub validations: Vec<(SettingId, Value)>,
 }
 
+/// Derives the lock-screen override toggle from a wallpaper path and a lock-screen path:
+/// the override is on exactly when the lock screen has its own image that is *not* the
+/// wallpaper (analysis §6.2 — the dotfiles unify the two, so "the same image" means no
+/// override).
+///
+/// The single definition of that rule, shared by [`WallpaperModel::load`] (which applies
+/// it to the paths read from disk) and [`WallpaperModel::commit`] (which re-applies it to
+/// the promoted baselines, i.e. to the paths now on disk). Keeping one copy is what stops
+/// the toggle's baseline from disagreeing with the files: a divergence would make
+/// [`WallpaperModel::reset`] restore a toggle state the config does not have, turning a
+/// clean page into a pending change the user never made (R5.1).
+fn override_from_paths(wallpaper: Option<&str>, lock: Option<&str>) -> bool {
+    lock.is_some() && lock != wallpaper
+}
+
 impl WallpaperModel {
     /// Builds the model by reading the backing config (task 6.5; R4.4, R8.5).
     ///
@@ -1580,10 +1857,7 @@ impl WallpaperModel {
             .and_then(|file| file.value(&KeyPath::at(&[LOCK_SECTION], LOCK_PATH_KEY)))
             .map(str::to_string);
 
-        // The override is on iff the lock-screen path is set and differs from the
-        // wallpaper path — i.e. the two are not the unified same-image default.
-        let override_initial =
-            lock_path.is_some() && lock_path.as_deref() != wallpaper_path.as_deref();
+        let override_initial = override_from_paths(wallpaper_path.as_deref(), lock_path.as_deref());
 
         let fit_options: Vec<String> = CURATED_FIT_MODES.iter().map(|s| (*s).to_string()).collect();
 
@@ -1749,7 +2023,7 @@ impl WallpaperModel {
         if !self.is_dirty() {
             return None;
         }
-        let writes = self.build_writes();
+        let (writes, _) = self.render_writes();
         if writes.is_empty() {
             // Dirty but nothing could be written (e.g. a parser edit error). Nothing to
             // apply; the page stays dirty for a retry.
@@ -1767,9 +2041,18 @@ impl WallpaperModel {
 
     /// Commits the staged changes after a successful Apply: re-baselines each written
     /// file's freshness from the exact bytes written, updates the in-memory backing
-    /// text, and promotes each staged value to its current value (R5.6).
+    /// text, and promotes the staged values **that actually reached a file** to their
+    /// current value (R5.6).
+    ///
+    /// Promotion is derived from the rendered writes, not from the
+    /// `*_write_needed` predicates: a value whose hyprlang edit was skipped (see
+    /// [`WrittenWallpaperValues`]) stays staged, so the page stays dirty and the user can
+    /// retry. Promoting it would leave the model claiming a path that reached no file, and
+    /// because the value would then no longer look changed, no later Apply would write it
+    /// — a permanent silent divergence between the UI and the config.
     pub fn commit(&mut self) {
-        for write in self.build_writes() {
+        let (writes, written) = self.render_writes();
+        for write in writes {
             self.freshness
                 .record_bytes(write.path.as_path(), &write.contents);
             if let Ok(text) = String::from_utf8(write.contents.clone()) {
@@ -1778,48 +2061,74 @@ impl WallpaperModel {
         }
         // Capture the effective lock path (which depends on the still-staged wallpaper
         // value when the override is off) before promoting the wallpaper edit.
-        let wrote_lock = self.hyprlock_write_needed();
         let new_lock = self.effective_lock().map(str::to_string);
-        self.wallpaper.commit();
-        self.fit.commit();
-        if wrote_lock {
-            self.lock.original = new_lock;
+        if written.wallpaper {
+            self.wallpaper.commit();
         }
-        self.lock.staged = None;
-        self.override_initial = self.override_on;
+        if written.fit {
+            self.fit.commit();
+        }
+        if written.lock {
+            // `hyprlock.conf` received exactly this path, so it becomes the baseline and
+            // the staged override value (if any) has served its purpose.
+            self.lock.original = new_lock;
+            self.lock.staged = None;
+        }
+        // Re-derive the toggle's baseline from the promoted baselines — which are now the
+        // paths on disk — with the very rule `load` uses. It must not be taken from
+        // `override_on`: a `hyprpaper.conf`-only write can change the *relationship*
+        // between the two paths (a new wallpaper next to an unchanged lock image) without
+        // `hyprlock.conf` being written at all, and a baseline that disagreed with the
+        // files would make `reset` restore a toggle state the config does not have —
+        // turning a clean page into a pending change the user never made (R5.1).
+        self.override_initial = override_from_paths(
+            self.wallpaper.original.as_deref(),
+            self.lock.original.as_deref(),
+        );
     }
 
-    /// Renders the file writes for the current staged changes (used by both
-    /// [`Self::apply_contribution`] and [`Self::commit`]).
-    fn build_writes(&self) -> Vec<FileWrite> {
+    /// Renders the file writes for the current staged changes, together with which values
+    /// actually reached one of them (used by both [`Self::apply_contribution`], which
+    /// needs only the writes, and [`Self::commit`], which needs the promotion record).
+    fn render_writes(&self) -> (Vec<FileWrite>, WrittenWallpaperValues) {
         let mut writes = Vec::new();
+        let mut written = WrittenWallpaperValues::default();
         if self.hyprpaper_write_needed() {
             if let Some(backing) = &self.hyprpaper {
-                if let Some(write) = self.render_hyprpaper(backing) {
-                    writes.push(write);
-                }
+                let (write, keys) = self.render_hyprpaper(backing);
+                written.merge(keys);
+                writes.extend(write);
             }
         }
         if self.hyprlock_write_needed() {
             if let Some(backing) = &self.hyprlock {
                 if let Some(write) = self.render_hyprlock(backing) {
+                    written.lock = true;
                     writes.push(write);
                 }
             }
         }
-        writes
+        (writes, written)
     }
 
     /// Renders the `hyprpaper.conf` write, editing only the `wallpaper.path` and/or
-    /// `wallpaper.fit_mode` value spans that changed (surgical, R5.3).
-    fn render_hyprpaper(&self, backing: &BackingText) -> Option<FileWrite> {
+    /// `wallpaper.fit_mode` value spans that changed (surgical, R5.3), and reports which
+    /// of the two the edit actually landed for.
+    fn render_hyprpaper(
+        &self,
+        backing: &BackingText,
+    ) -> (Option<FileWrite>, WrittenWallpaperValues) {
         let (mut file, _) = HyprlangFile::parse(&backing.text);
         let mut changed_keys = Vec::new();
+        let mut written = WrittenWallpaperValues::default();
 
         if self.wallpaper.is_changed() {
             if let Some(path) = self.wallpaper.effective() {
                 match file.set_value(&KeyPath::at(&[WALLPAPER_SECTION], WALLPAPER_PATH_KEY), path) {
-                    Ok(()) => changed_keys.push("wallpaper path".to_string()),
+                    Ok(()) => {
+                        changed_keys.push("wallpaper path".to_string());
+                        written.wallpaper = true;
+                    }
                     Err(error) => {
                         tracing::warn!(%error, "could not set the wallpaper path in hyprpaper.conf");
                     }
@@ -1829,7 +2138,10 @@ impl WallpaperModel {
         if self.fit.is_changed() {
             if let Some(fit) = self.fit.effective() {
                 match file.set_value(&KeyPath::at(&[WALLPAPER_SECTION], WALLPAPER_FIT_KEY), fit) {
-                    Ok(()) => changed_keys.push("fit mode".to_string()),
+                    Ok(()) => {
+                        changed_keys.push("fit mode".to_string());
+                        written.fit = true;
+                    }
                     Err(error) => {
                         tracing::warn!(%error, "could not set the fit mode in hyprpaper.conf");
                     }
@@ -1838,18 +2150,26 @@ impl WallpaperModel {
         }
 
         if changed_keys.is_empty() {
-            return None;
+            return (None, written);
         }
-        Some(FileWrite {
-            path: backing.path.clone(),
-            contents: file.emit().into_bytes(),
-            changed_keys,
-            backing: BackingFile::HyprpaperConf,
-        })
+        (
+            Some(FileWrite {
+                path: backing.path.clone(),
+                contents: file.emit().into_bytes(),
+                changed_keys,
+                backing: BackingFile::HyprpaperConf,
+            }),
+            written,
+        )
     }
 
     /// Renders the `hyprlock.conf` write, editing only the `background.path` value span
     /// to the effective lock path (surgical, R5.3).
+    ///
+    /// `None` means the edit could not be made — most plausibly a `hyprlock.conf` with no
+    /// `background { }` section, which the hyprlang writer never invents — and is what
+    /// keeps [`Self::commit`] from promoting the lock path (see
+    /// [`WrittenWallpaperValues`]).
     fn render_hyprlock(&self, backing: &BackingText) -> Option<FileWrite> {
         let path = self.effective_lock()?;
         let (mut file, _) = HyprlangFile::parse(&backing.text);
@@ -3016,6 +3336,196 @@ export XCURSOR_SIZE=16
         );
     }
 
+    #[test]
+    fn a_skipped_settings_ini_key_leaves_only_that_selection_dirty() {
+        // Task 9.6 accept criterion: a failed render leaves the affected selection dirty.
+        // A theme name containing a newline is a legal directory name on Linux (only `/`
+        // and NUL are forbidden), so discovery can surface one — but the settings.ini
+        // writer rejects it, because writing it would split the `key=value` line. That
+        // one key is skipped while the other is still written, and commit must promote
+        // only the key that reached a file: promoting the skipped one would leave the
+        // model showing a value no file holds, and since it would no longer look changed,
+        // no later Apply would write it either.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_backing_fixture(&config, UWSM_ENV);
+        let themes = tmp.path().join("themes");
+        fs::create_dir_all(themes.join("Adwaita").join("gtk-4.0")).unwrap();
+        let roots = ThemeRoots {
+            gtk_theme_dirs: vec![themes],
+            icon_dirs: Vec::new(),
+        };
+
+        let mut model = ThemesModel::load(&roots, paths, false, None);
+        model.stage_gtk_theme("Adwaita");
+        model.stage_icon_theme("Papirus\ngtk-theme-name=Injected");
+
+        let contribution = model
+            .apply_contribution()
+            .expect("the writable GTK theme change still contributes");
+        assert_eq!(
+            contribution.writes.len(),
+            2,
+            "both settings.ini copies are written (so the loop below is not vacuous)"
+        );
+        for write in &contribution.writes {
+            assert_eq!(
+                write.changed_keys,
+                vec!["GTK theme".to_string()],
+                "the rejected icon value is skipped; only the GTK theme is written"
+            );
+            assert!(
+                !String::from_utf8(write.contents.clone())
+                    .expect("settings.ini stays UTF-8")
+                    .contains("Injected"),
+                "the rejected value never reaches the file contents"
+            );
+        }
+
+        model.commit();
+        let selected_gtk = model
+            .selected_gtk_index()
+            .and_then(|index| model.gtk_themes().get(index))
+            .map(String::as_str);
+        assert_eq!(
+            selected_gtk,
+            Some("Adwaita"),
+            "the GTK theme reached both settings.ini files, so it is promoted"
+        );
+        assert_eq!(
+            model.icon_theme.original.as_deref(),
+            Some("Everforest-Dark"),
+            "the icon baseline still matches what is on disk"
+        );
+        assert!(
+            model.icon_theme.is_changed(),
+            "the skipped icon selection stays staged"
+        );
+        assert!(
+            model.is_dirty(),
+            "the page stays dirty, so the user sees the change is not applied and can retry"
+        );
+
+        // The retry renders nothing at all (the rejected value is the only dirty one), so
+        // there is no contribution — and a commit in that state must still promote
+        // nothing rather than silently re-baselining.
+        assert!(
+            model.apply_contribution().is_none(),
+            "with only the rejected value staged, no file can be written"
+        );
+        model.commit();
+        assert!(
+            model.icon_theme.is_changed() && model.is_dirty(),
+            "a commit with no rendered write promotes nothing"
+        );
+    }
+
+    #[test]
+    fn a_value_one_existing_copy_refuses_is_not_promoted() {
+        // Task 9.6, the divergence rule (R3.4): the writers do not share a value rule —
+        // hyprlang additionally rejects `#`, which it would otherwise read as the start of
+        // an inline comment and silently truncate the value at, while the settings.ini and
+        // uwsm/env writers accept it. A cursor theme directory named `Nord#ic` is legal on
+        // Linux and discovery offers it, so the cursor theme can reach three of its four
+        // copies while `hyprland.conf`'s env line keeps the old one. The copies on disk
+        // then genuinely differ, so the change must NOT be promoted: the page stays dirty
+        // rather than looking applied while one copy lags behind.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_backing_fixture(&config, UWSM_ENV);
+        let icons = write_icon_root(tmp.path());
+        fs::create_dir_all(icons.join("Nord#ic").join("cursors"))
+            .expect("create a cursor theme dir whose name contains a #");
+        let roots = ThemeRoots {
+            gtk_theme_dirs: Vec::new(),
+            icon_dirs: vec![icons],
+        };
+
+        let mut model = ThemesModel::load(&roots, paths.clone(), false, None);
+        assert!(
+            model.cursor_themes().contains(&"Nord#ic".to_string()),
+            "discovery surfaces the `#`-named cursor theme, so the drop-down offers it"
+        );
+        model.stage_cursor_theme("Nord#ic");
+
+        let contribution = model
+            .apply_contribution()
+            .expect("the copies that accept the value are still written");
+        assert_eq!(
+            contribution.writes.len(),
+            3,
+            "both settings.ini copies and uwsm/env accept the value"
+        );
+        assert!(
+            !contribution
+                .writes
+                .iter()
+                .any(|write| write.path == paths.hyprland_conf),
+            "hyprland.conf refuses the `#` value, so it contributes no write"
+        );
+
+        model.commit();
+        assert_eq!(
+            model.cursor_theme.original.as_deref(),
+            Some("Nordic-cursors"),
+            "the cursor baseline is not promoted while one existing copy holds the old value"
+        );
+        assert!(
+            model.cursor_theme.is_changed() && model.is_dirty(),
+            "the page stays dirty, so the user is not told a half-written change is applied"
+        );
+    }
+
+    #[test]
+    fn a_cursor_change_is_still_promoted_when_hyprland_conf_has_no_env_line() {
+        // Task 9.6, the other side of the divergence rule: an ABSENT copy must not block
+        // promotion. Here hyprland.conf carries only the XCURSOR_THEME line, and the
+        // hyprlang repeatable-key writer edits such lines but never appends a missing one,
+        // so a cursor *size* change can only reach the two settings.ini files and uwsm/env.
+        // Nothing on disk then disagrees with the new size, so the commit promotes it and
+        // the page goes clean. Were promotion to require all four copies instead, the page
+        // would stay dirty forever on such a host and every later Apply would rewrite the
+        // other three copies for nothing.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_backing_fixture(&config, UWSM_ENV);
+        fs::write(&paths.hyprland_conf, "env = XCURSOR_THEME,Nordic-cursors\n")
+            .expect("write a hyprland.conf with no XCURSOR_SIZE line");
+        let roots = ThemeRoots {
+            gtk_theme_dirs: Vec::new(),
+            icon_dirs: vec![write_icon_root(tmp.path())],
+        };
+
+        let mut model = ThemesModel::load(&roots, paths.clone(), false, None);
+        model.stage_cursor_size("24");
+
+        let contribution = model
+            .apply_contribution()
+            .expect("the three copies carrying the size are written");
+        assert!(
+            !contribution
+                .writes
+                .iter()
+                .any(|write| write.path == paths.hyprland_conf),
+            "with no XCURSOR_SIZE line to edit, hyprland.conf contributes no write"
+        );
+
+        model.commit();
+        let size = model
+            .selected_cursor_size_index()
+            .and_then(|index| model.cursor_sizes().get(index))
+            .map(String::as_str);
+        assert_eq!(
+            size,
+            Some("24"),
+            "the size is promoted on the strength of the copies that carry it"
+        );
+        assert!(
+            !model.is_dirty(),
+            "an absent copy does not keep the page dirty"
+        );
+    }
+
     // --- Wallpaper / lock background (task 6.5) ------------------------------
 
     /// A `hyprpaper.conf` fixture: a `wallpaper { }` block with a monitor line, a
@@ -3587,6 +4097,232 @@ label {
         assert!(
             model.fit_options().contains(&"stretch".to_string()),
             "the unusual value is present among the options"
+        );
+    }
+
+    #[test]
+    fn a_skipped_hyprlock_write_leaves_the_lock_path_un_promoted() {
+        // Task 9.6 accept criterion: a skipped hyprlock write leaves the lock field
+        // un-promoted. A `hyprlock.conf` without a `background { }` block cannot receive
+        // the lock path — the hyprlang writer never invents a section — while the
+        // wallpaper's own `hyprpaper.conf` write succeeds and is applied. Commit must
+        // promote the wallpaper and leave the lock baseline alone: claiming the lock path
+        // had been written would clear the pending write for good, because the model would
+        // then see the file as already holding it.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_wallpaper_fixture(&config);
+        fs::write(
+            &paths.hyprlock_conf,
+            "source = ~/.config/hypr/colors.conf\n\nlabel {\n    text = Hi\n}\n",
+        )
+        .expect("write a hyprlock.conf with no background section");
+        let hyprlock_before =
+            fs::read_to_string(&paths.hyprlock_conf).expect("read the hyprlock fixture");
+        let wall = write_image(tmp.path(), "wall.png");
+
+        let mut model = WallpaperModel::load(paths.clone(), true);
+        model
+            .stage_wallpaper(&wall)
+            .expect("a real image validates");
+
+        let contribution = model
+            .apply_contribution()
+            .expect("the wallpaper change contributes");
+        assert_eq!(
+            contribution.writes.len(),
+            1,
+            "only hyprpaper.conf could be rendered"
+        );
+        assert_eq!(contribution.writes[0].backing, BackingFile::HyprpaperConf);
+
+        let plan = ApplyPlan {
+            validations: contribution.validations,
+            writes: contribution.writes,
+            palette: None,
+            reload_params: contribution.reload_params,
+        };
+        let caps = Capabilities::for_tests(&[Binary::Hyprctl], &[Daemon::Hyprpaper], true);
+        assert!(matches!(
+            apply::run(
+                &plan,
+                &FreshnessTracker::new(),
+                &caps,
+                &MockCommandRunner::new(),
+                &MockProcessSignaller::new(),
+            ),
+            ApplyOutcome::Applied { .. }
+        ));
+
+        model.commit();
+        assert_eq!(
+            fs::read_to_string(&paths.hyprlock_conf).expect("read hyprlock.conf"),
+            hyprlock_before,
+            "hyprlock.conf is byte-identical: it never received the path"
+        );
+        assert_eq!(
+            model.lock.original, None,
+            "the lock baseline is not promoted to a path the file never received"
+        );
+        assert!(
+            model.is_dirty(),
+            "the pending lock write survives the commit, so a retry can still write it"
+        );
+        assert_eq!(
+            model.wallpaper_path(),
+            Some(wall.as_str()),
+            "the wallpaper path, which was written, is promoted"
+        );
+    }
+
+    #[test]
+    fn a_rejected_wallpaper_path_stays_dirty_while_the_fit_mode_is_promoted() {
+        // Task 9.6, per-key promotion *within* one file: an image whose filename contains
+        // a `#` is a real, readable file (so `stage_wallpaper`'s validation accepts it) but
+        // the hyprlang writer refuses to write it, because hyprlang would read the `#` as
+        // the start of an inline comment and silently truncate the path. The fit mode
+        // staged in the same file is written regardless, so commit promotes the fit and
+        // leaves the wallpaper path staged.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_wallpaper_fixture(&config);
+        let hashed = write_image(tmp.path(), "wall#1.png");
+
+        let mut model = WallpaperModel::load(paths, true);
+        model
+            .stage_wallpaper(&hashed)
+            .expect("a real image file validates");
+        model.stage_fit("tile");
+
+        let contribution = model
+            .apply_contribution()
+            .expect("the fit-mode change still contributes");
+        assert_eq!(
+            contribution.writes.len(),
+            1,
+            "hyprpaper.conf carries the fit mode; the lock write is rejected for the same reason"
+        );
+        assert_eq!(
+            contribution.writes[0].changed_keys,
+            vec!["fit mode".to_string()],
+            "the rejected wallpaper path is skipped"
+        );
+        let rendered = String::from_utf8(contribution.writes[0].contents.clone())
+            .expect("hyprpaper.conf stays UTF-8");
+        assert!(
+            rendered.contains("fit_mode = tile")
+                && rendered.contains("path = ~/Pictures/wallpaper/18.jpg"),
+            "the fit mode is rewritten while the wallpaper path keeps its on-disk value"
+        );
+
+        model.commit();
+        let selected_fit = model
+            .selected_fit_index()
+            .and_then(|index| model.fit_options().get(index))
+            .map(String::as_str);
+        assert_eq!(
+            selected_fit,
+            Some("tile"),
+            "the fit mode reached the file, so it is promoted"
+        );
+        assert_eq!(
+            model.wallpaper.original.as_deref(),
+            Some("~/Pictures/wallpaper/18.jpg"),
+            "the wallpaper baseline still matches what is on disk"
+        );
+        assert!(
+            model.wallpaper.is_changed() && model.is_dirty(),
+            "the rejected wallpaper path stays staged and the page stays dirty"
+        );
+    }
+
+    #[test]
+    fn a_hyprpaper_only_write_rebaselines_the_override_toggle_from_the_new_paths() {
+        // R5.1 / task 9.6: the override toggle's baseline describes the *relationship*
+        // between the two on-disk paths, and a `hyprpaper.conf`-only write can change that
+        // relationship without `hyprlock.conf` being written at all. On a unified host
+        // (both files point at the same image) the user can turn the override on without
+        // picking a lock image — nothing needs writing to hyprlock.conf, because the path
+        // the override would keep is the one already there — and then change the wallpaper.
+        // The two paths now differ, so the toggle's baseline must be "on", exactly as a
+        // fresh load of the same files derives it. A baseline left at "off" would make
+        // Reset turn the override off, inventing a pending change the user never made
+        // (which, if applied, would silently resync the lock background to the wallpaper).
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_wallpaper_fixture(&config);
+        let wall = write_image(tmp.path(), "new_wall.png");
+
+        let mut model = WallpaperModel::load(paths.clone(), true);
+        assert!(
+            !model.override_on(),
+            "the unified fixture (both files on the same image) starts with no override"
+        );
+        model.set_override(true);
+        model
+            .stage_wallpaper(&wall)
+            .expect("a real image validates");
+
+        let contribution = model
+            .apply_contribution()
+            .expect("the wallpaper change contributes");
+        assert_eq!(
+            contribution.writes.len(),
+            1,
+            "hyprlock.conf already holds the path the override keeps, so only \
+             hyprpaper.conf is written"
+        );
+        assert_eq!(contribution.writes[0].backing, BackingFile::HyprpaperConf);
+
+        let plan = ApplyPlan {
+            validations: contribution.validations,
+            writes: contribution.writes,
+            palette: None,
+            reload_params: contribution.reload_params,
+        };
+        let caps = Capabilities::for_tests(&[Binary::Hyprctl], &[Daemon::Hyprpaper], true);
+        assert!(matches!(
+            apply::run(
+                &plan,
+                &FreshnessTracker::new(),
+                &caps,
+                &MockCommandRunner::new(),
+                &MockProcessSignaller::new(),
+            ),
+            ApplyOutcome::Applied { .. }
+        ));
+
+        model.commit();
+        assert!(!model.is_dirty(), "the applied change leaves a clean page");
+        assert!(model.override_on(), "the override the user set stays on");
+
+        // The load-bearing assertion: Reset must be a no-op on a clean page.
+        model.reset();
+        assert!(
+            model.override_on(),
+            "Reset keeps the override on, because that is what the two files now say"
+        );
+        assert!(
+            !model.is_dirty(),
+            "Reset on a clean page creates no pending change"
+        );
+
+        // Cross-check against the ground truth: a fresh read of the same files derives the
+        // same toggle state, so the model and the config agree.
+        let reloaded = WallpaperModel::load(paths, true);
+        assert!(
+            reloaded.override_on(),
+            "a fresh load of the written files also derives the override as on"
+        );
+        assert_eq!(
+            reloaded.wallpaper_path(),
+            Some(wall.as_str()),
+            "the wallpaper on disk is the new image"
+        );
+        assert_eq!(
+            reloaded.lock_path(),
+            Some("~/Pictures/wallpaper/18.jpg"),
+            "the lock background on disk is untouched, which is why the two now differ"
         );
     }
 }
