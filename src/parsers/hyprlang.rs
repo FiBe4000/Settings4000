@@ -1176,6 +1176,7 @@ fn strip_terminator(raw: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::differing_lines;
 
     /// The app-owned `input.conf` (analysis §6.3): a header comment, the
     /// `input { }` block with flat keys, and a nested `touchpad { }` block. Uses
@@ -1344,24 +1345,6 @@ bind = $mainMod, Return, exec, $terminal
         ]
     }
 
-    /// Splits emitted text into lines and returns the indices at which `before`
-    /// and `after` differ — used to assert an edit changed exactly one line.
-    fn differing_line_indices(before: &str, after: &str) -> Vec<usize> {
-        let before_lines: Vec<&str> = before.lines().collect();
-        let after_lines: Vec<&str> = after.lines().collect();
-        assert_eq!(
-            before_lines.len(),
-            after_lines.len(),
-            "an in-place edit must not add or remove lines"
-        );
-        before_lines
-            .iter()
-            .zip(&after_lines)
-            .enumerate()
-            .filter_map(|(i, (b, a))| (b != a).then_some(i))
-            .collect()
-    }
-
     #[test]
     fn round_trip_identity_on_realistic_fixtures() {
         // Headline guarantee (R6.1, architecture §3): parse -> emit with no edit
@@ -1402,7 +1385,7 @@ bind = $mainMod, Return, exec, $terminal
         file.set_value(&path, "false").expect("editable entry");
         let edited = file.emit();
 
-        let changed = differing_line_indices(INPUT_CONF, &edited);
+        let changed = differing_lines(INPUT_CONF, &edited);
         let target = INPUT_CONF
             .lines()
             .position(|l| l == "        natural_scroll=true")
@@ -1459,7 +1442,7 @@ bind = $mainMod, Return, exec, $terminal
         file.set_value(&second, "600").expect("editable entry");
         let edited = file.emit();
 
-        let changed = differing_line_indices(HYPRIDLE_CONF, &edited);
+        let changed = differing_lines(HYPRIDLE_CONF, &edited);
         let target = HYPRIDLE_CONF
             .lines()
             .position(|l| l == "    timeout = 300          # 5 min")
@@ -1520,7 +1503,7 @@ bind = $mainMod, Return, exec, $terminal
             .expect("matched env line");
         let edited = file.emit();
 
-        let changed = differing_line_indices(HYPRLAND_ENV, &edited);
+        let changed = differing_lines(HYPRLAND_ENV, &edited);
         let target = HYPRLAND_ENV
             .lines()
             .position(|l| l == "env = XCURSOR_THEME,Nordic-cursors")

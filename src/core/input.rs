@@ -440,6 +440,7 @@ mod tests {
     use crate::core::store::{FileReader, FileValues, SettingsStore};
     use crate::system::command::{Command, MockCommandRunner};
     use crate::system::signal::MockProcessSignaller;
+    use crate::testing::differing_lines;
 
     /// The app-owned `input.conf` shape (analysis §6.3): the `input {}` block with a
     /// layout list, an option list carrying an entry the app has no switch for, flat
@@ -458,24 +459,6 @@ input {
     }
 }
 ";
-
-    /// The indices at which two texts' lines differ — to assert an edit touched exactly
-    /// the expected lines (mirrors the hyprlang parser's own edit tests).
-    fn differing_lines(before: &str, after: &str) -> Vec<usize> {
-        let before: Vec<&str> = before.lines().collect();
-        let after: Vec<&str> = after.lines().collect();
-        assert_eq!(
-            before.len(),
-            after.len(),
-            "a surgical edit must not add or remove lines"
-        );
-        before
-            .iter()
-            .zip(&after)
-            .enumerate()
-            .filter_map(|(i, (b, a))| (b != a).then_some(i))
-            .collect()
-    }
 
     /// Renders `edits` into `INPUT_CONF` and returns the emitted text.
     fn render(edits: &[(SettingId, Value)]) -> String {

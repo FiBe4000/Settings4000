@@ -23,16 +23,51 @@
 //! so that `core`/`parsers` live in a GUI-free crate, this test becomes
 //! redundant and can be removed.
 //!
-//! This is a lexical scanner, not a compiler. It blanks comments (see
-//! `strip_comments`) but does not parse string literals, so a forbidden crate
-//! name embedded in a string constant (e.g. `const S: &str = "gtk4::Widget";`)
-//! would be reported as a violation. That is a deliberate, low-risk
-//! simplification: such literals do not occur in these headless modules, and if
-//! one ever did the failure is a loud false positive that a human resolves —
-//! never a real import slipping through undetected.
+//! # What this guard does and does not promise
+//!
+//! It is a lexical scanner, not a compiler, so its promise is narrow: **no line
+//! of the guarded files names a forbidden crate, either as an import target or
+//! as the root of a path.** The ordinary ways of reaching for the toolkit are
+//! all within that promise — `use gtk4::…`, `pub use relm4::…`,
+//! `extern crate gtk`, a bare `gtk4::Window::new()`, the globally-qualified
+//! `::gtk4::Window::new()`, a raw identifier `r#gtk4::…` — and so is a reference
+//! that shares a line with a string literal, because `lexical_guard`'s scanner
+//! understands comments *and* literals (a `//` or `/*` inside a string used to
+//! blank the code around it, hiding real references; see that module).
+//!
+//! Spellings the scanner is known **not** to catch, so that nobody mistakes its
+//! green result for a proof:
+//!
+//! - **A path split across lines** — `gtk4` at the end of one line and
+//!   `::Window` at the start of the next. The scan is line-by-line.
+//! - **Whitespace inside the path** — `gtk4 :: Window`. This one is covered by a
+//!   different CI gate rather than by this test: `cargo fmt --check` is
+//!   mandatory and rustfmt rewrites such a path to `gtk4::Window`, which this
+//!   scanner then sees.
+//! - **Any indirect route that never names the crate** — a glob import from a
+//!   module that does depend on the toolkit (`use crate::ui::something::*;`
+//!   followed by a bare `Window::new()`), a macro expanding to a GTK path, a
+//!   `#[path = "…"]` attribute pulling a GTK source file into these modules, or
+//!   a dependency renamed in `Cargo.toml` (`toolkit = { package = "gtk4" }`,
+//!   then `use toolkit::…`) — that last one is not even in the scanned tree.
+//!
+//! Closing that last class needs the compiler, i.e. the "workspace crate split"
+//! that `docs/tasks.md` §1.1 offers as the alternative to this guard. Until then
+//! they are accepted risks: each requires a deliberate and conspicuous edit.
+//! Note also that the list above is of *known* gaps, not a proof that no others
+//! exist — a lexical scanner cannot promise that. What it does promise is that a
+//! violation it fails to catch had to be written in an unusual way; anything
+//! written the usual way fails this test.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+
+// The `.rs` walker and the code/non-code splitter are shared with the other
+// lexical source-policy guard (`tests/no_custom_css.rs`); see that module for why
+// the sharing works this way.
+mod lexical_guard;
+
+use lexical_guard::{rust_sources, strip_comments};
 
 /// Crate roots that must not appear in an import within `core/` or `parsers/`.
 ///
@@ -116,10 +151,11 @@ fn startup_load_logic_is_gtk_free() {
 /// Scans each file in `files` for a reference to any crate in `forbidden`,
 /// returning a repo-relative description of every offending line.
 ///
-/// Comments are blanked first (see [`strip_comments`]) so a crate name mentioned
-/// in prose never counts. Shared by both guards so the layer scan and the
-/// individual-file scan apply identical lexical rules, differing only in which
-/// crates they forbid.
+/// Comments and literals are blanked first (see [`strip_comments`]) so a crate
+/// name mentioned in prose or in a string never counts — and, conversely, so no
+/// string can blank the code around it. Shared by both guards so the layer scan
+/// and the individual-file scan apply identical lexical rules, differing only in
+/// which crates they forbid.
 fn scan_for_forbidden(
     files: &[PathBuf],
     forbidden: &[&'static str],
@@ -148,93 +184,15 @@ fn scan_for_forbidden(
     violations
 }
 
-/// Collects every `.rs` file under `dir`, recursing into subdirectories so that
-/// nested module files (e.g. `core/detect/mod.rs`) are covered too.
-fn rust_sources(dir: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    let entries = fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("failed to read directory {}: {e}", dir.display()));
-
-    for entry in entries {
-        let path = entry
-            .unwrap_or_else(|e| panic!("failed to read entry in {}: {e}", dir.display()))
-            .path();
-
-        if path.is_dir() {
-            files.extend(rust_sources(&path));
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            files.push(path);
-        }
-    }
-
-    files
-}
-
-/// Returns a copy of `source` with Rust comments blanked out so that a `gtk`
-/// mention inside a doc comment or example never counts as a real dependency.
-///
-/// Block comments (`/* … */`) are removed first, then line comments (`//` and
-/// doc `///`). Removed spans are replaced with spaces rather than deleted so
-/// that byte/line positions are preserved for readable failure messages. This
-/// is a pragmatic scanner, not a full Rust lexer: it does not special-case
-/// `//` or `/*` occurring inside string literals, which do not appear in these
-/// modules' import statements and are vanishingly unlikely elsewhere in them.
-fn strip_comments(source: &str) -> String {
-    let bytes = source.as_bytes();
-    let mut out = String::with_capacity(source.len());
-    let mut i = 0;
-
-    while i < bytes.len() {
-        // Start of a block comment: consume through the matching `*/`,
-        // emitting a space for every consumed byte except newlines (kept so
-        // line numbering stays intact).
-        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-            i += 2;
-            out.push_str("  ");
-            while i < bytes.len()
-                && !(bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/')
-            {
-                out.push(if bytes[i] == b'\n' { '\n' } else { ' ' });
-                i += 1;
-            }
-            if i < bytes.len() {
-                i += 2; // skip the closing `*/`
-                out.push_str("  ");
-            }
-            continue;
-        }
-
-        // Start of a line comment (covers `//`, `///`, `//!`): drop the rest
-        // of the line but keep the newline.
-        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-
-        // Emit ASCII bytes verbatim; replace any non-ASCII byte (a UTF-8
-        // continuation/lead byte, always >= 0x80) with a space. The tokens we
-        // scan for (`use`, `::`, the crate names) are pure ASCII, so this can
-        // neither create nor destroy a real match.
-        out.push(if bytes[i] < 0x80 {
-            bytes[i] as char
-        } else {
-            ' '
-        });
-        i += 1;
-    }
-
-    out
-}
-
 /// Inspects a single comment-free code line and returns the forbidden crate it
 /// references, if any, from the `forbidden` set.
 ///
 /// Two shapes are recognized:
 /// 1. An import declaration — `use <crate>…` or `extern crate <crate>` (after
 ///    an optional `pub`/`pub(…)` visibility modifier).
-/// 2. A fully-qualified path — a bare `<crate>::` prefix used without a `use`.
+/// 2. A path rooted at the crate — `<crate>::…` or the globally-qualified
+///    `::<crate>::…`, anywhere on the line, used without any `use` (see
+///    [`is_path_root`] for how the root is distinguished from an inner segment).
 ///
 /// The `forbidden` set is a parameter so the same lexical rules guard both the
 /// `core`/`parsers` layers and the individually-guarded `ui/` files, which forbid
@@ -278,10 +236,13 @@ fn strip_visibility(line: &str) -> &str {
 }
 
 /// Extracts the first `::`-delimited identifier from a path, ignoring a leading
-/// `::` (as in `use ::gtk::…`). For `gtk4::prelude::*;` this yields `gtk4`.
+/// `::` (as in `use ::gtk::…`) and a raw-identifier marker (`use r#gtk4::…`,
+/// which is legal because `gtk4` is not a keyword). For `gtk4::prelude::*;` this
+/// yields `gtk4`.
 fn first_path_segment(path: &str) -> String {
     path.trim_start()
         .trim_start_matches("::")
+        .trim_start_matches("r#")
         .chars()
         .take_while(|c| c.is_alphanumeric() || *c == '_')
         .collect()
@@ -289,44 +250,248 @@ fn first_path_segment(path: &str) -> String {
 
 /// Reports whether `line` references `<crate>` as the *root* of a
 /// fully-qualified path — the crate name immediately followed by `::`, standing
-/// on its own rather than as a segment of a longer path or identifier.
+/// on its own rather than as a segment of a longer path or as the tail of a
+/// longer identifier.
 ///
-/// The left-boundary guard rejects two kinds of preceding character:
-/// - an identifier character (alphanumeric or `_`), so a longer name that
-///   merely ends in the crate name does not match (e.g. `nix_gtk::`);
-/// - a `:`, so an *inner* path segment does not match. A preceding `:` is the
-///   second colon of a `::`, meaning the crate name sits mid-path
-///   (e.g. `crate::core::theme::gtk::Model` or `cfg::gtk4::Value`). Such a
-///   segment is an intra-crate module or type merely named after the toolkit,
-///   not an import of it — and the app legitimately edits GTK themes
-///   (task 6.4), so a GTK-free `core::…::gtk` submodule is plausible and must
-///   not be flagged as a violation.
-///
-/// Genuine toolkit references are still caught: a crate-root use such as
-/// `gtk4::Window::new()` is preceded by whitespace or a delimiter, and actual
-/// imports (`use gtk4::…`, `use ::gtk4::…`, `extern crate gtk4`) are matched by
-/// the import-declaration case in `forbidden_reference` before this runs, so
-/// rejecting a leading `:` here loses no real coverage.
+/// Every occurrence on the line is examined, because one rejected occurrence
+/// says nothing about the next (`crate::theme::gtk::Model` and a real
+/// `gtk4::Window` can share a line).
 fn contains_path_prefix(line: &str, crate_name: &str) -> bool {
     let needle = format!("{crate_name}::");
     let mut search_from = 0;
     while let Some(pos) = line[search_from..].find(&needle) {
         let abs = search_from + pos;
-        // Guard the left boundary. The crate name counts as a path root only
-        // when the preceding character is neither an identifier character (else
-        // it is the tail of a longer name such as `nix_gtk::`) nor a `:` (else
-        // it is an inner segment of a longer path such as `crate::…::gtk::`,
-        // not a crate-root reference). See this function's doc for why the
-        // inner-segment case must not be flagged.
-        let boundary_ok = abs == 0
-            || !line[..abs]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ':');
-        if boundary_ok {
+        if is_path_root(&line[..abs]) {
             return true;
         }
         search_from = abs + needle.len();
     }
     false
+}
+
+/// Decides whether a `<crate>::` occurrence stands as the *root* of a path,
+/// judging by `before` — the code preceding it on the same line.
+///
+/// The cases, in the order they are tested:
+///
+/// 1. **Nothing precedes it.** A root (the line starts with the crate name).
+/// 2. **An identifier character** (alphanumeric or `_`). Not a root, but the
+///    tail of a longer name such as `nix_gtk::` — a different crate.
+/// 3. **A `::` qualifier.** A root only when the `::` is *not* itself preceded
+///    by an identifier character:
+///    - `::gtk4::Window::new()` — a **global path**. It needs no `use` at all
+///      (the crate is a direct dependency), so it is a genuine toolkit
+///      reference and must be flagged. Missing this spelling was the hole task
+///      9.13 closed.
+///    - `crate::core::theme::gtk::Model` — an inner segment of a longer path,
+///      i.e. an intra-crate module or type merely *named* after the toolkit.
+///      That is plausible here, since the app legitimately edits GTK themes
+///      (task 6.4), so it must not be flagged.
+/// 4. **Anything else.** A root. This covers whitespace and delimiters
+///    (`(`, `<`, `&`, `,`) as well as a lone `:`, which introduces a type in an
+///    ascription or bound (`let w:gtk4::Window`) and is therefore a real
+///    reference.
+///
+/// The rule is intentionally asymmetric: the only case it rejects outright is a
+/// path that provably continues to the left. An exotic prefix it has not
+/// anticipated is flagged rather than waved through, so an unforeseen spelling
+/// costs a false positive instead of a silent miss.
+fn is_path_root(before: &str) -> bool {
+    let mut preceding = before.chars().rev();
+
+    let Some(prev) = preceding.next() else {
+        return true; // Case 1: start of line.
+    };
+    if is_ident_char(prev) {
+        return false; // Case 2: tail of a longer identifier.
+    }
+    if prev != ':' {
+        return true; // Case 4: whitespace, a delimiter, or a lone `:`.
+    }
+
+    // A preceding `:` is the second colon of a `::` when another `:` sits
+    // before it; a single `:` is a type ascription and falls into case 4.
+    match preceding.next() {
+        // Case 3: `::<crate>::`. A global path unless the `::` continues a
+        // longer path to its left.
+        Some(':') => !preceding.next().is_some_and(is_ident_char),
+        _ => true,
+    }
+}
+
+/// Reports whether `c` may appear inside a Rust identifier.
+///
+/// Used for the path-boundary checks. Non-ASCII bytes have already been blanked
+/// by `lexical_guard::strip_comments`, so in practice this only ever sees ASCII.
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Asserts that `line` is reported as a reference to `expected`.
+///
+/// The lines in the tests below are hand-written samples of *legal Rust* that a
+/// future edit to `core/`/`parsers/` could plausibly contain; the point of the
+/// samples is that the guard's verdict on each spelling is pinned, so nobody has
+/// to re-derive the boundary rules from the code to know what is covered.
+#[track_caller]
+fn assert_flagged(line: &str, expected: &str) {
+    assert_eq!(
+        forbidden_reference(line, FORBIDDEN_CRATES),
+        Some(expected),
+        "expected {line:?} to be flagged as a reference to `{expected}`"
+    );
+}
+
+/// Asserts that `line` is *not* reported, because it is legitimate code that a
+/// reader might expect to trip the guard.
+#[track_caller]
+fn assert_not_flagged(line: &str) {
+    assert_eq!(
+        forbidden_reference(line, FORBIDDEN_CRATES),
+        None,
+        "expected {line:?} not to be flagged"
+    );
+}
+
+/// Asserts that `line` is *not* reported because it is one of the blind spots
+/// listed in this file's module docs.
+///
+/// Separate from [`assert_not_flagged`] purely for its failure message: this
+/// assertion fails when someone *improves* the scanner, and the message a
+/// contributor reads in CI has to say so — otherwise it looks like the change
+/// broke something and invites reverting a genuine hardening.
+#[track_caller]
+fn assert_documented_blind_spot(line: &str) {
+    assert_eq!(
+        forbidden_reference(line, FORBIDDEN_CRATES),
+        None,
+        "{line:?} is recorded in this file's module docs as a spelling the scanner \
+         cannot see, but it was just caught. If you hardened the scanner, nothing is \
+         broken — that is an improvement: move this case to the catch-list tests and \
+         delete its entry from the module docs' blind-spot list. Only revert if the \
+         match was accidental."
+    );
+}
+
+#[test]
+fn import_declarations_are_flagged_in_every_visibility_and_alias_form() {
+    assert_flagged("use gtk4::prelude::*;", "gtk4");
+    assert_flagged("use gtk::Widget;", "gtk");
+    assert_flagged("pub use relm4::Component;", "relm4");
+    assert_flagged("pub(crate) use gtk4::Window;", "gtk4");
+    assert_flagged("pub(in crate::core) use gtk4::Window;", "gtk4");
+    assert_flagged("extern crate gtk4;", "gtk4");
+    // A global-path import, and an alias that hides the crate name from the
+    // rest of the file.
+    assert_flagged("use ::gtk4::Window;", "gtk4");
+    assert_flagged("use gtk4::Window as W;", "gtk4");
+    assert_flagged("use relm4 as framework;", "relm4");
+    // A raw identifier is legal here (`gtk4` is not a keyword) and would
+    // otherwise read as a crate named `r`.
+    assert_flagged("use r#gtk4::Label;", "gtk4");
+}
+
+#[test]
+fn paths_rooted_at_a_forbidden_crate_are_flagged_without_any_import() {
+    assert_flagged("    let w = gtk4::Window::new();", "gtk4");
+    // The globally-qualified spelling: legal with no `use` at all, because the
+    // crate is a direct dependency. Missing it was the hole task 9.13 closed.
+    assert_flagged("    let w = ::gtk4::Window::new();", "gtk4");
+    assert_flagged("    <gtk4::Window as Default>::default();", "gtk4");
+    assert_flagged("    let v = Vec::<gtk4::Widget>::new();", "gtk4");
+    assert_flagged("    let v = Vec::<::gtk4::Widget>::new();", "gtk4");
+    assert_flagged("    let w: gtk4::Window = todo!();", "gtk4");
+    // A type ascription written without the customary space: the `:` here is a
+    // lone colon, not half of a `::`.
+    assert_flagged("    let w:gtk4::Window = todo!();", "gtk4");
+    assert_flagged("    gtk4::glib::clone!(@strong x => move |_| {});", "gtk4");
+    assert_flagged("    fn send(tx: &::relm4::Sender<u8>) {}", "relm4");
+    assert_flagged(
+        "    fn bound<T: gtk4::prelude::IsA<gtk4::Widget>>() {}",
+        "gtk4",
+    );
+}
+
+#[test]
+fn intra_crate_paths_and_lookalike_names_are_not_flagged() {
+    // An inner path segment merely *named* after the toolkit. The app edits GTK
+    // themes (task 6.4), so a GTK-free `core::…::gtk` module is plausible.
+    assert_not_flagged("use crate::core::theme::gtk::Model;");
+    assert_not_flagged("    let m = crate::core::theme::gtk::Model::new();");
+    assert_not_flagged("    let m = self::gtk::helper();");
+    // Different crates whose names merely end in a forbidden one.
+    assert_not_flagged("use nix_gtk::Widget;");
+    assert_not_flagged("    let x = my_relm4::thing();");
+    // Ordinary identifiers containing a forbidden name but no path root.
+    assert_not_flagged("    let gtk_theme_name = read_key(\"gtk-theme-name\")?;");
+    assert_not_flagged("use crate::parsers::ini::KEY_GTK_THEME;");
+}
+
+#[test]
+fn a_rejected_occurrence_does_not_mask_a_real_one_later_on_the_line() {
+    // The first `gtk::` is an inner segment; the second is a crate root. A
+    // scanner that stopped at the first rejection would miss the real one.
+    assert_flagged(
+        "    let m = crate::core::theme::gtk::Model::from(gtk::Align::Fill);",
+        "gtk",
+    );
+}
+
+#[test]
+fn glib_is_forbidden_only_in_the_individually_guarded_ui_files() {
+    // `src/ui/startup.rs` must not reach for glib's main context either (the
+    // worker/main-thread handoff belongs in `window.rs`), while the rest of the
+    // GTK-free layers are scanned with the narrower set.
+    let line = "    let ctx = glib::MainContext::default();";
+    assert_eq!(
+        forbidden_reference(line, UI_FILE_FORBIDDEN_CRATES),
+        Some("glib")
+    );
+    assert_eq!(forbidden_reference(line, FORBIDDEN_CRATES), None);
+}
+
+#[test]
+fn a_reference_sharing_a_line_with_a_string_literal_is_still_flagged() {
+    // Whole-file scanning strips comments *and* literals before matching, so a
+    // string is no longer able to blank the code beside it. Both lines below are
+    // legal Rust that a config-editing app could plausibly contain, and both hid a
+    // real toolkit reference from the earlier, string-blind scanner: the `//` in a
+    // URL was read as a line comment, and the `/*` in a glob pattern opened a
+    // block comment that ran on into the following lines. `lexical_guard` has the
+    // multi-line half of this; here the guard's own verdict is pinned.
+    let line = strip_comments(
+        "    let ok = matches!((s == \"https://a\", ::gtk4::Align::Fill), (true, _));",
+    );
+    assert_flagged(&line, "gtk4");
+
+    let glob = strip_comments("    let p = \"/*.conf\"; let a = gtk4::Align::Fill;");
+    assert_flagged(&glob, "gtk4");
+
+    // The other direction, unchanged: a crate name that is only ever *mentioned*
+    // in a string is not a use of it, and no longer reported.
+    let mention = strip_comments("    const DOC: &str = \"see gtk4::Widget\";");
+    assert_not_flagged(&mention);
+}
+
+#[test]
+fn the_documented_blind_spots_are_still_blind_spots() {
+    // This test pins the *limits* stated in this file's module docs, so that
+    // hardening the scanner fails here and the docs get corrected with it. See
+    // `assert_documented_blind_spot` for why it has its own assertion.
+    //
+    // Whitespace inside a path. `cargo fmt --check` is a mandatory CI gate and
+    // rustfmt rewrites this to `gtk4::Window`, which the scanner does catch, so
+    // the spelling cannot actually land in the repo.
+    assert_documented_blind_spot("    let w = gtk4 :: Window::new();");
+    // A path split across lines: the scan is line-by-line, so neither half
+    // carries a `<crate>::` token.
+    assert_documented_blind_spot("    let w = gtk4");
+    assert_documented_blind_spot("        ::Window::new();");
+    // Indirect routes that never name the crate. Only a compiler-enforced crate
+    // split (`docs/tasks.md` §1.1) could catch these.
+    assert_documented_blind_spot("use crate::ui::reexports::*;");
+    assert_documented_blind_spot("    let w = Window::new();");
+    // A dependency renamed in `Cargo.toml` (`toolkit = { package = "gtk4" }`):
+    // the deception is not even in the scanned tree.
+    assert_documented_blind_spot("use toolkit::Window;");
 }

@@ -723,6 +723,7 @@ fn reject_unsafe_key(key: &str) -> Result<(), EditError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::differing_lines;
 
     /// A realistic `uwsm/env` fixture derived from the real dotfiles (analysis
     /// §6.3): a header comment, the non-cursor session env, the canonical cursor
@@ -752,25 +753,6 @@ export XCURSOR_SIZE=16
 export QT_QPA_PLATFORM=\"wayland;xcb\"
 export QT_QPA_PLATFORMTHEME=gtk3
 ";
-
-    /// Splits both texts into lines and returns the indices at which they differ,
-    /// asserting first that neither an edit added nor removed a line — used to
-    /// prove an edit changed exactly one line.
-    fn differing_line_indices(before: &str, after: &str) -> Vec<usize> {
-        let before_lines: Vec<&str> = before.lines().collect();
-        let after_lines: Vec<&str> = after.lines().collect();
-        assert_eq!(
-            before_lines.len(),
-            after_lines.len(),
-            "an in-place edit must not add or remove lines"
-        );
-        before_lines
-            .iter()
-            .zip(&after_lines)
-            .enumerate()
-            .filter_map(|(index, (b, a))| (b != a).then_some(index))
-            .collect()
-    }
 
     #[test]
     fn round_trip_identity_on_a_realistic_fixture() {
@@ -825,7 +807,7 @@ export QT_QPA_PLATFORMTHEME=gtk3
         assert_eq!(outcome, SetOutcome::Edited);
 
         let edited = env.emit();
-        let differing = differing_line_indices(UWSM_ENV_COMMENTED, &edited);
+        let differing = differing_lines(UWSM_ENV_COMMENTED, &edited);
         let theme_index = UWSM_ENV_COMMENTED
             .lines()
             .position(|line| line == "export XCURSOR_THEME=Nordic-cursors")
@@ -851,7 +833,7 @@ export QT_QPA_PLATFORMTHEME=gtk3
             .expect("XCURSOR_SIZE exists");
 
         let edited = env.emit();
-        let differing = differing_line_indices(UWSM_ENV_COMMENTED, &edited);
+        let differing = differing_lines(UWSM_ENV_COMMENTED, &edited);
         let size_index = UWSM_ENV_COMMENTED
             .lines()
             .position(|line| line == "export XCURSOR_SIZE=16")
@@ -1181,7 +1163,7 @@ export XCURSOR_SIZE=16
         assert_eq!(outcome, SetOutcome::Edited);
 
         let edited = env.emit();
-        let differing = differing_line_indices(UWSM_ENV_COMMENTED, &edited);
+        let differing = differing_lines(UWSM_ENV_COMMENTED, &edited);
         let qt_index = UWSM_ENV_COMMENTED
             .lines()
             .position(|line| line == "export QT_QPA_PLATFORM=\"wayland;xcb\"")

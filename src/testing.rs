@@ -1,5 +1,7 @@
-//! Test support: the fixture-dotfiles installer (task 7.1, R6.1) and the shared
-//! harness of the end-to-end Apply suites (task 7.2).
+//! Test support: the fixture-dotfiles installer (task 7.1, R6.1), the shared
+//! harness of the end-to-end Apply suites (task 7.2), and the small text
+//! assertions ([`replace_once`], [`differing_lines`]) that the parser and page
+//! unit tests use to state the surgical-edit contract (task 9.13).
 //!
 //! Integration suites need a realistic dotfiles environment: a repo tree like
 //! `~/.dotfiles` (palette sources, `scripts/generate-colors`, `theme/fonts`,
@@ -461,4 +463,39 @@ pub fn replace_once(text: &str, from: &str, to: &str) -> String {
         "pattern {from:?} must occur exactly once in the fixture text, found {occurrences}"
     );
     text.replacen(from, to, 1)
+}
+
+/// Splits both texts into lines and returns the indices at which they differ,
+/// asserting first that the edit neither added nor removed a line.
+///
+/// This is the standard way the parser and page-model unit tests state the
+/// surgical-edit contract (architecture §3): an edit rewrites the targeted value
+/// span and leaves every other byte alone, so the expected result of changing one
+/// setting is *exactly one* differing line index. Asserting the line count first
+/// makes the common failure — a writer that regenerated the file, reordered it, or
+/// dropped a comment — fail with a clear message instead of an opaque index list.
+///
+/// Line endings are consumed by [`str::lines`], so a text whose final newline was
+/// added or removed compares equal here; the round-trip tests
+/// (`parse → emit == input`) are what pin the terminators.
+///
+/// # Panics
+///
+/// Panics if the two texts have different line counts (see above). Test-only code,
+/// so panicking is the intended way to report the failure.
+#[track_caller]
+pub fn differing_lines(before: &str, after: &str) -> Vec<usize> {
+    let before_lines: Vec<&str> = before.lines().collect();
+    let after_lines: Vec<&str> = after.lines().collect();
+    assert_eq!(
+        before_lines.len(),
+        after_lines.len(),
+        "a surgical edit must not add or remove lines"
+    );
+    before_lines
+        .iter()
+        .zip(&after_lines)
+        .enumerate()
+        .filter_map(|(index, (b, a))| (b != a).then_some(index))
+        .collect()
 }

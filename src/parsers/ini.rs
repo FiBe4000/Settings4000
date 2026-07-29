@@ -692,6 +692,7 @@ fn reject_unsafe_section(section: &str) -> Result<(), EditError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::differing_lines;
 
     /// A realistic `gtk-3.0/settings.ini` fixture derived from the real dotfiles
     /// (analysis §6.5): a leading comment (the XSETTINGS/dconf caveat), the
@@ -709,25 +710,6 @@ gtk-cursor-theme-size=16
 gtk-font-name=Noto Sans  10
 gtk-application-prefer-dark-theme=1
 ";
-
-    /// Splits both texts into lines and returns the indices at which they differ,
-    /// asserting first that neither an edit added nor removed a line — used to
-    /// prove an edit changed exactly one line.
-    fn differing_line_indices(before: &str, after: &str) -> Vec<usize> {
-        let before_lines: Vec<&str> = before.lines().collect();
-        let after_lines: Vec<&str> = after.lines().collect();
-        assert_eq!(
-            before_lines.len(),
-            after_lines.len(),
-            "an in-place edit must not add or remove lines"
-        );
-        before_lines
-            .iter()
-            .zip(&after_lines)
-            .enumerate()
-            .filter_map(|(index, (b, a))| (b != a).then_some(index))
-            .collect()
-    }
 
     #[test]
     fn round_trip_identity_on_a_realistic_fixture() {
@@ -786,7 +768,7 @@ gtk-application-prefer-dark-theme=1
         assert_eq!(outcome, SetOutcome::Edited);
 
         let edited = ini.emit();
-        let differing = differing_line_indices(SETTINGS_INI, &edited);
+        let differing = differing_lines(SETTINGS_INI, &edited);
         let theme_index = SETTINGS_INI
             .lines()
             .position(|line| line == "gtk-theme-name=Everforest-Green-Dark")

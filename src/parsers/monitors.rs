@@ -802,6 +802,7 @@ fn strip_terminator(raw: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::differing_lines;
 
     /// A realistic `monitors.conf` fixture derived from the real dotfiles
     /// (analysis §4, §6.2): header comments, blank-line grouping, an eDP-1 record
@@ -825,24 +826,6 @@ monitor=,preferred,auto,1
 
 # End of monitor configuration.
 ";
-
-    /// Splits emitted text into lines and returns the indices at which `before`
-    /// and `after` differ — used to assert an edit changed exactly one line.
-    fn differing_line_indices(before: &str, after: &str) -> Vec<usize> {
-        let before_lines: Vec<&str> = before.lines().collect();
-        let after_lines: Vec<&str> = after.lines().collect();
-        assert_eq!(
-            before_lines.len(),
-            after_lines.len(),
-            "an in-place edit must not add or remove lines"
-        );
-        before_lines
-            .iter()
-            .zip(&after_lines)
-            .enumerate()
-            .filter_map(|(i, (b, a))| (b != a).then_some(i))
-            .collect()
-    }
 
     /// Returns the single `monitor=` line of `text` whose comma fields start with
     /// `monitor=<name>` — used to inspect one record's emitted bytes.
@@ -930,7 +913,7 @@ monitor=,preferred,auto,1
             .expect("eDP-1 scale is editable");
 
         let edited = file.emit();
-        let changed = differing_line_indices(MONITORS_CONF, &edited);
+        let changed = differing_lines(MONITORS_CONF, &edited);
         let target = MONITORS_CONF
             .lines()
             .position(|l| l == "monitor=eDP-1,2880x1800@120,0x0,1.333333,bitdepth,10")
@@ -1104,7 +1087,7 @@ monitor=,preferred,auto,1
         assert_eq!(outcome, SetOutcome::Edited);
 
         let edited = file.emit();
-        let changed = differing_line_indices(MONITORS_CONF, &edited);
+        let changed = differing_lines(MONITORS_CONF, &edited);
         let target = MONITORS_CONF
             .lines()
             .position(|l| l == "monitor=eDP-1,2880x1800@120,0x0,1.333333,bitdepth,10")

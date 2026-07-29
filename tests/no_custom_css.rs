@@ -12,15 +12,31 @@
 //! silently reintroduce styling. It mirrors `tests/module_boundaries.rs`, which
 //! guards the GTK-free layering rule the same way.
 //!
-//! This is a lexical scanner, not a compiler. It blanks comments (see
-//! `strip_comments`) so the rule can be *documented* in rustdoc without tripping the
-//! guard, but it does not parse string literals; a forbidden name inside a string
-//! constant would be reported. That is a deliberate, low-risk simplification: no
-//! such literal exists in this codebase, and if one were ever added the failure is a
-//! loud false positive a human resolves, never a real CSS override slipping through.
+//! This is a lexical scanner, not a compiler, and what it promises is
+//! correspondingly narrow: **no line under `src/` spells one of the listed API
+//! names in code.** Comments and string/character literals are blanked first (see
+//! `lexical_guard::strip_comments`), which serves the rule in both directions: the
+//! policy can be *documented* in rustdoc — `ui/theme.rs` and `ui/window.rs` both
+//! explain why a `CssProvider` is forbidden — and, less obviously, a `//` or `/*`
+//! inside an ordinary string can no longer blank the code around it and hide a
+//! real call. (`ui/sound.rs` contains a `"/*"` string that used to open a phantom
+//! block comment, blanking the code beside it into the following line until a
+//! later `*/` closed it; a `"//"` string further down truncated its own line.)
+//!
+//! Beyond that promise the scanner cannot see: a route that never spells one of
+//! the names — a macro expanding to a `CssProvider`, or CSS loaded by a
+//! dependency — is out of reach. The listed names are simply the only way to
+//! inject custom CSS that this codebase could plausibly grow.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+// The `.rs` walker and the code/non-code splitter are shared with the other
+// lexical source-policy guard (`tests/module_boundaries.rs`); see that module for
+// why the sharing works this way.
+mod lexical_guard;
+
+use lexical_guard::{rust_sources, strip_comments};
 
 /// Custom-CSS APIs that must not appear anywhere in `src/`.
 ///
@@ -79,83 +95,4 @@ fn src_uses_no_custom_css() {
          (R2.1). Offending lines:\n{}",
         violations.join("\n")
     );
-}
-
-/// Collects every `.rs` file under `dir`, recursing into subdirectories so nested
-/// module files (e.g. `ui/window.rs`) are covered too.
-fn rust_sources(dir: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    let entries = fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("failed to read directory {}: {e}", dir.display()));
-
-    for entry in entries {
-        let path = entry
-            .unwrap_or_else(|e| panic!("failed to read entry in {}: {e}", dir.display()))
-            .path();
-
-        if path.is_dir() {
-            files.extend(rust_sources(&path));
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            files.push(path);
-        }
-    }
-
-    files
-}
-
-/// Returns a copy of `source` with Rust comments blanked out so that a mention of a
-/// forbidden API inside a doc comment (e.g. documenting *why* we avoid it) never
-/// counts as a real use.
-///
-/// Block comments (`/* … */`) are removed first, then line comments (`//`, `///`,
-/// `//!`). Removed spans are replaced with spaces rather than deleted so that
-/// byte/line positions are preserved for readable failure messages. This is a
-/// pragmatic scanner, not a full Rust lexer: it does not special-case `//` or `/*`
-/// occurring inside string literals, which do not appear in these files.
-fn strip_comments(source: &str) -> String {
-    let bytes = source.as_bytes();
-    let mut out = String::with_capacity(source.len());
-    let mut i = 0;
-
-    while i < bytes.len() {
-        // Start of a block comment: consume through the matching `*/`, emitting a
-        // space for every consumed byte except newlines (kept so line numbering
-        // stays intact).
-        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-            i += 2;
-            out.push_str("  ");
-            while i < bytes.len()
-                && !(bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/')
-            {
-                out.push(if bytes[i] == b'\n' { '\n' } else { ' ' });
-                i += 1;
-            }
-            if i < bytes.len() {
-                i += 2; // skip the closing `*/`
-                out.push_str("  ");
-            }
-            continue;
-        }
-
-        // Start of a line comment (covers `//`, `///`, `//!`): drop the rest of the
-        // line but keep the newline.
-        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-
-        // Emit ASCII bytes verbatim; replace any non-ASCII byte with a space. The
-        // tokens we scan for are pure ASCII, so this can neither create nor destroy a
-        // real match.
-        out.push(if bytes[i] < 0x80 {
-            bytes[i] as char
-        } else {
-            ' '
-        });
-        i += 1;
-    }
-
-    out
 }

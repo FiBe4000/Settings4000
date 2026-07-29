@@ -324,6 +324,7 @@ mod tests {
     use crate::core::store::{FileReader, FileValues, SettingsStore};
     use crate::system::command::{Command, MockCommandRunner};
     use crate::system::signal::MockProcessSignaller;
+    use crate::testing::differing_lines;
 
     /// A realistic `hypridle.conf` fixture in the real dotfiles' shape (analysis §6): a
     /// `general { }` block with the lock command, then three `listener { }` blocks in the
@@ -353,24 +354,6 @@ listener {
     on-resume = hyprctl dispatch dpms on         # screen on.
 }
 ";
-
-    /// The indices at which two texts' lines differ — to assert an edit touched exactly
-    /// the expected lines (mirrors the Input page's own edit tests).
-    fn differing_lines(before: &str, after: &str) -> Vec<usize> {
-        let before: Vec<&str> = before.lines().collect();
-        let after: Vec<&str> = after.lines().collect();
-        assert_eq!(
-            before.len(),
-            after.len(),
-            "a surgical edit must not add or remove lines"
-        );
-        before
-            .iter()
-            .zip(&after)
-            .enumerate()
-            .filter_map(|(i, (b, a))| (b != a).then_some(i))
-            .collect()
-    }
 
     /// Renders `edits` into `HYPRIDLE_CONF` and returns the emitted text.
     fn render(edits: &[(SettingId, Value)]) -> String {
