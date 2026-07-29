@@ -351,12 +351,27 @@ pub fn base_apply_plan(store: &SettingsStore) -> ApplyPlan {
 ///
 /// The suites' happy-path and reload-failure assertions all start from an `Applied`
 /// outcome, so this keeps the match noise out of every test.
+///
+/// It additionally asserts the apply reported **no** unrelated conflicts — no tracked
+/// file outside the plan's writes was changed on disk behind the suite's back (task
+/// 9.11). Every suite installs its own fixture tree and edits it deliberately, so a
+/// stray conflict means the fixture moved under the test and its other assertions can no
+/// longer be trusted. A suite that deliberately provokes one matches
+/// [`ApplyOutcome::Applied`] itself instead of calling this.
 pub fn expect_applied(outcome: ApplyOutcome) -> (Vec<ReloadError>, Vec<PathBuf>) {
     match outcome {
         ApplyOutcome::Applied {
             reload_failures,
             written,
-        } => (reload_failures, written),
+            unrelated_conflicts,
+        } => {
+            assert!(
+                unrelated_conflicts.is_empty(),
+                "the apply reported conflicts in tracked files it did not write, so the \
+                 fixture changed underneath the test: {unrelated_conflicts:?}"
+            );
+            (reload_failures, written)
+        }
         other => panic!("expected ApplyOutcome::Applied, got {other:?}"),
     }
 }

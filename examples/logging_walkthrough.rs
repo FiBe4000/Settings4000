@@ -149,6 +149,7 @@ fn main() {
         ApplyOutcome::Applied {
             reload_failures,
             written,
+            ..
         } => {
             assert!(reload_failures.is_empty(), "the mocked reload succeeds");
             written

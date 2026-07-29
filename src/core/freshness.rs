@@ -49,6 +49,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
+use std::fmt;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -94,6 +95,22 @@ pub enum ConflictReason {
     /// conflict (rather than ignored) so the pipeline never proceeds to write over
     /// a target it can no longer verify. Carries the underlying OS error.
     Unreadable(io::Error),
+}
+
+/// Renders the reason as a short phrase that reads naturally after a file path, so a
+/// caller can list a conflict as `<path>: <reason>`.
+///
+/// Written for the user rather than the log: the Apply pipeline hands non-blocking
+/// conflicts to the UI (task 9.11), which lists the affected files and needs to say
+/// which of them merely changed and which can no longer be read at all — the two call
+/// for different action ("Refresh to reload it" versus "put the file back").
+impl fmt::Display for ConflictReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConflictReason::ContentChanged => f.write_str("changed on disk"),
+            ConflictReason::Unreadable(error) => write!(f, "could not be read: {error}"),
+        }
+    }
 }
 
 /// A tracked file whose on-disk state no longer matches what was recorded when it

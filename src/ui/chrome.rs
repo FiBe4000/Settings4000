@@ -39,6 +39,7 @@ use gtk4::{
 };
 
 use crate::core::apply::ApplyOutcome;
+use crate::core::freshness::Conflict;
 use crate::core::model::Category;
 use crate::core::reload::ReloadError;
 use crate::core::store::{RefreshReport, SettingsStore};
@@ -120,7 +121,10 @@ pub(crate) enum ApplyResponse {
 ///   never touches the store, so without this commit the store stays dirty and the
 ///   next apply spuriously conflicts on the app's own write (task 4.5). A non-empty
 ///   `reload_failures` becomes a toast (R5.5) — the reloads are non-fatal and the
-///   writes still stand.
+///   writes still stand — and so does a non-empty `unrelated_conflicts` (R5.6): those
+///   files were changed by another program and this apply left them alone, so the user
+///   is told to Refresh (task 9.11). When both are present the toast carries both
+///   notes, since either alone would hide the other.
 /// - [`ApplyOutcome::ValidationFailed`] / [`ApplyOutcome::Conflicted`] /
 ///   [`ApplyOutcome::WriteFailed`] → [`ApplyResponse::Warn`]. Nothing durable changed
 ///   that the store must learn about (a write failure already rolled back), so no
@@ -128,10 +132,21 @@ pub(crate) enum ApplyResponse {
 pub(crate) fn respond_to_apply(outcome: &ApplyOutcome) -> ApplyResponse {
     match outcome {
         ApplyOutcome::Applied {
-            reload_failures, ..
+            reload_failures,
+            unrelated_conflicts,
+            ..
         } => {
-            let toast =
-                (!reload_failures.is_empty()).then(|| reload_failure_summary(reload_failures));
+            // Both notes are optional and independent, so they are collected and joined
+            // rather than nested: an apply can perfectly well have a component that
+            // would not reload *and* an unrelated file someone else edited.
+            let mut notes = Vec::new();
+            if !reload_failures.is_empty() {
+                notes.push(reload_failure_summary(reload_failures));
+            }
+            if !unrelated_conflicts.is_empty() {
+                notes.push(unrelated_conflict_summary(unrelated_conflicts));
+            }
+            let toast = (!notes.is_empty()).then(|| notes.join("\n\n"));
             ApplyResponse::Commit { toast }
         }
         ApplyOutcome::ValidationFailed(invalid) => {
@@ -245,6 +260,34 @@ fn reload_failure_summary(failures: &[ReloadError]) -> String {
         summary.push_str(&format!("\n• {failure}"));
     }
     summary.push_str("\nThey will pick up the change the next time they start.");
+    summary
+}
+
+/// Formats the note about tracked files another program changed that this apply did not
+/// write (R5.6; task 9.11).
+///
+/// These conflicts deliberately do not block an apply — it wrote none of the listed files,
+/// so it cannot have clobbered them — but they must not pass in silence either: what the
+/// app shows for those files is now stale, and one of them may have been deleted outright.
+/// Each line names the file and
+/// [`ConflictReason`](crate::core::freshness::ConflictReason)'s phrase for it, and the
+/// note points at Refresh, which reloads and re-baselines every file it can still read
+/// (R4.3) — hence the aside about a file that has to be put back first, which Refresh
+/// cannot do anything about.
+fn unrelated_conflict_summary(conflicts: &[Conflict]) -> String {
+    let mut summary = String::from(
+        "Your changes were saved. Other configuration files changed or disappeared on \
+         disk since Settings4000 read them and were left untouched by this apply — click \
+         Refresh to \
+         pick them up (any listed as unreadable has to be restored first):",
+    );
+    for conflict in conflicts {
+        summary.push_str(&format!(
+            "\n• {} ({})",
+            conflict.path().display(),
+            conflict.reason()
+        ));
+    }
     summary
 }
 
@@ -386,7 +429,7 @@ mod tests {
         self, ApplyPlan, FileWrite, InvalidSetting, WriteFailure, WriteFailureCause,
         WriteValidation,
     };
-    use crate::core::detect::Capabilities;
+    use crate::core::detect::{Binary, Capabilities};
     use crate::core::freshness::FreshnessTracker;
     use crate::core::model::{SettingId, Value};
     use crate::core::reload::{BackingFile, ReloadParams};
@@ -485,6 +528,7 @@ mod tests {
         let outcome = ApplyOutcome::Applied {
             reload_failures: Vec::new(),
             written: Vec::new(),
+            unrelated_conflicts: Vec::new(),
         };
         match respond_to_apply(&outcome) {
             ApplyResponse::Commit { toast } => {
@@ -504,6 +548,7 @@ mod tests {
                 code: Some(1),
             }],
             written: Vec::new(),
+            unrelated_conflicts: Vec::new(),
         };
         match respond_to_apply(&outcome) {
             ApplyResponse::Commit { toast } => {
@@ -514,6 +559,61 @@ mod tests {
                 );
             }
             other => panic!("expected Commit with a toast, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_apply_with_an_unrelated_conflict_commits_and_toasts_both_notes() {
+        // Task 9.11 (R5.6): a tracked file another program changed that this apply did not
+        // write no longer blocks the apply, so the writes stand and the user is told about
+        // the file instead — otherwise the only signal would be an apply aborting later.
+        // A `Conflict` can only be produced by a real conflict check, so this runs the
+        // pipeline with one tracked file deleted while the plan writes the other.
+        //
+        // The reload is made to fail at the same time, because that is the case a naive
+        // implementation gets wrong: both notes compete for the single toast, and either
+        // one silently replacing the other would hide a genuine problem.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("input.conf");
+        fs::write(&target, b"kb_layout = us\n").expect("write the write target");
+        let deleted = dir.path().join("hypridle.conf");
+        fs::write(&deleted, b"listener { timeout = 300 }\n").expect("write the other file");
+        let mut tracker = FreshnessTracker::new();
+        tracker.record(&target).expect("baseline the write target");
+        tracker.record(&deleted).expect("baseline the other file");
+        fs::remove_file(&deleted).expect("delete the other tracked file");
+
+        let plan = ApplyPlan {
+            validations: Vec::new(),
+            writes: vec![FileWrite {
+                path: target.clone(),
+                contents: b"kb_layout = us,se\n".to_vec(),
+                changed_keys: vec!["kb_layout".to_string()],
+                backing: BackingFile::InputConf,
+                validation: WriteValidation::InPlan,
+            }],
+            palette: None,
+            reload_params: ReloadParams::default(),
+        };
+        // `hyprctl reload` runs (hyprctl present, socket live) and exits non-zero.
+        let caps = Capabilities::for_tests(&[Binary::Hyprctl], &[], true);
+        let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake(1))]);
+        let signaller = MockProcessSignaller::new();
+        let outcome = apply::run(&plan, &tracker, &caps, &runner, &signaller);
+
+        match respond_to_apply(&outcome) {
+            ApplyResponse::Commit { toast } => {
+                let text = toast.expect("both notes must produce a toast");
+                assert!(
+                    text.contains("hypridle.conf") && text.contains("Refresh"),
+                    "the toast names the file left alone and how to recover: {text}"
+                );
+                assert!(
+                    text.contains("hyprctl"),
+                    "the reload failure must not be displaced by the conflict note: {text}"
+                );
+            }
+            other => panic!("expected Commit, got {other:?}"),
         }
     }
 

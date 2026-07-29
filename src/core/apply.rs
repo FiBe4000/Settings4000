@@ -25,14 +25,34 @@
 //!    nothing is written. (The store already validates on stage, so this is a
 //!    final guard — and it genuinely re-checks time-sensitive rules like a
 //!    wallpaper path that may have been deleted since it was staged.)
-//! 2. **Conflict check** (R5.6): re-read and hash the tracked target files via
-//!    [`FreshnessTracker::check_conflicts`]. If any changed externally since it
-//!    was loaded, abort *before any write* and surface the conflict rather than
-//!    clobber the external edit. This is deliberately whole-tracker scoped: *any*
-//!    externally-changed tracked backing file aborts the apply, not only the ones
-//!    this apply would write, matching architecture §6's "re-read + hash compare"
-//!    — the conservative choice, since the store re-baselines on focus/refresh so
-//!    a conflict here is a genuine race that has arisen since the last refresh.
+//! 2. **Conflict check** (R5.6): re-read and hash the tracked files via
+//!    [`FreshnessTracker::check_conflicts`], then split the result by whether the
+//!    file is one this apply would write (see [`partition_conflicts`]):
+//!    - a **write target** that changed externally since it was loaded aborts the
+//!      apply *before any write*, so the external edit is surfaced rather than
+//!      clobbered ([`ApplyOutcome::Conflicted`]);
+//!    - any **other** tracked file that changed does not block the apply. It is
+//!      logged and handed back as
+//!      [`unrelated_conflicts`](ApplyOutcome::Applied::unrelated_conflicts) for the
+//!      UI to mention, because the store's in-memory copy of that file is now stale.
+//!
+//!    Scoping the *blocking* to the write targets is what keeps the pipeline
+//!    recoverable (task 9.11). Blocking on the whole tracker was safe but a dead
+//!    end: the store can only clear a baseline for a file it can re-read and
+//!    re-parse, so a tracked file that was deleted, had its permissions revoked, or
+//!    was left unparseable by a hand edit stays in conflict for the rest of the
+//!    session — and while it did, *every* category's apply returned `Conflicted`
+//!    with no way out short of restarting the app. Narrowing it costs nothing in
+//!    safety: R5.6 is about not clobbering an external edit, and an apply cannot
+//!    clobber a file it does not write. The problem file's own category stays
+//!    protected twice over — the conflict blocks the apply the moment that file
+//!    becomes a write target, and each page's write glue re-reads its backing file
+//!    to render the edit, so an unreadable one aborts the apply before the plan is
+//!    even assembled. What the narrowing does give up is the incidental early
+//!    warning the whole-tracker check gave for a file with no pending edits, which
+//!    is exactly why those conflicts are still *returned* rather than dropped: the
+//!    user is told and recovers with Refresh, which reloads and re-baselines what it
+//!    can (R4.3).
 //! 3. **Atomic writes with per-file rollback** (R5.4): write each planned file
 //!    through [`write_atomic`], collecting a [`FileSnapshot`] per success. If any
 //!    write fails, every already-written file is rolled back from its in-memory
@@ -332,8 +352,16 @@ pub enum ApplyOutcome {
     /// Step 1 failed: one or more staged values are invalid (R8.3). Nothing was
     /// written; the UI shows the errors and keeps the staged edits for correction.
     ValidationFailed(Vec<InvalidSetting>),
-    /// Step 2 failed: one or more tracked target files changed on disk since load
-    /// (R5.6). Nothing was written; the UI warns and reloads rather than clobber.
+    /// Step 2 failed: one or more files this apply would have **written** changed on
+    /// disk since load (R5.6). Nothing was written; the UI warns and reloads rather
+    /// than clobber.
+    ///
+    /// Carries only the conflicts that blocked the apply, i.e. the ones the user has
+    /// to resolve before it can succeed. Conflicts in tracked files this apply does
+    /// not write never block it (see the module docs on step 2) and are reported
+    /// through [`Applied`](Self::Applied)'s `unrelated_conflicts` instead — on an
+    /// aborted apply they are only logged, since the blocking ones are what the user
+    /// must act on.
     Conflicted(Vec<Conflict>),
     /// Step 3 or 4 failed: a file write or the palette generator failed. Every
     /// already-written file was rolled back to its pre-apply snapshot (R5.4).
@@ -359,6 +387,18 @@ pub enum ApplyOutcome {
         /// paths (not the symlink-resolved targets the snapshots hold). Also lets
         /// the UI report exactly which files changed.
         written: Vec<PathBuf>,
+        /// Tracked backing files that changed on disk since they were loaded but that
+        /// this apply did **not** write, so they never blocked it (step 2, R5.6; task
+        /// 9.11).
+        ///
+        /// Empty on the ordinary apply. A non-empty list means nothing was clobbered —
+        /// these files were left exactly as the other program left them — but the
+        /// store's in-memory originals for them are now stale, and one of them may no
+        /// longer be readable at all. The UI surfaces them as a non-fatal note so the
+        /// user knows to Refresh (which reloads and re-baselines what it can, R4.3)
+        /// rather than being told nothing until the next apply that touches one of
+        /// those files aborts.
+        unrelated_conflicts: Vec<Conflict>,
     },
 }
 
@@ -397,13 +437,24 @@ pub fn run(
     }
 
     // --- Step 2: conflict check — re-read + hash the tracked files (R5.6) ---
-    let conflicts = freshness.check_conflicts();
-    if !conflicts.is_empty() {
+    let (blocking, unrelated_conflicts) = partition_conflicts(plan, freshness.check_conflicts());
+    if !blocking.is_empty() {
         tracing::warn!(
-            count = conflicts.len(),
+            count = blocking.len(),
             "aborting apply: target files changed on disk since load; not clobbering (R5.6)"
         );
-        return ApplyOutcome::Conflicted(conflicts);
+        return ApplyOutcome::Conflicted(blocking);
+    }
+    if !unrelated_conflicts.is_empty() {
+        // Not a reason to abort: this apply writes none of these files, so it cannot
+        // clobber them (task 9.11). `check_conflicts` has already logged each one with
+        // its path and reason; this records the pipeline's decision to proceed, so the
+        // journal shows the conflict *and* that it did not block the apply (R7.3).
+        tracing::info!(
+            count = unrelated_conflicts.len(),
+            "tracked files changed on disk but are not written by this apply; \
+             continuing and reporting them"
+        );
     }
 
     // --- Steps 3 & 4: atomic writes then the palette generator, with rollback ---
@@ -436,12 +487,54 @@ pub fn run(
         files_written = written.len(),
         palette_regenerated = plan.palette.is_some(),
         reload_failures = reload_failures.len(),
+        unrelated_conflicts = unrelated_conflicts.len(),
         "apply completed; file writes stand"
     );
     ApplyOutcome::Applied {
         reload_failures,
         written,
+        unrelated_conflicts,
     }
+}
+
+/// Splits the tracker's conflicts into the ones that must abort this apply and the ones
+/// that are only reported (step 2, R5.6; task 9.11).
+///
+/// Returns `(blocking, unrelated)`: a conflict is **blocking** when its file is one of
+/// `plan`'s write targets, because writing it would clobber whatever changed on disk (or,
+/// for an unreadable file, would write bytes rendered from contents that could not be
+/// verified). Every other conflict is unrelated to this apply — it writes those files
+/// not at all — so it is reported to the caller instead of aborting the apply. See the
+/// module docs on step 2 for why the blocking set is scoped this way.
+///
+/// "Writes those files not at all" covers the palette step too, which mutates files that
+/// are *not* in `plan.writes` (the generated colour and font partials, `swaync/colors.css`,
+/// `state/active-scheme`). That is safe only because generated files are read-only inputs
+/// this app never loads into the store, so they can never be tracked and can never turn up
+/// as a conflict here. If a generated file ever did become store-loaded, this partition
+/// would call a conflict in it unrelated while a palette apply rewrote it — so keep that
+/// invariant, or teach this function about the generator's outputs.
+///
+/// Matching is by exact path equality, which is sound because both sides are the *same*
+/// live XDG path: the tracker is keyed by the path the loader read each file from
+/// (R8.5), and a [`FileWrite`] carries the path its page was built with from that same
+/// loader. It also rests on those paths never aliasing: two different path strings that
+/// resolve to one file would let a real write target be classed unrelated and written
+/// anyway. The app's tracked set is fixed and disjoint, so no such alias exists — but note
+/// the whole-tracker check this replaced was alias-proof by construction and this one is
+/// not, so a future tracked file reachable by two spellings needs care here.
+/// Nothing here canonicalizes, deliberately — a deleted or permission-revoked
+/// file cannot be canonicalized at all, and that is precisely the case this comparison
+/// has to get right.
+fn partition_conflicts(
+    plan: &ApplyPlan,
+    conflicts: Vec<Conflict>,
+) -> (Vec<Conflict>, Vec<Conflict>) {
+    conflicts.into_iter().partition(|conflict| {
+        plan.writes
+            .iter()
+            .any(|write| write.path.as_path() == conflict.path())
+    })
 }
 
 /// Validates every `(id, value)` pair, collecting the ones that fail (step 1).
@@ -718,6 +811,7 @@ mod tests {
     use nix::sys::signal::Signal;
 
     use crate::core::detect::{Binary, Daemon};
+    use crate::core::freshness::ConflictReason;
     use crate::system::command::{CommandOutput, MockCommandRunner};
     use crate::system::signal::{MockProcessSignaller, SignalCall};
 
@@ -784,12 +878,17 @@ mod tests {
             ApplyOutcome::Applied {
                 reload_failures,
                 written,
+                unrelated_conflicts,
             } => {
                 assert!(reload_failures.is_empty());
                 assert_eq!(
                     written,
                     vec![monitors.clone()],
                     "the written live path is reported for the caller to commit"
+                );
+                assert!(
+                    unrelated_conflicts.is_empty(),
+                    "an untouched tracker reports nothing to warn about"
                 );
             }
             other => panic!("expected Applied, got {other:?}"),
@@ -842,6 +941,7 @@ mod tests {
             ApplyOutcome::Applied {
                 reload_failures,
                 written,
+                ..
             } => {
                 assert!(reload_failures.is_empty());
                 assert!(
@@ -933,7 +1033,9 @@ mod tests {
     #[test]
     fn an_external_conflict_aborts_before_any_write() {
         // Accept criterion (d): a target file changed on disk since load aborts at
-        // step 2, so the staged write never clobbers the external edit (R5.6).
+        // step 2, so the staged write never clobbers the external edit (R5.6). The
+        // conflicting file is this plan's write target, which is exactly what makes it
+        // blocking (task 9.11 — see the module docs on step 2's scoping).
         let dir = tempfile::tempdir().expect("temp dir should be creatable");
         let target = write_file(&dir, "input.conf", b"kb_layout = us\n");
         let mut tracker = FreshnessTracker::new();
@@ -971,6 +1073,242 @@ mod tests {
             "the external edit stands; the staged write must not have clobbered it"
         );
         assert!(runner.recorded().is_empty(), "nothing runs on a conflict");
+    }
+
+    // --- step 2's scoping: only a write target's conflict blocks (task 9.11) ------
+
+    /// Two tracked files in a fresh temp dir, returning `(dir, input_conf, hypridle_conf)`
+    /// with both baselined in the returned tracker.
+    ///
+    /// The scoping tests all need the same two-file shape: the store tracks every backing
+    /// file it loaded (`input.conf`, swaync's `config.json`, `hypridle.conf`), while any
+    /// single apply writes only the files whose category the user actually edited. Which of
+    /// the two a given test makes its write target is the test's choice — deliberately not
+    /// baked into these names, since the blocking and non-blocking tests swap the roles.
+    fn two_tracked_files() -> (tempfile::TempDir, PathBuf, PathBuf, FreshnessTracker) {
+        let dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let input_conf = write_file(&dir, "input.conf", b"kb_layout = us\n");
+        let hypridle_conf = write_file(&dir, "hypridle.conf", b"listener { timeout = 300 }\n");
+        let tracker = record_baseline(&[&input_conf, &hypridle_conf]);
+        (dir, input_conf, hypridle_conf, tracker)
+    }
+
+    /// The `input.conf` write the scoping tests plan, given the path from
+    /// [`two_tracked_files`].
+    fn input_conf_write(path: &Path) -> FileWrite {
+        FileWrite {
+            path: path.to_path_buf(),
+            contents: b"kb_layout = us,se\n".to_vec(),
+            changed_keys: vec!["kb_layout".to_string()],
+            backing: BackingFile::InputConf,
+            validation: WriteValidation::InPlan,
+        }
+    }
+
+    #[test]
+    fn a_deleted_tracked_file_does_not_block_an_apply_to_other_files() {
+        // Task 9.11, the defect this scoping fixes: a tracked backing file that was
+        // deleted can never be re-baselined by the store's refresh, so a whole-tracker
+        // conflict check turned it into a permanent block on *every* category's apply
+        // until the app was restarted. The apply below writes only `input.conf`, so the
+        // deleted `hypridle.conf` cannot be clobbered by it and must not stop it — but it
+        // is still reported, because the app's view of that file is now wrong.
+        let (_dir, written, other, tracker) = two_tracked_files();
+        fs::remove_file(&other).expect("delete the other tracked file");
+
+        let plan = ApplyPlan {
+            validations: Vec::new(),
+            writes: vec![input_conf_write(&written)],
+            palette: None,
+            reload_params: ReloadParams::default(),
+        };
+        let runner = MockCommandRunner::new();
+        let signaller = MockProcessSignaller::new();
+
+        let outcome = run(&plan, &tracker, &hyprland_only(), &runner, &signaller);
+
+        match outcome {
+            ApplyOutcome::Applied {
+                written: written_paths,
+                unrelated_conflicts,
+                ..
+            } => {
+                assert_eq!(written_paths, vec![written.clone()]);
+                assert_eq!(
+                    unrelated_conflicts.len(),
+                    1,
+                    "the deleted file is reported rather than dropped"
+                );
+                assert_eq!(unrelated_conflicts[0].path(), other.as_path());
+                assert!(
+                    matches!(
+                        unrelated_conflicts[0].reason(),
+                        ConflictReason::Unreadable(_)
+                    ),
+                    "a deleted file's conflict reason is Unreadable, got {:?}",
+                    unrelated_conflicts[0].reason()
+                );
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(&written).expect("read the rewritten file"),
+            b"kb_layout = us,se\n",
+            "the unrelated file's problem must not cost the user their applied edit"
+        );
+        assert!(
+            !other.exists(),
+            "the apply must not recreate the file it did not plan to write"
+        );
+        assert_eq!(
+            runner.recorded(),
+            vec![Command::new("hyprctl").arg("reload")],
+            "the apply completes normally, reloads included"
+        );
+    }
+
+    #[test]
+    fn an_external_edit_to_a_file_this_apply_does_not_write_does_not_block_it() {
+        // The same scoping for the recoverable reason (task 9.11): a file someone else
+        // edited that this apply does not write is reported, not blocking. Its external
+        // bytes must stand untouched — the apply writes only its own target — and the
+        // user recovers the app's stale view of it with Refresh.
+        let (_dir, written, other, tracker) = two_tracked_files();
+        fs::write(&other, b"listener { timeout = 900 }\n").expect("external edit");
+
+        let plan = ApplyPlan {
+            validations: Vec::new(),
+            writes: vec![input_conf_write(&written)],
+            palette: None,
+            reload_params: ReloadParams::default(),
+        };
+        let runner = MockCommandRunner::new();
+        let signaller = MockProcessSignaller::new();
+
+        let outcome = run(&plan, &tracker, &hyprland_only(), &runner, &signaller);
+
+        match outcome {
+            ApplyOutcome::Applied {
+                unrelated_conflicts,
+                ..
+            } => {
+                assert_eq!(unrelated_conflicts.len(), 1);
+                assert_eq!(unrelated_conflicts[0].path(), other.as_path());
+                assert!(matches!(
+                    unrelated_conflicts[0].reason(),
+                    ConflictReason::ContentChanged
+                ));
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(&other).expect("read the externally edited file"),
+            b"listener { timeout = 900 }\n",
+            "the external edit stands: this apply never targeted that file"
+        );
+    }
+
+    #[test]
+    fn a_deleted_write_target_still_aborts_the_whole_apply() {
+        // The other half of the scoping: the file's *own* category is still protected.
+        // Here the deleted file is the one the plan writes, so step 2 blocks — the apply
+        // must never write bytes rendered from contents it could not verify. Nothing else
+        // in the plan is written either: an apply is all-or-nothing (R5.4).
+        let (_dir, other, target, tracker) = two_tracked_files();
+        fs::remove_file(&target).expect("delete the write target");
+
+        let plan = ApplyPlan {
+            validations: Vec::new(),
+            writes: vec![FileWrite {
+                path: target.clone(),
+                contents: b"listener { timeout = 600 }\n".to_vec(),
+                changed_keys: vec!["listener[1].timeout".to_string()],
+                backing: BackingFile::HypridleConf,
+                validation: WriteValidation::InPlan,
+            }],
+            palette: None,
+            reload_params: ReloadParams::default(),
+        };
+        let runner = MockCommandRunner::new();
+        let signaller = MockProcessSignaller::new();
+
+        let outcome = run(&plan, &tracker, &hyprland_only(), &runner, &signaller);
+
+        match outcome {
+            ApplyOutcome::Conflicted(conflicts) => {
+                assert_eq!(conflicts.len(), 1, "only the write target blocks");
+                assert_eq!(conflicts[0].path(), target.as_path());
+                assert!(matches!(
+                    conflicts[0].reason(),
+                    ConflictReason::Unreadable(_)
+                ));
+            }
+            other => panic!("expected Conflicted, got {other:?}"),
+        }
+        assert!(
+            !target.exists(),
+            "a blocked apply must not create the missing target"
+        );
+        assert_eq!(
+            fs::read(&other).expect("read the untouched file"),
+            b"kb_layout = us\n",
+            "the apply aborted before any write"
+        );
+        assert!(runner.recorded().is_empty(), "nothing runs on a conflict");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_target_whose_contents_cannot_be_read_aborts_the_apply() {
+        // The case where step 2 is the *only* thing standing between the user and a
+        // clobber: a target that still exists (so the atomic writer would happily
+        // rewrite it) but whose read permission was revoked after it was loaded, meaning
+        // the app cannot know what is in it now. The write must not proceed.
+        //
+        // Guarded so it degrades to a no-op when the suite happens to run as root, where
+        // the mode is ignored and the read still succeeds — the same guard the freshness
+        // tests use.
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, _other, target, tracker) = two_tracked_files();
+        let original = fs::read(&target).expect("read the target before locking it");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o000))
+            .expect("revoke read permission");
+        let unreadable = fs::read(&target).is_err();
+
+        let plan = ApplyPlan {
+            validations: Vec::new(),
+            writes: vec![FileWrite {
+                path: target.clone(),
+                contents: b"listener { timeout = 600 }\n".to_vec(),
+                changed_keys: vec!["listener[1].timeout".to_string()],
+                backing: BackingFile::HypridleConf,
+                validation: WriteValidation::InPlan,
+            }],
+            palette: None,
+            reload_params: ReloadParams::default(),
+        };
+        let runner = MockCommandRunner::new();
+        let signaller = MockProcessSignaller::new();
+
+        let outcome = run(&plan, &tracker, &hyprland_only(), &runner, &signaller);
+
+        if unreadable {
+            assert!(
+                matches!(outcome, ApplyOutcome::Conflicted(_)),
+                "an unverifiable write target must abort the apply, got {outcome:?}"
+            );
+        }
+        // Restore the mode so the contents can be checked and the temp dir cleaned up.
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644))
+            .expect("restore permissions");
+        if unreadable {
+            assert_eq!(
+                fs::read(&target).expect("read the target back"),
+                original,
+                "the file the app could not read must keep its bytes"
+            );
+        }
     }
 
     // --- (e) a mid-write failure: earlier files rolled back, no reloads ----------
@@ -1320,6 +1658,7 @@ mod tests {
             ApplyOutcome::Applied {
                 reload_failures,
                 written,
+                ..
             } => {
                 assert_eq!(reload_failures.len(), 1, "the failed reload is surfaced");
                 assert!(matches!(
@@ -1378,6 +1717,7 @@ mod tests {
             ApplyOutcome::Applied {
                 reload_failures,
                 written,
+                ..
             } => {
                 assert_eq!(reload_failures.len(), 1, "only the hyprctl reload failed");
                 assert!(
@@ -1451,6 +1791,7 @@ mod tests {
             ApplyOutcome::Applied {
                 reload_failures,
                 written,
+                ..
             } => {
                 assert!(reload_failures.is_empty());
                 assert_eq!(written, vec![monitors.clone()]);
@@ -1526,6 +1867,7 @@ mod tests {
             ApplyOutcome::Applied {
                 reload_failures,
                 written,
+                ..
             } => {
                 assert!(reload_failures.is_empty());
                 assert_eq!(written, vec![config.clone()]);

@@ -833,6 +833,7 @@ input {
             ApplyOutcome::Applied {
                 reload_failures,
                 written,
+                ..
             } => {
                 assert!(reload_failures.is_empty());
                 assert_eq!(written, vec![path.clone()]);

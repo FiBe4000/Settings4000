@@ -11,6 +11,10 @@
 //! byte-identical. Per-setting byte-exact coverage lives in `core::input`'s unit
 //! tests (task 6.6); this suite exercises a representative edit through real
 //! files, symlinks, and the shared harness.
+//!
+//! One case here reaches beyond the Input page on purpose: an Input apply made while
+//! *another* page's backing file is missing, which is where the conflict check's
+//! write-target scoping is observable end to end (task 9.11).
 
 use std::fs;
 
@@ -18,6 +22,7 @@ use settings4000::core::apply::{self, ApplyOutcome};
 use settings4000::core::detect::{Binary, Capabilities};
 use settings4000::core::input::InputModel;
 use settings4000::core::model::{Category, SettingId, Value};
+use settings4000::core::power::PowerModel;
 use settings4000::core::store::SettingsStore;
 use settings4000::system::command::{Command, CommandOutput, MockCommandRunner};
 use settings4000::system::signal::MockProcessSignaller;
@@ -219,6 +224,102 @@ fn an_external_edit_between_load_and_apply_aborts_as_conflicted() {
         "no command runs on a conflict"
     );
     assert!(signaller.calls().is_empty());
+}
+
+#[test]
+fn a_deleted_hypridle_conf_neither_blocks_an_input_apply_nor_lets_its_own_page_write() {
+    // Task 9.11 (R5.6/R8.3), both halves of the rule, end to end through the real
+    // loaders and models: a *second* backing file — `hypridle.conf`, the Power & Idle
+    // page's — is loaded into the same store and then deleted, the state the store can
+    // never re-baseline on its own.
+    //
+    // (i) The Input apply must still succeed. It writes only `input.conf`, so it cannot
+    //     clobber the missing file; before this fix the whole-tracker conflict check made
+    //     every category's apply return `Conflicted` until the app was restarted.
+    // (ii) The missing file's own page must still refuse to write. Its write glue reads
+    //     the file to render the edit, so a Power & Idle apply fails at preparation and
+    //     the window aborts — the app never writes bytes rendered from contents it could
+    //     not read. (The pipeline's own guard for the same case — a plan whose write
+    //     target is unreadable — is unit-tested in `core::apply`.)
+    let fx = FixtureDotfiles::install();
+    let before = repo_snapshot(&fx);
+    let path = input_conf(&fx);
+    let original = fs::read_to_string(&path).expect("read the fixture input.conf");
+
+    let (mut store, model) = store_and_model(&fx);
+    let hypridle_conf = fx.config_path("hypr/hypridle.conf");
+    load_into_store(&mut store, &hypridle_conf, loaders::hypridle_conf);
+    let power = PowerModel::load(hypridle_conf.clone());
+
+    // The deployed path disappears — an undeployed dotfiles link, a `rm`, a half-finished
+    // edit in another program. The repo file behind it is untouched, so the assertion
+    // below that no repo file changed still means what it says.
+    fs::remove_file(&hypridle_conf).expect("delete the deployed hypridle.conf");
+
+    store
+        .stage(
+            SettingId::KeyboardLayouts,
+            Value::String("se,us".to_string()),
+        )
+        .expect("the Input edit stages");
+
+    let mut plan = base_apply_plan(&store);
+    plan.writes.push(
+        model
+            .input_conf_write(&store.dirty_in_category(Category::Input))
+            .expect("the write renders")
+            .expect("a dirty setting produces a write"),
+    );
+
+    let runner = MockCommandRunner::new();
+    let signaller = MockProcessSignaller::new();
+    let outcome = apply::run(&plan, store.freshness(), &caps(), &runner, &signaller);
+
+    // (i) Applied, not Conflicted — and the missing file is reported so the user learns
+    // about it. Matched directly rather than through `expect_applied`, which asserts the
+    // opposite (no unrelated conflicts) for the suites that expect an undisturbed tree.
+    match outcome {
+        ApplyOutcome::Applied {
+            reload_failures,
+            written,
+            unrelated_conflicts,
+        } => {
+            assert!(reload_failures.is_empty(), "the mocked reload succeeds");
+            assert_eq!(written, vec![path.clone()], "only input.conf was written");
+            assert_eq!(
+                unrelated_conflicts.len(),
+                1,
+                "the deleted file is reported, not silently dropped"
+            );
+            assert_eq!(unrelated_conflicts[0].path(), hypridle_conf.as_path());
+        }
+        other => panic!("expected Applied, got {other:?}"),
+    }
+    assert_eq!(
+        fs::read_to_string(&path).expect("read the applied file"),
+        replace_once(&original, "kb_layout=us,se", "kb_layout=se,us"),
+        "the Input edit was applied byte-exactly despite the unrelated missing file"
+    );
+    assert_eq!(
+        runner.recorded(),
+        vec![Command::new("hyprctl").arg("reload")],
+        "the apply completed normally, reload included"
+    );
+
+    // (ii) The Power & Idle page cannot prepare a write for the file that is gone, so an
+    // apply of *its* edits aborts before the pipeline runs — and no repo file changed
+    // beyond the Input write above.
+    store
+        .stage(SettingId::DimTimeout, Value::Integer(600))
+        .expect("the Power & Idle edit stages");
+    let error = power
+        .hypridle_conf_write(&store.dirty_in_category(Category::PowerAndIdle))
+        .expect_err("a deleted hypridle.conf cannot be written");
+    assert!(
+        error.to_string().contains("hypridle.conf"),
+        "the abort names the file the user has to restore: {error}"
+    );
+    assert_repo_untouched_except(&fx, &before, &["config/hypr/input.conf"]);
 }
 
 #[test]
