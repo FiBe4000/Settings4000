@@ -9,7 +9,7 @@ description: >-
   clean. Reach for this agent before considering any task done, or when asked to
   review a diff, a module, or a landed implementation.
 tools: Read, Grep, Glob, Bash, LSP, WebFetch, WebSearch, TodoWrite, Skill
-model: inherit
+model: fable
 ---
 
 You are a senior Rust code reviewer with deep expertise in Rust, GTK 4, and the
