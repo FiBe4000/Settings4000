@@ -2335,6 +2335,7 @@ mod tests {
     use crate::core::reload::ReloadParams;
     use crate::system::command::{Command, MockCommandRunner};
     use crate::system::signal::{MockProcessSignaller, SignalCall};
+    use crate::testing::replace_once;
 
     /// A complete, schema-valid `colors/<scheme>` source with all 17 keys.
     const VALID_SCHEME: &str = "\
@@ -3086,6 +3087,161 @@ export XCURSOR_SIZE=16
             fs::read_to_string(&paths.gtk4_settings)
                 .unwrap()
                 .contains("gtk-theme-name = Adwaita")
+        );
+    }
+
+    #[test]
+    fn an_icon_theme_change_writes_both_settings_ini_copies_and_sets_gsettings() {
+        // The icon theme's sibling of the GTK-theme test above (task 9.12). Like the GTK
+        // theme, the icon theme is declared only in the two settings.ini files — the env
+        // files carry cursor copies only — so an icon change must leave both settings.ini
+        // copies holding the identical value (R3.4) and take live effect through exactly
+        // one `gsettings set … icon-theme` (R2.2/R3.4).
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        fs::create_dir_all(&config).unwrap();
+        let paths = write_backing_fixture(&config, UWSM_ENV);
+        let roots = ThemeRoots {
+            gtk_theme_dirs: Vec::new(),
+            icon_dirs: vec![write_icon_root(tmp.path())],
+        };
+        // Captured before the apply, so the expected post-apply bytes below can be built
+        // from the originals: the surgical-edit contract (§3) says everything outside the
+        // edited span stays byte-identical, so the expectation *is* the original patched.
+        let gtk3_before = fs::read_to_string(&paths.gtk3_settings).expect("read gtk-3.0 original");
+        let gtk4_before = fs::read_to_string(&paths.gtk4_settings).expect("read gtk-4.0 original");
+
+        let mut model = ThemesModel::load(&roots, paths.clone(), false, None);
+        // The configured icon theme is not one the fixture roots offer, so it is prepended
+        // to the discovered names — the drop-down must always be able to preselect the
+        // value the config actually holds.
+        assert_eq!(
+            model.icon_themes(),
+            vec![
+                "Everforest-Dark".to_string(),
+                "Adwaita".to_string(),
+                "Papirus".to_string()
+            ],
+            "the icon drop-down offers the discovered themes plus the configured value"
+        );
+        assert_eq!(
+            model.selected_icon_index(),
+            Some(0),
+            "before any edit the drop-down preselects settings.ini's gtk-icon-theme-name"
+        );
+
+        model.stage_icon_theme("Papirus");
+        assert!(model.is_dirty());
+        assert_eq!(
+            model.selected_icon_index(),
+            Some(2),
+            "the drop-down shows the staged selection while the change is pending"
+        );
+
+        let contribution = model
+            .apply_contribution()
+            .expect("an icon theme change contributes writes");
+        assert_eq!(
+            contribution.writes.len(),
+            2,
+            "only the two settings.ini files carry the icon theme"
+        );
+        assert!(
+            contribution
+                .writes
+                .iter()
+                .all(|write| write.backing == BackingFile::GtkSettings)
+        );
+        // Task 9.10: `ThemesApply` carries no validations at all, so every write it
+        // produces must declare itself validation-free — otherwise the Apply pipeline's
+        // plan-drift guard would warn on every icon change. Task 9.27, which gives these
+        // values validations of their own, is what should flip this to `InPlan`.
+        assert!(
+            contribution
+                .writes
+                .iter()
+                .all(|write| write.validation == WriteValidation::NotNeeded),
+            "theme writes are validation-free by design until task 9.27"
+        );
+        assert_eq!(
+            contribution.reload_params.icon_theme,
+            Some("Papirus".to_string()),
+            "the reload carries the new icon theme name"
+        );
+        assert!(contribution.reload_params.gtk_theme.is_none());
+        assert!(contribution.reload_params.cursor.is_none());
+
+        let plan = ApplyPlan {
+            validations: Vec::new(),
+            writes: contribution.writes,
+            palette: None,
+            reload_params: contribution.reload_params,
+        };
+        let runner = MockCommandRunner::new();
+        let signaller = MockProcessSignaller::new();
+        // Only gsettings, since that is all an icon change needs. Note what this does and
+        // does not prove: reload actions are capability-filtered, so an absent hyprctl
+        // would *hide* a spurious `hyprctl setcursor` rather than fail the test. The
+        // reload_params assertions above are what rule that out — they show the
+        // contribution never asked for a cursor or GTK-theme reload in the first place.
+        let caps = Capabilities::for_tests(&[Binary::Gsettings], &[], false);
+        let outcome = apply::run(&plan, &FreshnessTracker::new(), &caps, &runner, &signaller);
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied { .. }),
+            "the icon apply must succeed, got {outcome:?}"
+        );
+        assert_eq!(
+            runner.recorded(),
+            vec![Command::new("gsettings").args([
+                "set",
+                "org.gnome.desktop.interface",
+                "icon-theme",
+                "Papirus",
+            ])],
+            "an icon theme change reloads with only the icon-theme gsettings key"
+        );
+
+        // The gtk-3.0 copy holds the icon key, so it is patched in place: its original
+        // bytes with only that value span rewritten — every other key, the comments and
+        // the ordering byte-identical.
+        assert_eq!(
+            fs::read_to_string(&paths.gtk3_settings).expect("read the applied gtk-3.0 file"),
+            replace_once(
+                &gtk3_before,
+                "gtk-icon-theme-name=Everforest-Dark",
+                "gtk-icon-theme-name=Papirus",
+            ),
+            "gtk-3.0/settings.ini: only the icon theme value may change"
+        );
+        // The gtk-4.0 fixture deliberately has no icon key — the case a writer that only
+        // rewrites existing value spans would silently skip, leaving GTK 4 applications on
+        // the old icon theme while GTK 3 ones moved (exactly the R3.4 desync the app must
+        // not create). The INI writer appends the key instead, at the end of the
+        // `[Settings]` body and in that file's own `key = value` separator style, so both
+        // copies end up holding the identical value.
+        assert_eq!(
+            fs::read_to_string(&paths.gtk4_settings).expect("read the applied gtk-4.0 file"),
+            format!("{gtk4_before}gtk-icon-theme-name = Papirus\n"),
+            "gtk-4.0/settings.ini: the absent icon key is appended, not skipped"
+        );
+
+        // Task 9.6: the value reached both files, so commit may promote it — the page goes
+        // clean and the drop-down's baseline becomes the applied theme. (A value no file
+        // accepted stays staged instead; that path is covered by
+        // `a_skipped_settings_ini_key_leaves_only_that_selection_dirty`.)
+        model.commit();
+        assert!(
+            !model.is_dirty(),
+            "a fully written icon change leaves the page clean"
+        );
+        let selected = model
+            .selected_icon_index()
+            .and_then(|index| model.icon_themes().get(index))
+            .map(String::as_str);
+        assert_eq!(
+            selected,
+            Some("Papirus"),
+            "commit promotes the applied icon theme to the current value"
         );
     }
 
