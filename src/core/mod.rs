@@ -52,9 +52,9 @@ pub mod reload;
 // rollback, the palette `generate-colors` step last, then the changed+running
 // reloads — over an `ApplyPlan` assembled from staged edits and the parsers,
 // returning a structured `ApplyOutcome`. It ties together the writer,
-// freshness, model, store, detection, and reload table. The window's Apply
-// chrome (`ui::window`, `ui::chrome`) assembles the plan, runs the pipeline,
-// and commits the store and page models on success.
+// freshness, model, store, detection, and reload table. The plan itself is built by
+// `assemble` from every staging source; the window's Apply chrome (`ui::window`,
+// `ui::chrome`) runs the pipeline and commits the store and page models on success.
 pub mod apply;
 
 // The Display-page domain model (task 6.1; R2.3, R4.2, R4.4, R5.2, R5.4, R8.3). It
@@ -69,8 +69,8 @@ pub mod display;
 // store-`SettingId` -> `input.conf` write glue (rendering the store's dirty Input
 // settings into one surgical `FileWrite` through the hyprlang writer) and the XKB
 // keyboard-layout candidate list. Its `input.conf` freshness is the store's, not its
-// own. It is consumed by the Input page UI glue (`ui::input`) and the window's Apply
-// wiring (`ui::window`), so its public surface is exercised in a non-test build too.
+// own. It is consumed by the Input page UI glue (`ui::input`) and the plan assembler
+// (`assemble`), so its public surface is exercised in a non-test build too.
 pub mod input;
 
 // The Network-page domain model (task 6.9; R3.1, R4.2). It reads the active
@@ -90,8 +90,8 @@ pub mod network;
 // commands (`swaync-client --get-dnd`/`--dnd-on`/`--dnd-off`) — DND is live daemon state,
 // not a config key, so it bypasses staging (R5.2). Its `config.json` freshness is the
 // store's, not its own. It is consumed by the Notifications page UI glue
-// (`ui::notifications`) and the window's Apply wiring (`ui::window`), so its public surface
-// is exercised in a non-test build too.
+// (`ui::notifications`) and the plan assembler (`assemble`), so its public surface is
+// exercised in a non-test build too.
 pub mod notifications;
 
 // The Power & Idle-page domain logic (task 6.8; R4.2, R4.4, R5.6, R8.3). It provides the
@@ -101,8 +101,8 @@ pub mod notifications;
 // and the lock command by `general.lock_cmd`, so editing one listener leaves the others
 // byte-identical. Its `hypridle.conf` freshness is the store's, not its own; the Apply
 // pipeline (task 4.5) follows the write with a hypridle restart (task 4.4). It is consumed
-// by the window's Apply wiring (`ui::window`), so its public surface is exercised in a
-// non-test build too.
+// by the plan assembler (`assemble`), so its public surface is exercised in a non-test
+// build too.
 pub mod power;
 
 // The Sound-page domain model (task 6.2; R3.1, R5.2). It enumerates the PipeWire audio
@@ -121,3 +121,13 @@ pub mod sound;
 // Theme page UI glue (`ui::theme`) and the window, so its surface is exercised in a
 // non-test build too.
 pub mod theme;
+
+// The Apply-plan assembler (task 9.16; architecture §6; R5.3–R5.6, R8.3). It sits above
+// every other module here: it asks the store and each bespoke page model (`display`,
+// `input`, `notifications`, `power`, `theme`) for its contribution and folds them into the
+// one `apply::ApplyPlan` the pipeline runs — in a fixed order, refusing to plan anything
+// when a model's files changed on disk or a write cannot be prepared. It is the front half
+// of the window's Apply button, kept here so those decisions are testable without a
+// display (R6.2); the window (`ui::window`) runs the resulting plan, surfaces the outcome
+// through `ui::chrome`, and commits the sources the assembler reports as contributing.
+pub mod assemble;

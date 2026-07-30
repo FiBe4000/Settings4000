@@ -339,13 +339,19 @@ pub fn load_into_store(
 }
 
 /// Builds the base [`ApplyPlan`] from the store's dirty edits, through the app's real
-/// plan builder (`ui::window::base_apply_plan`, task 5.3/7.2).
+/// plan builder ([`crate::core::assemble::base_apply_plan`], task 5.3/7.2).
 ///
-/// The suites then fold in the per-page writes exactly as the window's Apply handler
-/// does — the store-driven `FileWrite`s from the page models, plus the Display/Theme
-/// contributions — so the plan a suite runs is assembled by the same code the app runs.
+/// The per-page suites then fold in that page's write by hand — the store-driven
+/// `FileWrite` from its model, or a Display/Theme contribution — which keeps each suite
+/// focused on one page while still starting from the app's own validations half. The
+/// *whole* assembly, over every source at once, is
+/// [`crate::core::assemble::assemble_apply_plan`] and has its own suite
+/// (`tests/apply_assembly.rs`).
+///
+/// This wrapper exists only so the suites need one import path for the harness; the
+/// underlying function is public API of [`crate::core`] like the rest of the domain layer.
 pub fn base_apply_plan(store: &SettingsStore) -> ApplyPlan {
-    crate::ui::window::base_apply_plan(store)
+    crate::core::assemble::base_apply_plan(store)
 }
 
 /// Unwraps an [`ApplyOutcome::Applied`], returning its reload failures and written

@@ -68,18 +68,15 @@
 //! files against the real baselines the startup load recorded (R5.6) rather than an
 //! empty tracker.
 //!
-//! The Display page (task 6.1) contributed the first bespoke-model file write, and the
-//! Input page (task 6.6) the first **store-driven** one: [`wire_apply`] folds each
-//! into the same plan — Display's `monitors.conf` [`FileWrite`](crate::core::apply::FileWrite)
-//! from its own model, and Input's `input.conf` write rendered from the store's dirty
-//! Input settings (via [`InputModel::input_conf_write`]) — so an Apply rewrites the
-//! target lines and reloads via `hyprctl reload`. The Input write is the general
-//! store-`SettingId` → `FileWrite` shape the Notifications page (task 6.7) reuses for
-//! swaync `config.json` — its position/timeout write is folded in the same way, and its
-//! runtime-only DND switch applies immediately outside the pipeline (R5.2) — and the Power
-//! & Idle page (task 6.8) reuses again for `hypridle.conf`: its dim/lock/DPMS timeouts and
-//! lock command render into one write folded in identically, after which the pipeline
-//! restarts hypridle (task 4.4) only because that file changed.
+//! Building that plan out of the store and the seven bespoke page models — which writes to
+//! fold in, in which order, and when to refuse to apply at all — is **not** done here:
+//! it is [`assemble_apply_plan`](crate::core::assemble::assemble_apply_plan) in the
+//! GTK-free [`core::assemble`](crate::core::assemble) module, so those decisions are
+//! testable without a display (R6.2; task 9.16). What stays with the window is the part
+//! that needs widgets or side effects: running the pipeline, reloading a model whose
+//! files changed on disk ([`Shell::reload_conflicted_source`]), committing the sources
+//! the assembler reports as having contributed ([`Shell::commit_applied`]), and showing
+//! the dialog or toast.
 //!
 //! # No libadwaita, no custom CSS (R2.1/R2.2)
 //!
@@ -100,17 +97,20 @@ use gtk4::{
 };
 use relm4::{ComponentController, Controller};
 
-use crate::core::apply::{self, ApplyPlan};
+use crate::core::apply;
+use crate::core::assemble::{
+    ApplySources, AssembledPlan, ConflictedSource, ModelCommits, PrepareFailure,
+    assemble_apply_plan,
+};
 use crate::core::detect::Capabilities;
 use crate::core::display::DisplayModel;
 use crate::core::input::InputModel;
 use crate::core::model::Category;
 use crate::core::notifications::NotificationsModel;
 use crate::core::power::PowerModel;
-use crate::core::reload::ReloadParams;
 use crate::core::store::SettingsStore;
 use crate::core::theme::{PaletteModel, ThemesModel, WallpaperModel};
-use crate::system::command::SystemCommandRunner;
+use crate::system::command::{CommandRunner, SystemCommandRunner};
 use crate::system::signal::SystemProcessSignaller;
 use crate::ui::category::{SidebarCategory, visible_categories};
 use crate::ui::chrome::{self, ApplyResponse, Toast};
@@ -173,7 +173,7 @@ struct Shell {
     /// glue. `None` until the startup worker builds it, or when there is no live
     /// compositor. It is a second staging source alongside the store: its dirty state
     /// feeds the same Apply/Reset chrome, and its `monitors.conf` write is folded into
-    /// the same Apply pipeline (see [`Shell::wire_apply`]).
+    /// the same Apply pipeline (see [`assemble_apply_plan`]).
     display: Rc<RefCell<Option<DisplayModel>>>,
     /// The mounted Display page, retained so the window can re-render it after a Reset
     /// or a committed Apply. Rebuilt by [`Shell::populate`]; `None` while the Display
@@ -184,14 +184,14 @@ struct Shell {
     /// models it is **not** a separate staging source — every Input setting is staged in
     /// the shared store — so it feeds neither the dirty rollup nor a bespoke commit; it
     /// only supplies the keyboard-layout candidates and renders the store's dirty Input
-    /// settings into the `input.conf` write on Apply (see [`Shell::wire_apply`]).
+    /// settings into the `input.conf` write on Apply (see [`assemble_apply_plan`]).
     input: Rc<RefCell<Option<InputModel>>>,
     /// The Notifications page's helper (task 6.7), shared with the Notifications glue.
     /// `None` until the startup worker builds it, or when swaync is absent. Like the
     /// [`InputModel`] it is **not** a separate staging source — the position/timeout are
     /// staged in the shared store — so it feeds neither the dirty rollup nor a bespoke
     /// commit; it only renders the store's dirty Notifications settings into the
-    /// `config.json` write on Apply (see [`Shell::wire_apply`]). The runtime-only DND
+    /// `config.json` write on Apply (see [`assemble_apply_plan`]). The runtime-only DND
     /// switch is applied immediately and holds no state here.
     notifications: Rc<RefCell<Option<NotificationsModel>>>,
     /// The Notifications page's mounted Do-Not-Disturb control (task 6.7), retained so the
@@ -206,7 +206,7 @@ struct Shell {
     /// the timeouts and lock command are staged in the shared store as ordinary framework
     /// rows — so it feeds neither the dirty rollup nor a bespoke commit; it only renders
     /// the store's dirty Power & Idle settings into the `hypridle.conf` write on Apply,
-    /// which the pipeline follows with a hypridle restart (see [`Shell::wire_apply`]).
+    /// which the pipeline follows with a hypridle restart (see [`assemble_apply_plan`]).
     power: Rc<RefCell<Option<PowerModel>>>,
     /// The mounted Sound page (task 6.2), retained so the window can enumerate it when the
     /// page is shown — both its deferred first enumeration and every later page entry
@@ -224,20 +224,20 @@ struct Shell {
     /// `None` until the startup worker builds it, or when there is no dotfiles palette
     /// source. Like the Display model it is a staging source alongside the store: its
     /// dirty state feeds the same Apply/Reset chrome, and its scheme switch is folded
-    /// into the same Apply pipeline as a `PaletteSwitch` (see [`Shell::wire_apply`]).
+    /// into the same Apply pipeline as a `PaletteSwitch` (see [`assemble_apply_plan`]).
     palette: Rc<RefCell<Option<PaletteModel>>>,
     /// The Theme page's GTK/icon/cursor theme model (task 6.4), shared with the Theme
     /// glue. `None` until the startup worker builds it, or when `gsettings` is absent.
     /// Like the palette model it is a staging source alongside the store: its dirty
     /// state feeds the same Apply/Reset chrome, and its multi-file theme/cursor writes
-    /// are folded into the same Apply pipeline (see [`Shell::wire_apply`]).
+    /// are folded into the same Apply pipeline (see [`assemble_apply_plan`]).
     themes: Rc<RefCell<Option<ThemesModel>>>,
     /// The Theme page's wallpaper / lock-background model (task 6.5), shared with the
     /// Theme glue. `None` until the startup worker builds it, or when hyprpaper is
     /// absent. Like the other Theme models it is a staging source alongside the store:
     /// its dirty state feeds the same Apply/Reset chrome, and its `hyprpaper.conf` /
     /// `hyprlock.conf` writes are folded into the same Apply pipeline (see
-    /// [`Shell::wire_apply`]).
+    /// [`assemble_apply_plan`]).
     wallpaper: Rc<RefCell<Option<WallpaperModel>>>,
     /// The mounted Theme page, retained so the window can re-render it after a Reset or a
     /// committed Apply. Rebuilt by [`Shell::populate`]; `None` while the Theme category
@@ -872,7 +872,7 @@ impl Shell {
     /// store-backed [`SettingId`](crate::core::model::SettingId)s, so they are built by the
     /// declarative row framework exactly like the generic path (via [`page::plan_category`]);
     /// their dirty marker tracks the store's Notifications rollup and their `config.json`
-    /// write is folded into the shared Apply pipeline (see [`Shell::wire_apply`]). The one
+    /// write is folded into the shared Apply pipeline (see [`assemble_apply_plan`]). The one
     /// thing the framework cannot build is appended here: the **runtime-only DND switch**
     /// (task 6.7 gotcha — swaync's do-not-disturb is live daemon state via `swaync-client`,
     /// **not** a config key), which applies immediately and never stages/dirties (R5.2). The
@@ -1083,331 +1083,73 @@ impl Shell {
         );
     }
 
-    /// Wires the Apply button to run the pipeline and handle its outcome (R5.3–R5.6).
+    /// Wires the Apply button: assemble the plan, run the pipeline, dispatch the outcome
+    /// (R5.3–R5.6).
     ///
-    /// See the module docs: the handler starts from [`base_apply_plan`] (the store's
-    /// dirty settings as validations) and folds in the per-page file writes, the
-    /// pipeline is given the store's real freshness tracker so its conflict check
-    /// measures against the loaded baselines (R5.6), the outcome is dispatched through
-    /// [`chrome::respond_to_apply`], and an
-    /// [`ApplyOutcome::Applied`](crate::core::apply::ApplyOutcome::Applied) is committed
-    /// to the store with the plan's written paths + bytes before the pages are
-    /// re-rendered and the chrome refreshed. A non-fatal reload failure raises a toast;
-    /// any abort/failure shows a modal warning.
+    /// The handler is deliberately thin, because everything it *decides* is decided in
+    /// GTK-free, headlessly tested code (R6.2):
+    ///
+    /// - [`assemble_apply_plan`] folds every staging source into one plan — the store's
+    ///   dirty settings as validations (R8.3) plus each page's rendered file writes — or
+    ///   refuses to plan the Apply at all, in which case nothing is written, every staged
+    ///   edit is kept, and the reason is surfaced through [`chrome::assembly_warning`];
+    ///   for a conflict (R5.6) that happens after [`Self::reload_conflicted_source`] has
+    ///   adopted what is now on disk.
+    /// - [`apply::run`] is given the **store's** freshness tracker, so its own step-2
+    ///   conflict check measures the store's files against the baselines the startup load
+    ///   recorded (R5.6) rather than an empty tracker.
+    /// - [`chrome::respond_to_apply`] maps the outcome to commit-or-warn; a commit is
+    ///   reconciled by [`Self::commit_applied`] and may raise a non-fatal toast (R5.5).
     fn wire_apply(&self, apply_button: &Button) {
         let shell = self.clone();
         apply_button.connect_clicked(move |_| {
             let runner = SystemCommandRunner::new();
 
-            // F2 (R5.6): before writing a pending monitor edit, check whether
-            // monitors.conf changed on disk since it was loaded. Only relevant when the
-            // Display page is dirty (that is the only case that would write it). On a
-            // conflict, warn and re-load the model rather than clobbering the stale
-            // parse — the pipeline's own conflict check covers the store's files.
-            let display_conflict = {
-                let display = shell.display.borrow();
-                display
-                    .as_ref()
-                    .is_some_and(|model| model.is_dirty() && model.check_conflict())
-            };
-            if display_conflict {
-                let reloaded = {
-                    let display = shell.display.borrow();
-                    display.as_ref().and_then(|model| model.reload(&runner))
-                };
-                *shell.display.borrow_mut() = reloaded;
-                shell.rerender_display();
-                (shell.update_chrome)();
-                chrome::show_warning(
-                    &shell.window,
-                    "Files changed on disk",
-                    "monitors.conf changed on disk since Settings4000 read it, so nothing was \
-                     written. It has been reloaded from disk — re-apply your display changes.",
-                );
-                return;
-            }
-
-            // F (R5.6): the same conflict guard for the Theme page's GTK/icon/cursor
-            // backing files (both settings.ini, hyprland.conf, uwsm/env). These are not
-            // in the store's tracker, so the pipeline's own conflict check does not cover
-            // them — the themes model owns their freshness and is checked here. Only
-            // relevant when a theme change is pending (the only case that writes them).
-            let themes_conflict = {
-                let themes = shell.themes.borrow();
-                themes
-                    .as_ref()
-                    .is_some_and(|model| model.is_dirty() && model.check_conflict())
-            };
-            if themes_conflict {
-                let reloaded = shell.themes.borrow().as_ref().map(ThemesModel::reload);
-                *shell.themes.borrow_mut() = reloaded;
-                shell.rerender_theme();
-                (shell.update_chrome)();
-                chrome::show_warning(
-                    &shell.window,
-                    "Files changed on disk",
-                    "A theme configuration file changed on disk since Settings4000 read it, so \
-                     nothing was written. It has been reloaded from disk — re-apply your theme \
-                     changes.",
-                );
-                return;
-            }
-
-            // F (R5.6): the same conflict guard for the wallpaper page's backing files
-            // (hyprpaper.conf / hyprlock.conf). Like the themes model, these are not in
-            // the store's tracker, so the wallpaper model owns their freshness and is
-            // checked here. Only relevant when a wallpaper/lock change is pending.
-            let wallpaper_conflict = {
-                let wallpaper = shell.wallpaper.borrow();
-                wallpaper
-                    .as_ref()
-                    .is_some_and(|model| model.is_dirty() && model.check_conflict())
-            };
-            if wallpaper_conflict {
-                let reloaded = shell
-                    .wallpaper
-                    .borrow()
-                    .as_ref()
-                    .map(WallpaperModel::reload);
-                *shell.wallpaper.borrow_mut() = reloaded;
-                shell.rerender_theme();
-                (shell.update_chrome)();
-                chrome::show_warning(
-                    &shell.window,
-                    "Files changed on disk",
-                    "A wallpaper configuration file changed on disk since Settings4000 read it, \
-                     so nothing was written. It has been reloaded from disk — re-apply your \
-                     wallpaper changes.",
-                );
-                return;
-            }
-
-            let mut plan = base_apply_plan(&shell.store.borrow());
-
-            // Fold the store-backed Input settings into one surgical `input.conf` write
-            // (task 6.6) — the first store-driven page to produce a real FileWrite. Done
-            // *before* `store_writes` is captured below so the write is committed and
-            // re-baselined by the store's `commit_apply`: `input.conf`'s freshness lives
-            // in the store's tracker (loaded at startup), unlike the Display/Theme models
-            // which own their files' freshness and commit separately (R5.6).
-            let input_write = {
+            // Every staging source, borrowed together and read-only: assembly never
+            // mutates one, so an abort below cannot have disturbed a staged edit. The
+            // borrows end with this block, before a commit or reload borrows mutably.
+            let assembled = {
                 let store = shell.store.borrow();
+                let display = shell.display.borrow();
                 let input = shell.input.borrow();
-                match input.as_ref() {
-                    Some(model) => model.input_conf_write(&store.dirty_in_category(Category::Input)),
-                    None => Ok(None),
-                }
-            };
-            match input_write {
-                Ok(Some(write)) => plan.writes.push(write),
-                Ok(None) => {}
-                // The user has pending Input edits but the write could not be prepared
-                // (input.conf unreadable, or the writer rejected an edit). Abort the whole
-                // Apply and keep the staged edits — never proceed to commit, which would
-                // promote the Input values against an unchanged file and desync the
-                // store. Near-unreachable in practice.
-                Err(error) => {
-                    tracing::error!(%error, "aborting apply: could not prepare the input.conf write");
-                    chrome::show_warning(
-                        &shell.window,
-                        "Could not prepare the input changes",
-                        &format!(
-                            "Settings4000 could not update input.conf, so nothing was written: \
-                             {error}. Your input changes were kept — fix the problem and try again."
-                        ),
-                    );
-                    return;
-                }
-            }
-
-            // Fold the store-backed Notifications settings into one swaync `config.json`
-            // write (task 6.7) — the same store-driven shape as the Input write, since
-            // config.json is store-loaded (its freshness lives in the store's tracker).
-            // Done before `store_writes` is captured so the write is committed and
-            // re-baselined by the store's `commit_apply`. (Do Not Disturb is runtime-only
-            // and applies immediately from the switch, so it never appears here.)
-            let notifications_write = {
-                let store = shell.store.borrow();
                 let notifications = shell.notifications.borrow();
-                match notifications.as_ref() {
-                    Some(model) => {
-                        model.swaync_config_write(&store.dirty_in_category(Category::Notifications))
-                    }
-                    None => Ok(None),
-                }
-            };
-            match notifications_write {
-                Ok(Some(write)) => plan.writes.push(write),
-                Ok(None) => {}
-                // Pending Notifications edits but the write could not be prepared
-                // (config.json unreadable, or no longer valid JSON). Abort the whole Apply
-                // and keep the staged edits — never proceed to commit, which would promote
-                // the values against an unchanged file and desync the store (the same
-                // abort-not-skip contract as the Input write above). Near-unreachable in
-                // practice.
-                Err(error) => {
-                    tracing::error!(%error, "aborting apply: could not prepare the swaync config.json write");
-                    chrome::show_warning(
-                        &shell.window,
-                        "Could not prepare the notification changes",
-                        &format!(
-                            "Settings4000 could not update swaync's config.json, so nothing was \
-                             written: {error}. Your notification changes were kept — fix the \
-                             problem and try again."
-                        ),
-                    );
-                    return;
-                }
-            }
-
-            // Fold the store-backed Power & Idle settings into one `hypridle.conf` write
-            // (task 6.8) — the same store-driven shape as the Input/Notifications writes,
-            // since hypridle.conf is store-loaded (its freshness lives in the store's
-            // tracker). Done before `store_writes` is captured so the write is committed and
-            // re-baselined by the store's `commit_apply`. When this write is present the
-            // pipeline restarts hypridle (task 4.4); when no Power & Idle setting is dirty
-            // there is no write and hypridle is left running (restart-only-when-changed).
-            let power_write = {
-                let store = shell.store.borrow();
                 let power = shell.power.borrow();
-                match power.as_ref() {
-                    Some(model) => {
-                        model.hypridle_conf_write(&store.dirty_in_category(Category::PowerAndIdle))
-                    }
-                    None => Ok(None),
-                }
-            };
-            match power_write {
-                Ok(Some(write)) => plan.writes.push(write),
-                Ok(None) => {}
-                // Pending Power & Idle edits but the write could not be prepared
-                // (hypridle.conf unreadable, or the writer rejected an edit — e.g. a `#` in
-                // the lock command). Abort the whole Apply and keep the staged edits — never
-                // proceed to commit, which would promote the values against an unchanged file
-                // and desync the store (the same abort-not-skip contract as the
-                // Input/Notifications writes above). Near-unreachable in practice.
-                Err(error) => {
-                    tracing::error!(%error, "aborting apply: could not prepare the hypridle.conf write");
-                    chrome::show_warning(
-                        &shell.window,
-                        "Could not prepare the power and idle changes",
-                        &format!(
-                            "Settings4000 could not update hypridle.conf, so nothing was \
-                             written: {error}. Your power and idle changes were kept — fix the \
-                             problem and try again."
-                        ),
-                    );
-                    return;
-                }
-            }
-
-            // The store-backed writes to commit to the store after a successful apply
-            // (the `input.conf`, swaync `config.json`, and `hypridle.conf` writes folded
-            // in above are included, so `commit_apply` re-baselines them). Captured before the
-            // Display/Theme contributions are folded in, because those models commit their
-            // own files separately (their freshness is owned by the model, not the store).
-            let store_writes: Vec<(PathBuf, Vec<u8>)> = plan
-                .writes
-                .iter()
-                .map(|write| (write.path.clone(), write.contents.clone()))
-                .collect();
-
-            // Fold in the Display page's `monitors.conf` write + validations (task 6.1)
-            // — the first real file write in the app. The immutable borrow ends here,
-            // before the commit below borrows the model mutably.
-            let display_write = {
-                let display = shell.display.borrow();
-                match display.as_ref() {
-                    Some(model) => model.apply_contribution(),
-                    None => Ok(None),
-                }
-            };
-            let has_display_write = match display_write {
-                Ok(Some(contribution)) => {
-                    plan.writes.push(contribution.write);
-                    plan.validations.extend(contribution.validations);
-                    true
-                }
-                Ok(None) => false,
-                // Pending monitor edits but the write could not be rendered. Abort the
-                // whole Apply and keep the staged edits — never proceed, which would
-                // commit the Display model against a file that was never written and
-                // desync it from disk (the same abort-not-skip contract as the
-                // Input/Notifications/Power writes above). Near-unreachable in practice.
-                Err(error) => {
-                    tracing::error!(%error, "aborting apply: could not prepare the monitors.conf write");
-                    chrome::show_warning(
-                        &shell.window,
-                        "Could not prepare the display changes",
-                        &format!(
-                            "Settings4000 could not update monitors.conf, so nothing was written: \
-                             {error}. Your display changes were kept — fix the problem and try again."
-                        ),
-                    );
-                    return;
-                }
-            };
-
-            // Fold in the Theme page's palette switch (task 6.3): a staged scheme
-            // contributes a `PaletteSwitch`, so the pipeline runs the discovered
-            // `generate-colors <scheme>` as its last write step and then the palette
-            // reload chain. It writes no file directly — v1 never edits `colors/<scheme>`.
-            let has_palette_switch = {
                 let palette = shell.palette.borrow();
-                match palette.as_ref().and_then(PaletteModel::apply_contribution) {
-                    Some(switch) => {
-                        plan.palette = Some(switch);
-                        true
-                    }
-                    None => false,
-                }
-            };
-
-            // Fold in the Theme page's GTK/icon/cursor theme writes (task 6.4): a change
-            // writes the value identically to both settings.ini and — for the cursor —
-            // hyprland.conf's env lines and uwsm/env, and carries the reload parameters
-            // that drive `gsettings set` (+ `hyprctl setcursor` for the cursor). The
-            // themes model owns its own freshness (checked above), so it commits
-            // separately from the store, like the Display model.
-            let has_themes_write = {
                 let themes = shell.themes.borrow();
-                match themes.as_ref().and_then(ThemesModel::apply_contribution) {
-                    Some(contribution) => {
-                        plan.writes.extend(contribution.writes);
-                        merge_reload_params(&mut plan.reload_params, contribution.reload_params);
-                        true
-                    }
-                    None => false,
-                }
-            };
-
-            // Fold in the Theme page's wallpaper / lock-background writes (task 6.5): a
-            // change writes hyprpaper.conf (wallpaper path + fit) and/or hyprlock.conf
-            // (the lock background — the same path, or the override), plus the wallpaper
-            // reload parameter that drives `hyprctl hyprpaper preload`/`wallpaper` (only
-            // when hyprpaper.conf changed; a hyprlock-only change reloads nothing). Its
-            // chosen paths are re-validated by the pipeline (R8.3). Like the themes
-            // model it owns its own freshness (checked above), so it commits separately.
-            let has_wallpaper_write = {
                 let wallpaper = shell.wallpaper.borrow();
-                match wallpaper
-                    .as_ref()
-                    .and_then(WallpaperModel::apply_contribution)
-                {
-                    Some(contribution) => {
-                        plan.writes.extend(contribution.writes);
-                        plan.validations.extend(contribution.validations);
-                        merge_reload_params(&mut plan.reload_params, contribution.reload_params);
-                        true
+                assemble_apply_plan(ApplySources {
+                    store: &store,
+                    display: display.as_ref(),
+                    input: input.as_ref(),
+                    notifications: notifications.as_ref(),
+                    power: power.as_ref(),
+                    palette: palette.as_ref(),
+                    themes: themes.as_ref(),
+                    wallpaper: wallpaper.as_ref(),
+                })
+            };
+            let AssembledPlan {
+                plan,
+                store_writes,
+                commits,
+            } = match assembled {
+                Ok(assembled) => assembled,
+                Err(failure) => {
+                    // Nothing was written either way. A conflicted model additionally has
+                    // to be reloaded from disk before the dialog tells the user to
+                    // re-apply against the new contents; a write that could not be
+                    // prepared changed nothing at all, so there is nothing to reload.
+                    if let PrepareFailure::Conflict(source) = failure {
+                        shell.reload_conflicted_source(source, &runner);
                     }
-                    None => false,
+                    let warning = chrome::assembly_warning(&failure);
+                    chrome::show_warning(&shell.window, &warning.heading, &warning.detail);
+                    return;
                 }
             };
 
-            // Side-effect seams: the real system runner (created above) plus the
-            // signaller. The freshness tracker is the store's own (task 5.4), holding
-            // the baselines recorded when the startup load read the backing files, so
-            // the pipeline's step-2 conflict check measures against them (R5.6).
+            // The side-effect seams: the real system runner (created above) plus the
+            // signaller for the reloads that signal a process rather than run a command.
             let signaller = SystemProcessSignaller::new();
             let outcome = {
                 let store = shell.store.borrow();
@@ -1417,44 +1159,7 @@ impl Shell {
 
             match chrome::respond_to_apply(&outcome) {
                 ApplyResponse::Commit { toast: message } => {
-                    // The writes stood (R5.5). Commit reconciles each staging source:
-                    // the store promotes staged→original and re-baselines its own
-                    // written files' freshness (task 4.5); the Display model promotes
-                    // its staged monitor edits and updates its in-memory records.
-                    shell.store.borrow_mut().commit_apply(&store_writes);
-                    if has_display_write {
-                        if let Some(display) = shell.display.borrow_mut().as_mut() {
-                            display.commit();
-                        }
-                    }
-                    // Promote the staged scheme to active so the palette is clean again
-                    // (task 6.3). There is no on-disk baseline to re-record — the app
-                    // does not write the generated colors.conf, generate-colors does.
-                    if has_palette_switch {
-                        if let Some(palette) = shell.palette.borrow_mut().as_mut() {
-                            palette.commit();
-                        }
-                    }
-                    // Commit the GTK/icon/cursor theme model too (task 6.4): promote its
-                    // staged selections and re-baseline its backing files' freshness from
-                    // the just-written bytes, so the app's own write is not a self-conflict.
-                    if has_themes_write {
-                        if let Some(themes) = shell.themes.borrow_mut().as_mut() {
-                            themes.commit();
-                        }
-                    }
-                    // Commit the wallpaper / lock-background model too (task 6.5), the
-                    // same way: promote staged paths/fit and re-baseline hyprpaper.conf /
-                    // hyprlock.conf freshness from the just-written bytes.
-                    if has_wallpaper_write {
-                        if let Some(wallpaper) = shell.wallpaper.borrow_mut().as_mut() {
-                            wallpaper.commit();
-                        }
-                    }
-                    shell.rerender_pages();
-                    shell.rerender_display();
-                    shell.rerender_theme();
-                    (shell.update_chrome)();
+                    shell.commit_applied(&store_writes, commits);
                     if let Some(message) = message {
                         shell.toast.show(&message);
                     }
@@ -1468,6 +1173,94 @@ impl Shell {
                 }
             }
         });
+    }
+
+    /// Reconciles every staging source with what an
+    /// [`ApplyOutcome::Applied`](crate::core::apply::ApplyOutcome::Applied) apply put on
+    /// disk, then re-renders the pages and re-derives the chrome (task 5.3/6.1/6.3–6.5).
+    ///
+    /// The store and the bespoke models commit separately because they track freshness
+    /// separately: `store_writes` are the files the store loaded, so it promotes their
+    /// staged values and re-baselines their freshness from the bytes just written (task
+    /// 4.5) — without which the app's own write looks like an external edit on the next
+    /// Apply — while each model re-baselines the files it owns inside its own `commit`.
+    /// `commits` says which models actually contributed to the plan; committing one that
+    /// wrote nothing would promote staged edits against contents never written.
+    fn commit_applied(&self, store_writes: &[(PathBuf, Vec<u8>)], commits: ModelCommits) {
+        self.store.borrow_mut().commit_apply(store_writes);
+        // The Display model promotes its staged monitor edits and updates its in-memory
+        // records (task 6.1).
+        if commits.display {
+            if let Some(display) = self.display.borrow_mut().as_mut() {
+                display.commit();
+            }
+        }
+        // The palette model promotes the staged scheme to active, so the palette control
+        // is clean again (task 6.3). There is no on-disk baseline to re-record: the app
+        // does not write the generated `colors.conf`, `generate-colors` does.
+        if commits.palette {
+            if let Some(palette) = self.palette.borrow_mut().as_mut() {
+                palette.commit();
+            }
+        }
+        // The GTK/icon/cursor model promotes its staged selections and re-baselines its
+        // backing files' freshness from the just-written bytes (task 6.4).
+        if commits.themes {
+            if let Some(themes) = self.themes.borrow_mut().as_mut() {
+                themes.commit();
+            }
+        }
+        // The wallpaper / lock-background model does the same for `hyprpaper.conf` and
+        // `hyprlock.conf` (task 6.5).
+        if commits.wallpaper {
+            if let Some(wallpaper) = self.wallpaper.borrow_mut().as_mut() {
+                wallpaper.commit();
+            }
+        }
+        self.rerender_pages();
+        self.rerender_display();
+        self.rerender_theme();
+        (self.update_chrome)();
+    }
+
+    /// Reloads the staging model whose backing files changed on disk, re-renders its page,
+    /// and re-derives the chrome (R5.6).
+    ///
+    /// Called when [`assemble_apply_plan`] refuses to plan an Apply because a file a
+    /// model owns was changed by another program since the model read it: rather than
+    /// write over that edit, the app adopts what is now on disk and asks the user to
+    /// re-apply, which discards the pending edits to that model (they were made against
+    /// contents that no longer exist).
+    ///
+    /// The three arms differ in more than which model they touch, which is why this is a
+    /// `match` rather than one generic helper: the Display model is rebuilt by probing the
+    /// compositor, so its reload needs a [`CommandRunner`] and may yield nothing at all
+    /// (the compositor went away — the same state as a cold start without one), while the
+    /// two Theme models only re-read files and always produce a model. The Display model
+    /// also drives its own page, whereas both Theme models share the Theme page.
+    fn reload_conflicted_source(&self, source: ConflictedSource, runner: &dyn CommandRunner) {
+        match source {
+            ConflictedSource::Display => {
+                let reloaded = self
+                    .display
+                    .borrow()
+                    .as_ref()
+                    .and_then(|model| model.reload(runner));
+                *self.display.borrow_mut() = reloaded;
+                self.rerender_display();
+            }
+            ConflictedSource::Themes => {
+                let reloaded = self.themes.borrow().as_ref().map(ThemesModel::reload);
+                *self.themes.borrow_mut() = reloaded;
+                self.rerender_theme();
+            }
+            ConflictedSource::Wallpaper => {
+                let reloaded = self.wallpaper.borrow().as_ref().map(WallpaperModel::reload);
+                *self.wallpaper.borrow_mut() = reloaded;
+                self.rerender_theme();
+            }
+        }
+        (self.update_chrome)();
     }
 
     /// Wires the Reset button to discard staged edits and revert the controls (R5.1).
@@ -1636,60 +1429,6 @@ impl Shell {
         if let Some(page) = self.theme_page.borrow().as_ref() {
             page.rerender();
         }
-    }
-}
-
-/// Builds the base [`ApplyPlan`] from the store's dirty edits (task 5.3).
-///
-/// It carries the store's dirty settings as `validations` (so [`apply::run`]'s first
-/// gate re-checks them, R8.3). It produces **no** `writes` itself: turning a staged
-/// [`Value`](crate::core::model::Value) into concrete file bytes goes through the format
-/// parsers and is per-page glue. [`Shell::wire_apply`] folds those writes into the plan
-/// after building it — the store-driven `input.conf` (task 6.6), swaync `config.json`
-/// (task 6.7), and `hypridle.conf` (task 6.8) writes rendered from the store's dirty
-/// settings, plus the Display/Theme models' writes from their own staging — so this
-/// stays a thin shared starting point.
-///
-/// Crate-visible so `crate::testing` can re-expose it to the integration suites (task
-/// 7.2), which assemble their Apply plans through this exact function rather than a
-/// test re-implementation.
-pub(crate) fn base_apply_plan(store: &SettingsStore) -> ApplyPlan {
-    let validations = store
-        .dirty_ids()
-        .into_iter()
-        .filter_map(|id| store.value(id).cloned().map(|value| (id, value)))
-        .collect();
-    ApplyPlan {
-        validations,
-        writes: Vec::new(),
-        palette: None,
-        reload_params: ReloadParams::default(),
-    }
-}
-
-/// Merges a page's reload parameters into the plan's, setting each field only when the
-/// contribution provides it (task 6.4).
-///
-/// Both Theme sub-features fill [`ReloadParams`]: the GTK/icon/cursor model (task 6.4)
-/// the theme names and cursor theme+size, and the wallpaper model (task 6.5) the
-/// wallpaper path and fit mode. A field is overwritten only when `Some`, so a value one
-/// contribution sets is never clobbered by another that leaves it `None`. The plan
-/// starts from [`ReloadParams::default`] (all `None`), so this composes both cleanly.
-fn merge_reload_params(target: &mut ReloadParams, from: ReloadParams) {
-    if from.gtk_theme.is_some() {
-        target.gtk_theme = from.gtk_theme;
-    }
-    if from.icon_theme.is_some() {
-        target.icon_theme = from.icon_theme;
-    }
-    if from.cursor.is_some() {
-        target.cursor = from.cursor;
-    }
-    if from.wallpaper.is_some() {
-        target.wallpaper = from.wallpaper;
-    }
-    if from.fit.is_some() {
-        target.fit = from.fit;
     }
 }
 

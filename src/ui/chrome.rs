@@ -15,10 +15,12 @@
 //!   intent: whether the actions are enabled ([`actions_enabled`]), which model
 //!   [`Category`] a sidebar page maps to for its marker ([`marker_category`]), what to
 //!   do with an [`ApplyOutcome`] ([`respond_to_apply`]), and whether a
-//!   [`RefreshReport`] warrants a conflict warning ([`refresh_conflict_warning`]).
+//!   [`RefreshReport`] warrants a conflict warning ([`refresh_conflict_warning`]), and
+//!   how to phrase an Apply the assembler refused to plan ([`assembly_warning`]).
 //!   These carry no GTK types so they are unit-tested headlessly (R6.2) — the tests at
 //!   the bottom cover the dirty→enabled/marker mapping against a real store, the
-//!   apply-outcome→toast/dialog/commit mapping, and the refresh-report→dialog content.
+//!   apply-outcome→toast/dialog/commit mapping, the refresh-report→dialog content, and
+//!   the per-source prepare-failure text.
 //! - **The widgets** — [`Toast`] (the non-libadwaita transient notification) and
 //!   [`show_warning`] (the conflict/error dialog), built from plain GTK4 only.
 //!
@@ -39,6 +41,7 @@ use gtk4::{
 };
 
 use crate::core::apply::ApplyOutcome;
+use crate::core::assemble::{ConflictedSource, FailedWrite, PrepareFailure};
 use crate::core::freshness::Conflict;
 use crate::core::model::Category;
 use crate::core::reload::ReloadError;
@@ -200,13 +203,16 @@ pub(crate) fn respond_to_apply(outcome: &ApplyOutcome) -> ApplyResponse {
     }
 }
 
-/// The heading and body for a conflict warning built from a [`RefreshReport`], or
-/// `None` when the refresh was quiet (R5.6).
+/// The heading and body of a warning dialog ([`show_warning`]).
+///
+/// Returned by the pure text builders in this module — [`refresh_conflict_warning`] for
+/// an external edit found by a manual refresh (R5.6), and [`assembly_warning`] for an
+/// Apply that could not be planned — so the strings are unit-testable without a display.
 #[derive(Debug)]
 pub(crate) struct ConflictWarning {
-    /// A short heading for the dialog.
+    /// A short heading, shown as the dialog's title.
     pub(crate) heading: String,
-    /// The body listing which files reloaded and which could not.
+    /// The dialog body.
     pub(crate) detail: String,
 }
 
@@ -245,6 +251,62 @@ pub(crate) fn refresh_conflict_warning(report: &RefreshReport) -> Option<Conflic
         heading: "Files changed on disk".to_string(),
         detail,
     })
+}
+
+/// The warning to show for an Apply the assembler refused to plan (task 9.16).
+///
+/// The two failure kinds read differently to the user even though neither wrote
+/// anything:
+///
+/// - [`PrepareFailure::Conflict`] — another program changed a file the affected page
+///   would have written since Settings4000 read it (R5.6). The window has reloaded that
+///   model from disk by the time this is shown, so the text says so and asks the user to
+///   re-apply; the reloaded values are on screen for them to look at first.
+/// - [`PrepareFailure::Write`] — the app itself could not produce the new file contents
+///   (the file is unreadable, or the writer rejects a staged value). Nothing changed on
+///   disk and nothing changed on screen: the staged edits are still pending, so the text
+///   quotes the reason and says the changes were kept.
+///
+/// Kept here, beside the other dialog text, rather than in the GTK-free assembler: the
+/// assembler names the failing source and the UI decides how to say it.
+pub(crate) fn assembly_warning(failure: &PrepareFailure) -> ConflictWarning {
+    match failure {
+        PrepareFailure::Conflict(source) => {
+            // What changed, and the noun for the user's pending edits. Only the Display
+            // model writes a single, well-known file worth naming; the two Theme models
+            // each own several, and which of them changed is not something the user needs
+            // in order to act (they re-apply either way).
+            let (subject, noun) = match source {
+                ConflictedSource::Display => ("monitors.conf", "display"),
+                ConflictedSource::Themes => ("A theme configuration file", "theme"),
+                ConflictedSource::Wallpaper => ("A wallpaper configuration file", "wallpaper"),
+            };
+            ConflictWarning {
+                heading: "Files changed on disk".to_string(),
+                detail: format!(
+                    "{subject} changed on disk since Settings4000 read it, so nothing was \
+                     written. It has been reloaded from disk — re-apply your {noun} changes."
+                ),
+            }
+        }
+        PrepareFailure::Write { source, message } => {
+            // The file the app could not update, and the noun for the affected page's
+            // edits.
+            let (file, noun) = match source {
+                FailedWrite::Display => ("monitors.conf", "display"),
+                FailedWrite::Input => ("input.conf", "input"),
+                FailedWrite::Notifications => ("swaync's config.json", "notification"),
+                FailedWrite::Power => ("hypridle.conf", "power and idle"),
+            };
+            ConflictWarning {
+                heading: format!("Could not prepare the {noun} changes"),
+                detail: format!(
+                    "Settings4000 could not update {file}, so nothing was written: {message}. \
+                     Your {noun} changes were kept — fix the problem and try again."
+                ),
+            }
+        }
+    }
 }
 
 /// Formats a non-fatal reload-failure summary for a toast (R5.5).
@@ -784,5 +846,82 @@ mod tests {
             "the warning names the changed file: {}",
             warning.detail
         );
+    }
+
+    #[test]
+    fn a_stale_source_warning_says_the_model_was_reloaded() {
+        // Task 9.16: the assembler names the conflicted source and this builds the text.
+        // Each variant must name the affected *page's* changes, since that is what tells
+        // the user which pending edits they have to make again; the Display case
+        // additionally names the one file it writes.
+        for (source, expected_noun) in [
+            (ConflictedSource::Display, "display"),
+            (ConflictedSource::Themes, "theme"),
+            (ConflictedSource::Wallpaper, "wallpaper"),
+        ] {
+            let warning = assembly_warning(&PrepareFailure::Conflict(source));
+            assert_eq!(warning.heading, "Files changed on disk");
+            assert!(
+                warning.detail.contains("nothing was written"),
+                "{source:?}: the user must be told the Apply did not write: {}",
+                warning.detail
+            );
+            assert!(
+                warning
+                    .detail
+                    .contains(&format!("re-apply your {expected_noun} changes")),
+                "{source:?}: the text must point at the {expected_noun} page: {}",
+                warning.detail
+            );
+        }
+        assert!(
+            assembly_warning(&PrepareFailure::Conflict(ConflictedSource::Display))
+                .detail
+                .contains("monitors.conf"),
+            "the Display case names the single file it would have written"
+        );
+    }
+
+    #[test]
+    fn a_prepare_failure_warning_names_the_file_and_quotes_the_reason() {
+        // Task 9.16: the four write-preparation failures each name the file the user has
+        // to fix, quote the underlying reason, and promise the edits were kept — the last
+        // being the whole point of aborting instead of skipping the write.
+        for (source, expected_file, expected_noun) in [
+            (FailedWrite::Display, "monitors.conf", "display"),
+            (FailedWrite::Input, "input.conf", "input"),
+            (
+                FailedWrite::Notifications,
+                "swaync's config.json",
+                "notification",
+            ),
+            (FailedWrite::Power, "hypridle.conf", "power and idle"),
+        ] {
+            let warning = assembly_warning(&PrepareFailure::Write {
+                source,
+                message: "permission denied".to_string(),
+            });
+            assert_eq!(
+                warning.heading,
+                format!("Could not prepare the {expected_noun} changes")
+            );
+            assert!(
+                warning.detail.contains(expected_file),
+                "{source:?}: the text must name {expected_file}: {}",
+                warning.detail
+            );
+            assert!(
+                warning.detail.contains("permission denied"),
+                "{source:?}: the underlying reason must be quoted: {}",
+                warning.detail
+            );
+            assert!(
+                warning
+                    .detail
+                    .contains(&format!("Your {expected_noun} changes were kept")),
+                "{source:?}: the retained edits must be stated: {}",
+                warning.detail
+            );
+        }
     }
 }

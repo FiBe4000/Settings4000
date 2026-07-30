@@ -86,7 +86,10 @@
 //! The pipeline is deliberately **parser-agnostic** — it orchestrates, the pages
 //! produce the bytes. Translating a `SettingId` + staged [`Value`] into concrete
 //! new file bytes goes through the format parsers (§3) and is page-specific glue
-//! (the §6 category tasks). So a page assembles an [`ApplyPlan`] like this:
+//! (the §6 category tasks). In the running application there is exactly one caller that
+//! does this — [`crate::core::assemble::assemble_apply_plan`], which folds every page's
+//! contribution into a single plan (task 9.16); the per-page integration suites assemble
+//! narrower plans by hand. Either way a plan is built like this:
 //!
 //! - **`validations`**: the dirty staged values to re-check — the caller reads
 //!   them from the [`SettingsStore`](crate::core) (`dirty_ids()` mapped through
