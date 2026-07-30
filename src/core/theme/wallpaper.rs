@@ -15,12 +15,11 @@
 use std::path::{Path, PathBuf};
 
 use crate::core::apply::{FileWrite, WriteValidation};
-use crate::core::freshness::FreshnessTracker;
 use crate::core::model::{SettingId, ValidationError, Value, validate_image_path};
 use crate::core::reload::{BackingFile, ReloadParams};
 use crate::parsers::hyprlang::{HyprlangFile, KeyPath};
 
-use super::{BackingText, PathField, Selection, read_backing};
+use super::{BackingSet, BackingText, Selection, Staged};
 
 /// The `hyprpaper.conf` section holding the wallpaper (`wallpaper { path = … }`).
 const WALLPAPER_SECTION: &str = "wallpaper";
@@ -130,19 +129,17 @@ impl WrittenWallpaperValues {
 /// are unit-tested headlessly (R6.2); the layering guard in
 /// `tests/module_boundaries.rs` forbids any `gtk`/`relm4` import.
 pub struct WallpaperModel {
-    /// `hyprpaper.conf`, or `None` when it was unreadable (R4.4) — the wallpaper rows
-    /// are then hidden.
-    hyprpaper: Option<BackingText>,
-    /// `hyprlock.conf`, or `None` when it was unreadable (R4.4) — the lock override is
-    /// then unavailable.
-    hyprlock: Option<BackingText>,
+    /// The two backing config files this model edits, with their freshness baseline
+    /// (R5.6). Reached through the per-file accessors [`Self::hyprpaper`] and
+    /// [`Self::hyprlock`].
+    backing: BackingSet,
     /// The wallpaper image path (`hyprpaper.conf` `wallpaper.path`).
-    wallpaper: PathField,
+    wallpaper: Staged,
     /// The wallpaper fit mode (`hyprpaper.conf` `wallpaper.fit_mode`).
     fit: Selection,
     /// The lock-screen override image path (`hyprlock.conf` `background.path`). Only
     /// consulted when [`override_on`](Self::override_on) is set.
-    lock: PathField,
+    lock: Staged,
     /// Whether the lock screen uses a *different* image than the wallpaper (the current
     /// state of the override toggle). Seeded from whether the two on-disk paths already
     /// differ (see [`Self::load`]).
@@ -154,11 +151,6 @@ pub struct WallpaperModel {
     /// lock override control is hidden and `hyprlock.conf` is never written (R4.2), even
     /// if the file happens to be readable.
     lock_available: bool,
-    /// The freshness baseline for the two backing files, recorded from the exact bytes
-    /// read at load, so a pre-write conflict check catches an external edit and
-    /// [`Self::commit`] re-baselines the app's own write (R5.6). Only readable files are
-    /// tracked.
-    freshness: FreshnessTracker,
     /// The backing paths, kept so [`Self::reload`] can re-read the files.
     paths: WallpaperPaths,
 }
@@ -208,14 +200,16 @@ impl WallpaperModel {
     /// starts on only when the lock-screen path already differs from the wallpaper path
     /// on disk (i.e. the two are not the unified default).
     pub fn load(paths: WallpaperPaths, lock_available: bool) -> WallpaperModel {
-        let hyprpaper = read_backing(&paths.hyprpaper_conf);
-        let hyprlock = read_backing(&paths.hyprlock_conf);
+        let backing = BackingSet::load(&[
+            paths.hyprpaper_conf.as_path(),
+            paths.hyprlock_conf.as_path(),
+        ]);
 
-        let hyprpaper_file = hyprpaper
-            .as_ref()
+        let hyprpaper_file = backing
+            .get(&paths.hyprpaper_conf)
             .map(|backing| HyprlangFile::parse(&backing.text).0);
-        let hyprlock_file = hyprlock
-            .as_ref()
+        let hyprlock_file = backing
+            .get(&paths.hyprlock_conf)
             .map(|backing| HyprlangFile::parse(&backing.text).0);
 
         let wallpaper_path = hyprpaper_file
@@ -235,11 +229,6 @@ impl WallpaperModel {
 
         let fit_options: Vec<String> = CURATED_FIT_MODES.iter().map(|s| (*s).to_string()).collect();
 
-        let mut freshness = FreshnessTracker::new();
-        for backing in [&hyprpaper, &hyprlock].into_iter().flatten() {
-            freshness.record_bytes(backing.path.as_path(), backing.text.as_bytes());
-        }
-
         tracing::info!(
             wallpaper = wallpaper_path.is_some(),
             lock = lock_path.is_some(),
@@ -249,29 +238,39 @@ impl WallpaperModel {
         );
 
         WallpaperModel {
-            hyprpaper,
-            hyprlock,
-            wallpaper: PathField::new(wallpaper_path),
+            backing,
+            wallpaper: Staged::new(wallpaper_path),
             fit: Selection::new(fit_options, fit),
-            lock: PathField::new(lock_path),
+            lock: Staged::new(lock_path),
             override_on: override_initial,
             override_initial,
             lock_available,
-            freshness,
             paths,
         }
+    }
+
+    /// `hyprpaper.conf`'s current text, or `None` when it was unreadable (R4.4) — the
+    /// wallpaper rows are then hidden.
+    fn hyprpaper(&self) -> Option<&BackingText> {
+        self.backing.get(&self.paths.hyprpaper_conf)
+    }
+
+    /// `hyprlock.conf`'s current text, or `None` when it was unreadable (R4.4) — the lock
+    /// override is then unavailable.
+    fn hyprlock(&self) -> Option<&BackingText> {
+        self.backing.get(&self.paths.hyprlock_conf)
     }
 
     /// Whether the wallpaper rows should be shown: `hyprpaper.conf` was readable, so a
     /// path/fit edit can be written (R4.4).
     pub fn wallpaper_editable(&self) -> bool {
-        self.hyprpaper.is_some()
+        self.hyprpaper().is_some()
     }
 
     /// Whether the lock-screen override control should be shown: hyprlock is present and
     /// `hyprlock.conf` is readable, so an override can be written (R4.2/R4.4).
     pub fn lock_editable(&self) -> bool {
-        self.lock_available && self.hyprlock.is_some()
+        self.lock_available && self.hyprlock().is_some()
     }
 
     /// The effective wallpaper image path (staged or current), or `None` when unset.
@@ -374,15 +373,11 @@ impl WallpaperModel {
         self.override_on = self.override_initial;
     }
 
-    /// Whether either backing file changed on disk since it was loaded (R5.6).
-    ///
-    /// The Apply glue calls this before writing a dirty change; a `true` result means
-    /// another program edited one of the files, so the write must be aborted and the
-    /// model reloaded rather than clobbering the stale parse — the same discipline the
-    /// Display and GTK/icon/cursor models follow (the pipeline's own conflict check
-    /// covers only the store's files, not these bespoke ones).
+    /// Whether either backing file changed on disk since it was loaded, so a dirty change
+    /// must be reloaded instead of written (R5.6) — see [`BackingSet::check_conflict`] for
+    /// the discipline this is part of.
     pub fn check_conflict(&self) -> bool {
-        !self.freshness.check_conflicts().is_empty()
+        self.backing.check_conflict()
     }
 
     /// Re-reads the backing files, returning a fresh model with a new freshness baseline
@@ -413,10 +408,10 @@ impl WallpaperModel {
         })
     }
 
-    /// Commits the staged changes after a successful Apply: re-baselines each written
-    /// file's freshness from the exact bytes written, updates the in-memory backing
-    /// text, and promotes the staged values **that actually reached a file** to their
-    /// current value (R5.6).
+    /// Commits the staged changes after a successful Apply: takes the written bytes back
+    /// into the backing set (re-baselining freshness and the in-memory text, see
+    /// [`BackingSet::absorb_writes`]) and promotes the staged values **that actually
+    /// reached a file** to their current value (R5.6).
     ///
     /// Promotion is derived from the rendered writes, not from the
     /// `*_write_needed` predicates: a value whose hyprlang edit was skipped (see
@@ -426,13 +421,7 @@ impl WallpaperModel {
     /// — a permanent silent divergence between the UI and the config.
     pub fn commit(&mut self) {
         let (writes, written) = self.render_writes();
-        for write in writes {
-            self.freshness
-                .record_bytes(write.path.as_path(), &write.contents);
-            if let Ok(text) = String::from_utf8(write.contents.clone()) {
-                self.set_backing_text(&write.path, text);
-            }
-        }
+        self.backing.absorb_writes(&writes);
         // Capture the effective lock path (which depends on the still-staged wallpaper
         // value when the override is off) before promoting the wallpaper edit.
         let new_lock = self.effective_lock().map(str::to_string);
@@ -468,14 +457,14 @@ impl WallpaperModel {
         let mut writes = Vec::new();
         let mut written = WrittenWallpaperValues::default();
         if self.hyprpaper_write_needed() {
-            if let Some(backing) = &self.hyprpaper {
+            if let Some(backing) = self.hyprpaper() {
                 let (write, keys) = self.render_hyprpaper(backing);
                 written.merge(keys);
                 writes.extend(write);
             }
         }
         if self.hyprlock_write_needed() {
-            if let Some(backing) = &self.hyprlock {
+            if let Some(backing) = self.hyprlock() {
                 if let Some(write) = self.render_hyprlock(backing) {
                     written.lock = true;
                     writes.push(write);
@@ -622,20 +611,6 @@ impl WallpaperModel {
             }
         }
         validations
-    }
-
-    /// Updates the in-memory backing text for the file at `path` after a commit, so a
-    /// subsequent edit re-parses the current bytes.
-    fn set_backing_text(&mut self, path: &Path, text: String) {
-        for backing in [self.hyprpaper.as_mut(), self.hyprlock.as_mut()]
-            .into_iter()
-            .flatten()
-        {
-            if backing.path == path {
-                backing.text = text;
-                return;
-            }
-        }
     }
 }
 
@@ -969,6 +944,51 @@ label {
             "the lock override path is validated too"
         );
         assert!(!model.is_dirty(), "a rejected path is never staged");
+    }
+
+    #[test]
+    fn re_choosing_the_configured_wallpaper_leaves_the_page_clean() {
+        // The dirty rule for the two free-form image paths, which share their staging core
+        // with the drop-downs (`Staged`): re-choosing the path the config already holds
+        // clears the pending edit, so a user who opens the file chooser and picks the
+        // current wallpaper again does not light up Apply (R5.1). The fixture's configured
+        // path has to be a real image here, because staging re-validates it (R8.3).
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_wallpaper_fixture(&config);
+        let current = write_image(tmp.path(), "current.png");
+        let other = write_image(tmp.path(), "other.png");
+        fs::write(
+            &paths.hyprpaper_conf,
+            HYPRPAPER_CONF.replace("~/Pictures/wallpaper/18.jpg", &current),
+        )
+        .expect("point the fixture's wallpaper at a real image");
+
+        let mut model = WallpaperModel::load(paths, true);
+        assert_eq!(model.wallpaper_path(), Some(current.as_str()));
+        assert!(!model.is_dirty(), "a freshly loaded page is clean");
+
+        model
+            .stage_wallpaper(&other)
+            .expect("a real image validates");
+        assert!(model.is_dirty(), "a different image is a pending change");
+
+        model
+            .stage_wallpaper(&current)
+            .expect("the configured image validates too");
+        assert!(
+            !model.is_dirty(),
+            "re-choosing the configured wallpaper cancels the pending change"
+        );
+        assert_eq!(
+            model.wallpaper_path(),
+            Some(current.as_str()),
+            "and the effective path is the configured one again"
+        );
+        assert!(
+            model.apply_contribution().is_none(),
+            "a clean page contributes nothing to an Apply"
+        );
     }
 
     #[test]

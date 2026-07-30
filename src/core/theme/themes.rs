@@ -12,7 +12,6 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::core::apply::{FileWrite, WriteValidation};
-use crate::core::freshness::FreshnessTracker;
 use crate::core::reload::{BackingFile, CursorValue, ReloadParams};
 use crate::parsers::env::{EnvFile, GtkThemeOverride};
 // Aliased because each parser module has its own `EditError`; only hyprlang's variants are
@@ -20,7 +19,7 @@ use crate::parsers::env::{EnvFile, GtkThemeOverride};
 use crate::parsers::hyprlang::{EditError as HyprlangEditError, HyprlangFile};
 use crate::parsers::ini::IniFile;
 
-use super::{BackingText, Selection, read_backing};
+use super::{BackingSet, BackingText, Selection};
 
 /// The GLib key-file group the app's theme keys live under in `settings.ini`.
 const SETTINGS_GROUP: &str = "Settings";
@@ -290,16 +289,10 @@ pub struct ThemesModel {
     cursor_theme: Selection,
     /// The cursor size drop-down (values held as strings; parsed when written).
     cursor_size: Selection,
-    /// `gtk-3.0/settings.ini`, or `None` when it was unreadable (R4.4).
-    gtk3: Option<BackingText>,
-    /// `gtk-4.0/settings.ini`, or `None` when it was unreadable (R4.4).
-    gtk4: Option<BackingText>,
-    /// `hyprland.conf`, or `None` when it was unreadable — only its cursor `env =`
-    /// lines are edited.
-    hyprland: Option<BackingText>,
-    /// `uwsm/env`, or `None` when it was unreadable — the canonical cursor env copy,
-    /// and the source of the uwsm `GTK_THEME` override reading (R3.3).
-    uwsm: Option<BackingText>,
+    /// The four backing config files this model edits, with their freshness baseline
+    /// (R5.6). Reached through the per-file accessors [`Self::gtk3`], [`Self::gtk4`],
+    /// [`Self::hyprland`], and [`Self::uwsm`], which document what each one is for.
+    backing: BackingSet,
     /// The active `GTK_THEME` override (app environment preferred over `uwsm/env`), or
     /// `None`. When `Some`, the GTK-theme drop-down is disabled and a banner shown
     /// (R3.3).
@@ -307,11 +300,6 @@ pub struct ThemesModel {
     /// Whether a live theme-restyle path (settings portal or dconf) is available, so
     /// the UI may claim a live GTK-theme restyle rather than "next launch" (R2.2).
     live_restyle: bool,
-    /// The freshness baseline for the backing files, recorded from the exact bytes
-    /// read at load, so a pre-write conflict check catches an external edit and
-    /// [`Self::commit`] re-baselines the app's own write (R5.6). Only readable files
-    /// are tracked.
-    freshness: FreshnessTracker,
     /// The theme roots, kept so [`Self::reload`] can re-discover on a conflict reload.
     roots: ThemeRoots,
     /// The backing paths, kept so [`Self::reload`] can re-read the files.
@@ -357,19 +345,23 @@ impl ThemesModel {
         settings_portal_available: bool,
         app_env_gtk_theme: Option<String>,
     ) -> ThemesModel {
-        let gtk3 = read_backing(&paths.gtk3_settings);
-        let gtk4 = read_backing(&paths.gtk4_settings);
-        let hyprland = read_backing(&paths.hyprland_conf);
-        let uwsm = read_backing(&paths.uwsm_env);
+        let backing = BackingSet::load(&[
+            paths.gtk3_settings.as_path(),
+            paths.gtk4_settings.as_path(),
+            paths.hyprland_conf.as_path(),
+            paths.uwsm_env.as_path(),
+        ]);
 
         // Read current values from whichever settings.ini is present (prefer gtk-3.0),
         // since both carry the same keys. The cursor theme/size fall back to uwsm/env's
         // XCURSOR_* when settings.ini did not set them.
-        let settings_ini = gtk3
-            .as_ref()
-            .or(gtk4.as_ref())
+        let settings_ini = backing
+            .get(&paths.gtk3_settings)
+            .or_else(|| backing.get(&paths.gtk4_settings))
             .map(|backing| IniFile::parse(&backing.text).0);
-        let uwsm_file = uwsm.as_ref().map(|backing| EnvFile::parse(&backing.text).0);
+        let uwsm_file = backing
+            .get(&paths.uwsm_env)
+            .map(|backing| EnvFile::parse(&backing.text).0);
 
         let current_gtk = settings_value(&settings_ini, KEY_GTK_THEME);
         let current_icon = settings_value(&settings_ini, KEY_ICON_THEME);
@@ -385,11 +377,6 @@ impl ThemesModel {
         // very app, regardless of what uwsm/env says (R3.3).
         let uwsm_override = uwsm_file.as_ref().map(EnvFile::gtk_theme_override);
         let gtk_override = resolve_gtk_override(app_env_gtk_theme.clone(), uwsm_override.as_ref());
-
-        let mut freshness = FreshnessTracker::new();
-        for backing in [&gtk3, &gtk4, &hyprland, &uwsm].into_iter().flatten() {
-            freshness.record_bytes(backing.path.as_path(), backing.text.as_bytes());
-        }
 
         let curated_sizes: Vec<String> = CURATED_CURSOR_SIZES
             .iter()
@@ -410,17 +397,35 @@ impl ThemesModel {
             icon_theme: Selection::new(icon_themes, current_icon),
             cursor_theme: Selection::new(cursor_themes, current_cursor),
             cursor_size: Selection::new(curated_sizes, current_size),
-            gtk3,
-            gtk4,
-            hyprland,
-            uwsm,
+            backing,
             gtk_override,
             live_restyle: settings_portal_available,
-            freshness,
             roots: roots.clone(),
             paths,
             app_env_gtk_theme,
         }
+    }
+
+    /// `gtk-3.0/settings.ini`'s current text, or `None` when it was unreadable (R4.4).
+    fn gtk3(&self) -> Option<&BackingText> {
+        self.backing.get(&self.paths.gtk3_settings)
+    }
+
+    /// `gtk-4.0/settings.ini`'s current text, or `None` when it was unreadable (R4.4).
+    fn gtk4(&self) -> Option<&BackingText> {
+        self.backing.get(&self.paths.gtk4_settings)
+    }
+
+    /// `hyprland.conf`'s current text, or `None` when it was unreadable — only its cursor
+    /// `env =` lines are edited.
+    fn hyprland(&self) -> Option<&BackingText> {
+        self.backing.get(&self.paths.hyprland_conf)
+    }
+
+    /// `uwsm/env`'s current text, or `None` when it was unreadable — the canonical cursor
+    /// env copy, and the source of the uwsm `GTK_THEME` override reading (R3.3).
+    fn uwsm(&self) -> Option<&BackingText> {
+        self.backing.get(&self.paths.uwsm_env)
     }
 
     /// Whether the theme rows should be shown: at least one `settings.ini` was readable
@@ -432,7 +437,7 @@ impl ThemesModel {
     /// Display page's "hide the file-backed controls when the config is unreadable"
     /// rule.
     pub fn themes_editable(&self) -> bool {
-        self.gtk3.is_some() || self.gtk4.is_some()
+        self.gtk3().is_some() || self.gtk4().is_some()
     }
 
     /// The GTK theme drop-down options (installed GTK themes plus the current value).
@@ -539,15 +544,11 @@ impl ThemesModel {
         self.cursor_size.reset();
     }
 
-    /// Whether any backing file changed on disk since it was loaded (R5.6).
-    ///
-    /// The Apply glue calls this before writing a dirty theme change; a `true` result
-    /// means another program edited one of the backing files, so the write must be
-    /// aborted and the model reloaded rather than clobbering the stale parse — the same
-    /// discipline the Display page follows (the pipeline's own conflict check covers
-    /// only the store's files, not these bespoke ones).
+    /// Whether any of the four backing files changed on disk since it was loaded, so a
+    /// dirty theme change must be reloaded instead of written (R5.6) — see
+    /// [`BackingSet::check_conflict`] for the discipline this is part of.
     pub fn check_conflict(&self) -> bool {
-        !self.freshness.check_conflicts().is_empty()
+        self.backing.check_conflict()
     }
 
     /// Re-reads the backing files and re-discovers themes, returning a fresh model with
@@ -592,14 +593,10 @@ impl ThemesModel {
         })
     }
 
-    /// Commits the staged changes after a successful Apply: re-baselines each written
-    /// file's freshness from the exact bytes written, updates the in-memory backing
-    /// text, and promotes the staged selections **that actually reached a file** to
-    /// their current value (R5.6).
-    ///
-    /// Re-baselining is what stops the app's own write being mistaken for an external
-    /// conflict on the next Apply; updating the backing text keeps the in-memory copy
-    /// in step so a subsequent edit builds on the current bytes.
+    /// Commits the staged changes after a successful Apply: takes the written bytes back
+    /// into the backing set (re-baselining freshness and the in-memory text, see
+    /// [`BackingSet::absorb_writes`]) and promotes the staged selections **that actually
+    /// reached a file** to their current value (R5.6).
     ///
     /// Promotion is derived from the rendered writes rather than from the dirty flags:
     /// a selection that reached no file, or that one of the files carrying it refused
@@ -609,17 +606,11 @@ impl ThemesModel {
     /// the selection would no longer look changed.
     pub fn commit(&mut self) {
         // Re-render the writes (staged values still present) to capture the exact bytes
-        // written, then re-baseline and update the stored text for each. Rendering is
-        // deterministic and the backing texts are unchanged since the Apply, so this
-        // reproduces both the bytes that were written and which keys were skipped.
+        // written. Rendering is deterministic and the backing texts are unchanged since
+        // the Apply, so this reproduces both the bytes that were written and which keys
+        // were skipped.
         let (writes, record) = self.render_writes();
-        for write in writes {
-            self.freshness
-                .record_bytes(write.path.as_path(), &write.contents);
-            if let Ok(text) = String::from_utf8(write.contents.clone()) {
-                self.set_backing_text(&write.path, text);
-            }
-        }
+        self.backing.absorb_writes(&writes);
         let promotable = record.promotable();
         if promotable.gtk_theme {
             self.gtk_theme.commit();
@@ -640,24 +631,19 @@ impl ThemesModel {
     /// which needs only the writes, and [`Self::commit`], which needs the record to decide
     /// what may be promoted).
     fn render_writes(&self) -> (Vec<FileWrite>, ThemeRenderRecord) {
-        let gtk_changed = self.gtk_theme.is_changed();
-        let icon_changed = self.icon_theme.is_changed();
-        let cursor_theme_changed = self.cursor_theme.is_changed();
-        let cursor_size_changed = self.cursor_size.is_changed();
+        // Which files are involved is decided here; *which keys* each file receives is
+        // decided by the per-render functions, which read the same per-value dirty flags.
+        let cursor_changed = self.cursor_theme.is_changed() || self.cursor_size.is_changed();
+        let any_changed =
+            self.gtk_theme.is_changed() || self.icon_theme.is_changed() || cursor_changed;
 
         let mut writes = Vec::new();
         let mut record = ThemeRenderRecord::default();
 
         // Every theme/cursor key lives in settings.ini, so any change writes both files.
-        if gtk_changed || icon_changed || cursor_theme_changed || cursor_size_changed {
-            for backing in [&self.gtk3, &self.gtk4].into_iter().flatten() {
-                let (write, file_record) = self.render_settings_ini(
-                    backing,
-                    gtk_changed,
-                    icon_changed,
-                    cursor_theme_changed,
-                    cursor_size_changed,
-                );
+        if any_changed {
+            for backing in [self.gtk3(), self.gtk4()].into_iter().flatten() {
+                let (write, file_record) = self.render_settings_ini(backing);
                 record.merge(file_record);
                 writes.extend(write);
             }
@@ -665,16 +651,14 @@ impl ThemesModel {
 
         // The cursor is additionally duplicated in hyprland.conf's env lines and
         // uwsm/env; write the identical value there whenever the cursor changed (R3.4).
-        if cursor_theme_changed || cursor_size_changed {
-            if let Some(backing) = &self.hyprland {
-                let (write, file_record) =
-                    self.render_hyprland_env(backing, cursor_theme_changed, cursor_size_changed);
+        if cursor_changed {
+            if let Some(backing) = self.hyprland() {
+                let (write, file_record) = self.render_hyprland_env(backing);
                 record.merge(file_record);
                 writes.extend(write);
             }
-            if let Some(backing) = &self.uwsm {
-                let (write, file_record) =
-                    self.render_uwsm_env(backing, cursor_theme_changed, cursor_size_changed);
+            if let Some(backing) = self.uwsm() {
+                let (write, file_record) = self.render_uwsm_env(backing);
                 record.merge(file_record);
                 writes.extend(write);
             }
@@ -694,14 +678,7 @@ impl ThemesModel {
     /// value the INI writer rejects, i.e. one containing a newline, is rejected by the env
     /// and hyprlang writers too, so nothing is written anywhere; the flag is what keeps
     /// that conclusion from depending on the three writers agreeing.)
-    fn render_settings_ini(
-        &self,
-        backing: &BackingText,
-        gtk_changed: bool,
-        icon_changed: bool,
-        cursor_theme_changed: bool,
-        cursor_size_changed: bool,
-    ) -> (Option<FileWrite>, ThemeRenderRecord) {
+    fn render_settings_ini(&self, backing: &BackingText) -> (Option<FileWrite>, ThemeRenderRecord) {
         let (mut ini, _) = IniFile::parse(&backing.text);
         let mut changed_keys = Vec::new();
         let mut record = ThemeRenderRecord::default();
@@ -721,7 +698,7 @@ impl ThemesModel {
                 }
             }
         };
-        if gtk_changed {
+        if self.gtk_theme.is_changed() {
             set(
                 ThemeValue::GtkTheme,
                 KEY_GTK_THEME,
@@ -729,7 +706,7 @@ impl ThemesModel {
                 "GTK theme",
             );
         }
-        if icon_changed {
+        if self.icon_theme.is_changed() {
             set(
                 ThemeValue::IconTheme,
                 KEY_ICON_THEME,
@@ -737,7 +714,7 @@ impl ThemesModel {
                 "icon theme",
             );
         }
-        if cursor_theme_changed {
+        if self.cursor_theme.is_changed() {
             set(
                 ThemeValue::CursorTheme,
                 KEY_CURSOR_THEME,
@@ -745,7 +722,7 @@ impl ThemesModel {
                 "cursor theme",
             );
         }
-        if cursor_size_changed {
+        if self.cursor_size.is_changed() {
             set(
                 ThemeValue::CursorSize,
                 KEY_CURSOR_SIZE,
@@ -806,12 +783,7 @@ impl ThemesModel {
     ///
     /// [`HyprlangEditError::SectionNotFound`] cannot arise here — `set_repeatable_field_value`
     /// addresses top-level repeatable keys, not sections.
-    fn render_hyprland_env(
-        &self,
-        backing: &BackingText,
-        cursor_theme_changed: bool,
-        cursor_size_changed: bool,
-    ) -> (Option<FileWrite>, ThemeRenderRecord) {
+    fn render_hyprland_env(&self, backing: &BackingText) -> (Option<FileWrite>, ThemeRenderRecord) {
         let (mut file, _) = HyprlangFile::parse(&backing.text);
         let mut changed_keys = Vec::new();
         let mut record = ThemeRenderRecord::default();
@@ -842,7 +814,7 @@ impl ThemesModel {
                 }
             }
         };
-        if cursor_theme_changed {
+        if self.cursor_theme.is_changed() {
             set(
                 ThemeValue::CursorTheme,
                 ENV_CURSOR_THEME,
@@ -850,7 +822,7 @@ impl ThemesModel {
                 "cursor theme (hyprland.conf env)",
             );
         }
-        if cursor_size_changed {
+        if self.cursor_size.is_changed() {
             set(
                 ThemeValue::CursorSize,
                 ENV_CURSOR_SIZE,
@@ -881,12 +853,7 @@ impl ThemesModel {
     ///
     /// Like the `settings.ini` render, a failure here is a refusal by a file that carries
     /// the value (the env writer appends a missing export), so it blocks promotion.
-    fn render_uwsm_env(
-        &self,
-        backing: &BackingText,
-        cursor_theme_changed: bool,
-        cursor_size_changed: bool,
-    ) -> (Option<FileWrite>, ThemeRenderRecord) {
+    fn render_uwsm_env(&self, backing: &BackingText) -> (Option<FileWrite>, ThemeRenderRecord) {
         let (mut file, _) = EnvFile::parse(&backing.text);
         let mut changed_keys = Vec::new();
         let mut record = ThemeRenderRecord::default();
@@ -906,7 +873,7 @@ impl ThemesModel {
                 }
             }
         };
-        if cursor_theme_changed {
+        if self.cursor_theme.is_changed() {
             set(
                 ThemeValue::CursorTheme,
                 ENV_CURSOR_THEME,
@@ -914,7 +881,7 @@ impl ThemesModel {
                 "cursor theme (uwsm/env)",
             );
         }
-        if cursor_size_changed {
+        if self.cursor_size.is_changed() {
             set(
                 ThemeValue::CursorSize,
                 ENV_CURSOR_SIZE,
@@ -981,25 +948,6 @@ impl ThemesModel {
                 .is_changed()
                 .then(|| self.icon_theme.effective().map(str::to_string))
                 .flatten(),
-        }
-    }
-
-    /// Updates the in-memory backing text for the file at `path` after a commit, so a
-    /// subsequent edit re-parses the current bytes.
-    fn set_backing_text(&mut self, path: &Path, text: String) {
-        for backing in [
-            self.gtk3.as_mut(),
-            self.gtk4.as_mut(),
-            self.hyprland.as_mut(),
-            self.uwsm.as_mut(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if backing.path == path {
-                backing.text = text;
-                return;
-            }
         }
     }
 }
@@ -1721,6 +1669,110 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
+    fn a_second_apply_builds_on_the_bytes_the_first_one_wrote() {
+        // The post-commit bookkeeping both Theme models share has two jobs:
+        // re-baselining freshness, so the app's own write is not later read as an external
+        // conflict (covered by `a_committed_theme_apply_is_not_a_self_conflict`), and
+        // refreshing the in-memory backing text, so the *next* edit re-parses the bytes
+        // now on disk. This covers the second job, which no other test pinned down: a
+        // model still holding its pre-Apply text would render the next write from it and
+        // silently revert the first change — the applied value is no longer staged, so
+        // nothing would put it back into the second write.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        fs::create_dir_all(&config).unwrap();
+        let paths = write_backing_fixture(&config, UWSM_ENV);
+        let roots = ThemeRoots {
+            gtk_theme_dirs: Vec::new(),
+            icon_dirs: vec![write_icon_root(tmp.path())],
+        };
+        // Only gsettings, so the icon reload has a runner to reach; the cursor reload of
+        // the second apply is capability-filtered away, which this test does not care
+        // about — it is about the bytes, not the reloads.
+        let caps = Capabilities::for_tests(&[Binary::Gsettings], &[], false);
+        let signaller = MockProcessSignaller::new();
+        let mut model = ThemesModel::load(&roots, paths.clone(), false, None);
+
+        // First apply: the icon theme, which lives only in the two settings.ini files.
+        model.stage_icon_theme("Papirus");
+        let first = model
+            .apply_contribution()
+            .expect("an icon theme change contributes writes");
+        let outcome = apply::run(
+            &ApplyPlan {
+                validations: Vec::new(),
+                writes: first.writes,
+                palette: None,
+                reload_params: first.reload_params,
+            },
+            &FreshnessTracker::new(),
+            &caps,
+            &MockCommandRunner::new(),
+            &signaller,
+        );
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied { .. }),
+            "the first apply must succeed, got {outcome:?}"
+        );
+        model.commit();
+
+        // Second apply: the cursor size — a different key in the same files. Its
+        // gtk-3.0 write must carry the icon theme the first apply wrote, which only the
+        // refreshed in-memory text can supply.
+        model.stage_cursor_size("32");
+        let second = model
+            .apply_contribution()
+            .expect("a cursor size change contributes writes");
+        let expected_gtk3 = replace_once(
+            &replace_once(
+                SETTINGS_INI,
+                "gtk-icon-theme-name=Everforest-Dark",
+                "gtk-icon-theme-name=Papirus",
+            ),
+            "gtk-cursor-theme-size=16",
+            "gtk-cursor-theme-size=32",
+        );
+        let rendered_gtk3 = second
+            .writes
+            .iter()
+            .find(|write| write.path == paths.gtk3_settings)
+            .map(|write| String::from_utf8(write.contents.clone()).expect("the write is text"))
+            .expect("the cursor size is written to gtk-3.0/settings.ini");
+        assert_eq!(
+            rendered_gtk3, expected_gtk3,
+            "the second write carries both the applied icon theme and the new cursor size"
+        );
+
+        // And through the pipeline, so the file on disk really ends up holding both.
+        let outcome = apply::run(
+            &ApplyPlan {
+                validations: Vec::new(),
+                writes: second.writes,
+                palette: None,
+                reload_params: second.reload_params,
+            },
+            &FreshnessTracker::new(),
+            &caps,
+            &MockCommandRunner::new(),
+            &signaller,
+        );
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied { .. }),
+            "the second apply must succeed, got {outcome:?}"
+        );
+        model.commit();
+        assert_eq!(
+            fs::read_to_string(&paths.gtk3_settings).expect("read the twice-applied gtk-3.0 file"),
+            expected_gtk3,
+            "two applies in a row accumulate: neither change is lost"
+        );
+        assert!(
+            !model.is_dirty(),
+            "both values reached every file that carries them, so the page is clean"
+        );
+    }
+
+    #[test]
     fn resolve_gtk_override_prefers_app_env_then_uwsm_then_none() {
         // Pure/headless decision (R3.3): the app's own environment wins; an empty value
         // is not an override; a commented-out uwsm line is not an override.
@@ -2174,7 +2226,7 @@ export XCURSOR_SIZE=16
             "the GTK theme reached both settings.ini files, so it is promoted"
         );
         assert_eq!(
-            model.icon_theme.original.as_deref(),
+            model.icon_theme.value.original.as_deref(),
             Some("Everforest-Dark"),
             "the icon baseline still matches what is on disk"
         );
@@ -2247,7 +2299,7 @@ export XCURSOR_SIZE=16
 
         model.commit();
         assert_eq!(
-            model.cursor_theme.original.as_deref(),
+            model.cursor_theme.value.original.as_deref(),
             Some("Nordic-cursors"),
             "the cursor baseline is not promoted while one existing copy holds the old value"
         );
