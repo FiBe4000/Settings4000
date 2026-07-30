@@ -46,12 +46,12 @@
 //! `positionX`.
 
 use std::fmt;
-use std::io;
 use std::path::PathBuf;
 
 use crate::core::apply::{FileWrite, WriteValidation};
 use crate::core::model::{SettingId, Value};
 use crate::core::reload::BackingFile;
+use crate::core::store_write::{RenderedEdit, StoreBackedFile, StoreWriteError};
 use crate::parsers::swaync::{ParseError, SwayncConfigFile};
 use crate::system::command::{Command, CommandRunner};
 
@@ -72,22 +72,6 @@ const FLAG_GET_DND: &str = "--get-dnd";
 const FLAG_DND_ON: &str = "--dnd-on";
 /// `swaync-client` flag that turns do-not-disturb off and prints the new state.
 const FLAG_DND_OFF: &str = "--dnd-off";
-
-/// The complete new `config.json` bytes plus the changed-key labels, produced by applying
-/// the store's dirty Notifications edits to the current file (task 6.7).
-///
-/// Returned by [`render_swaync_config`] and wrapped in a [`FileWrite`] by
-/// [`NotificationsModel::swaync_config_write`]. The `changed_keys` are the JSON keys the
-/// edit touched (e.g. `positionY`, `timeout`), used only for the apply-level log line
-/// (R7.3), never the file contents.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SwayncConfEdit {
-    /// The complete new file contents — canonical 2-space pretty JSON with a trailing
-    /// newline, with only the edited value spans changed and key order preserved (§3.4).
-    pub contents: Vec<u8>,
-    /// The JSON keys this edit changed, for logging.
-    pub changed_keys: Vec<String>,
-}
 
 /// Why [`render_swaync_config`] could not produce the new bytes.
 ///
@@ -120,49 +104,6 @@ impl std::error::Error for SwayncRenderError {
     }
 }
 
-/// Why [`NotificationsModel::swaync_config_write`] could not produce a write despite there
-/// being dirty Notifications settings to apply (task 6.7, the same abort-not-skip
-/// contract as the Input page's `InputWriteError`).
-///
-/// This is distinct from "nothing was dirty" (a plain `Ok(None)`): when the user *has*
-/// pending Notifications edits but the write cannot be rendered, the Apply must **abort**
-/// rather than skip the write and let the store commit the staged values against an
-/// unchanged file — that would desync the store from disk. Both cases are near-unreachable
-/// in practice (`config.json` is readable and was parseable at load), but treating them as
-/// failures keeps the store and the file in agreement (R8.3).
-#[derive(Debug)]
-pub enum SwayncWriteError {
-    /// `config.json` could not be read to render the edits.
-    Read(io::Error),
-    /// The JSON could no longer be parsed to apply the edits.
-    Render(SwayncRenderError),
-}
-
-impl fmt::Display for SwayncWriteError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SwayncWriteError::Read(error) => {
-                write!(f, "swaync config.json could not be read: {error}")
-            }
-            SwayncWriteError::Render(error) => {
-                write!(
-                    f,
-                    "the swaync config.json edit could not be applied: {error}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for SwayncWriteError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            SwayncWriteError::Read(error) => Some(error),
-            SwayncWriteError::Render(error) => Some(error),
-        }
-    }
-}
-
 /// Splits the store's combined position token (`"<positionY>-<positionX>"`) back into its
 /// two on-disk halves, or `None` for a token with no separator.
 ///
@@ -177,7 +118,9 @@ fn decompose_position(token: &str) -> Option<(&str, &str)> {
 }
 
 /// Applies the store's dirty Notifications `edits` to the current `config.json` `bytes`,
-/// returning the complete new bytes (task 6.7; R5.3 item 1).
+/// returning the complete new bytes — canonical 2-space pretty JSON with a trailing newline
+/// — plus the JSON keys it changed (e.g. `positionY`, `timeout`) for the apply-level log
+/// line (task 6.7; R5.3 item 1).
 ///
 /// This is the pure store-`SettingId` → `config.json` glue, mirroring
 /// [`crate::core::input::render_input_conf`]. It parses the current JSON through the
@@ -196,7 +139,7 @@ fn decompose_position(token: &str) -> Option<(&str, &str)> {
 pub fn render_swaync_config(
     bytes: &[u8],
     edits: &[(SettingId, Value)],
-) -> Result<SwayncConfEdit, SwayncRenderError> {
+) -> Result<RenderedEdit, SwayncRenderError> {
     let text = String::from_utf8_lossy(bytes);
     let mut config = SwayncConfigFile::parse(&text).map_err(SwayncRenderError::Parse)?;
 
@@ -229,7 +172,7 @@ pub fn render_swaync_config(
         }
     }
 
-    Ok(SwayncConfEdit {
+    Ok(RenderedEdit {
         contents: config.emit().into_bytes(),
         changed_keys,
     })
@@ -247,81 +190,57 @@ pub fn render_swaync_config(
 /// [`FileWrite`] on Apply. (Do Not Disturb needs no state here — it is applied through the
 /// free [`set_dnd`]/[`dnd_state`] functions by the UI.)
 pub struct NotificationsModel {
-    /// The live XDG path of `swaync/config.json` (R8.5), read fresh when rendering a write.
-    swaync_config: PathBuf,
+    /// The `swaync/config.json` write target: its live XDG path (R8.5), read fresh when
+    /// rendering a write, plus how the shared glue labels and logs it (see
+    /// [`write_target`]).
+    swaync_config: StoreBackedFile,
 }
 
 impl NotificationsModel {
     /// Builds the model, recording the `config.json` path (the production entry point,
     /// called from the startup worker — architecture §8).
     pub fn load(swaync_config: PathBuf) -> NotificationsModel {
-        NotificationsModel { swaync_config }
+        NotificationsModel {
+            swaync_config: write_target(swaync_config),
+        }
     }
 
-    /// Renders the store's dirty Notifications settings into a `config.json` [`FileWrite`]
-    /// (task 6.7).
+    /// The Notifications page's contribution to an Apply: the store's dirty position and
+    /// timeout settings rendered into one `config.json` [`FileWrite`] (task 6.7; named like
+    /// every other page's Apply seam since task 9.17).
     ///
     /// `dirty` is the store's dirty Notifications settings (from
     /// [`SettingsStore::dirty_in_category`](crate::core::store::SettingsStore::dirty_in_category)).
-    /// It reads the current file bytes and applies the edits through
-    /// [`render_swaync_config`], returning a single [`FileWrite`] for the shared Apply
-    /// pipeline. Reading fresh each time — rather than caching a parsed copy — is what
-    /// keeps it correct across repeated applies and external edits without a bespoke
-    /// freshness tracker: the pipeline's conflict check (against the store's baseline)
-    /// aborts the apply if the file changed since load, so a fresh read can never clobber
-    /// an external edit (the same contract as [`InputModel`](crate::core::input::InputModel)).
-    ///
-    /// Returns:
-    /// - `Ok(None)` when there is nothing to write — `dirty` is empty (the common clean
-    ///   case);
-    /// - `Ok(Some(write))` with the rendered write;
-    /// - `Err(SwayncWriteError)` when there *are* dirty Notifications settings but the
-    ///   write cannot be produced (the file is unreadable, or the JSON no longer parses).
-    ///   The caller must **abort the Apply** rather than skip the write, since the store
-    ///   would otherwise commit the staged values against an unchanged file and desync.
-    ///   Both failure modes are near-unreachable in practice.
-    pub fn swaync_config_write(
+    /// The shared glue ([`StoreBackedFile::render_write`]) reads the current file bytes and
+    /// applies them through [`render_swaync_config`]; see it for the three answers this can
+    /// give — no write, one write, or an error the caller must turn into an aborted Apply
+    /// rather than a skipped file. Both failure modes are near-unreachable in practice
+    /// (`config.json` is readable and was parseable at load).
+    pub fn apply_contribution(
         &self,
         dirty: &[(SettingId, Value)],
-    ) -> Result<Option<FileWrite>, SwayncWriteError> {
-        if dirty.is_empty() {
-            return Ok(None);
-        }
-        let bytes = std::fs::read(&self.swaync_config).map_err(|error| {
-            tracing::error!(
-                path = %self.swaync_config.display(),
-                %error,
-                "could not read swaync config.json to render the Notifications edits; \
-                 aborting the apply (R8.3)"
-            );
-            SwayncWriteError::Read(error)
-        })?;
-        let edit = render_swaync_config(&bytes, dirty).map_err(|error| {
-            tracing::error!(
-                path = %self.swaync_config.display(),
-                %error,
-                "failed to render a swaync config.json edit; aborting the apply (R8.3)"
-            );
-            SwayncWriteError::Render(error)
-        })?;
-        // `dirty` is non-empty here (the early return above handles the empty case), and
-        // every Notifications setting maps to at least one JSON key with a rendered value,
-        // so `changed_keys` is always non-empty at this point — this branch is truly
-        // unreachable. It is kept only as a guard against emitting a byte-identical no-op
-        // write; unlike the `Read`/`Render` errors above, which correctly abort a genuine
-        // runtime failure, reaching here would signal a logic bug, not a failure.
-        if edit.changed_keys.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(FileWrite {
-            path: self.swaync_config.clone(),
-            contents: edit.contents,
-            changed_keys: edit.changed_keys,
-            backing: BackingFile::SwayncConfig,
-            // Rendered from the store's dirty Notifications settings, which the plan
-            // carries as its validations (both come from the same `dirty_ids()`).
-            validation: WriteValidation::InPlan,
-        }))
+    ) -> Result<Option<FileWrite>, StoreWriteError<SwayncRenderError>> {
+        self.swaync_config.render_write(dirty, render_swaync_config)
+    }
+}
+
+/// How the shared store-backed write glue addresses, labels and logs swaync's
+/// `config.json` (task 9.17).
+///
+/// Only the path varies between runs, so everything else the glue needs is fixed here, at
+/// the one place a reader can check it against the file it describes.
+fn write_target(path: PathBuf) -> StoreBackedFile {
+    StoreBackedFile {
+        path,
+        name: "swaync config.json",
+        backing: BackingFile::SwayncConfig,
+        // Rendered from the store's dirty Notifications settings, which the plan carries as
+        // its validations (both come from the same `dirty_ids()`).
+        validation: WriteValidation::InPlan,
+        read_failure_log: "could not read swaync config.json to render the Notifications \
+                           edits; aborting the apply (R8.3)",
+        render_failure_log: "failed to render a swaync config.json edit; aborting the apply \
+                             (R8.3)",
     }
 }
 
@@ -626,27 +545,35 @@ mod tests {
     }
 
     #[test]
-    fn swaync_config_write_is_none_when_clean() {
+    fn apply_contribution_is_none_when_clean() {
         // No dirty Notifications settings -> Ok(None), no write (the common clean case).
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("config.json");
         fs::write(&path, CONFIG_JSON).expect("write config.json");
         let model = NotificationsModel::load(path);
-        assert!(matches!(model.swaync_config_write(&[]), Ok(None)));
+        assert!(matches!(model.apply_contribution(&[]), Ok(None)));
     }
 
     #[test]
-    fn swaync_config_write_errors_when_dirty_but_the_file_is_unreadable() {
+    fn apply_contribution_errors_when_dirty_but_the_file_is_unreadable() {
         // A dirty Notifications edit against a missing file is an error (the
         // Apply aborts), never a silent skip that would let commit_apply promote an
         // unwritten value.
         let dir = tempfile::tempdir().expect("temp dir");
         let model = NotificationsModel::load(dir.path().join("gone.json"));
         let dirty = vec![(SettingId::NotificationTimeout, Value::Integer(5))];
-        assert!(matches!(
-            model.swaync_config_write(&dirty),
-            Err(SwayncWriteError::Read(_))
-        ));
+        let error = model
+            .apply_contribution(&dirty)
+            .expect_err("a missing config.json must fail");
+        assert!(matches!(error, StoreWriteError::Read { .. }));
+        // The dialog quotes this message verbatim, so it has to name the file the user has
+        // to fix (the `name` the shared glue is given — task 9.17).
+        assert!(
+            error
+                .to_string()
+                .starts_with("swaync config.json could not be read: "),
+            "the message names swaync's config.json: {error}"
+        );
     }
 
     #[test]
@@ -737,11 +664,15 @@ mod tests {
             (SettingId::NotificationTimeout, Value::Integer(30)),
         ];
         let write = model
-            .swaync_config_write(&dirty)
+            .apply_contribution(&dirty)
             .expect("no error rendering the write")
             .expect("a dirty Notifications setting produces a write");
         assert_eq!(write.path, path);
         assert_eq!(write.backing, BackingFile::SwayncConfig);
+        // Task 9.10's drift guard trusts this declaration rather than checking it, so a
+        // page silently claiming NotNeeded would disable the guard for its own write
+        // (task 9.17 review). Pinned here, where the claim is made.
+        assert_eq!(write.validation, WriteValidation::InPlan);
         assert_eq!(
             write.changed_keys,
             vec![
@@ -851,7 +782,7 @@ mod tests {
             .expect("stage the first edit");
         let dirty = store.dirty_in_category(Category::Notifications);
         let write = model
-            .swaync_config_write(&dirty)
+            .apply_contribution(&dirty)
             .expect("no error")
             .expect("a write");
         let written_bytes = write.contents.clone();
@@ -876,7 +807,7 @@ mod tests {
             .expect("stage the second edit");
         let dirty2 = store.dirty_in_category(Category::Notifications);
         let write2 = model
-            .swaync_config_write(&dirty2)
+            .apply_contribution(&dirty2)
             .expect("no error")
             .expect("a write");
         let plan2 = ApplyPlan {

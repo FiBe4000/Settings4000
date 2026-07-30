@@ -185,8 +185,11 @@ pub enum PrepareFailure {
         /// [`Display`](fmt::Display) — the assembler logs it and the UI quotes it.
         ///
         /// The message is carried as text rather than as the typed error because the four
-        /// sources have four unrelated error types and nothing downstream distinguishes
-        /// them: the log line and the dialog both only quote the reason.
+        /// sources do not share one error type — the Display model has its own, and the
+        /// three store-backed pages share a
+        /// [`StoreWriteError`](crate::core::store_write::StoreWriteError) generic over two
+        /// different renderer errors — and nothing downstream distinguishes them anyway:
+        /// the log line and the dialog both only quote the reason.
         message: String,
     },
 }
@@ -267,7 +270,7 @@ pub fn assemble_apply_plan(sources: ApplySources<'_>) -> Result<AssembledPlan, P
         sources.store,
         Category::Input,
         sources.input,
-        InputModel::input_conf_write,
+        InputModel::apply_contribution,
         FailedWrite::Input,
     )?;
     fold_store_write(
@@ -275,7 +278,7 @@ pub fn assemble_apply_plan(sources: ApplySources<'_>) -> Result<AssembledPlan, P
         sources.store,
         Category::Notifications,
         sources.notifications,
-        NotificationsModel::swaync_config_write,
+        NotificationsModel::apply_contribution,
         FailedWrite::Notifications,
     )?;
     fold_store_write(
@@ -283,7 +286,7 @@ pub fn assemble_apply_plan(sources: ApplySources<'_>) -> Result<AssembledPlan, P
         sources.store,
         Category::PowerAndIdle,
         sources.power,
-        PowerModel::hypridle_conf_write,
+        PowerModel::apply_contribution,
         FailedWrite::Power,
     )?;
 
@@ -420,7 +423,7 @@ fn first_conflicted_source(sources: &ApplySources<'_>) -> Option<ConflictedSourc
 /// renderer, and treat the three possible answers as "nothing to write" (the common clean
 /// case), "one write" or "abort" — which is why they are one helper rather than three
 /// blocks. `render` is the page's renderer (e.g.
-/// [`InputModel::input_conf_write`]); `source` names the page in the resulting failure.
+/// [`InputModel::apply_contribution`]); `source` names the page in the resulting failure.
 ///
 /// An absent `model` returns without consulting the store: a page whose app is not
 /// installed has no settings loaded, so there is nothing dirty to render either way.

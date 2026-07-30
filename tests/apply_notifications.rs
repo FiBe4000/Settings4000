@@ -87,7 +87,7 @@ fn position_and_timeout_apply_byte_exactly_and_reload_swaync() {
     let mut plan = base_apply_plan(&store);
     plan.writes.push(
         model
-            .swaync_config_write(&store.dirty_in_category(Category::Notifications))
+            .apply_contribution(&store.dirty_in_category(Category::Notifications))
             .expect("the write renders")
             .expect("dirty settings produce a write"),
     );
@@ -176,13 +176,13 @@ fn a_mid_plan_write_failure_rolls_back_the_earlier_category_write() {
     let mut plan = base_apply_plan(&store);
     plan.writes.push(
         input_model
-            .input_conf_write(&store.dirty_in_category(Category::Input))
+            .apply_contribution(&store.dirty_in_category(Category::Input))
             .expect("the input write renders")
             .expect("a dirty setting produces a write"),
     );
     plan.writes.push(
         notifications_model
-            .swaync_config_write(&store.dirty_in_category(Category::Notifications))
+            .apply_contribution(&store.dirty_in_category(Category::Notifications))
             .expect("the swaync write renders")
             .expect("a dirty setting produces a write"),
     );

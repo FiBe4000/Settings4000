@@ -130,7 +130,7 @@ fn main() {
     let mut plan = base_apply_plan(&store);
     plan.writes.push(
         model
-            .input_conf_write(&store.dirty_in_category(Category::Input))
+            .apply_contribution(&store.dirty_in_category(Category::Input))
             .expect("the write renders")
             .expect("dirty settings produce a write"),
     );
@@ -179,7 +179,7 @@ fn main() {
     let mut failing_plan = base_apply_plan(&store);
     failing_plan.writes.push(
         model
-            .input_conf_write(&store.dirty_in_category(Category::Input))
+            .apply_contribution(&store.dirty_in_category(Category::Input))
             .expect("the second write renders")
             .expect("a dirty setting produces a write"),
     );

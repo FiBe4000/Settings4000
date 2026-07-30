@@ -82,7 +82,7 @@ fn a_staged_input_edit_applies_byte_exactly_and_reloads_hyprland() {
     // surgical FileWrite.
     let mut plan = base_apply_plan(&store);
     let write = model
-        .input_conf_write(&store.dirty_in_category(Category::Input))
+        .apply_contribution(&store.dirty_in_category(Category::Input))
         .expect("the write renders")
         .expect("dirty settings produce a write");
     plan.writes.push(write);
@@ -145,7 +145,7 @@ fn a_staged_input_edit_applies_byte_exactly_and_reloads_hyprland() {
     let mut second_plan = base_apply_plan(&store);
     second_plan.writes.push(
         model
-            .input_conf_write(&store.dirty_in_category(Category::Input))
+            .apply_contribution(&store.dirty_in_category(Category::Input))
             .expect("the second write renders")
             .expect("a dirty setting produces a write"),
     );
@@ -198,7 +198,7 @@ fn an_external_edit_between_load_and_apply_aborts_as_conflicted() {
     let mut plan = base_apply_plan(&store);
     plan.writes.push(
         model
-            .input_conf_write(&store.dirty_in_category(Category::Input))
+            .apply_contribution(&store.dirty_in_category(Category::Input))
             .expect("the write renders")
             .expect("a dirty setting produces a write"),
     );
@@ -266,7 +266,7 @@ fn a_deleted_hypridle_conf_neither_blocks_an_input_apply_nor_lets_its_own_page_w
     let mut plan = base_apply_plan(&store);
     plan.writes.push(
         model
-            .input_conf_write(&store.dirty_in_category(Category::Input))
+            .apply_contribution(&store.dirty_in_category(Category::Input))
             .expect("the write renders")
             .expect("a dirty setting produces a write"),
     );
@@ -313,7 +313,7 @@ fn a_deleted_hypridle_conf_neither_blocks_an_input_apply_nor_lets_its_own_page_w
         .stage(SettingId::DimTimeout, Value::Integer(600))
         .expect("the Power & Idle edit stages");
     let error = power
-        .hypridle_conf_write(&store.dirty_in_category(Category::PowerAndIdle))
+        .apply_contribution(&store.dirty_in_category(Category::PowerAndIdle))
         .expect_err("a deleted hypridle.conf cannot be written");
     assert!(
         error.to_string().contains("hypridle.conf"),
@@ -338,7 +338,7 @@ fn a_failed_hyprctl_reload_is_non_fatal_and_the_write_stands() {
     let mut plan = base_apply_plan(&store);
     plan.writes.push(
         model
-            .input_conf_write(&store.dirty_in_category(Category::Input))
+            .apply_contribution(&store.dirty_in_category(Category::Input))
             .expect("the write renders")
             .expect("a dirty setting produces a write"),
     );

@@ -17,7 +17,8 @@
 //!   the store's dirty Input settings and applies each to the file through the surgical
 //!   hyprlang writer (§3.2), producing one lossless [`FileWrite`] whose diff is limited
 //!   to the touched value spans (the first store-driven page to produce a real write;
-//!   task 6.7 reuses the same shape for swaync);
+//!   task 6.7 reuses the same shape for swaync, and task 9.17 turned the steps around the
+//!   renderer into the shared [`crate::core::store_write`] glue);
 //! - the **keyboard-layout candidate list** sourced from the XKB registry
 //!   (`/usr/share/xkb/rules/evdev.xml`), parsed by [`parse_xkb_layouts`], which the
 //!   Input page's reorderable add-control offers (R2.3).
@@ -44,50 +45,18 @@
 //! freshness baseline and hands the same tracker to the Apply pipeline
 //! ([`apply::run`](crate::core::apply::run)); a commit re-baselines it. So this module
 //! deliberately owns **no** [`FreshnessTracker`](crate::core::freshness::FreshnessTracker):
-//! [`InputModel::input_conf_write`] just reads the current bytes and renders the edit,
+//! [`InputModel::apply_contribution`] just reads the current bytes and renders the edit,
 //! and the pipeline's step-2 conflict check aborts the apply if the file changed
 //! externally — nothing here can clobber an external edit.
 
 use std::collections::BTreeSet;
-use std::fmt;
-use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::core::apply::{FileWrite, WriteValidation};
 use crate::core::model::{SettingId, Value};
 use crate::core::reload::BackingFile;
+use crate::core::store_write::{RenderedEdit, StoreBackedFile, StoreWriteError};
 use crate::parsers::hyprlang::{EditError, HyprlangFile, KeyPath};
-
-/// Why [`InputModel::input_conf_write`] could not produce a write despite there being
-/// dirty Input settings to apply (task 6.6).
-///
-/// This is distinct from "nothing was dirty" (which is a plain `Ok(None)`): when the
-/// user *has* pending Input edits but the write cannot be rendered, the Apply must
-/// **abort** rather than skip the write and let the store commit the staged values
-/// against an unchanged file — that would desync the store from disk. Both cases are
-/// near-unreachable in practice (`input.conf` is app-owned and readable), but treating
-/// them as failures keeps the store and the file in agreement (R8.3).
-#[derive(Debug)]
-pub enum InputWriteError {
-    /// `input.conf` could not be read to render the edits.
-    Read(io::Error),
-    /// The hyprlang writer rejected an edit — a value it cannot represent, or a missing
-    /// `input {}` section to write into.
-    Render(EditError),
-}
-
-impl fmt::Display for InputWriteError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            InputWriteError::Read(error) => write!(f, "input.conf could not be read: {error}"),
-            InputWriteError::Render(error) => {
-                write!(f, "the input.conf edit could not be applied: {error}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for InputWriteError {}
 
 /// The well-known filesystem locations of the XKB rules registry the keyboard-layout
 /// candidate list is parsed from, tried in order (task 6.6 / requirements §3).
@@ -131,21 +100,6 @@ pub struct LayoutOption {
     pub code: String,
     /// The registry's human-readable description (e.g. `English (US)`).
     pub description: String,
-}
-
-/// The complete new `input.conf` bytes plus the changed-key labels, produced by
-/// applying the store's dirty Input edits to the current file (task 6.6).
-///
-/// Returned by [`render_input_conf`] and wrapped in a [`FileWrite`] by
-/// [`InputModel::input_conf_write`]. The `changed_keys` are the rendered section paths
-/// (e.g. `input.kb_layout`) used only for the apply-level log line (R7.3), never the
-/// file contents.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InputConfEdit {
-    /// The complete new file contents (surgical, span-preserving — §3).
-    pub contents: Vec<u8>,
-    /// The section paths this edit changed, for logging.
-    pub changed_keys: Vec<String>,
 }
 
 /// The `input.conf` section path each Input [`SettingId`] edits, or `None` for a
@@ -192,7 +146,8 @@ fn value_to_hypr_string(id: SettingId, value: &Value) -> Option<String> {
 }
 
 /// Applies the store's dirty Input `edits` to the current `input.conf` `bytes`,
-/// returning the complete new bytes (task 6.6; R5.3 item 1).
+/// returning the complete new bytes plus the rendered section paths it changed (e.g.
+/// `input.kb_layout`) for the apply-level log line (task 6.6; R5.3 item 1).
 ///
 /// This is the pure store-`SettingId` → `input.conf` glue. It parses the current file
 /// losslessly, then for each `(id, value)` rewrites **only** that setting's value span
@@ -208,7 +163,7 @@ fn value_to_hypr_string(id: SettingId, value: &Value) -> Option<String> {
 pub fn render_input_conf(
     bytes: &[u8],
     edits: &[(SettingId, Value)],
-) -> Result<InputConfEdit, EditError> {
+) -> Result<RenderedEdit, EditError> {
     let text = String::from_utf8_lossy(bytes);
     let (mut file, _warnings) = HyprlangFile::parse(&text);
 
@@ -225,7 +180,7 @@ pub fn render_input_conf(
         changed_keys.push(path.to_string());
     }
 
-    Ok(InputConfEdit {
+    Ok(RenderedEdit {
         contents: file.emit().into_bytes(),
         changed_keys,
     })
@@ -340,8 +295,9 @@ fn unescape_xml(text: &str) -> String {
 /// commit all flow through the store. This just supplies the layout add-list and turns
 /// the store's dirty Input settings into the `input.conf` [`FileWrite`] on Apply.
 pub struct InputModel {
-    /// The live XDG path of `input.conf` (R8.5), read fresh when rendering a write.
-    input_conf: PathBuf,
+    /// The `input.conf` write target: its live XDG path (R8.5), read fresh when rendering
+    /// a write, plus how the shared glue labels and logs it (see [`write_target`]).
+    input_conf: StoreBackedFile,
     /// The XKB layout candidates the reorderable add-control offers (R2.3).
     layouts: Vec<LayoutOption>,
 }
@@ -355,7 +311,7 @@ impl InputModel {
     /// cold-start budget; an unreadable registry degrades to no candidates (R4.4).
     pub fn load(input_conf: PathBuf, xkb_registry: &Path) -> InputModel {
         InputModel {
-            input_conf,
+            input_conf: write_target(input_conf),
             layouts: read_xkb_layouts(xkb_registry),
         }
     }
@@ -365,65 +321,41 @@ impl InputModel {
         &self.layouts
     }
 
-    /// Renders the store's dirty Input settings into an `input.conf` [`FileWrite`]
-    /// (task 6.6).
+    /// The Input page's contribution to an Apply: the store's dirty Input settings
+    /// rendered into one surgical `input.conf` [`FileWrite`] (task 6.6; named like every
+    /// other page's Apply seam since task 9.17).
     ///
     /// `dirty` is the store's dirty Input settings (from
     /// [`SettingsStore::dirty_in_category`](crate::core::store::SettingsStore::dirty_in_category)).
-    /// It reads the current file bytes and applies the edits through [`render_input_conf`],
-    /// returning a single surgical [`FileWrite`] for the shared Apply pipeline. Reading
-    /// fresh each time — rather than caching a parsed copy — is what keeps it correct
-    /// across repeated applies and external edits without a bespoke freshness tracker:
-    /// the pipeline's conflict check (against the store's baseline) aborts the apply if
-    /// the file changed since load, so a fresh read can never clobber an external edit.
-    ///
-    /// Returns:
-    /// - `Ok(None)` when there is nothing to write — `dirty` is empty (the common clean
-    ///   case);
-    /// - `Ok(Some(write))` with the rendered write;
-    /// - `Err(InputWriteError)` when there *are* dirty Input settings but the write
-    ///   cannot be produced (the file is unreadable, or the writer rejects an edit). The
-    ///   caller must **abort the Apply** in this case rather than skip the write, since
-    ///   the store would otherwise commit the staged values against an unchanged file and
-    ///   desync. Both failure modes are near-unreachable in practice.
-    pub fn input_conf_write(
+    /// The shared glue ([`StoreBackedFile::render_write`]) reads the current file bytes and
+    /// applies them through [`render_input_conf`]; see it for the three answers this can
+    /// give — no write, one write, or an error the caller must turn into an aborted Apply
+    /// rather than a skipped file. Both failure modes are near-unreachable in practice
+    /// (`input.conf` is app-owned and readable).
+    pub fn apply_contribution(
         &self,
         dirty: &[(SettingId, Value)],
-    ) -> Result<Option<FileWrite>, InputWriteError> {
-        if dirty.is_empty() {
-            return Ok(None);
-        }
-        let bytes = std::fs::read(&self.input_conf).map_err(|error| {
-            tracing::error!(
-                path = %self.input_conf.display(),
-                %error,
-                "could not read input.conf to render the Input edits; aborting the apply (R8.3)"
-            );
-            InputWriteError::Read(error)
-        })?;
-        let edit = render_input_conf(&bytes, dirty).map_err(|error| {
-            tracing::error!(
-                path = %self.input_conf.display(),
-                %error,
-                "failed to render an input.conf edit; aborting the apply (R8.3)"
-            );
-            InputWriteError::Render(error)
-        })?;
-        // Defensive: every dirty Input setting maps to a section path and a rendered
-        // value, so `changed_keys` is non-empty here — this branch is effectively dead,
-        // but is guarded rather than emitting a byte-identical no-op write.
-        if edit.changed_keys.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(FileWrite {
-            path: self.input_conf.clone(),
-            contents: edit.contents,
-            changed_keys: edit.changed_keys,
-            backing: BackingFile::InputConf,
-            // Rendered from the store's dirty Input settings, which the plan carries as
-            // its validations (the window builds both from the same `dirty_ids()`).
-            validation: WriteValidation::InPlan,
-        }))
+    ) -> Result<Option<FileWrite>, StoreWriteError<EditError>> {
+        self.input_conf.render_write(dirty, render_input_conf)
+    }
+}
+
+/// How the shared store-backed write glue addresses, labels and logs `input.conf`
+/// (task 9.17).
+///
+/// Only the path varies between runs, so everything else the glue needs is fixed here, at
+/// the one place a reader can check it against the file it describes.
+fn write_target(path: PathBuf) -> StoreBackedFile {
+    StoreBackedFile {
+        path,
+        name: "input.conf",
+        backing: BackingFile::InputConf,
+        // Rendered from the store's dirty Input settings, which the plan carries as its
+        // validations (the assembler builds both from the same `dirty_ids()`).
+        validation: WriteValidation::InPlan,
+        read_failure_log: "could not read input.conf to render the Input edits; aborting \
+                           the apply (R8.3)",
+        render_failure_log: "failed to render an input.conf edit; aborting the apply (R8.3)",
     }
 }
 
@@ -736,17 +668,17 @@ input {
     }
 
     #[test]
-    fn input_conf_write_is_none_when_clean() {
+    fn apply_contribution_is_none_when_clean() {
         // No dirty Input settings -> Ok(None), no write (the common clean case).
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("input.conf");
         fs::write(&path, INPUT_CONF).expect("write input.conf");
         let model = InputModel::load(path, Path::new("/nonexistent-xkb"));
-        assert!(matches!(model.input_conf_write(&[]), Ok(None)));
+        assert!(matches!(model.apply_contribution(&[]), Ok(None)));
     }
 
     #[test]
-    fn input_conf_write_errors_when_dirty_but_the_section_is_missing() {
+    fn apply_contribution_errors_when_dirty_but_the_section_is_missing() {
         // Dirty Input settings but the writer cannot apply them (no `input {}`
         // section) must surface as an error, so the Apply aborts rather than skipping the
         // write and letting the store commit an unwritten value against an unchanged file.
@@ -759,22 +691,30 @@ input {
             Value::String("us,se".to_string()),
         )];
         assert!(matches!(
-            model.input_conf_write(&dirty),
-            Err(InputWriteError::Render(_))
+            model.apply_contribution(&dirty),
+            Err(StoreWriteError::Render { .. })
         ));
     }
 
     #[test]
-    fn input_conf_write_errors_when_dirty_but_the_file_is_unreadable() {
+    fn apply_contribution_errors_when_dirty_but_the_file_is_unreadable() {
         // A dirty Input edit against a missing file is an error (the Apply aborts),
         // never a silent skip that would let commit_apply promote an unwritten value.
         let dir = tempfile::tempdir().expect("temp dir");
         let model = InputModel::load(dir.path().join("gone.conf"), Path::new("/nonexistent-xkb"));
         let dirty = vec![(SettingId::MouseSensitivity, Value::Float(0.5))];
-        assert!(matches!(
-            model.input_conf_write(&dirty),
-            Err(InputWriteError::Read(_))
-        ));
+        let error = model
+            .apply_contribution(&dirty)
+            .expect_err("a missing input.conf must fail");
+        assert!(matches!(error, StoreWriteError::Read { .. }));
+        // The dialog quotes this message verbatim, so it has to name the file the user has
+        // to fix (the `name` the shared glue is given — task 9.17).
+        assert!(
+            error
+                .to_string()
+                .starts_with("input.conf could not be read: "),
+            "the message names input.conf: {error}"
+        );
     }
 
     #[test]
@@ -790,11 +730,15 @@ input {
 
         let dirty = vec![(SettingId::MouseSensitivity, Value::Float(0.5))];
         let write = model
-            .input_conf_write(&dirty)
+            .apply_contribution(&dirty)
             .expect("no error rendering the write")
             .expect("a dirty Input setting produces a write");
         assert_eq!(write.path, path);
         assert_eq!(write.backing, BackingFile::InputConf);
+        // Task 9.10's drift guard trusts this declaration rather than checking it, so a
+        // page silently claiming NotNeeded would disable the guard for its own write
+        // (task 9.17 review). Pinned here, where the claim is made.
+        assert_eq!(write.validation, WriteValidation::InPlan);
         assert_eq!(write.changed_keys, vec!["input.sensitivity".to_string()]);
 
         // The freshness baseline matches the on-disk bytes, so no conflict.
@@ -847,7 +791,7 @@ input {
         // Proves the window's fold-before-`store_writes`-capture plus
         // `commit_apply`'s re-baseline of input.conf work through the REAL renderer (not
         // apply.rs's hand-built write). Load input.conf into a real store, stage an Input
-        // edit, build the write via `input_conf_write`, run `apply::run` over the store's
+        // edit, build the write via `apply_contribution`, run `apply::run` over the store's
         // freshness, commit, then stage a SECOND edit and re-apply — the outcome must be
         // `Applied`, not `Conflicted` (the app's own first write must not read as an
         // external change on the next apply, R5.6).
@@ -893,7 +837,7 @@ input {
             .expect("stage the first edit");
         let dirty = store.dirty_in_category(Category::Input);
         let write = model
-            .input_conf_write(&dirty)
+            .apply_contribution(&dirty)
             .expect("no error")
             .expect("a write");
         let written_bytes = write.contents.clone();
@@ -921,7 +865,7 @@ input {
             .expect("stage the second edit");
         let dirty2 = store.dirty_in_category(Category::Input);
         let write2 = model
-            .input_conf_write(&dirty2)
+            .apply_contribution(&dirty2)
             .expect("no error")
             .expect("a write");
         let plan2 = ApplyPlan {

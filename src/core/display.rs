@@ -241,9 +241,8 @@ pub struct DisplayModel {
 /// **abort** rather than skip the write and let the model [`commit`](DisplayModel::commit)
 /// the staged values — that would promote them and re-baseline `monitors.conf`'s
 /// freshness against bytes no write ever produced, desyncing the model from disk. The
-/// store-backed pages ([`InputModel::input_conf_write`](crate::core::input::InputModel::input_conf_write)
-/// and its Notifications/Power siblings) return an error in exactly this case for the
-/// same reason.
+/// store-backed pages (whose shared glue is
+/// [`crate::core::store_write`]) return an error in exactly this case for the same reason.
 ///
 /// Unlike those siblings there is no read-failure variant: this model holds
 /// `monitors.conf` parsed from the startup load rather than re-reading it per Apply, and

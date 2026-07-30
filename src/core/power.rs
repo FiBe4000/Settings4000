@@ -60,18 +60,17 @@
 //! freshness baseline and hands the same tracker to the Apply pipeline
 //! ([`apply::run`](crate::core::apply::run)); a commit re-baselines it. So this module
 //! deliberately owns **no** [`FreshnessTracker`](crate::core::freshness::FreshnessTracker):
-//! [`PowerModel::hypridle_conf_write`] just reads the current bytes and renders the edit,
+//! [`PowerModel::apply_contribution`] just reads the current bytes and renders the edit,
 //! and the pipeline's step-2 conflict check aborts the apply if the file changed
 //! externally — nothing here can clobber an external edit (the same contract as the Input
 //! and Notifications pages).
 
-use std::fmt;
-use std::io;
 use std::path::PathBuf;
 
 use crate::core::apply::{FileWrite, WriteValidation};
 use crate::core::model::{SettingId, Value};
 use crate::core::reload::BackingFile;
+use crate::core::store_write::{RenderedEdit, StoreBackedFile, StoreWriteError};
 use crate::parsers::hyprlang::{EditError, HyprlangFile, KeyPath, SectionStep};
 
 /// The hyprlang section name of a `listener { }` block in `hypridle.conf`.
@@ -133,56 +132,10 @@ fn value_to_hypr_string(id: SettingId, value: &Value) -> Option<String> {
     }
 }
 
-/// The complete new `hypridle.conf` bytes plus the changed-key labels, produced by
-/// applying the store's dirty Power & Idle edits to the current file (task 6.8).
-///
-/// Returned by [`render_hypridle_conf`] and wrapped in a [`FileWrite`] by
-/// [`PowerModel::hypridle_conf_write`]. The `changed_keys` are the rendered section
-/// paths (e.g. `listener[1].timeout`, `general.lock_cmd`) used only for the apply-level
-/// log line (R7.3), never the file contents.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HypridleConfEdit {
-    /// The complete new file contents (surgical, span-preserving — §3).
-    pub contents: Vec<u8>,
-    /// The section paths this edit changed, for logging.
-    pub changed_keys: Vec<String>,
-}
-
-/// Why [`PowerModel::hypridle_conf_write`] could not produce a write despite there being
-/// dirty Power & Idle settings to apply (task 6.8, the same abort-not-skip contract as
-/// the Input page's `InputWriteError`).
-///
-/// This is distinct from "nothing was dirty" (a plain `Ok(None)`): when the user *has*
-/// pending Power & Idle edits but the write cannot be rendered, the Apply must **abort**
-/// rather than skip the write and let the store commit the staged values against an
-/// unchanged file — that would desync the store from disk. Both cases are near-unreachable
-/// in practice (`hypridle.conf` is readable and was parseable at load), but treating them
-/// as failures keeps the store and the file in agreement (R8.3).
-#[derive(Debug)]
-pub enum PowerWriteError {
-    /// `hypridle.conf` could not be read to render the edits.
-    Read(io::Error),
-    /// The hyprlang writer rejected an edit — a value it cannot represent (a `#` or
-    /// newline in the lock command, R8.3), or a missing `listener`/`general` section to
-    /// write into.
-    Render(EditError),
-}
-
-impl fmt::Display for PowerWriteError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PowerWriteError::Read(error) => write!(f, "hypridle.conf could not be read: {error}"),
-            PowerWriteError::Render(error) => {
-                write!(f, "the hypridle.conf edit could not be applied: {error}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PowerWriteError {}
-
 /// Applies the store's dirty Power & Idle `edits` to the current `hypridle.conf` `bytes`,
-/// returning the complete new bytes (task 6.8; R5.3 item 1).
+/// returning the complete new bytes plus the rendered section paths it changed (e.g.
+/// `listener[1].timeout`, `general.lock_cmd`) for the apply-level log line (task 6.8;
+/// R5.3 item 1).
 ///
 /// This is the pure store-`SettingId` → `hypridle.conf` glue. It parses the current file
 /// losslessly, then for each `(id, value)` rewrites **only** that setting's value span
@@ -199,7 +152,7 @@ impl std::error::Error for PowerWriteError {}
 pub fn render_hypridle_conf(
     bytes: &[u8],
     edits: &[(SettingId, Value)],
-) -> Result<HypridleConfEdit, EditError> {
+) -> Result<RenderedEdit, EditError> {
     let text = String::from_utf8_lossy(bytes);
     let (mut file, _warnings) = HyprlangFile::parse(&text);
 
@@ -215,7 +168,7 @@ pub fn render_hypridle_conf(
         changed_keys.push(path.to_string());
     }
 
-    Ok(HypridleConfEdit {
+    Ok(RenderedEdit {
         contents: file.emit().into_bytes(),
         changed_keys,
     })
@@ -233,80 +186,60 @@ pub fn render_hypridle_conf(
 /// [`FileWrite`] on Apply, which the pipeline then follows with a hypridle restart
 /// (task 4.4).
 pub struct PowerModel {
-    /// The live XDG path of `hypridle.conf` (R8.5), read fresh when rendering a write.
-    hypridle_conf: PathBuf,
+    /// The `hypridle.conf` write target: its live XDG path (R8.5), read fresh when
+    /// rendering a write, plus how the shared glue labels and logs it (see
+    /// [`write_target`]).
+    hypridle_conf: StoreBackedFile,
 }
 
 impl PowerModel {
     /// Builds the model, recording the `hypridle.conf` path (the production entry point,
     /// called from the startup worker — architecture §8).
     pub fn load(hypridle_conf: PathBuf) -> PowerModel {
-        PowerModel { hypridle_conf }
+        PowerModel {
+            hypridle_conf: write_target(hypridle_conf),
+        }
     }
 
-    /// Renders the store's dirty Power & Idle settings into a `hypridle.conf`
-    /// [`FileWrite`] (task 6.8).
+    /// The Power & Idle page's contribution to an Apply: the store's dirty timeouts and
+    /// lock command rendered into one surgical `hypridle.conf` [`FileWrite`] (task 6.8;
+    /// named like every other page's Apply seam since task 9.17).
     ///
     /// `dirty` is the store's dirty Power & Idle settings (from
     /// [`SettingsStore::dirty_in_category`](crate::core::store::SettingsStore::dirty_in_category)).
-    /// It reads the current file bytes and applies the edits through
-    /// [`render_hypridle_conf`], returning a single surgical [`FileWrite`] for the shared
-    /// Apply pipeline. Reading fresh each time — rather than caching a parsed copy — is
-    /// what keeps it correct across repeated applies and external edits without a bespoke
-    /// freshness tracker: the pipeline's conflict check (against the store's baseline)
-    /// aborts the apply if the file changed since load, so a fresh read can never clobber
-    /// an external edit (the same contract as the Input and Notifications models).
+    /// The shared glue ([`StoreBackedFile::render_write`]) reads the current file bytes and
+    /// applies them through [`render_hypridle_conf`]; see it for the three answers this can
+    /// give — no write, one write, or an error the caller must turn into an aborted Apply
+    /// rather than a skipped file. Both failure modes are near-unreachable in practice
+    /// (`hypridle.conf` is readable and was parseable at load).
     ///
-    /// Returns:
-    /// - `Ok(None)` when there is nothing to write — `dirty` is empty (the common clean
-    ///   case). This is what makes the hypridle restart fire **only** when the file
-    ///   actually changed: with no write, the pipeline derives no `HypridleConf` change
-    ///   and plans no restart.
-    /// - `Ok(Some(write))` with the rendered write;
-    /// - `Err(PowerWriteError)` when there *are* dirty Power & Idle settings but the write
-    ///   cannot be produced (the file is unreadable, or the writer rejects an edit). The
-    ///   caller must **abort the Apply** rather than skip the write, since the store would
-    ///   otherwise commit the staged values against an unchanged file and desync. Both
-    ///   failure modes are near-unreachable in practice.
-    pub fn hypridle_conf_write(
+    /// The "no write" answer is also what makes the hypridle restart fire **only** when the
+    /// file actually changed: with no write, the pipeline derives no `HypridleConf` change
+    /// and plans no restart.
+    pub fn apply_contribution(
         &self,
         dirty: &[(SettingId, Value)],
-    ) -> Result<Option<FileWrite>, PowerWriteError> {
-        if dirty.is_empty() {
-            return Ok(None);
-        }
-        let bytes = std::fs::read(&self.hypridle_conf).map_err(|error| {
-            tracing::error!(
-                path = %self.hypridle_conf.display(),
-                %error,
-                "could not read hypridle.conf to render the Power & Idle edits; \
-                 aborting the apply (R8.3)"
-            );
-            PowerWriteError::Read(error)
-        })?;
-        let edit = render_hypridle_conf(&bytes, dirty).map_err(|error| {
-            tracing::error!(
-                path = %self.hypridle_conf.display(),
-                %error,
-                "failed to render a hypridle.conf edit; aborting the apply (R8.3)"
-            );
-            PowerWriteError::Render(error)
-        })?;
-        // Defensive: every dirty Power & Idle setting maps to an address and a rendered
-        // value, so `changed_keys` is non-empty here — this branch is effectively dead,
-        // but is guarded rather than emitting a byte-identical no-op write.
-        if edit.changed_keys.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(FileWrite {
-            path: self.hypridle_conf.clone(),
-            contents: edit.contents,
-            changed_keys: edit.changed_keys,
-            backing: BackingFile::HypridleConf,
-            // Rendered from the store's dirty Power & Idle settings, which the plan
-            // carries as its validations (both come from the same `dirty_ids()`).
-            validation: WriteValidation::InPlan,
-        }))
+    ) -> Result<Option<FileWrite>, StoreWriteError<EditError>> {
+        self.hypridle_conf.render_write(dirty, render_hypridle_conf)
+    }
+}
+
+/// How the shared store-backed write glue addresses, labels and logs `hypridle.conf`
+/// (task 9.17).
+///
+/// Only the path varies between runs, so everything else the glue needs is fixed here, at
+/// the one place a reader can check it against the file it describes.
+fn write_target(path: PathBuf) -> StoreBackedFile {
+    StoreBackedFile {
+        path,
+        name: "hypridle.conf",
+        backing: BackingFile::HypridleConf,
+        // Rendered from the store's dirty Power & Idle settings, which the plan carries as
+        // its validations (both come from the same `dirty_ids()`).
+        validation: WriteValidation::InPlan,
+        read_failure_log: "could not read hypridle.conf to render the Power & Idle edits; \
+                           aborting the apply (R8.3)",
+        render_failure_log: "failed to render a hypridle.conf edit; aborting the apply (R8.3)",
     }
 }
 
@@ -523,7 +456,7 @@ listener {
     }
 
     #[test]
-    fn hypridle_conf_write_is_none_when_clean() {
+    fn apply_contribution_is_none_when_clean() {
         // No dirty Power & Idle settings -> Ok(None), no write (the common clean case).
         // This is also what makes the restart fire only on a real change: no write means
         // no HypridleConf in the reload set.
@@ -531,28 +464,36 @@ listener {
         let path = dir.path().join("hypridle.conf");
         fs::write(&path, HYPRIDLE_CONF).expect("write hypridle.conf");
         let model = PowerModel::load(path);
-        assert!(matches!(model.hypridle_conf_write(&[]), Ok(None)));
+        assert!(matches!(model.apply_contribution(&[]), Ok(None)));
     }
 
     #[test]
-    fn hypridle_conf_write_errors_when_dirty_but_the_file_is_unreadable() {
+    fn apply_contribution_errors_when_dirty_but_the_file_is_unreadable() {
         // A dirty Power & Idle edit against a missing file is an error (the Apply aborts),
         // never a silent skip that would let commit_apply promote an unwritten value.
         let dir = tempfile::tempdir().expect("temp dir");
         let model = PowerModel::load(dir.path().join("gone.conf"));
         let dirty = vec![(SettingId::DimTimeout, Value::Integer(90))];
-        assert!(matches!(
-            model.hypridle_conf_write(&dirty),
-            Err(PowerWriteError::Read(_))
-        ));
+        let error = model
+            .apply_contribution(&dirty)
+            .expect_err("a missing hypridle.conf must fail");
+        assert!(matches!(error, StoreWriteError::Read { .. }));
+        // The dialog quotes this message verbatim, so it has to name the file the user has
+        // to fix (the `name` the shared glue is given — task 9.17).
+        assert!(
+            error
+                .to_string()
+                .starts_with("hypridle.conf could not be read: "),
+            "the message names hypridle.conf: {error}"
+        );
     }
 
     #[test]
-    fn hypridle_conf_write_rejects_an_unsafe_lock_command_defense_in_depth() {
+    fn apply_contribution_rejects_an_unsafe_lock_command_defense_in_depth() {
         // Defense in depth: even though the stage-time validator rejects a lock
         // command containing `#`/newline before it can be staged, the writer keeps its own
         // `reject_unsafe_value` guard — a lock command with a `#` surfaces as a
-        // `PowerWriteError::Render` here, so a value that somehow reached this point
+        // `StoreWriteError::Render` here, so a value that somehow reached this point
         // (bypassing stage validation) still aborts the Apply rather than truncating the
         // config at the `#`.
         let dir = tempfile::tempdir().expect("temp dir");
@@ -564,8 +505,11 @@ listener {
             Value::String("hyprlock # note".to_string()),
         )];
         assert!(matches!(
-            model.hypridle_conf_write(&dirty),
-            Err(PowerWriteError::Render(EditError::InvalidValue(_)))
+            model.apply_contribution(&dirty),
+            Err(StoreWriteError::Render {
+                error: EditError::InvalidValue(_),
+                ..
+            })
         ));
     }
 
@@ -590,11 +534,15 @@ listener {
             ),
         ];
         let write = model
-            .hypridle_conf_write(&dirty)
+            .apply_contribution(&dirty)
             .expect("no error rendering the write")
             .expect("a dirty Power & Idle setting produces a write");
         assert_eq!(write.path, path);
         assert_eq!(write.backing, BackingFile::HypridleConf);
+        // Task 9.10's drift guard trusts this declaration rather than checking it, so a
+        // page silently claiming NotNeeded would disable the guard for its own write
+        // (task 9.17 review). Pinned here, where the claim is made.
+        assert_eq!(write.validation, WriteValidation::InPlan);
         assert_eq!(
             write.changed_keys,
             vec![
@@ -663,7 +611,7 @@ listener {
         let model = PowerModel::load(path.clone());
 
         // Clean: no write.
-        assert!(matches!(model.hypridle_conf_write(&[]), Ok(None)));
+        assert!(matches!(model.apply_contribution(&[]), Ok(None)));
 
         // A plan with no writes (the clean Power & Idle case) reloads nothing.
         let mut tracker = FreshnessTracker::new();
@@ -739,7 +687,7 @@ listener {
             .expect("stage the first edit");
         let dirty = store.dirty_in_category(Category::PowerAndIdle);
         let write = model
-            .hypridle_conf_write(&dirty)
+            .apply_contribution(&dirty)
             .expect("no error")
             .expect("a write");
         let written_bytes = write.contents.clone();
@@ -767,7 +715,7 @@ listener {
             .expect("stage the second edit");
         let dirty2 = store.dirty_in_category(Category::PowerAndIdle);
         let write2 = model
-            .hypridle_conf_write(&dirty2)
+            .apply_contribution(&dirty2)
             .expect("no error")
             .expect("a write");
         let plan2 = ApplyPlan {

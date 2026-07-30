@@ -54,7 +54,7 @@ fn plan_with_power_write(store: &SettingsStore, model: &PowerModel) -> ApplyPlan
     let mut plan = base_apply_plan(store);
     plan.writes.push(
         model
-            .hypridle_conf_write(&store.dirty_in_category(Category::PowerAndIdle))
+            .apply_contribution(&store.dirty_in_category(Category::PowerAndIdle))
             .expect("the write renders")
             .expect("dirty settings produce a write"),
     );

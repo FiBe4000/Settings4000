@@ -57,6 +57,15 @@ pub mod reload;
 // `ui::chrome`) runs the pipeline and commits the store and page models on success.
 pub mod apply;
 
+// The write glue shared by the store-backed pages (task 9.17; architecture §6; R5.3, R8.3).
+// `input`, `notifications` and `power` each stage every one of their settings in the shared
+// `store` and write exactly one backing file, so the steps around their per-page renderer —
+// no write when nothing is dirty, read the current bytes, render, wrap the result in an
+// `apply::FileWrite` — are one implementation here rather than one copy per page. It also
+// owns the one error type those failures share, whose contract is that the Apply aborts
+// rather than skipping a file whose write could not be prepared.
+pub mod store_write;
+
 // The Display-page domain model (task 6.1; R2.3, R4.2, R4.4, R5.2, R5.4, R8.3). It
 // merges the `monitors.conf` records with the live `hyprctl monitors -j` state into a
 // per-monitor staging model, produces the `monitors.conf` FileWrite the Apply pipeline
