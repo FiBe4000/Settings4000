@@ -26,6 +26,7 @@ use settings4000::parsers::env::{EnvFile, GtkThemeOverride};
 use settings4000::parsers::generated::{ActiveScheme, read_active_scheme};
 use settings4000::parsers::hyprlang::{HyprlangFile, KeyPath, SectionStep};
 use settings4000::parsers::ini::IniFile;
+use settings4000::parsers::lua_literal::{LuaConfigFile, LuaValue, TableStatus};
 use settings4000::parsers::monitors::{MonitorField, MonitorsFile};
 use settings4000::parsers::palette::PaletteFile;
 use settings4000::parsers::swaync::SwayncConfigFile;
@@ -263,6 +264,46 @@ fn hyprlang_configs_parse_losslessly_at_their_deployed_paths() {
         Some(expected)
     );
     assert!(validate_image_path(&wallpaper).is_ok());
+}
+
+/// Both Lua configs parse structurally sound through their deployed symlinks,
+/// round-trip byte-identically, and expose exactly what the Input page and the
+/// cursor write set address (analysis §7.1, task 11.3): a fully recognised
+/// `input` table in `input.lua` with the Lua key names (`tap_to_click`), and the
+/// two cursor `hl.env` lines of `hyprland.lua`.
+#[test]
+fn lua_configs_parse_losslessly_at_their_deployed_paths() {
+    let fx = FixtureDotfiles::install();
+
+    for relative in ["hypr/input.lua", "hypr/hyprland.lua"] {
+        let input = read(&fx.config_path(relative));
+        let file = LuaConfigFile::parse(&input);
+        assert_eq!(file.structure_error(), None, "{relative}");
+        assert_eq!(file.emit(), input, "{relative} should round-trip");
+    }
+
+    let input_lua = LuaConfigFile::parse(&read(&fx.config_path("hypr/input.lua")));
+    assert_eq!(input_lua.table_status("input"), TableStatus::Clean);
+    assert_eq!(
+        input_lua.value("input.kb_layout"),
+        Some(&LuaValue::String("us,se".to_string()))
+    );
+    assert_eq!(
+        input_lua.value("input.touchpad.tap_to_click"),
+        Some(&LuaValue::Boolean(true))
+    );
+    assert_eq!(
+        input_lua.value("input.kb_variant"),
+        None,
+        "absent until inserted"
+    );
+
+    let hyprland_lua = LuaConfigFile::parse(&read(&fx.config_path("hypr/hyprland.lua")));
+    assert_eq!(
+        hyprland_lua.env_value("XCURSOR_THEME"),
+        Some("breeze_cursors")
+    );
+    assert_eq!(hyprland_lua.env_value("XCURSOR_SIZE"), Some("24"));
 }
 
 /// `monitors.conf` parses warning-free with the awk-shaped eDP record

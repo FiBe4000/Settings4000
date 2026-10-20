@@ -27,12 +27,14 @@ pub mod palette;
 // edits with it.
 pub mod hyprlang;
 
-// Lua literal values (task 11.2) — the single definition of which values may be
-// written into Hyprland's Lua config and how (strings double-quoted with `"`, `\`
-// and control characters refused; numbers and booleans bare). The live
-// `hyprctl eval` helper (`core::reload::HyprlandEval`) renders through it today;
-// the surgical `input.lua`/`hyprland.lua` editor of task 11.3 is built in this
-// module and reuses the same rule for every value it writes.
+// Lua literal values (task 11.2) and the surgical Lua-literal editor (task 11.3).
+// `LuaLiteral` is the single definition of which values may be written into
+// Hyprland's Lua config and how (strings double-quoted with `"`, `\` and control
+// characters refused; numbers and booleans bare); the live `hyprctl eval` helper
+// (`core::reload::HyprlandEval`) renders through it. `LuaConfigFile` edits
+// `key = <literal>,` lines of the schema-flat `input.lua` by table path and the
+// two cursor `hl.env(…)` lines of `hyprland.lua`, reporting everything else as
+// opaque so a loader can hide a page instead of guessing.
 pub mod lua_literal;
 
 // The monitors.conf record parser (task 3.3). The Display-page domain model
