@@ -130,6 +130,16 @@ tracked in the dotfiles repo itself, in
 `~/.dotfiles/settings_app_prep_tasks.md` (all completed); the resulting layout
 the app targets is documented in `docs/dotfiles_analysis.md` §6.
 
+**Status (2026-10-20):** the dotfiles have since moved to a Lua Hyprland
+config (`hyprland.lua` + app-owned `input.lua`; the `.conf` files are a frozen
+fallback) and replaced swaync with a self-written `notifd` daemon. The code
+here still targets the earlier layout, so on that desktop the Input page, the
+cursor env write and the Notifications page currently write files or run
+commands the session ignores. The new layout is analysed in
+`docs/dotfiles_analysis.md` §7 and the re-alignment work is the §11 backlog in
+`docs/tasks.md`; the mentions of swaync in this README describe the code as it
+is until that backlog lands.
+
 ## Documentation
 
 - `docs/requirements.md` — what to build: the numbered **R…** requirements
