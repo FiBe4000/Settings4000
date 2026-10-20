@@ -82,6 +82,10 @@ fn main() {
             fx.config_path("swaync/config.json"),
             fx.config_path("hypr/hypridle.conf"),
         ],
+        // No compositor is consulted, so the config provider follows the fixture's
+        // deployed `hyprland.lua` (task 11.2).
+        hyprctl_status: None,
+        hyprland_lua_config: fx.config_path("hypr/hyprland.lua"),
     };
     let detected = Capabilities::detect(&inputs);
     let generate_colors = detected

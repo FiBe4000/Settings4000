@@ -108,15 +108,21 @@ pub struct ThemeRoots {
 /// Injected for the same reason as [`ThemeRoots`]: tests point them at a fixture tree,
 /// and the writer follows symlinks so a dotfiles-deployed file is handled identically
 /// to a plain one. The cursor is duplicated across all four; a GTK/icon theme change
-/// touches only the two `settings.ini` files (analysis §6.2, R3.4).
+/// touches only the two `settings.ini` files (analysis §6.2, R3.4). The Hyprland-side
+/// copy is optional because it is guarded by the Hyprland config provider (task 11.2,
+/// analysis §8.6): the startup loader leaves it `None` unless the compositor runs its
+/// Lua provider, and then no Hyprland-side cursor write exists at all.
 #[derive(Clone, Debug)]
 pub struct ThemesPaths {
     /// `~/.config/gtk-3.0/settings.ini`.
     pub gtk3_settings: PathBuf,
     /// `~/.config/gtk-4.0/settings.ini`.
     pub gtk4_settings: PathBuf,
-    /// `~/.config/hypr/hyprland.conf` (only its cursor `env =` lines are edited).
-    pub hyprland_conf: PathBuf,
+    /// `~/.config/hypr/hyprland.conf` (only its cursor `env =` lines are edited), or
+    /// `None` when the Hyprland-side cursor write is hidden because the compositor does
+    /// not run its Lua config provider (task 11.2). Task 11.5 retargets this copy to
+    /// the two `hl.env` lines of `hyprland.lua` behind the same guard.
+    pub hyprland_conf: Option<PathBuf>,
     /// `~/.config/uwsm/env` (the canonical cursor env copy).
     pub uwsm_env: PathBuf,
 }
@@ -345,12 +351,16 @@ impl ThemesModel {
         settings_portal_available: bool,
         app_env_gtk_theme: Option<String>,
     ) -> ThemesModel {
-        let backing = BackingSet::load(&[
-            paths.gtk3_settings.as_path(),
-            paths.gtk4_settings.as_path(),
-            paths.hyprland_conf.as_path(),
-            paths.uwsm_env.as_path(),
-        ]);
+        let backing_paths: Vec<&Path> = [
+            Some(paths.gtk3_settings.as_path()),
+            Some(paths.gtk4_settings.as_path()),
+            paths.hyprland_conf.as_deref(),
+            Some(paths.uwsm_env.as_path()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let backing = BackingSet::load(&backing_paths);
 
         // Read current values from whichever settings.ini is present (prefer gtk-3.0),
         // since both carry the same keys. The cursor theme/size fall back to uwsm/env's
@@ -416,10 +426,14 @@ impl ThemesModel {
         self.backing.get(&self.paths.gtk4_settings)
     }
 
-    /// `hyprland.conf`'s current text, or `None` when it was unreadable — only its cursor
-    /// `env =` lines are edited.
+    /// `hyprland.conf`'s current text, or `None` when it was unreadable or the
+    /// Hyprland-side cursor write is guarded off (task 11.2) — only its cursor `env =`
+    /// lines are edited.
     fn hyprland(&self) -> Option<&BackingText> {
-        self.backing.get(&self.paths.hyprland_conf)
+        self.paths
+            .hyprland_conf
+            .as_deref()
+            .and_then(|path| self.backing.get(path))
     }
 
     /// `uwsm/env`'s current text, or `None` when it was unreadable — the canonical cursor
@@ -1154,6 +1168,15 @@ export XCURSOR_THEME=Nordic-cursors
 export XCURSOR_SIZE=16
 ";
 
+    /// The Hyprland-side cursor copy of a test's [`ThemesPaths`], which every fixture
+    /// below sets (only the provider-guard test leaves it `None`).
+    fn hypr_conf(paths: &ThemesPaths) -> &Path {
+        paths
+            .hyprland_conf
+            .as_deref()
+            .expect("the fixture sets the hyprland.conf path")
+    }
+
     /// Writes the four backing files into `dir` and returns their [`ThemesPaths`]. The
     /// `uwsm` text is supplied so a test can flip the `GTK_THEME` override on.
     fn write_backing_fixture(dir: &Path, uwsm: &str) -> ThemesPaths {
@@ -1181,7 +1204,7 @@ export XCURSOR_SIZE=16
         ThemesPaths {
             gtk3_settings,
             gtk4_settings,
-            hyprland_conf,
+            hyprland_conf: Some(hyprland_conf),
             uwsm_env,
         }
     }
@@ -1325,6 +1348,61 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
+    fn a_guarded_off_hyprland_copy_gets_no_cursor_write() {
+        // Task 11.2: on a host whose compositor does not run the Lua config provider,
+        // the startup loader passes no Hyprland-side path. A cursor change then writes
+        // the other three copies only, and the Hyprland file on disk is untouched.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        fs::create_dir_all(&config).unwrap();
+        let mut paths = write_backing_fixture(&config, UWSM_ENV);
+        let hyprland_conf = hypr_conf(&paths).to_path_buf();
+        paths.hyprland_conf = None;
+        let roots = ThemeRoots {
+            gtk_theme_dirs: Vec::new(),
+            icon_dirs: vec![write_icon_root(tmp.path())],
+        };
+
+        let mut model = ThemesModel::load(&roots, paths.clone(), false, None);
+        model.stage_cursor_theme("Bibata");
+        let contribution = model
+            .apply_contribution()
+            .expect("a cursor change still contributes the other writes");
+        let written: Vec<&Path> = contribution
+            .writes
+            .iter()
+            .map(|write| write.path.as_path())
+            .collect();
+        assert_eq!(
+            written,
+            vec![
+                paths.gtk3_settings.as_path(),
+                paths.gtk4_settings.as_path(),
+                paths.uwsm_env.as_path(),
+            ],
+            "both settings.ini and uwsm/env are written, the Hyprland copy is not"
+        );
+        assert!(
+            contribution
+                .writes
+                .iter()
+                .all(|write| write.backing != BackingFile::HyprlandConf),
+            "no write is attributed to the Hyprland config"
+        );
+
+        model.commit();
+        assert!(
+            !model.is_dirty(),
+            "the change is promoted from the remaining copies"
+        );
+        assert_eq!(
+            fs::read_to_string(&hyprland_conf).unwrap(),
+            HYPRLAND_ENV,
+            "the guarded-off Hyprland file is never touched"
+        );
+    }
+
+    #[test]
     fn a_cursor_change_writes_all_four_files_to_the_same_value_and_reloads() {
         // Accept criterion: a cursor apply writes BOTH settings.ini files AND both env
         // files to the SAME value, and drives the exact gsettings/hyprctl setcursor
@@ -1421,7 +1499,7 @@ export XCURSOR_SIZE=16
         // Every copy on disk now holds the identical new value.
         let gtk3 = fs::read_to_string(&paths.gtk3_settings).unwrap();
         let gtk4 = fs::read_to_string(&paths.gtk4_settings).unwrap();
-        let hypr = fs::read_to_string(&paths.hyprland_conf).unwrap();
+        let hypr = fs::read_to_string(hypr_conf(&paths)).unwrap();
         let uwsm = fs::read_to_string(&paths.uwsm_env).unwrap();
         assert!(gtk3.contains("gtk-cursor-theme-name=Bibata"));
         assert!(gtk3.contains("gtk-cursor-theme-size=24"));
@@ -1893,7 +1971,7 @@ export XCURSOR_SIZE=16
         let paths = ThemesPaths {
             gtk3_settings: tmp.path().join("gtk-3.0/settings.ini"),
             gtk4_settings: tmp.path().join("gtk-4.0/settings.ini"),
-            hyprland_conf: tmp.path().join("hypr/hyprland.conf"),
+            hyprland_conf: Some(tmp.path().join("hypr/hyprland.conf")),
             uwsm_env: tmp.path().join("uwsm/env"),
         };
         let roots = ThemeRoots {
@@ -1992,7 +2070,7 @@ export XCURSOR_SIZE=16
         let paths = ThemesPaths {
             gtk3_settings: config.join("gtk-3.0/settings.ini"),
             gtk4_settings: config.join("gtk-4.0/settings.ini"),
-            hyprland_conf: config.join("hypr/hyprland.conf"),
+            hyprland_conf: Some(config.join("hypr/hyprland.conf")),
             uwsm_env: config.join("uwsm/env"),
         };
         // settings.ini has a GTK theme but no cursor keys.
@@ -2006,7 +2084,7 @@ export XCURSOR_SIZE=16
             "[Settings]\ngtk-theme-name=Everforest-Green-Dark\n",
         )
         .unwrap();
-        fs::write(&paths.hyprland_conf, HYPRLAND_ENV).unwrap();
+        fs::write(hypr_conf(&paths), HYPRLAND_ENV).unwrap();
         fs::write(&paths.uwsm_env, UWSM_ENV).unwrap(); // XCURSOR_THEME=Nordic-cursors, SIZE=16
         let roots = ThemeRoots {
             gtk_theme_dirs: Vec::new(),
@@ -2097,13 +2175,13 @@ export XCURSOR_SIZE=16
         let paths = ThemesPaths {
             gtk3_settings: config.join("gtk-3.0/settings.ini"),
             gtk4_settings: config.join("gtk-4.0/settings.ini"),
-            hyprland_conf: config.join("hypr/hyprland.conf"),
+            hyprland_conf: Some(config.join("hypr/hyprland.conf")),
             uwsm_env: config.join("uwsm/env"),
         };
         let ini = "[Settings]\ngtk-cursor-theme-name=Nordic-cursors\ngtk-cursor-theme-size=big\n";
         fs::write(&paths.gtk3_settings, ini).unwrap();
         fs::write(&paths.gtk4_settings, ini).unwrap();
-        fs::write(&paths.hyprland_conf, HYPRLAND_ENV).unwrap();
+        fs::write(hypr_conf(&paths), HYPRLAND_ENV).unwrap();
         fs::write(&paths.uwsm_env, UWSM_ENV).unwrap();
         let roots = ThemeRoots {
             gtk_theme_dirs: Vec::new(),
@@ -2135,7 +2213,7 @@ export XCURSOR_SIZE=16
         let config = tmp.path().join("config");
         let paths = write_backing_fixture(&config, UWSM_ENV);
         // Leave only the XCURSOR_THEME env line; drop XCURSOR_SIZE.
-        fs::write(&paths.hyprland_conf, "env = XCURSOR_THEME,Nordic-cursors\n").unwrap();
+        fs::write(hypr_conf(&paths), "env = XCURSOR_THEME,Nordic-cursors\n").unwrap();
         let roots = ThemeRoots {
             gtk_theme_dirs: Vec::new(),
             icon_dirs: vec![write_icon_root(tmp.path())],
@@ -2151,7 +2229,7 @@ export XCURSOR_SIZE=16
         let hypr_write = contribution
             .writes
             .iter()
-            .find(|write| write.path == paths.hyprland_conf)
+            .find(|write| write.path == hypr_conf(&paths))
             .expect("hyprland.conf is still written despite the missing XCURSOR_SIZE line");
         let text = String::from_utf8(hypr_write.contents.clone()).unwrap();
         assert!(
@@ -2293,7 +2371,7 @@ export XCURSOR_SIZE=16
             !contribution
                 .writes
                 .iter()
-                .any(|write| write.path == paths.hyprland_conf),
+                .any(|write| write.path == hypr_conf(&paths)),
             "hyprland.conf refuses the `#` value, so it contributes no write"
         );
 
@@ -2322,7 +2400,7 @@ export XCURSOR_SIZE=16
         let tmp = tempfile::tempdir().expect("temp dir");
         let config = tmp.path().join("config");
         let paths = write_backing_fixture(&config, UWSM_ENV);
-        fs::write(&paths.hyprland_conf, "env = XCURSOR_THEME,Nordic-cursors\n")
+        fs::write(hypr_conf(&paths), "env = XCURSOR_THEME,Nordic-cursors\n")
             .expect("write a hyprland.conf with no XCURSOR_SIZE line");
         let roots = ThemeRoots {
             gtk_theme_dirs: Vec::new(),
@@ -2339,7 +2417,7 @@ export XCURSOR_SIZE=16
             !contribution
                 .writes
                 .iter()
-                .any(|write| write.path == paths.hyprland_conf),
+                .any(|write| write.path == hypr_conf(&paths)),
             "with no XCURSOR_SIZE line to edit, hyprland.conf contributes no write"
         );
 

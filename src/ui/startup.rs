@@ -64,7 +64,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::core::detect::{Binary, Capabilities, DetectionInputs};
+use crate::core::detect::{Binary, Capabilities, DetectionInputs, HyprConfigProvider};
 use crate::core::display::DisplayModel;
 use crate::core::input::{InputModel, default_xkb_registry};
 use crate::core::model::{SettingId, Value};
@@ -198,7 +198,10 @@ fn config_home() -> PathBuf {
 /// pages register their own per-row config paths with detection when they need
 /// [`Capabilities::config_readable`].
 pub(crate) fn load() -> StartupLoad {
-    let capabilities = Capabilities::detect(&DetectionInputs::from_system(Vec::new()));
+    let capabilities = Capabilities::detect(&DetectionInputs::from_system(
+        &SystemCommandRunner::new(),
+        Vec::new(),
+    ));
     let files = load_files(&BackingPaths::from_system());
     let display = load_display(&capabilities);
     let input = load_input(&capabilities);
@@ -336,10 +339,14 @@ fn load_power(capabilities: &Capabilities) -> Option<PowerModel> {
     Some(PowerModel::load(hypridle_conf))
 }
 
-/// Builds the Input page's helper on the worker thread (task 6.6; R4.2).
+/// Builds the Input page's helper on the worker thread (tasks 6.6, 11.2; R4.2).
 ///
 /// Only builds when `hyprctl` is present — an Input change applies via `hyprctl reload`,
-/// so without it the Input category is hidden (task 5.1) and there is nothing to load.
+/// so without it the Input category is hidden (task 5.1) and there is nothing to load —
+/// **and** the compositor runs its Lua config provider: the app's input settings exist
+/// only for the Lua config (`input.lua`, task 11.4), so on a hyprlang host the page is
+/// hidden like a missing app rather than writing a file the compositor ignores
+/// (analysis §8.6).
 /// When present it reads the XKB layout registry (resolved by
 /// [`default_xkb_registry`] from the well-known locations) for the keyboard-layout
 /// add-list; a missing/unparseable registry degrades to an empty list (R4.4). Reading
@@ -350,6 +357,14 @@ fn load_power(capabilities: &Capabilities) -> Option<PowerModel> {
 fn load_input(capabilities: &Capabilities) -> Option<InputModel> {
     if !capabilities.has_binary(Binary::Hyprctl) {
         tracing::info!("hyprctl not found; the Input page is hidden (R4.2)");
+        return None;
+    }
+    if capabilities.hypr_config_provider() != HyprConfigProvider::Lua {
+        tracing::info!(
+            provider = %capabilities.hypr_config_provider(),
+            "Hyprland does not run its Lua config provider; the Input page is hidden \
+             (analysis §8.6, R4.2)"
+        );
         return None;
     }
     let input_conf = config_home().join("hypr").join("input.conf");
@@ -428,7 +443,7 @@ fn load_themes(capabilities: &Capabilities) -> Option<ThemesModel> {
     }
     Some(ThemesModel::load(
         &theme_roots(),
-        themes_paths(),
+        themes_paths(capabilities),
         capabilities.settings_portal_available(),
         std::env::var("GTK_THEME").ok(),
     ))
@@ -460,13 +475,28 @@ fn theme_roots() -> ThemeRoots {
     }
 }
 
-/// The live XDG paths of the four config files a theme/cursor change writes (R8.5).
-fn themes_paths() -> ThemesPaths {
+/// The live XDG paths of the config files a theme/cursor change writes (R8.5).
+///
+/// The Hyprland-side cursor copy is included only when the compositor runs its Lua
+/// config provider (task 11.2, analysis §8.6): the app keeps no hyprlang cursor path,
+/// so on any other host that write is hidden (logged at `info`) while the
+/// `settings.ini`, `uwsm/env`, `gsettings` and `hyprctl setcursor` legs stay.
+fn themes_paths(capabilities: &Capabilities) -> ThemesPaths {
     let config = config_home();
+    let hyprland_conf = if capabilities.hypr_config_provider() == HyprConfigProvider::Lua {
+        Some(config.join("hypr").join("hyprland.conf"))
+    } else {
+        tracing::info!(
+            provider = %capabilities.hypr_config_provider(),
+            "Hyprland does not run its Lua config provider; the Hyprland-side cursor \
+             write is hidden (analysis §8.6, R4.2)"
+        );
+        None
+    };
     ThemesPaths {
         gtk3_settings: config.join("gtk-3.0").join("settings.ini"),
         gtk4_settings: config.join("gtk-4.0").join("settings.ini"),
-        hyprland_conf: config.join("hypr").join("hyprland.conf"),
+        hyprland_conf,
         uwsm_env: config.join("uwsm").join("env"),
     }
 }
@@ -1186,6 +1216,38 @@ mod tests {
             Some(&Value::Float(-0.5)),
             "the staged edit is untouched by a no-op refresh"
         );
+    }
+
+    #[test]
+    fn a_hyprlang_provider_hides_the_input_page_and_the_hyprland_cursor_write() {
+        // Task 11.2 (analysis §8.6): the config provider is a guard. With `hyprctl`
+        // present, a Lua host shows the Input page and keeps the Hyprland-side cursor
+        // copy; a hyprlang host hides both, with nothing routed to a hyprlang writer.
+        use crate::ui::category::{SidebarCategory, visible_categories};
+
+        let lua = Capabilities::for_tests(&[Binary::Hyprctl, Binary::Gsettings], &[], true);
+        assert_eq!(lua.hypr_config_provider(), HyprConfigProvider::Lua);
+        assert!(visible_categories(&lua).contains(&SidebarCategory::Input));
+        assert!(load_input(&lua).is_some(), "the Input helper is built");
+        assert!(
+            themes_paths(&lua).hyprland_conf.is_some(),
+            "the Hyprland-side cursor copy is written on a Lua host"
+        );
+
+        let hyprlang = Capabilities::for_tests(&[Binary::Hyprctl, Binary::Gsettings], &[], true)
+            .with_hypr_config_provider_for_tests(HyprConfigProvider::Hyprlang);
+        assert!(
+            !visible_categories(&hyprlang).contains(&SidebarCategory::Input),
+            "the Input page is hidden on a hyprlang host"
+        );
+        assert!(load_input(&hyprlang).is_none(), "no Input helper is built");
+        assert!(
+            themes_paths(&hyprlang).hyprland_conf.is_none(),
+            "the Hyprland-side cursor write is hidden on a hyprlang host"
+        );
+        // The rest of the Theme page is unaffected: gsettings still gates it.
+        assert!(visible_categories(&hyprlang).contains(&SidebarCategory::Theme));
+        assert!(load_themes(&hyprlang).is_some());
     }
 
     #[test]

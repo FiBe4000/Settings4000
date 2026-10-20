@@ -31,7 +31,7 @@
 //! is available and hidden only when *all* are gone, so the whole-category-hidden
 //! rule (R4.2) holds even before row-level gating exists.
 
-use crate::core::detect::{Binary, Capabilities};
+use crate::core::detect::{Binary, Capabilities, HyprConfigProvider};
 
 /// One of the seven top-level settings categories shown in the window sidebar
 /// (requirements §3, architecture §7).
@@ -144,9 +144,14 @@ impl SidebarCategory {
                     || capabilities.has_binary(Binary::Hyprpaper)
                     || capabilities.has_binary(Binary::Hyprlock)
             }
-            // Input edits the sourced `input.conf` and applies via `hyprctl reload`
-            // (§6.6).
-            SidebarCategory::Input => capabilities.has_binary(Binary::Hyprctl),
+            // Input edits Hyprland's input settings and applies via `hyprctl reload`
+            // (§6.6). Those settings exist only for the Lua config provider, so the
+            // page also requires it: on a hyprlang host it is hidden rather than
+            // writing a file the compositor ignores (task 11.2, analysis §8.6).
+            SidebarCategory::Input => {
+                capabilities.has_binary(Binary::Hyprctl)
+                    && capabilities.hypr_config_provider() == HyprConfigProvider::Lua
+            }
             // Notifications edits swaync's `config.json` and reloads via
             // `swaync-client` (§6.7).
             SidebarCategory::Notifications => capabilities.has_binary(Binary::Swaync),
@@ -260,6 +265,18 @@ mod tests {
         let without = Capabilities::for_tests(&[], &[], true);
         assert!(!SidebarCategory::Display.is_visible(&without));
         assert!(!SidebarCategory::Input.is_visible(&without));
+    }
+
+    #[test]
+    fn the_input_category_also_requires_the_lua_config_provider() {
+        // Task 11.2: a hyprlang host hides Input even with `hyprctl` installed, while
+        // Display stays visible: its file-backed `monitors.conf` path and
+        // `hyprctl monitors -j` work on both providers (only the laptop toggle's
+        // live `hyprctl eval` call needs Lua, and it is best-effort).
+        let hyprlang = Capabilities::for_tests(&[Binary::Hyprctl], &[], true)
+            .with_hypr_config_provider_for_tests(HyprConfigProvider::Hyprlang);
+        assert!(!SidebarCategory::Input.is_visible(&hyprlang));
+        assert!(SidebarCategory::Display.is_visible(&hyprlang));
     }
 
     #[test]

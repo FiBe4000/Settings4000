@@ -57,6 +57,18 @@
 //! [`Capabilities`]; [`plan_reloads`] applies it. A reload for an absent or stopped
 //! component is silently dropped, never attempted.
 //!
+//! # Live option changes go through `hyprctl eval` (task 11.2)
+//!
+//! Hyprland's Lua config provider (Hyprland ≥ 0.55, the provider the target
+//! dotfiles run, analysis §7.1) rejects `hyprctl keyword …` with `keyword can't
+//! work with non-legacy parsers. Use eval.` — and, worse, still exits 0 while doing
+//! so. A live option change is therefore sent as one Lua call through `hyprctl
+//! eval`, built and run by [`HyprlandEval`]; success is the literal reply `ok` on
+//! stdout, so a zero exit alone is never taken as success. The app issues no
+//! `hyprctl keyword` anywhere. `hyprctl reload`, `setcursor`, `monitors -j`,
+//! `getoption` and the hyprpaper IPC are requests rather than keywords and work on
+//! both providers, so they stay as they are.
+//!
 //! # Reload failures are non-fatal (R5.5)
 //!
 //! [`ReloadAction::execute`] logs each reload and its result (R7.3) and returns a
@@ -71,7 +83,8 @@ use std::io;
 use nix::sys::signal::Signal;
 
 use crate::core::detect::{Binary, Capabilities, Daemon};
-use crate::system::command::{Command, CommandError, CommandRunner};
+use crate::parsers::lua_literal::{LuaLiteral, LuaLiteralError, is_identifier};
+use crate::system::command::{Command, CommandError, CommandRunner, STDERR_EXCERPT_LIMIT};
 use crate::system::signal::ProcessSignaller;
 
 /// The GSettings schema every theme/cursor key the app writes lives under.
@@ -537,6 +550,155 @@ fn run_and_check(runner: &dyn CommandRunner, command: Command) -> Result<(), Rel
     }
 }
 
+/// The reply `hyprctl eval` prints on stdout when the Lua call was accepted
+/// (verified on Hyprland 0.56.2, analysis §7.1).
+const HYPRCTL_EVAL_OK: &str = "ok";
+
+/// A live Hyprland change rendered as a single Lua call, sent with `hyprctl eval
+/// <code>` (task 11.2; architecture §6; analysis §7.1).
+///
+/// This is the one place the app turns a live option change into Lua source, so
+/// every live tweak quotes strings, writes numbers and booleans bare, and applies
+/// the forbidden-character rule of [`crate::parsers::lua_literal`] — the same rule
+/// the Lua-literal file editor (task 11.3) uses, so a value refused for the file is
+/// also refused live. Keys are checked with
+/// [`is_identifier`], so neither a key nor a value can inject code into the call.
+///
+/// The code is passed to `hyprctl` as **one argument** of the argument vector (the
+/// quotes in `hyprctl eval 'hl.config({ … })'` are only how a shell user would write
+/// it — no shell is involved here). [`Self::run`] treats exactly the stdout reply
+/// `ok` as success: a Lua error or an unknown option comes back as `error: …` (exit
+/// status 7 on Hyprland 0.56.2), but `hyprctl` also exits 0 for some refusals — the
+/// `keyword` rejection quoted in the module docs is one — so the exit status alone is
+/// not trustworthy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HyprlandEval {
+    /// The Lua source sent to Hyprland, e.g.
+    /// `hl.config({ input = { touchpad = { natural_scroll = true } } })`.
+    code: String,
+}
+
+impl HyprlandEval {
+    /// An option change at a dotted table path, rendered as nested tables:
+    /// `input.touchpad.natural_scroll` = `true` becomes
+    /// `hl.config({ input = { touchpad = { natural_scroll = true } } })`.
+    ///
+    /// The dotted path is the same addressing the config files use (`input.kb_layout`,
+    /// analysis §7.1). `hl.config` merges the given table into the live config, so
+    /// only the named option changes. Fails with [`LuaLiteralError::InvalidKey`] when
+    /// the path is empty or any segment is not a bare Lua key (for example the
+    /// hyprlang spelling `tap-to-click`; the Lua name is `tap_to_click`).
+    pub fn config(path: &str, value: &LuaLiteral) -> Result<HyprlandEval, LuaLiteralError> {
+        let segments: Vec<&str> = path.split('.').collect();
+        if let Some(bad) = segments.iter().find(|segment| !is_identifier(segment)) {
+            return Err(LuaLiteralError::InvalidKey((*bad).to_string()));
+        }
+        // Build the table inside-out: `c = v`, then `b = { c = v }`, and so on.
+        // `segments` is never empty (`split` yields at least one item), and every
+        // segment was checked above.
+        let mut table = String::new();
+        for (depth, segment) in segments.iter().rev().enumerate() {
+            table = if depth == 0 {
+                format!("{segment} = {value}")
+            } else {
+                format!("{segment} = {{ {table} }}")
+            };
+        }
+        Ok(HyprlandEval {
+            code: format!("hl.config({{ {table} }})"),
+        })
+    }
+
+    /// A monitor rule applied live, rendered as a flat `hl.monitor({ … })` call with
+    /// the fields in the given order, e.g.
+    /// `hl.monitor({ output = "eDP-1", disabled = true })`.
+    ///
+    /// This is the Lua replacement for `hyprctl keyword monitor …` and the exact form
+    /// the dotfiles' own `scripts/hypr-toggle-laptop-display` issues (dotfiles commit
+    /// `8a5b20b`). `hl.monitor` *merges* into the existing rule for the output, so a
+    /// re-enable must pass `disabled = false` explicitly (analysis §7.1). Fails with
+    /// [`LuaLiteralError::InvalidKey`] when a field name is not a bare Lua key.
+    pub fn monitor<K: AsRef<str>>(
+        fields: &[(K, LuaLiteral)],
+    ) -> Result<HyprlandEval, LuaLiteralError> {
+        if let Some((bad, _)) = fields.iter().find(|(key, _)| !is_identifier(key.as_ref())) {
+            return Err(LuaLiteralError::InvalidKey(bad.as_ref().to_string()));
+        }
+        let body = fields
+            .iter()
+            .map(|(key, value)| format!("{} = {value}", key.as_ref()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(HyprlandEval {
+            code: format!("hl.monitor({{ {body} }})"),
+        })
+    }
+
+    /// The rendered Lua source.
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    /// The shell-free command that sends the call: `hyprctl` with the arguments
+    /// `eval` and the Lua source as a single argument.
+    pub fn command(&self) -> Command {
+        Command::new("hyprctl").arg("eval").arg(self.code.as_str())
+    }
+
+    /// Sends the call through `runner`, logging the attempt and its outcome (R7.3).
+    ///
+    /// Success is a zero exit **and** the stdout reply `ok` (surrounding whitespace
+    /// ignored). Anything else — a Lua error, an unknown option, a hyprlang session
+    /// that does not understand `eval` — is a [`ReloadError::EvalRejected`] carrying
+    /// a bounded excerpt of Hyprland's reply; a command that could not run at all is
+    /// a [`ReloadError::Command`]. Failures are logged at `error` and returned for
+    /// the caller to surface; like every reload they are non-fatal (R5.5).
+    pub fn run(&self, runner: &dyn CommandRunner) -> Result<(), ReloadError> {
+        let command = self.command();
+        match runner.run(&command) {
+            Ok(output)
+                if output.success()
+                    && String::from_utf8_lossy(output.stdout()).trim() == HYPRCTL_EVAL_OK =>
+            {
+                tracing::info!(command = %command, "hyprctl eval accepted the live change");
+                Ok(())
+            }
+            Ok(output) => {
+                let reply = eval_reply_excerpt(output.stdout());
+                tracing::error!(
+                    command = %command,
+                    exit_code = ?output.code(),
+                    %reply,
+                    "hyprctl eval did not answer `ok`; the live change was not applied (R5.5)"
+                );
+                Err(ReloadError::EvalRejected {
+                    code: output.code(),
+                    reply,
+                })
+            }
+            Err(error) => {
+                tracing::error!(command = %command, %error, "hyprctl eval could not be run (R5.5)");
+                Err(ReloadError::Command(error))
+            }
+        }
+    }
+}
+
+/// The leading, trimmed slice of a `hyprctl eval` reply kept for logs and error
+/// messages, bounded by [`STDERR_EXCERPT_LIMIT`] like every other captured output
+/// the app surfaces. The reply is Hyprland's own diagnostic (e.g. `error: … unknown
+/// config key 'input.foo'`), never file contents.
+fn eval_reply_excerpt(stdout: &[u8]) -> String {
+    let end = stdout.len().min(STDERR_EXCERPT_LIMIT);
+    let mut excerpt = String::from_utf8_lossy(&stdout[..end]).trim().to_string();
+    // Same convention as the generator-output excerpt in `core/apply.rs`: a trailing
+    // `…` tells the reader the reply was cut, not that it ended there.
+    if stdout.len() > end {
+        excerpt.push('…');
+    }
+    excerpt
+}
+
 /// Reloads kitty by delivering SIGUSR1 to every running kitty (architecture §6).
 ///
 /// kitty re-reads its config on SIGUSR1, so this is how a palette change reaches it
@@ -646,6 +808,16 @@ pub enum ReloadError {
     },
     /// A signal-based reload could not enumerate its target processes.
     Signal(io::Error),
+    /// A `hyprctl eval` call ran but Hyprland did not answer `ok` (see
+    /// [`HyprlandEval::run`]), so the live change was not applied.
+    EvalRejected {
+        /// The exit code of `hyprctl`, or `None` if it was terminated by a signal.
+        /// It may be `0`: `hyprctl` exits 0 for some refusals.
+        code: Option<i32>,
+        /// A bounded, trimmed excerpt of Hyprland's reply on stdout (empty when it
+        /// printed nothing).
+        reply: String,
+    },
 }
 
 impl fmt::Display for ReloadError {
@@ -659,6 +831,12 @@ impl fmt::Display for ReloadError {
             ReloadError::Signal(error) => {
                 write!(f, "failed to signal a process for reload: {error}")
             }
+            ReloadError::EvalRejected { reply, .. } if reply.is_empty() => {
+                write!(f, "Hyprland did not accept the live change (no reply)")
+            }
+            ReloadError::EvalRejected { reply, .. } => {
+                write!(f, "Hyprland did not accept the live change: {reply}")
+            }
         }
     }
 }
@@ -668,7 +846,7 @@ impl std::error::Error for ReloadError {
         match self {
             ReloadError::Command(error) => Some(error),
             ReloadError::Signal(error) => Some(error),
-            ReloadError::NonZeroExit { .. } => None,
+            ReloadError::NonZeroExit { .. } | ReloadError::EvalRejected { .. } => None,
         }
     }
 }
@@ -1413,5 +1591,185 @@ mod tests {
                 "every ReloadError must render a message, got empty for {error:?}"
             );
         }
+    }
+
+    // --- Live option changes via `hyprctl eval` (task 11.2) ---
+
+    #[test]
+    fn eval_renders_a_nested_table_path_as_nested_tables() {
+        let eval =
+            HyprlandEval::config("input.touchpad.natural_scroll", &LuaLiteral::boolean(true))
+                .expect("a valid path renders");
+        assert_eq!(
+            eval.code(),
+            "hl.config({ input = { touchpad = { natural_scroll = true } } })"
+        );
+
+        let eval = HyprlandEval::config("input.sensitivity", &LuaLiteral::float(0.3).unwrap())
+            .expect("a valid path renders");
+        assert_eq!(eval.code(), "hl.config({ input = { sensitivity = 0.3 } })");
+
+        // A single segment is a top-level key.
+        let eval = HyprlandEval::config("input", &LuaLiteral::integer(1)).expect("renders");
+        assert_eq!(eval.code(), "hl.config({ input = 1 })");
+    }
+
+    #[test]
+    fn eval_quotes_strings_and_writes_numbers_and_booleans_bare() {
+        let layouts = LuaLiteral::string("us,se").expect("allowed");
+        assert_eq!(
+            HyprlandEval::config("input.kb_layout", &layouts)
+                .unwrap()
+                .code(),
+            r#"hl.config({ input = { kb_layout = "us,se" } })"#
+        );
+        assert_eq!(
+            HyprlandEval::config("input.follow_mouse", &LuaLiteral::integer(1))
+                .unwrap()
+                .code(),
+            "hl.config({ input = { follow_mouse = 1 } })"
+        );
+        assert_eq!(
+            HyprlandEval::config("input.touchpad.tap_to_click", &LuaLiteral::boolean(false))
+                .unwrap()
+                .code(),
+            "hl.config({ input = { touchpad = { tap_to_click = false } } })"
+        );
+    }
+
+    #[test]
+    fn eval_refuses_forbidden_string_characters_before_rendering() {
+        // The forbidden-character rule lives in `parsers::lua_literal` and is shared
+        // with the Lua-literal file editor (task 11.3): such a value can never reach
+        // a `hyprctl eval` call, because the literal cannot be built at all.
+        for value in ["us\"", "us\\se", "us\nse"] {
+            assert!(
+                matches!(
+                    LuaLiteral::string(value),
+                    Err(LuaLiteralError::ForbiddenCharacter { .. })
+                ),
+                "{value:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn eval_refuses_keys_that_are_not_bare_lua_names() {
+        let value = LuaLiteral::boolean(true);
+        for path in [
+            "",
+            "input..natural_scroll",
+            "input.touchpad.tap-to-click",
+            "input.end",
+            "input = {} }) os.exit() --",
+        ] {
+            assert!(
+                matches!(
+                    HyprlandEval::config(path, &value),
+                    Err(LuaLiteralError::InvalidKey(_))
+                ),
+                "{path:?} must be refused as a table path"
+            );
+        }
+        assert!(matches!(
+            HyprlandEval::monitor(&[("output-name", LuaLiteral::boolean(true))]),
+            Err(LuaLiteralError::InvalidKey(_))
+        ));
+    }
+
+    #[test]
+    fn eval_renders_a_flat_monitor_rule_in_field_order() {
+        // The exact call `scripts/hypr-toggle-laptop-display` issues to turn the panel
+        // off (dotfiles commit 8a5b20b).
+        let eval = HyprlandEval::monitor(&[
+            ("output", LuaLiteral::string("eDP-1").unwrap()),
+            ("disabled", LuaLiteral::boolean(true)),
+        ])
+        .expect("renders");
+        assert_eq!(
+            eval.code(),
+            r#"hl.monitor({ output = "eDP-1", disabled = true })"#
+        );
+    }
+
+    #[test]
+    fn eval_runs_as_a_single_argument_without_a_shell() {
+        let eval =
+            HyprlandEval::config("input.kb_layout", &LuaLiteral::string("us,se").unwrap()).unwrap();
+        let runner =
+            MockCommandRunner::with_outcomes([Ok(CommandOutput::fake_with_streams(0, "ok\n", ""))]);
+        eval.run(&runner).expect("an `ok` reply is success");
+        assert_eq!(
+            runner.recorded(),
+            vec![
+                Command::new("hyprctl")
+                    .args(["eval", r#"hl.config({ input = { kb_layout = "us,se" } })"#,])
+            ],
+            "the Lua source is one argv entry, never split or shell-quoted"
+        );
+    }
+
+    #[test]
+    fn eval_treats_anything_but_an_ok_reply_as_failure() {
+        let eval =
+            HyprlandEval::config("input.sensitivity", &LuaLiteral::float(0.3).unwrap()).unwrap();
+
+        // Exit 0 but not `ok` — how `hyprctl` refuses some requests (the Lua-session
+        // `keyword` rejection is printed with exit status 0).
+        let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake_with_streams(
+            0,
+            "keyword can't work with non-legacy parsers. Use eval.\n",
+            "",
+        ))]);
+        match eval.run(&runner) {
+            Err(ReloadError::EvalRejected { code, reply }) => {
+                assert_eq!(code, Some(0));
+                assert_eq!(
+                    reply,
+                    "keyword can't work with non-legacy parsers. Use eval."
+                );
+            }
+            other => panic!("a non-`ok` reply must be EvalRejected, got {other:?}"),
+        }
+
+        // A Lua error: non-zero exit with the diagnostic on stdout.
+        let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake_with_streams(
+            7,
+            "error: unknown config key 'input.foo'\n",
+            "",
+        ))]);
+        let error = eval.run(&runner).expect_err("a Lua error is a failure");
+        assert!(matches!(
+            error,
+            ReloadError::EvalRejected { code: Some(7), .. }
+        ));
+        assert!(error.to_string().contains("unknown config key"));
+
+        // Exit 0 with empty stdout is not success either.
+        let runner = MockCommandRunner::new();
+        let error = eval.run(&runner).expect_err("an empty reply is not `ok`");
+        assert!(matches!(error, ReloadError::EvalRejected { ref reply, .. } if reply.is_empty()));
+        assert!(!error.to_string().is_empty());
+
+        // `ok` with a failing exit status is still a failure.
+        let runner =
+            MockCommandRunner::with_outcomes([Ok(CommandOutput::fake_with_streams(1, "ok", ""))]);
+        assert!(eval.run(&runner).is_err());
+
+        // A command that could not be spawned at all.
+        let runner = MockCommandRunner::with_outcomes([Err(CommandError::Spawn(io::Error::from(
+            io::ErrorKind::NotFound,
+        )))]);
+        assert!(matches!(eval.run(&runner), Err(ReloadError::Command(_))));
+    }
+
+    #[test]
+    fn eval_reply_excerpt_is_bounded_and_trimmed() {
+        let long = "x".repeat(STDERR_EXCERPT_LIMIT * 2);
+        assert_eq!(
+            eval_reply_excerpt(long.as_bytes()),
+            format!("{}…", "x".repeat(STDERR_EXCERPT_LIMIT))
+        );
+        assert_eq!(eval_reply_excerpt(b"  error: bad\n"), "error: bad");
     }
 }

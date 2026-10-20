@@ -60,14 +60,17 @@
 //!
 //! The internal panel's on/off state is **not** a `monitor=…,disable` record — the
 //! hotplug watcher (`scripts/hypr-monitor-hotplug`) would fight one. Instead the
-//! toggle mirrors the dotfiles' own `scripts/hypr-toggle-laptop-display` exactly: it
-//! applies the on/off state live with the granular `hyprctl keyword monitor` command
-//! (`…,disable` to turn off; `…,<mode>,<position>,<scale>[,<extras>]` re-applied from
-//! the record to turn on) and writes/removes `/tmp/hypr-laptop-display-forced` (the
-//! watcher's manual override: present = keep the panel on rather than auto-disabling
-//! it when docked). The keyword command — not `hyprctl reload`, which re-reads the
-//! still-active record and so cannot turn the panel off — is what actually toggles the
-//! panel. It never stages, never becomes dirty, and never touches `monitors.conf`
+//! toggle mirrors the dotfiles' own `scripts/hypr-toggle-laptop-display`: it applies
+//! the on/off state live with one `hl.monitor({ … })` call sent through `hyprctl eval`
+//! (`disabled = true` to turn off; the record's mode, position, scale and extras with
+//! `disabled = false` to turn on — see [`HyprlandEval::monitor`]) and writes/removes
+//! `/tmp/hypr-laptop-display-forced` (the watcher's manual override: present = keep
+//! the panel on rather than auto-disabling it when docked). `hyprctl keyword monitor`
+//! is not used: Hyprland's Lua config provider rejects it (analysis §7.1). The live
+//! call — not `hyprctl reload`, which re-reads the still-active record and so cannot
+//! turn the panel off — is what actually toggles the panel. Task 11.8 replaces this
+//! in-app toggle with a run of the dotfiles script itself. It never stages, never
+//! becomes dirty, and never touches `monitors.conf`
 //! ([`Self::toggle_laptop`]). The panel's *mode and scale*, by contrast, live in the
 //! eDP `monitor=` record and are edited like any other monitor (the single-source
 //! gotcha) — only its enablement is runtime.
@@ -84,7 +87,8 @@ use crate::core::model::{
     SCALE_RANGE, SettingId, Value, validate_float_range, validate_monitor_mode,
     validate_monitor_position,
 };
-use crate::core::reload::BackingFile;
+use crate::core::reload::{BackingFile, HyprlandEval};
+use crate::parsers::lua_literal::{LuaLiteral, LuaLiteralError};
 use crate::parsers::monitors::{EditError, MonitorField, MonitorState, MonitorsFile};
 use crate::system::command::{Command, CommandRunner};
 
@@ -786,48 +790,43 @@ impl DisplayModel {
     }
 
     /// Applies the laptop-display enable toggle immediately (runtime-only, R5.2),
-    /// mirroring `scripts/hypr-toggle-laptop-display` (analysis §3/§6.2).
+    /// mirroring `scripts/hypr-toggle-laptop-display` (analysis §7.1, §8.1).
     ///
     /// Turning the panel **on** re-applies its configured record live with
-    /// `hyprctl keyword monitor "<output>,<mode>,<position>,<scale>[,<extras>]"` and
-    /// **creates** the hotplug override state file; turning it **off** issues
-    /// `hyprctl keyword monitor "<output>,disable"` and **removes** the state file. The
-    /// granular `hyprctl keyword monitor` command is deliberate: `hyprctl reload` would
-    /// re-read the (active) `monitor=` record and so cannot turn the panel off, whereas
-    /// the keyword command applies the on/off state directly — this is the exact
-    /// mechanism the dotfiles' toggle/hotplug scripts use, so keep it in step with them.
-    /// The state file is the manual override the hotplug watcher reads on the next
-    /// hotplug event (present = keep the panel on when docked), so the watcher does not
-    /// fight the choice.
+    /// `hyprctl eval 'hl.monitor({ output = "<output>", mode = …, position = …,
+    /// scale = …[, <extras>], disabled = false })'` and **creates** the hotplug
+    /// override state file; turning it **off** sends `hl.monitor({ output =
+    /// "<output>", disabled = true })` and **removes** the state file. A live call is
+    /// deliberate: `hyprctl reload` would re-read the (active) `monitor=` record and so
+    /// cannot turn the panel off. `disabled = false` must be explicit on re-enable
+    /// because `hl.monitor` merges into the existing rule, so an earlier `disabled =
+    /// true` would otherwise stick. The state file is the manual override the hotplug
+    /// watcher and the Lua monitor loader read (present = keep the panel on when
+    /// docked), so neither fights the choice.
     ///
     /// This never stages, never becomes dirty, and **never touches `monitors.conf`**
-    /// (which would fight the watcher). The live keyword call is best-effort (R5.5): a
-    /// failure is logged but does not fail the toggle, since the persistent override is
-    /// still recorded. The stored live-enabled state is updated so the switch reflects
-    /// the new state.
+    /// (which would fight the watcher). The live call is best-effort (R5.5): a refusal
+    /// or a failure to run is logged but does not fail the toggle, since the persistent
+    /// override is still recorded. The stored live-enabled state is updated so the
+    /// switch reflects the new state. (Task 11.8 replaces this with a run of the
+    /// dotfiles script, which owns the state file itself.)
     pub fn toggle_laptop(
         &mut self,
         index: usize,
         enable: bool,
         runner: &dyn CommandRunner,
     ) -> std::io::Result<()> {
-        let output = self.monitors[index].output_name.clone();
-        let command = if enable {
-            let body = self.laptop_keyword_body(index);
-            Command::new("hyprctl")
-                .arg("keyword")
-                .arg("monitor")
-                .arg(format!("{output},{body}"))
-        } else {
-            Command::new("hyprctl")
-                .arg("keyword")
-                .arg("monitor")
-                .arg(format!("{output},disable"))
-        };
-
-        // Apply live via the granular keyword command; failures are non-fatal (R5.5).
-        if let Err(error) = runner.run(&command) {
-            tracing::error!(%error, "the laptop-display keyword command failed (R5.5)");
+        // Apply live; every failure is non-fatal (R5.5). `HyprlandEval::run` logs a
+        // refusal itself, so only a value that cannot be rendered is logged here.
+        match self.laptop_monitor_eval(index, enable) {
+            Ok(eval) => {
+                let _ = eval.run(runner);
+            }
+            Err(error) => tracing::error!(
+                %error,
+                "the laptop panel's monitor rule cannot be rendered as a Lua call; \
+                 skipping the live toggle (R5.5)"
+            ),
         }
 
         // Record/clear the hotplug override, matching the toggle script's directions
@@ -854,12 +853,62 @@ impl DisplayModel {
         Ok(())
     }
 
-    /// The `<mode>,<position>,<scale>[,<extras>]` body used to re-enable the laptop
-    /// panel live, sourced from its configured `monitor=` record (the single source,
-    /// analysis §6.2) so the live re-enable matches the on-disk record — extras and
-    /// all. Falls back to the merged config's mode/position/scale when there is no
-    /// record body (an unreadable `monitors.conf`, or a record-less output).
-    fn laptop_keyword_body(&self, index: usize) -> String {
+    /// The live `hl.monitor({ … })` call that turns the laptop panel at `index` on or
+    /// off (see [`Self::toggle_laptop`]).
+    ///
+    /// The re-enable fields come from the panel's configured `monitor=` record — the
+    /// single source of its mode and scale (analysis §6.2) — so the live re-enable
+    /// matches the on-disk record, extras and all. They are converted the way the
+    /// dotfiles' Lua monitor loader in `hyprland.lua` converts a record: the mode,
+    /// position and scale stay strings, and each trailing `key,value` pair becomes a
+    /// field whose value is a number when it reads as one (`bitdepth = 10`) and a
+    /// string otherwise. With no record body (an unreadable `monitors.conf`, or a
+    /// record-less output) the merged config's mode/position/scale are used.
+    ///
+    /// This deliberately differs from `scripts/hypr-toggle-laptop-display` in one
+    /// field: the script hard-codes `position = "0x1440"` while the app passes the
+    /// record's own position (often `auto`). Task 11.8 replaces this in-app call with
+    /// the script itself, so the difference is interim and not worth reconciling.
+    fn laptop_monitor_eval(
+        &self,
+        index: usize,
+        enable: bool,
+    ) -> Result<HyprlandEval, LuaLiteralError> {
+        let mut fields = vec![(
+            "output".to_string(),
+            LuaLiteral::string(&self.monitors[index].output_name)?,
+        )];
+        if enable {
+            let body = self.laptop_record_body(index);
+            let parts: Vec<&str> = body.split(',').map(str::trim).collect();
+            // Fields 1-3 of the body are mode, position, scale, with the loader's
+            // defaults for a short record.
+            for (position, (key, default)) in [
+                ("mode", "preferred"),
+                ("position", "auto"),
+                ("scale", "auto"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let value = parts.get(position).copied().unwrap_or(default);
+                fields.push((key.to_string(), LuaLiteral::string(value)?));
+            }
+            // The frozen grammar allows only `key,value` pairs after the scale; an odd
+            // trailing field without a value is ignored, exactly as the loader does.
+            for pair in parts.get(3..).unwrap_or_default().chunks_exact(2) {
+                fields.push((pair[0].to_string(), lua_number_or_string(pair[1])?));
+            }
+        }
+        fields.push(("disabled".to_string(), LuaLiteral::boolean(!enable)));
+        HyprlandEval::monitor(&fields)
+    }
+
+    /// The `<mode>,<position>,<scale>[,<extras>]` body of the laptop panel's
+    /// configured `monitor=` record, or the merged config's mode/position/scale when
+    /// there is no record body (an unreadable `monitors.conf`, or a record-less
+    /// output).
+    fn laptop_record_body(&self, index: usize) -> String {
         if let (Some(records), Some(name)) =
             (&self.records, self.monitors[index].record_name.as_deref())
         {
@@ -869,6 +918,23 @@ impl DisplayModel {
         }
         let config = &self.monitors[index].original;
         format!("{},{},{}", config.mode, config.position, config.scale)
+    }
+}
+
+/// Converts a `monitors.conf` extra value the way `hyprland.lua`'s monitor loader
+/// does with Lua's `tonumber(v) or v`: an integer or a finite decimal becomes a bare
+/// number, anything else a quoted string (subject to the forbidden-character rule).
+/// Lua's `tonumber` also accepts hex (`0x10`), which this does not; the frozen
+/// `monitors.conf` grammar never carries hex extras, so the two agree in practice.
+fn lua_number_or_string(value: &str) -> Result<LuaLiteral, LuaLiteralError> {
+    if let Ok(integer) = value.parse::<i64>() {
+        return Ok(LuaLiteral::integer(integer));
+    }
+    match value.parse::<f64>() {
+        // Rust also parses `inf`/`NaN`, which Lua's `tonumber` does not; those fall
+        // through to a string, as they would in the loader.
+        Ok(float) if float.is_finite() => LuaLiteral::float(float),
+        _ => LuaLiteral::string(value),
     }
 }
 
@@ -1618,11 +1684,13 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     }
 
     #[test]
-    fn laptop_toggle_uses_hyprctl_keyword_and_the_state_file_without_touching_monitors_conf() {
-        // Test #3 (F1): the runtime laptop toggle mirrors hypr-toggle-laptop-display —
-        // it applies the on/off state with the granular `hyprctl keyword monitor`
-        // command (NOT `hyprctl reload`, which cannot disable the panel), creates the
-        // state file on enable and removes it on disable, and never writes monitors.conf.
+    fn laptop_toggle_uses_hyprctl_eval_and_the_state_file_without_touching_monitors_conf() {
+        // Test #3 (F1), revised by task 11.2: the runtime laptop toggle mirrors
+        // hypr-toggle-laptop-display — it applies the on/off state with a live
+        // `hl.monitor({ … })` call through `hyprctl eval` (NOT `hyprctl reload`, which
+        // cannot disable the panel, and NOT `hyprctl keyword`, which a Lua-config
+        // session rejects), creates the state file on enable and removes it on
+        // disable, and never writes monitors.conf.
         let dir = tempfile::tempdir().expect("temp dir");
         let conf_path = dir.path().join("monitors.conf");
         std::fs::write(&conf_path, MONITORS_CONF).expect("write monitors.conf");
@@ -1640,9 +1708,13 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         );
         assert!(!state_file.exists());
 
-        let runner = MockCommandRunner::new();
+        let runner = MockCommandRunner::with_outcomes([
+            Ok(CommandOutput::fake_with_streams(0, "ok", "")),
+            Ok(CommandOutput::fake_with_streams(0, "ok", "")),
+        ]);
 
-        // Turn OFF: `hyprctl keyword monitor eDP-1,disable` + remove the state file.
+        // Turn OFF: `hl.monitor({ output = "eDP-1", disabled = true })` + remove the
+        // state file.
         model
             .toggle_laptop(0, false, &runner)
             .expect("toggle off succeeds");
@@ -1652,8 +1724,9 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         );
         assert!(!state_file.exists(), "disable removes the state file");
 
-        // Turn ON: re-apply the record body live + create the state file. The body is
-        // sourced from the winning eDP desc record (2560x1440,auto,1.066667).
+        // Turn ON: re-apply the record live with an explicit `disabled = false` +
+        // create the state file. The fields are sourced from the winning eDP desc
+        // record (2560x1440,auto,1.066667).
         model
             .toggle_laptop(0, true, &runner)
             .expect("toggle on succeeds");
@@ -1666,20 +1739,94 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         assert_eq!(
             runner.recorded(),
             vec![
-                Command::new("hyprctl").args(["keyword", "monitor", "eDP-1,disable"]),
                 Command::new("hyprctl").args([
-                    "keyword",
-                    "monitor",
-                    "eDP-1,2560x1440,auto,1.066667",
+                    "eval",
+                    r#"hl.monitor({ output = "eDP-1", disabled = true })"#,
+                ]),
+                Command::new("hyprctl").args([
+                    "eval",
+                    r#"hl.monitor({ output = "eDP-1", mode = "2560x1440", position = "auto", scale = "1.066667", disabled = false })"#,
                 ]),
             ],
-            "the toggle applies via the granular keyword command, never hyprctl reload"
+            "the toggle applies via a live hl.monitor eval, never hyprctl reload or keyword"
         );
         // The toggle is runtime-only: monitors.conf on disk is byte-for-byte unchanged.
         assert_eq!(
             std::fs::read_to_string(&conf_path).expect("read monitors.conf"),
             MONITORS_CONF,
             "the laptop toggle must never touch monitors.conf"
+        );
+    }
+
+    #[test]
+    fn laptop_re_enable_carries_the_record_extras_as_lua_fields() {
+        // A panel matched by the generic `eDP-1` record (not the AU Optronics desc
+        // rule) re-enables with that record's trailing `bitdepth,10` pair, converted
+        // the way hyprland.lua's monitor loader converts it: a numeric value is a bare
+        // number, the mode/position/scale stay strings.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let hyprctl = r#"[{"name":"eDP-1","description":"Some Panel 0x1234","width":2880,"height":1800,"refreshRate":120.0,"x":0,"y":0,"scale":1.333333,"disabled":false,"availableModes":["2880x1800@120.00Hz"]}]"#;
+        let mut model = DisplayModel::from_sources(
+            Some(MONITORS_CONF),
+            hyprctl,
+            dir.path().join("monitors.conf"),
+            dir.path().join("forced"),
+        );
+        assert!(model.is_laptop(0));
+
+        let runner =
+            MockCommandRunner::with_outcomes([Ok(CommandOutput::fake_with_streams(0, "ok", ""))]);
+        model
+            .toggle_laptop(0, true, &runner)
+            .expect("toggle on succeeds");
+        assert_eq!(
+            runner.recorded(),
+            vec![Command::new("hyprctl").args([
+                "eval",
+                r#"hl.monitor({ output = "eDP-1", mode = "2880x1800@120", position = "auto", scale = "1.333333", bitdepth = 10, disabled = false })"#,
+            ])],
+        );
+    }
+
+    #[test]
+    fn a_refused_live_laptop_toggle_still_records_the_override() {
+        // R5.5: the live call is best-effort. When Hyprland does not answer `ok` (here
+        // the reply a Lua session gives the retired `keyword` request), the toggle
+        // still records the persistent override and reflects the requested state.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state_file = dir.path().join("forced");
+        let mut model = DisplayModel::from_sources(
+            Some(MONITORS_CONF),
+            HYPRCTL_LAPTOP,
+            dir.path().join("monitors.conf"),
+            state_file.clone(),
+        );
+        let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake_with_streams(
+            0,
+            "keyword can't work with non-legacy parsers. Use eval.",
+            "",
+        ))]);
+        model
+            .toggle_laptop(0, true, &runner)
+            .expect("a refused live call does not fail the toggle");
+        assert!(state_file.exists(), "the override is still recorded");
+        assert!(model.laptop_enabled(0));
+    }
+
+    #[test]
+    fn monitors_conf_extras_convert_like_the_lua_loader() {
+        // `tonumber(v) or v`: integers and finite decimals are bare numbers, anything
+        // else (including Rust-only spellings such as `inf`) a quoted string.
+        assert_eq!(lua_number_or_string("10").unwrap().to_string(), "10");
+        assert_eq!(lua_number_or_string("1.5").unwrap().to_string(), "1.5");
+        assert_eq!(lua_number_or_string("inf").unwrap().to_string(), "\"inf\"");
+        assert_eq!(
+            lua_number_or_string("auto").unwrap().to_string(),
+            "\"auto\""
+        );
+        assert!(
+            lua_number_or_string("a\"b").is_err(),
+            "the forbidden-character rule applies to extras"
         );
     }
 

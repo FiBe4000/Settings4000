@@ -424,9 +424,9 @@ impl MonitorsFile {
     /// after the `monitor=<name>,` prefix up to any inline comment — or `None` when
     /// there is no such record or it is in the disable form.
     ///
-    /// This is the `<mode>,<position>,<scale>[,<extras>]` a caller re-applies live with
-    /// `hyprctl keyword monitor "<output>,<body>"` (the granular path the dotfiles'
-    /// laptop-display toggle uses, analysis §3/§6.2): it reproduces the record's mode,
+    /// This is the `<mode>,<position>,<scale>[,<extras>]` a caller re-applies live
+    /// (the Display model turns it into a `hyprctl eval 'hl.monitor({ … })'` call, the
+    /// path the dotfiles' laptop-display toggle uses, analysis §7.1): it reproduces the record's mode,
     /// position, scale, and any trailing extras (`bitdepth,10`) exactly as configured,
     /// so a live re-enable matches the single-source `monitors.conf` record. The
     /// disable form has no such body, so it returns `None`.
@@ -1336,7 +1336,7 @@ monitor=eDP-1,1920x1200@60,0x0,2.0
     #[test]
     fn record_body_returns_the_fields_after_the_name() {
         // `record_body` yields the raw `<mode>,<position>,<scale>[,<extras>]` used to
-        // re-apply a monitor live via `hyprctl keyword monitor` — the mode, position,
+        // re-apply a monitor live (as an `hl.monitor` eval call) — the mode, position,
         // scale, and trailing extras, but not the `monitor=<name>,` prefix.
         let (file, _) = MonitorsFile::parse(MONITORS_CONF);
         assert_eq!(

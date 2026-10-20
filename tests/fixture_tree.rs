@@ -20,7 +20,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
-use settings4000::core::detect::{Capabilities, DetectionInputs};
+use settings4000::core::detect::{Capabilities, DetectionInputs, HyprConfigProvider};
 use settings4000::core::model::validate_image_path;
 use settings4000::parsers::env::{EnvFile, GtkThemeOverride};
 use settings4000::parsers::generated::{ActiveScheme, read_active_scheme};
@@ -164,6 +164,8 @@ fn detection_discovers_the_palette_source_behind_the_deployed_symlink() {
         hyprland_socket: None,
         palette_config_anchor: fx.config_path("hypr/colors.conf"),
         config_paths: vec![input_conf.clone()],
+        hyprctl_status: None,
+        hyprland_lua_config: fx.config_path("hypr/hyprland.lua"),
     };
     let caps = Capabilities::detect(&inputs);
 
@@ -177,6 +179,9 @@ fn detection_discovers_the_palette_source_behind_the_deployed_symlink() {
         fx.repo_path("scripts/generate-colors")
     );
     assert!(caps.config_readable(&input_conf));
+    // Task 11.2: with no running session, the deployed `hyprland.lua` makes the
+    // host read as a Lua-config host, so the Lua-only controls stay visible.
+    assert_eq!(caps.hypr_config_provider(), HyprConfigProvider::Lua);
 }
 
 /// The palette scheme files parse with the full 17-key schema and round-trip

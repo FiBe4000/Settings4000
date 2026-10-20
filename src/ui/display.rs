@@ -177,9 +177,9 @@ impl Inner {
     }
 
     /// The runtime laptop-display enable toggle (R5.2): flipping it applies the panel
-    /// on/off live via `hyprctl keyword monitor` and writes/removes the hotplug state
-    /// file, never staging or touching `monitors.conf`. Its position reflects the
-    /// panel's current live state.
+    /// on/off live via a `hyprctl eval 'hl.monitor({ … })'` call and writes/removes the
+    /// hotplug state file, never staging or touching `monitors.conf`. Its position
+    /// reflects the panel's current live state.
     fn build_laptop_toggle(self: &Rc<Self>, model: &DisplayModel, index: usize) -> GtkBox {
         let switch = Switch::new();
         switch.set_halign(Align::End);
@@ -316,7 +316,7 @@ impl Inner {
     /// Applies the runtime laptop toggle immediately (R5.2), then rebuilds.
     ///
     /// Runtime-only: it does not stage or change dirty state, so it does not call
-    /// `on_changed`; the live `hyprctl keyword monitor` command runs through the real
+    /// `on_changed`; the live `hyprctl eval` monitor call runs through the real
     /// system runner. The model records the new live-enabled state, which the rebuild
     /// reflects.
     fn toggle_laptop(self: &Rc<Self>, index: usize, enable: bool) {

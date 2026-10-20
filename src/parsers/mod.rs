@@ -1,9 +1,9 @@
 //! Config-file parsers and surgical writers (architecture §3).
 //!
 //! One submodule per file format the app edits (palette `key=hex`, hyprlang,
-//! `monitors.conf`, swaync JSON, GTK INI, `uwsm/env`). Each parser produces a
-//! lossless line/token representation and rewrites only the value span of a
-//! targeted key, leaving comments, ordering, and commented-out lines
+//! Lua literals, `monitors.conf`, swaync JSON, GTK INI, `uwsm/env`). Each parser
+//! produces a lossless line/token representation and rewrites only the value span
+//! of a targeted key, leaving comments, ordering, and commented-out lines
 //! byte-identical. Every parser carries round-trip tests (`parse → edit
 //! nothing → emit == input`).
 //!
@@ -26,6 +26,14 @@ pub mod palette;
 // wallpaper/lock + cursor-env (`core::theme`) write glue renders its surgical
 // edits with it.
 pub mod hyprlang;
+
+// Lua literal values (task 11.2) — the single definition of which values may be
+// written into Hyprland's Lua config and how (strings double-quoted with `"`, `\`
+// and control characters refused; numbers and booleans bare). The live
+// `hyprctl eval` helper (`core::reload::HyprlandEval`) renders through it today;
+// the surgical `input.lua`/`hyprland.lua` editor of task 11.3 is built in this
+// module and reuses the same rule for every value it writes.
+pub mod lua_literal;
 
 // The monitors.conf record parser (task 3.3). The Display-page domain model
 // (`core::display`) reads the `monitor=` records through it and renders the

@@ -122,6 +122,8 @@ fn palette_model(fx: &FixtureDotfiles) -> PaletteModel {
         hyprland_socket: None,
         palette_config_anchor: anchor.clone(),
         config_paths: Vec::new(),
+        hyprctl_status: None,
+        hyprland_lua_config: fx.config_path("hypr/hyprland.lua"),
     };
     let source = Capabilities::detect(&inputs);
     let source = source
@@ -144,7 +146,7 @@ fn themes_model(fx: &FixtureDotfiles) -> ThemesModel {
     let paths = ThemesPaths {
         gtk3_settings: fx.config_path("gtk-3.0/settings.ini"),
         gtk4_settings: fx.config_path("gtk-4.0/settings.ini"),
-        hyprland_conf: fx.config_path("hypr/hyprland.conf"),
+        hyprland_conf: Some(fx.config_path("hypr/hyprland.conf")),
         uwsm_env: fx.config_path("uwsm/env"),
     };
     ThemesModel::load(&roots, paths, false, None)

@@ -1,4 +1,4 @@
-//! Installed-app detection and dynamic visibility (task 4.3; architecture §4;
+//! Installed-app detection and dynamic visibility (tasks 4.3, 11.2; architecture §4;
 //! R4.1–R4.4, R2.2, R3.2, R8.5, R6.1, R7.3).
 //!
 //! # What this module is
@@ -16,15 +16,34 @@
 //! (see below), so it is headlessly testable (R6.2) and the layering guard in
 //! `tests/module_boundaries.rs` forbids any `gtk`/`relm4` import.
 //!
-//! # Why detection does *not* use `CommandRunner`
+//! # Detection spawns (almost) nothing
 //!
 //! Unlike reloads (which spawn processes and therefore go through
-//! [`crate::system::command`]), detection only *reads* the environment,
+//! [`crate::system::command`]), detection mostly *reads* the environment,
 //! filesystem, procfs, and socket paths. Reading is not a process side effect, so
-//! there is no shell and no subprocess here: the binary scan is a manual `$PATH`
-//! walk (a `which`-equivalent, architecture §4), daemon liveness is a procfs scan,
-//! and everything else is a filesystem stat/read. Avoiding a `which` subprocess
-//! per binary also keeps cold start inside the budget (R8.1).
+//! there is no shell and no subprocess for those probes: the binary scan is a
+//! manual `$PATH` walk (a `which`-equivalent, architecture §4), daemon liveness is
+//! a procfs scan, and everything else is a filesystem stat/read. Avoiding a
+//! `which` subprocess per binary also keeps cold start inside the budget (R8.1).
+//!
+//! The one exception is Hyprland's **config provider** (task 11.2), which a
+//! running compositor reports only over its IPC (`hyprctl status` →
+//! `configProvider: lua`). That single query is issued by
+//! [`DetectionInputs::from_system`] through the injected
+//! [`CommandRunner`] (arg vector, no shell, the usual timeout) and only when the
+//! IPC socket exists; its stdout is then just another input. [`Capabilities::detect`]
+//! itself still spawns nothing.
+//!
+//! # The config provider is a guard, not a router (analysis §8.6)
+//!
+//! Hyprland ≥ 0.55 runs `hyprland.lua` through its Lua config provider, and the
+//! target dotfiles deleted their hyprlang `hyprland.conf`/`input.conf`. The app's
+//! Hyprland-side input and cursor writes therefore exist only for the Lua files;
+//! there is deliberately no hyprlang code path for them (Hyprland deprecated
+//! hyprlang in 0.55). [`HyprConfigProvider`] records which provider is in use so a
+//! host that still runs hyprlang gets the Input page and the Hyprland-side cursor
+//! write *hidden* (logged at `info`), like a missing app (R4.2), instead of
+//! receiving writes its compositor would ignore.
 //!
 //! # The injectable seam (R6.1)
 //!
@@ -39,13 +58,18 @@
 //!   procfs scan, a test injects a fixed set;
 //! - Hyprland liveness and the palette anchor and config files are given as
 //!   **paths** ([`DetectionInputs::hyprland_socket`],
-//!   [`DetectionInputs::palette_config_anchor`], [`DetectionInputs::config_paths`]),
-//!   which [`Capabilities::detect`] checks against the real filesystem — so a test
-//!   builds a temp-dir fixture (a fake socket file, a config symlinked into a fake
-//!   repo, an unreadable config) and gets faithful behavior.
+//!   [`DetectionInputs::palette_config_anchor`], [`DetectionInputs::config_paths`],
+//!   [`DetectionInputs::hyprland_lua_config`]), which [`Capabilities::detect`]
+//!   checks against the real filesystem — so a test builds a temp-dir fixture (a
+//!   fake socket file, a config symlinked into a fake repo, an unreadable config)
+//!   and gets faithful behavior;
+//! - the compositor's own config-provider report is given as the captured
+//!   **text** of `hyprctl status` ([`DetectionInputs::hyprctl_status`]), so a test
+//!   injects a fake reply.
 //!
 //! [`DetectionInputs::from_system`] gathers the real inputs (env `$PATH`, a procfs
-//! scan, the `$XDG_RUNTIME_DIR` socket path, the XDG config anchor);
+//! scan, the `$XDG_RUNTIME_DIR` socket path, the XDG config paths, and the
+//! `hyprctl status` reply);
 //! [`Capabilities::detect`] is the pure, re-runnable routine over any inputs. A
 //! manual refresh (R4.3) simply re-gathers the inputs and calls it again.
 //!
@@ -58,13 +82,17 @@
 //!
 //! # Logging (R4.2, R7.3)
 //!
-//! Absent page-gating binaries, an absent palette source, and an absent settings
-//! portal are logged at `info` (the "hidden item" signal, R4.2); a missing or
-//! unreadable config is logged at `warn` (R4.4); a one-line detection summary is
-//! logged at `info` (R7.3). File *contents* are never logged.
+//! Absent page-gating binaries, an absent palette source, an absent settings
+//! portal, and a non-Lua Hyprland config provider are logged at `info` (the
+//! "hidden item" signal, R4.2); a missing or unreadable config is logged at `warn`
+//! (R4.4); a one-line detection summary, naming the config provider, is logged at
+//! `info` (R7.3). File *contents* are never logged.
 
 use std::collections::BTreeSet;
+use std::fmt;
 use std::path::{Path, PathBuf};
+
+use crate::system::command::{Command, CommandRunner};
 
 /// An external program the app scans for on `$PATH`.
 ///
@@ -228,6 +256,49 @@ const SETTINGS_PORTAL_BACKENDS: &[&str] = &[
     "xdg-desktop-portal-kde",
 ];
 
+/// The prefix of the `hyprctl status` line that names the active config provider
+/// (`configProvider: lua`, verified on Hyprland 0.56.2, analysis §7.1).
+const CONFIG_PROVIDER_PREFIX: &str = "configProvider:";
+
+/// Which configuration language the Hyprland compositor runs (task 11.2; analysis
+/// §7.1, §8.6; R4.1).
+///
+/// Hyprland ≥ 0.55 loads `~/.config/hypr/hyprland.lua` through its Lua provider
+/// when that file exists and falls back to the legacy hyprlang `hyprland.conf`
+/// otherwise. The app's Hyprland-side input and cursor writes target only the Lua
+/// files (`input.lua`, the two `hl.env` lines of `hyprland.lua`), so this value is
+/// a **guard**: anything other than [`Lua`](Self::Lua) hides those controls (see
+/// [`Capabilities::hypr_config_provider`]). It never selects an alternative
+/// hyprlang writer — there is none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HyprConfigProvider {
+    /// The Lua config provider (`hyprland.lua`) — the provider the target dotfiles
+    /// run, and the only one the Input page and the Hyprland-side cursor write
+    /// support.
+    Lua,
+    /// The legacy hyprlang provider (`hyprland.conf`). Also the conservative answer
+    /// when nothing indicates Lua (no session reports it and no `hyprland.lua`
+    /// exists), since then the Lua files the app would write are not in use.
+    Hyprlang,
+}
+
+impl HyprConfigProvider {
+    /// The provider's name as `hyprctl status` spells it (`lua` / `hyprlang`), used
+    /// in log messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HyprConfigProvider::Lua => "lua",
+            HyprConfigProvider::Hyprlang => "hyprlang",
+        }
+    }
+}
+
+impl fmt::Display for HyprConfigProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The repo-relative path of the config file used to discover the dotfiles repo
 /// root (R8.5).
 ///
@@ -306,6 +377,17 @@ pub struct DetectionInputs {
     /// The live XDG paths of backing config files to check for readability (R4.4).
     /// Each unreadable path is recorded and logged at `warn`.
     pub config_paths: Vec<PathBuf>,
+    /// The captured stdout of `hyprctl status`, or `None` when it was not gathered
+    /// (no live IPC socket, `hyprctl` not on `$PATH`) or the command failed. Its
+    /// `configProvider:` line, when present, is the authoritative config provider
+    /// of the running session (task 11.2); it is consulted only when
+    /// [`Self::hyprland_socket`] exists.
+    pub hyprctl_status: Option<String>,
+    /// The live XDG path of Hyprland's Lua config, conventionally
+    /// `~/.config/hypr/hyprland.lua`. When no running session reports its provider,
+    /// the file's existence decides it: Hyprland itself prefers this file whenever it
+    /// exists (analysis §7.1).
+    pub hyprland_lua_config: PathBuf,
 }
 
 impl DetectionInputs {
@@ -314,18 +396,34 @@ impl DetectionInputs {
     ///
     /// `config_paths` are the backing-config XDG paths to check for readability;
     /// the caller (startup, task 5.4) resolves them, since path resolution is its
-    /// concern. The `$PATH`, the procfs process list, the Hyprland socket path, and
-    /// the palette anchor are all read from the environment here. Every read is
-    /// best-effort: a missing environment variable or an unreadable `/proc` simply
-    /// yields an empty/`None` input, which [`Capabilities::detect`] turns into the
-    /// "absent" capability rather than an error.
-    pub fn from_system(config_paths: Vec<PathBuf>) -> Self {
+    /// concern. The `$PATH`, the procfs process list, the Hyprland socket path, the
+    /// palette anchor, and the Lua config path are all read from the environment
+    /// here. Every read is best-effort: a missing environment variable or an
+    /// unreadable `/proc` simply yields an empty/`None` input, which
+    /// [`Capabilities::detect`] turns into the "absent" capability rather than an
+    /// error.
+    ///
+    /// `runner` is used for exactly one command, `hyprctl status`, issued only when
+    /// the Hyprland IPC socket exists and `hyprctl` is on `$PATH` — so a session
+    /// without Hyprland spawns nothing; a failed query degrades to `None`.
+    pub fn from_system(runner: &dyn CommandRunner, config_paths: Vec<PathBuf>) -> Self {
+        let path = std::env::var("PATH").ok();
+        let hyprland_socket = hyprland_socket_path();
+        let hyprctl_status = if hyprland_socket.as_deref().is_some_and(Path::exists)
+            && is_on_path(path.as_deref(), Binary::Hyprctl.command_name())
+        {
+            query_hyprctl_status(runner)
+        } else {
+            None
+        };
         DetectionInputs {
-            path: std::env::var("PATH").ok(),
+            path,
             running_processes: scan_procfs_process_names(),
-            hyprland_socket: hyprland_socket_path(),
-            palette_config_anchor: default_palette_anchor(),
+            hyprland_socket,
+            palette_config_anchor: default_config_path(&["hypr", "colors.conf"]),
             config_paths,
+            hyprctl_status,
+            hyprland_lua_config: default_config_path(&["hypr", "hyprland.lua"]),
         }
     }
 }
@@ -352,6 +450,9 @@ pub struct Capabilities {
     palette_source: Option<PaletteSource>,
     /// Backing config paths that could not be read (missing or unreadable, R4.4).
     unreadable_configs: BTreeSet<PathBuf>,
+    /// The Hyprland config provider in use, the guard for the Lua-only input and
+    /// cursor writes (task 11.2).
+    hypr_config_provider: HyprConfigProvider,
 }
 
 impl Capabilities {
@@ -359,10 +460,11 @@ impl Capabilities {
     ///
     /// This is the pure, re-runnable routine: a manual refresh (R4.3) re-gathers
     /// [`DetectionInputs`] and calls it again. It performs the binary scan, daemon
-    /// and Hyprland liveness checks, the settings-portal probe, palette-source
-    /// discovery, and config-readability checks, logging absent page-gating items
-    /// at `info` and unreadable configs at `warn` (R4.2/R4.4/R7.3), then returns
-    /// the plain [`Capabilities`]. It never fails: every probe degrades to "absent".
+    /// and Hyprland liveness checks, the config-provider resolution, the
+    /// settings-portal probe, palette-source discovery, and config-readability
+    /// checks, logging absent page-gating items at `info` and unreadable configs at
+    /// `warn` (R4.2/R4.4/R7.3), then returns the plain [`Capabilities`]. It never
+    /// fails: every probe degrades to "absent".
     pub fn detect(inputs: &DetectionInputs) -> Capabilities {
         let present_binaries = scan_binaries(inputs.path.as_deref());
         log_binary_results(&present_binaries);
@@ -373,6 +475,19 @@ impl Capabilities {
         // `None` anchor (no socket path resolvable) is simply "not live".
         let hyprland_ipc = inputs.hyprland_socket.as_deref().is_some_and(Path::exists);
         tracing::debug!(hyprland_ipc, "Hyprland IPC socket liveness");
+
+        let hypr_config_provider = detect_config_provider(
+            hyprland_ipc,
+            inputs.hyprctl_status.as_deref(),
+            &inputs.hyprland_lua_config,
+        );
+        if hypr_config_provider != HyprConfigProvider::Lua {
+            tracing::info!(
+                provider = %hypr_config_provider,
+                "Hyprland is not using its Lua config provider; the Input page and the \
+                 Hyprland-side cursor write are hidden (analysis §8.6, R4.2)"
+            );
+        }
 
         let settings_portal = detect_settings_portal(&inputs.running_processes, &present_binaries);
         if !settings_portal {
@@ -395,6 +510,7 @@ impl Capabilities {
             settings_portal,
             palette_source,
             unreadable_configs,
+            hypr_config_provider,
         };
         capabilities.log_summary();
         capabilities
@@ -410,7 +526,9 @@ impl Capabilities {
     /// category is shown until the worker completes. It is also the value the window
     /// falls back to if the worker fails to deliver a result, so the user still gets
     /// a usable (if empty) window with a working Refresh action (R4.3). Unlike
-    /// [`Capabilities::detect`] it runs no probes and logs nothing.
+    /// [`Capabilities::detect`] it runs no probes and logs nothing. Its config
+    /// provider is [`HyprConfigProvider::Hyprlang`], the value that keeps the
+    /// Lua-only controls hidden.
     pub fn absent() -> Capabilities {
         Capabilities {
             present_binaries: BTreeSet::new(),
@@ -419,6 +537,7 @@ impl Capabilities {
             settings_portal: false,
             palette_source: None,
             unreadable_configs: BTreeSet::new(),
+            hypr_config_provider: HyprConfigProvider::Hyprlang,
         }
     }
 
@@ -456,6 +575,16 @@ impl Capabilities {
     /// uses this to decide whether to run `hyprctl reload`.
     pub fn hyprland_reloadable(&self) -> bool {
         self.has_binary(Binary::Hyprctl) && self.hyprland_ipc
+    }
+
+    /// The Hyprland config provider in use (task 11.2; analysis §8.6).
+    ///
+    /// Resolved from the running session's `hyprctl status` when the IPC socket
+    /// exists, else from whether `~/.config/hypr/hyprland.lua` exists, else
+    /// [`HyprConfigProvider::Hyprlang`]. The Input page and the Hyprland-side cursor
+    /// write require [`HyprConfigProvider::Lua`] and are hidden otherwise.
+    pub fn hypr_config_provider(&self) -> HyprConfigProvider {
+        self.hypr_config_provider
     }
 
     /// Whether a live theme-restyle path is available — the GTK settings portal is
@@ -504,6 +633,7 @@ impl Capabilities {
             settings_portal = self.settings_portal,
             palette_source = self.palette_source.is_some(),
             unreadable_configs = self.unreadable_configs.len(),
+            hypr_config_provider = %self.hypr_config_provider,
             "capabilities detection complete"
         );
     }
@@ -523,7 +653,9 @@ impl Capabilities {
     /// scenario requires. `settings_portal`, `palette_source`, and
     /// `unreadable_configs` are irrelevant to the reload table, so they are fixed to
     /// their "absent"/empty forms; a test that needs them exercises the real
-    /// [`Capabilities::detect`] path instead.
+    /// [`Capabilities::detect`] path instead. The config provider is fixed to
+    /// [`HyprConfigProvider::Lua`], the target dotfiles' provider; a test of the
+    /// hyprlang guard switches it with [`Self::with_hypr_config_provider_for_tests`].
     pub fn for_tests(
         binaries: &[Binary],
         live_daemons: &[Daemon],
@@ -536,7 +668,19 @@ impl Capabilities {
             settings_portal: false,
             palette_source: None,
             unreadable_configs: BTreeSet::new(),
+            hypr_config_provider: HyprConfigProvider::Lua,
         }
+    }
+
+    /// Returns `self` with the given Hyprland config provider, for tests of the
+    /// provider guard (task 11.2) — builder-style, like
+    /// [`Self::with_palette_source_for_tests`].
+    pub fn with_hypr_config_provider_for_tests(
+        mut self,
+        provider: HyprConfigProvider,
+    ) -> Capabilities {
+        self.hypr_config_provider = provider;
+        self
     }
 
     /// Returns `self` with the dotfiles palette source marked present, for tests that
@@ -571,16 +715,105 @@ fn scan_binaries(path: Option<&str>) -> BTreeSet<Binary> {
         return present;
     };
 
-    let dirs: Vec<&str> = path.split(':').filter(|dir| !dir.is_empty()).collect();
     for &binary in Binary::ALL {
-        let found = dirs
-            .iter()
-            .any(|dir| is_executable_file(&Path::new(dir).join(binary.command_name())));
-        if found {
+        if is_on_path(Some(path), binary.command_name()) {
             present.insert(binary);
         }
     }
     present
+}
+
+/// Whether an executable named `name` is in any directory of the `$PATH` string
+/// `path` (see [`scan_binaries`] for the empty-entry rule). `None` (no `$PATH`)
+/// finds nothing.
+fn is_on_path(path: Option<&str>, name: &str) -> bool {
+    path.is_some_and(|path| {
+        path.split(':')
+            .filter(|dir| !dir.is_empty())
+            .any(|dir| is_executable_file(&Path::new(dir).join(name)))
+    })
+}
+
+/// Resolves the Hyprland config provider (task 11.2; analysis §7.1, §8.6).
+///
+/// The order is the one the compositor itself implies:
+///
+/// 1. When the IPC socket is live and the captured `hyprctl status` reply carries
+///    a recognisable `configProvider:` line, that report wins — it is what the
+///    running session actually loaded.
+/// 2. Otherwise (no session, `hyprctl` missing or failing, or a reply without the
+///    line), the provider is [`HyprConfigProvider::Lua`] when `lua_config` exists:
+///    Hyprland ≥ 0.55 loads `hyprland.lua` whenever it is present.
+/// 3. Otherwise [`HyprConfigProvider::Hyprlang`].
+///
+/// `Path::exists` follows symlinks, so a deployed `hyprland.lua` symlink into the
+/// dotfiles repo counts and a dangling one does not. Nothing here can fail.
+fn detect_config_provider(
+    hyprland_ipc: bool,
+    hyprctl_status: Option<&str>,
+    lua_config: &Path,
+) -> HyprConfigProvider {
+    if hyprland_ipc {
+        if let Some(provider) = hyprctl_status.and_then(parse_config_provider) {
+            tracing::debug!(%provider, "config provider reported by `hyprctl status`");
+            return provider;
+        }
+    }
+    let provider = if lua_config.exists() {
+        HyprConfigProvider::Lua
+    } else {
+        HyprConfigProvider::Hyprlang
+    };
+    tracing::debug!(
+        %provider,
+        lua_config = %lua_config.display(),
+        "config provider inferred from whether the Lua config exists"
+    );
+    provider
+}
+
+/// Parses the `configProvider: <name>` line of a `hyprctl status` reply.
+///
+/// The reply is a few `key: value` lines (`configProvider: lua`, `backend: drm`
+/// on Hyprland 0.56.2). Returns `None` when the line is absent or names a
+/// provider this app does not know, so [`detect_config_provider`] falls back to
+/// the file check rather than guessing.
+fn parse_config_provider(status: &str) -> Option<HyprConfigProvider> {
+    let value = status
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(CONFIG_PROVIDER_PREFIX))?
+        .trim();
+    if value.eq_ignore_ascii_case("lua") {
+        Some(HyprConfigProvider::Lua)
+    } else if value.eq_ignore_ascii_case("hyprlang") {
+        Some(HyprConfigProvider::Hyprlang)
+    } else {
+        tracing::debug!(
+            value,
+            "`hyprctl status` names an unknown config provider; ignoring it"
+        );
+        None
+    }
+}
+
+/// Runs `hyprctl status` through `runner` and returns its stdout, or `None` when
+/// the command could not run or reported failure (logged at `debug`; detection then
+/// falls back to the Lua-config file check, so this is never an error).
+fn query_hyprctl_status(runner: &dyn CommandRunner) -> Option<String> {
+    let command = Command::new(Binary::Hyprctl.command_name()).arg("status");
+    match runner.run(&command) {
+        Ok(output) if output.success() => {
+            Some(String::from_utf8_lossy(output.stdout()).into_owned())
+        }
+        Ok(output) => {
+            tracing::debug!(exit_code = ?output.code(), "`hyprctl status` reported failure");
+            None
+        }
+        Err(error) => {
+            tracing::debug!(%error, "`hyprctl status` could not be run");
+            None
+        }
+    }
 }
 
 /// Logs which page-gating binaries are absent, at `info` (the "hidden item" signal,
@@ -879,36 +1112,35 @@ fn hyprland_socket_path() -> Option<PathBuf> {
     )
 }
 
-/// The default palette config anchor from the XDG environment (R8.5).
+/// The live XDG path of a config file, given its components below the config
+/// directory (R8.5) — used for the palette anchor (`hypr/colors.conf`) and the Lua
+/// config (`hypr/hyprland.lua`).
 ///
-/// Prefers `$XDG_CONFIG_HOME/hypr/colors.conf`, falling back to
-/// `$HOME/.config/hypr/colors.conf`. When neither variable is set the returned
-/// relative path simply fails discovery in [`detect_palette_source`] (the palette
-/// source degrades to absent), so this never has to fail.
-fn default_palette_anchor() -> PathBuf {
-    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
-        if !config_home.is_empty() {
-            return Path::new(&config_home).join("hypr").join("colors.conf");
-        }
+/// Prefers `$XDG_CONFIG_HOME/<relative>`, falling back to
+/// `$HOME/.config/<relative>`. When neither variable is set the returned bare file
+/// name is relative to the working directory and simply misses (the palette source
+/// degrades to absent, the Lua config reads as absent), so this never has to fail.
+fn default_config_path(relative: &[&str]) -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|config_home| !config_home.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".config")));
+    match base {
+        Some(base) => relative.iter().fold(base, |path, part| path.join(part)),
+        None => relative.last().map_or_else(PathBuf::new, PathBuf::from),
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        return Path::new(&home)
-            .join(".config")
-            .join("hypr")
-            .join("colors.conf");
-    }
-    PathBuf::from("colors.conf")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::system::command::{CommandOutput, MockCommandRunner};
     use std::fs;
     use std::path::Path;
 
     /// Detection inputs with everything absent — a blank slate a test tweaks. The
-    /// palette anchor points at a nonexistent path so the palette source is absent
-    /// by default.
+    /// palette anchor and the Lua config point at nonexistent paths so the palette
+    /// source is absent and the config provider falls back to hyprlang by default.
     fn base_inputs() -> DetectionInputs {
         DetectionInputs {
             path: None,
@@ -916,6 +1148,8 @@ mod tests {
             hyprland_socket: None,
             palette_config_anchor: PathBuf::from("/nonexistent/settings4000/hypr/colors.conf"),
             config_paths: Vec::new(),
+            hyprctl_status: None,
+            hyprland_lua_config: PathBuf::from("/nonexistent/settings4000/hypr/hyprland.lua"),
         }
     }
 
@@ -1371,9 +1605,164 @@ mod tests {
     fn from_system_gathers_inputs_without_panicking() {
         // The production gathering path must run on the real system without failing,
         // producing a usable Capabilities value. We assert only that it completes —
-        // the machine running the test may or may not have any given tool.
-        let inputs = DetectionInputs::from_system(Vec::new());
+        // the machine running the test may or may not have any given tool. The mock
+        // runner keeps the test from spawning a real `hyprctl`; whatever it was asked
+        // to run can only be the one config-provider query.
+        let runner = MockCommandRunner::new();
+        let inputs = DetectionInputs::from_system(&runner, Vec::new());
         let _ = Capabilities::detect(&inputs);
+        for command in runner.recorded() {
+            assert_eq!(command, Command::new("hyprctl").arg("status"));
+        }
+    }
+
+    // --- Hyprland config provider (task 11.2) ---
+
+    /// The `hyprctl status` reply of a Lua session (verbatim from Hyprland 0.56.2).
+    const STATUS_LUA: &str = "configProvider: lua\nbackend: drm\n\n";
+    /// The reply of a session on the legacy provider.
+    const STATUS_HYPRLANG: &str = "configProvider: hyprlang\nbackend: drm\n";
+    /// A reply without the provider line (e.g. a build that does not report it).
+    const STATUS_WITHOUT_PROVIDER: &str = "backend: drm\n";
+
+    /// Inputs with a live stand-in IPC socket (so `hyprctl status` is consulted),
+    /// the given captured reply, and the given Lua-config path.
+    fn session_inputs(socket: &Path, status: Option<&str>, lua_config: PathBuf) -> DetectionInputs {
+        let mut inputs = base_inputs();
+        inputs.hyprland_socket = Some(socket.to_path_buf());
+        inputs.hyprctl_status = status.map(str::to_string);
+        inputs.hyprland_lua_config = lua_config;
+        inputs
+    }
+
+    #[test]
+    fn a_live_session_reports_its_config_provider() {
+        let run = tempfile::tempdir().expect("temp dir");
+        let socket = run.path().join(".socket.sock");
+        fs::write(&socket, b"").expect("stand-in socket");
+        let missing_lua = run.path().join("hyprland.lua");
+
+        // The session's report wins even with no `hyprland.lua` on disk.
+        let caps = Capabilities::detect(&session_inputs(
+            &socket,
+            Some(STATUS_LUA),
+            missing_lua.clone(),
+        ));
+        assert_eq!(caps.hypr_config_provider(), HyprConfigProvider::Lua);
+
+        // ...and a hyprlang report wins even when a `hyprland.lua` exists (the session
+        // did not load it, so writing the Lua files would have no effect).
+        let lua = run.path().join("present.lua");
+        fs::write(&lua, b"hl.config({})\n").expect("write a Lua config");
+        let caps = Capabilities::detect(&session_inputs(&socket, Some(STATUS_HYPRLANG), lua));
+        assert_eq!(caps.hypr_config_provider(), HyprConfigProvider::Hyprlang);
+    }
+
+    #[test]
+    fn a_reply_without_the_provider_line_falls_back_to_the_lua_file_check() {
+        let run = tempfile::tempdir().expect("temp dir");
+        let socket = run.path().join(".socket.sock");
+        fs::write(&socket, b"").expect("stand-in socket");
+        let lua = run.path().join("hyprland.lua");
+
+        let without_file = session_inputs(&socket, Some(STATUS_WITHOUT_PROVIDER), lua.clone());
+        assert_eq!(
+            Capabilities::detect(&without_file).hypr_config_provider(),
+            HyprConfigProvider::Hyprlang,
+            "no report and no hyprland.lua -> hyprlang"
+        );
+
+        fs::write(&lua, b"hl.config({})\n").expect("write a Lua config");
+        let with_file = session_inputs(&socket, Some(STATUS_WITHOUT_PROVIDER), lua.clone());
+        assert_eq!(
+            Capabilities::detect(&with_file).hypr_config_provider(),
+            HyprConfigProvider::Lua,
+            "no report but hyprland.lua exists -> lua"
+        );
+
+        // A failed/ungathered query (`None`) behaves the same way.
+        let ungathered = session_inputs(&socket, None, lua);
+        assert_eq!(
+            Capabilities::detect(&ungathered).hypr_config_provider(),
+            HyprConfigProvider::Lua
+        );
+    }
+
+    #[test]
+    fn a_status_reply_is_ignored_without_a_live_socket() {
+        // A stale captured reply must not outvote the filesystem when no compositor
+        // is live: only the file check applies.
+        let mut inputs = base_inputs();
+        inputs.hyprctl_status = Some(STATUS_LUA.to_string());
+        assert_eq!(
+            Capabilities::detect(&inputs).hypr_config_provider(),
+            HyprConfigProvider::Hyprlang,
+            "no socket and no hyprland.lua -> hyprlang, whatever the reply said"
+        );
+    }
+
+    #[test]
+    fn the_fixture_tree_hyprland_lua_makes_an_offline_host_lua() {
+        // With no running session, the deployed fixture `hyprland.lua` (a symlink into
+        // the fixture repo, task 11.1) decides the provider; without it the host reads
+        // as hyprlang.
+        let fx = crate::testing::FixtureDotfiles::install();
+        let mut inputs = base_inputs();
+        inputs.hyprland_lua_config = fx.config_path("hypr/hyprland.lua");
+        assert_eq!(
+            Capabilities::detect(&inputs).hypr_config_provider(),
+            HyprConfigProvider::Lua
+        );
+
+        fs::remove_file(fx.config_path("hypr/hyprland.lua")).expect("remove the deployed link");
+        assert_eq!(
+            Capabilities::detect(&inputs).hypr_config_provider(),
+            HyprConfigProvider::Hyprlang
+        );
+    }
+
+    #[test]
+    fn the_provider_line_is_parsed_leniently_and_unknown_names_are_ignored() {
+        assert_eq!(
+            parse_config_provider("  configProvider:   Lua  \n"),
+            Some(HyprConfigProvider::Lua)
+        );
+        assert_eq!(
+            parse_config_provider("backend: drm\nconfigProvider: hyprlang"),
+            Some(HyprConfigProvider::Hyprlang)
+        );
+        assert_eq!(parse_config_provider("configProvider: toml\n"), None);
+        assert_eq!(parse_config_provider(STATUS_WITHOUT_PROVIDER), None);
+        assert_eq!(parse_config_provider(""), None);
+    }
+
+    #[test]
+    fn hyprctl_status_is_queried_through_the_runner() {
+        let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake_with_streams(
+            0, STATUS_LUA, "",
+        ))]);
+        assert_eq!(query_hyprctl_status(&runner).as_deref(), Some(STATUS_LUA));
+        assert_eq!(
+            runner.recorded(),
+            vec![Command::new("hyprctl").arg("status")]
+        );
+
+        // A failing or unrunnable query degrades to `None`, never an error.
+        let failing = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake(1))]);
+        assert_eq!(query_hyprctl_status(&failing), None);
+        let unrunnable =
+            MockCommandRunner::with_outcomes([Err(crate::system::command::CommandError::Spawn(
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ))]);
+        assert_eq!(query_hyprctl_status(&unrunnable), None);
+    }
+
+    #[test]
+    fn the_absent_placeholder_keeps_the_lua_only_controls_hidden() {
+        assert_eq!(
+            Capabilities::absent().hypr_config_provider(),
+            HyprConfigProvider::Hyprlang
+        );
     }
 
     #[test]
@@ -1387,17 +1776,27 @@ mod tests {
         use tracing_subscriber::Layer;
         use tracing_subscriber::layer::SubscriberExt;
 
+        /// One captured event: its level, its message, and its other fields rendered
+        /// as `name=value` pairs (kept apart so a field value can never satisfy a
+        /// message assertion).
+        type Captured = (Level, String, String);
+
         #[derive(Clone, Default)]
         struct LogCapture {
-            events: Arc<Mutex<Vec<(Level, String)>>>,
+            events: Arc<Mutex<Vec<Captured>>>,
         }
 
-        struct MessageVisitor<'a>(&'a mut String);
+        struct MessageVisitor<'a> {
+            message: &'a mut String,
+            fields: &'a mut String,
+        }
         impl tracing::field::Visit for MessageVisitor<'_> {
             fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
                 if field.name() == "message" {
-                    use std::fmt::Write as _;
-                    let _ = write!(self.0, "{value:?}");
+                    let _ = write!(self.message, "{value:?}");
+                } else {
+                    let _ = write!(self.fields, "{}={value:?} ", field.name());
                 }
             }
         }
@@ -1409,11 +1808,15 @@ mod tests {
                 _ctx: tracing_subscriber::layer::Context<'_, S>,
             ) {
                 let mut message = String::new();
-                event.record(&mut MessageVisitor(&mut message));
+                let mut fields = String::new();
+                event.record(&mut MessageVisitor {
+                    message: &mut message,
+                    fields: &mut fields,
+                });
                 self.events
                     .lock()
                     .expect("log capture mutex should not be poisoned")
-                    .push((*event.metadata().level(), message));
+                    .push((*event.metadata().level(), message, fields));
             }
         }
 
@@ -1456,20 +1859,38 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|(level, message)| *level == Level::INFO && message.contains("palette")),
+                .any(|(level, message, _)| *level == Level::INFO && message.contains("palette")),
             "an absent palette source must be logged at info"
         );
         assert!(
             events
                 .iter()
-                .any(|(level, message)| *level == Level::INFO && message.contains("PATH")),
+                .any(|(level, message, _)| *level == Level::INFO && message.contains("PATH")),
             "an absent binary must be logged at info"
         );
         assert!(
             events
                 .iter()
-                .any(|(level, message)| *level == Level::WARN && message.contains("unreadable")),
+                .any(|(level, message, _)| *level == Level::WARN && message.contains("unreadable")),
             "an unreadable config must be logged at warn"
+        );
+        // Task 11.2: no `hyprland.lua` and no session -> hyprlang, which hides the
+        // Lua-only controls (an `info` hidden item), and the summary names it.
+        assert!(
+            events
+                .iter()
+                .any(|(level, message, _)| *level == Level::INFO
+                    && message.contains("Input page")
+                    && message.contains("cursor write")),
+            "a non-Lua provider must log the hidden Input page and cursor write at info"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(level, message, fields)| *level == Level::INFO
+                    && message.contains("detection complete")
+                    && fields.contains("hypr_config_provider=hyprlang")),
+            "the detection summary must name the config provider"
         );
     }
 
