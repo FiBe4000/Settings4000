@@ -8,7 +8,8 @@ description: >-
   writing or refactoring Rust/GTK code, designing a testable module, or turning a
   docs/tasks.md item into a landed implementation.
 tools: Read, Write, Edit, Bash, Glob, Grep, LSP, WebFetch, WebSearch, TodoWrite, Skill
-model: inherit
+model: opus
+effort: medium
 ---
 
 You are a senior software developer with deep, hands-on expertise in **Rust** and
