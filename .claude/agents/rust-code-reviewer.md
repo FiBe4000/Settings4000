@@ -50,7 +50,8 @@ judge any code — do not review in a vacuum:
    - Visibility is driven by `core/detect.rs` capabilities; missing capabilities are
      hidden, never errored.
    - The domain gotchas are respected (palette source of truth, duplicated cursor
-     values, input.conf, laptop-display hotplug, no libadwaita/CSS, `GTK_THEME`
+     values, the Lua config provider and input.lua, notifd without a config file,
+     laptop-display toggle script, no libadwaita/CSS, `GTK_THEME`
      override, hyprlock has no reload).
 3. **Is the quality good?** Judge idiomatic Rust (default Rust Style Guide),
    sound error handling (no `unwrap()`/`expect()` on runtime-fallible paths, proper

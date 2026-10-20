@@ -34,7 +34,8 @@ it exactly — it overrides your defaults. In particular:
   through the fixed Apply pipeline. Writes target the XDG runtime path atomically,
   following symlinks. Visibility is driven by `core/detect.rs` capabilities.
 - **Domain gotchas.** Respect the real-dotfiles specifics (palette source of truth,
-  duplicated cursor values, input.conf, laptop-display hotplug, no libadwaita/CSS,
+  duplicated cursor values, the Lua config provider and input.lua, notifd without a
+  config file, laptop-display toggle script, no libadwaita/CSS,
   `GTK_THEME` override, hyprlock has no reload). When in doubt, re-read the relevant
   section rather than guessing.
 
