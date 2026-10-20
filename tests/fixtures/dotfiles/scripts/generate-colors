@@ -13,5 +13,293 @@
 # failure injection — the non-zero exit drives the Apply pipeline's
 # write-failure, rollback, and command-exit logging. The `exit 2` below is
 # load-bearing for that walkthrough (it asserts GenerateColorsExit code 2).
+# tests/fixture_tree.rs also runs it once, to prove that the copy below stays
+# inert (exit 2, no file written).
+#
+# Everything after the `exit 2` is a verbatim copy of the real script (dotfiles
+# commit 8a5b20b, minus its shebang). Bash reads a script incrementally, so
+# none of it is ever parsed or run; it is here as *text* for the app to read:
+# the palette schema is taken from its `NAMES` array line (18 keys, `shadow`
+# last; it is the only line in this file that starts with that assignment), and its heredocs document the generated files, including the
+# `colors.lua` emitter.
 echo "settings4000 fixture: generate-colors stub invoked for real" >&2
 exit 2
+
+# ---- verbatim copy of the real scripts/generate-colors (never executed) ----
+# Generate format-specific color files from a single color scheme source.
+# Usage: generate-colors [scheme]
+# Default scheme: nord
+
+set -euo pipefail
+
+DOTFILES="$(cd "$(dirname "$0")/.." && pwd)"
+SCHEME="${1:-nord}"
+SOURCE="$DOTFILES/colors/$SCHEME"
+
+if [[ ! -f "$SOURCE" ]]; then
+    echo "Error: Color scheme '$SOURCE' not found" >&2
+    exit 1
+fi
+
+# Parse the source file into an associative array
+declare -A colors
+while IFS='=' read -r key value; do
+    [[ -z "$key" || "$key" =~ ^# ]] && continue
+    colors["$key"]="$value"
+done < "$SOURCE"
+
+NAMES=(bg0 bg1 bg2 bg3 fg0 fg1 fg2 accent0 accent1 accent2 accent3 red orange yellow green blue purple shadow)
+
+# Verify all expected colors are present
+for name in "${NAMES[@]}"; do
+    if [[ -z "${colors[$name]+x}" ]]; then
+        echo "Error: Missing color '$name' in $SOURCE" >&2
+        exit 1
+    fi
+done
+
+header="# Generated from colors/$SCHEME — do not edit manually"
+
+# --- Hyprland (hyprlang variables) ---
+cat > "$DOTFILES/config/hypr/colors.conf" << EOF
+$header
+
+\$bg0 = rgb(${colors[bg0]})
+\$bg1 = rgb(${colors[bg1]})
+\$bg2 = rgb(${colors[bg2]})
+\$bg3 = rgb(${colors[bg3]})
+
+\$fg0 = rgb(${colors[fg0]})
+\$fg1 = rgb(${colors[fg1]})
+\$fg2 = rgb(${colors[fg2]})
+
+\$accent0 = rgb(${colors[accent0]})
+\$accent1 = rgb(${colors[accent1]})
+\$accent2 = rgb(${colors[accent2]})
+\$accent3 = rgb(${colors[accent3]})
+
+\$red = rgb(${colors[red]})
+\$orange = rgb(${colors[orange]})
+\$yellow = rgb(${colors[yellow]})
+\$green = rgb(${colors[green]})
+\$blue = rgb(${colors[blue]})
+\$purple = rgb(${colors[purple]})
+
+\$shadow = rgb(${colors[shadow]})
+EOF
+echo "  Generated config/hypr/colors.conf"
+
+# --- Hyprland Lua (module returning bare hex; hyprland.lua wraps as rgb()) ---
+# colors.conf above stays: hyprlock still sources it (hyprlock has no Lua config).
+cat > "$DOTFILES/config/hypr/colors.lua" << EOF
+-- $header
+
+return {
+    bg0 = "${colors[bg0]}",
+    bg1 = "${colors[bg1]}",
+    bg2 = "${colors[bg2]}",
+    bg3 = "${colors[bg3]}",
+
+    fg0 = "${colors[fg0]}",
+    fg1 = "${colors[fg1]}",
+    fg2 = "${colors[fg2]}",
+
+    accent0 = "${colors[accent0]}",
+    accent1 = "${colors[accent1]}",
+    accent2 = "${colors[accent2]}",
+    accent3 = "${colors[accent3]}",
+
+    red = "${colors[red]}",
+    orange = "${colors[orange]}",
+    yellow = "${colors[yellow]}",
+    green = "${colors[green]}",
+    blue = "${colors[blue]}",
+    purple = "${colors[purple]}",
+
+    shadow = "${colors[shadow]}",
+}
+EOF
+echo "  Generated config/hypr/colors.lua"
+
+# --- eww (SCSS variables) ---
+cat > "$DOTFILES/config/eww/_colors.scss" << EOF
+// $header
+
+\$bg0: #${colors[bg0]};
+\$bg1: #${colors[bg1]};
+\$bg2: #${colors[bg2]};
+\$bg3: #${colors[bg3]};
+
+\$fg0: #${colors[fg0]};
+\$fg1: #${colors[fg1]};
+\$fg2: #${colors[fg2]};
+
+\$accent0: #${colors[accent0]};
+\$accent1: #${colors[accent1]};
+\$accent2: #${colors[accent2]};
+\$accent3: #${colors[accent3]};
+
+\$red: #${colors[red]};
+\$orange: #${colors[orange]};
+\$yellow: #${colors[yellow]};
+\$green: #${colors[green]};
+\$blue: #${colors[blue]};
+\$purple: #${colors[purple]};
+
+\$shadow: #${colors[shadow]};
+EOF
+echo "  Generated config/eww/_colors.scss"
+
+# --- rofi (rasi variables) ---
+cat > "$DOTFILES/config/rofi/colors.rasi" << EOF
+/* $header */
+
+* {
+    bg0: #${colors[bg0]};
+    bg1: #${colors[bg1]};
+    bg2: #${colors[bg2]};
+    bg3: #${colors[bg3]};
+
+    fg0: #${colors[fg0]};
+    fg1: #${colors[fg1]};
+    fg2: #${colors[fg2]};
+
+    accent0: #${colors[accent0]};
+    accent1: #${colors[accent1]};
+    accent2: #${colors[accent2]};
+    accent3: #${colors[accent3]};
+
+    red: #${colors[red]};
+    orange: #${colors[orange]};
+    yellow: #${colors[yellow]};
+    green: #${colors[green]};
+    blue: #${colors[blue]};
+    purple: #${colors[purple]};
+
+    shadow: #${colors[shadow]};
+
+    bg0-overlay: #${colors[bg0]}66;
+}
+EOF
+echo "  Generated config/rofi/colors.rasi"
+
+# --- kitty (terminal color config) ---
+cat > "$DOTFILES/config/kitty/colors.conf" << EOF
+$header
+
+foreground            #${colors[fg0]}
+background            #${colors[bg0]}
+selection_foreground  #${colors[bg0]}
+selection_background  #${colors[fg0]}
+cursor                #${colors[blue]}
+url_color             #${colors[accent1]}
+
+# black
+color0   #${colors[bg1]}
+color8   #${colors[bg3]}
+
+# red
+color1   #${colors[red]}
+color9   #${colors[red]}
+
+# green
+color2   #${colors[green]}
+color10  #${colors[green]}
+
+# yellow
+color3   #${colors[yellow]}
+color11  #${colors[yellow]}
+
+# blue
+color4   #${colors[blue]}
+color12  #${colors[blue]}
+
+# magenta
+color5   #${colors[purple]}
+color13  #${colors[purple]}
+
+# cyan
+color6   #${colors[accent1]}
+color14  #${colors[accent0]}
+
+# white
+color7   #${colors[fg1]}
+color15  #${colors[fg2]}
+EOF
+echo "  Generated config/kitty/colors.conf"
+
+# --- zsh (shell variables for prompt theming) ---
+cat > "$DOTFILES/zsh/colors.zsh" << EOF
+$header
+
+THEME_ACCENT2='#${colors[accent2]}'
+EOF
+echo "  Generated zsh/colors.zsh"
+
+# === Fonts =================================================================
+# Font families/sizes live in a sibling source file (theme/fonts), independent
+# of the color scheme, and are templated into per-target font partials that each
+# component includes the same way it includes its color partial.
+FONTS_SOURCE="$DOTFILES/theme/fonts"
+if [[ ! -f "$FONTS_SOURCE" ]]; then
+    echo "Error: Font source '$FONTS_SOURCE' not found" >&2
+    exit 1
+fi
+
+declare -A fonts
+while IFS='=' read -r key value; do
+    [[ -z "$key" || "$key" =~ ^# ]] && continue
+    fonts["$key"]="$value"
+done < "$FONTS_SOURCE"
+
+FONT_KEYS=(kitty_font eww_font rofi_font kitty_font_size eww_font_size rofi_font_size)
+for key in "${FONT_KEYS[@]}"; do
+    if [[ -z "${fonts[$key]+x}" ]]; then
+        echo "Error: Missing font key '$key' in $FONTS_SOURCE" >&2
+        exit 1
+    fi
+done
+
+# mono_font (optional) overrides every monospace target at once; blank/absent
+# falls back to each target's own family.
+mono="${fonts[mono_font]:-}"
+kitty_fam="${mono:-${fonts[kitty_font]}}"
+eww_fam="${mono:-${fonts[eww_font]}}"
+rofi_fam="${mono:-${fonts[rofi_font]}}"
+
+font_header="# Generated from theme/fonts — do not edit manually"
+
+# --- kitty (included from kitty.conf) ---
+cat > "$DOTFILES/config/kitty/fonts.conf" << EOF
+$font_header
+
+font_family ${kitty_fam}
+font_size ${fonts[kitty_font_size]}
+EOF
+echo "  Generated config/kitty/fonts.conf"
+
+# --- eww (SCSS partial @imported by eww.scss) ---
+cat > "$DOTFILES/config/eww/_fonts.scss" << EOF
+// $font_header
+
+\$mono-font: ${eww_fam};
+\$mono-font-size: ${fonts[eww_font_size]}px;
+EOF
+echo "  Generated config/eww/_fonts.scss"
+
+# --- rofi (rasi @imported by config.rasi) ---
+cat > "$DOTFILES/config/rofi/fonts.rasi" << EOF
+/* $font_header */
+
+configuration {
+    font: "${rofi_fam} ${fonts[rofi_font_size]}";
+}
+EOF
+echo "  Generated config/rofi/fonts.rasi"
+
+# --- active-scheme marker (single-purpose state, outside colors/) ---
+mkdir -p "$DOTFILES/state"
+printf '%s\n' "$SCHEME" > "$DOTFILES/state/active-scheme"
+echo "  Generated state/active-scheme"
+
+echo "Done! All color configs generated from colors/$SCHEME."

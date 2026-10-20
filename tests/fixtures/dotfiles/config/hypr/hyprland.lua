@@ -1,0 +1,485 @@
+-- Hyprland configuration (Lua, Hyprland 0.55+ hl.* API).
+-- API reference: /usr/share/hypr/stubs/hl.meta.lua
+
+local home = os.getenv("HOME")
+local confdir = home .. "/.config/hypr/"
+
+------------------
+---- MONITORS ----
+------------------
+
+-- Docked state. Every reload (full or config-only) re-runs this file, and the
+-- hl.monitor()/hl.config() calls apply immediately, so without this the eDP
+-- rule from monitors.conf would re-enable the laptop panel that
+-- scripts/hypr-monitor-hotplug disabled at dock time (and misc.vrr would go
+-- back to 1). Ask Hyprland directly instead of reading the daemon's count
+-- file: hl.get_monitors() lists only ENABLED outputs, so "docked" is any
+-- enabled monitor that is not the panel or a virtual output (same exclusion
+-- list as count_external_monitors() in hypr-monitor-hotplug). At first boot
+-- the list is empty -> undocked -> startup is unchanged; the daemon still
+-- makes the login decision.
+--
+-- The one state file read here is the manual-override flag: it is created by
+-- scripts/hypr-toggle-laptop-display when the panel is forced on while docked
+-- and removed by the toggle, by hypr-monitor-hotplug on undock and at daemon
+-- startup. Both scripts define STATE_FILE with the same path; this is the
+-- canonical description of it.
+local FORCED_FILE = "/tmp/hypr-laptop-display-forced"
+
+-- monitors.conf rule keys that address the laptop panel. The generic eDP-*
+-- output name plus the per-machine desc: overrides; keep the desc list in
+-- sync with the `case "$_edp_desc"` mapping in hypr-display-profile.sh.
+local LAPTOP_PANEL_DESCS = {
+    ["desc:Example Panel Vendor 0x2036"] = true,
+}
+local function is_laptop_panel(output)
+    return output:sub(1, 4) == "eDP-" or LAPTOP_PANEL_DESCS[output] == true
+end
+
+local function file_exists(path)
+    local f = io.open(path, "r")
+    if f then
+        f:close()
+        return true
+    end
+    return false
+end
+
+local function query_docked()
+    for _, m in ipairs(hl.get_monitors()) do
+        local name = m.name
+        if type(name) == "string" and name ~= "eDP-1" and name ~= "FALLBACK"
+            and name:sub(1, 9) ~= "HEADLESS-" then
+            return true
+        end
+    end
+    return false
+end
+
+-- Computed once, before the loader and the misc block below (which sets vrr
+-- from it). Any failure of the query degrades to "undocked" = today's
+-- behaviour.
+local docked_ok, docked = pcall(query_docked)
+if not docked_ok then
+    print("hyprland.lua: hl.get_monitors() failed: " .. tostring(docked))
+    docked = false
+end
+local forced = file_exists(FORCED_FILE)
+
+-- monitors.conf stays a plain data file: it is the single source for eDP
+-- mode/scale and is parsed by BOTH this section and the awk in
+-- scripts/hypr-display-profile.sh. Its format is frozen (see its header).
+-- Rule order is load-bearing: a later matching rule overrides earlier ones,
+-- so the catch-all comes first — hl.monitor() calls are issued in file order.
+local function apply_monitors()
+    local rules = 0
+    local f = assert(io.open(confdir .. "monitors.conf", "r"))
+    for line in f:lines() do
+        local stripped = line:gsub("#.*$", "")
+        local body = stripped:match("^%s*monitor%s*=%s*(.-)%s*$")
+        if body and body ~= "" then
+            local fields = {}
+            for field in (body .. ","):gmatch("(.-),") do
+                fields[#fields + 1] = field:match("^%s*(.-)%s*$")
+            end
+            local spec = {
+                output   = fields[1] or "",
+                mode     = fields[2] or "preferred",
+                position = fields[3] or "auto",
+                scale    = fields[4] or "auto",
+            }
+            -- Trailing key,value pairs (e.g. bitdepth,10)
+            for i = 5, #fields - 1, 2 do
+                spec[fields[i]] = tonumber(fields[i + 1]) or fields[i + 1]
+            end
+            -- Laptop panel while docked: keep the daemon's decision across
+            -- reloads. Forced on by the toggle -> enabled at the toggle's
+            -- position so a reload does not move it; otherwise disabled.
+            -- Undocked the rule is emitted exactly as written.
+            if docked and is_laptop_panel(spec.output) then
+                if forced then
+                    spec.position = "0x1440"
+                    spec.disabled = false
+                else
+                    spec.disabled = true
+                end
+            end
+            hl.monitor(spec)
+            rules = rules + 1
+        end
+    end
+    f:close()
+    assert(rules > 0, "no monitor rules parsed")
+end
+
+local ok, err = pcall(apply_monitors)
+if not ok then
+    -- Degrade to "displays work, untuned" — same failure contract as the
+    -- shell parser's preferred/scale-1 fallback.
+    print("hyprland.lua: monitors.conf parse failed: " .. tostring(err))
+    hl.monitor({ output = "", mode = "preferred", position = "auto", scale = "auto" })
+    -- Still honour the docked state: the catch-all alone would re-enable eDP-1.
+    if docked and not forced then
+        hl.monitor({ output = "eDP-1", disabled = true })
+    end
+end
+
+---------------
+---- INPUT ----
+---------------
+
+dofile(confdir .. "input.lua")
+
+-------------
+---- ENV ----
+-------------
+
+-- Session env is consolidated in config/uwsm/env (Qt/GTK/Ozone/backend hints).
+-- ONLY cursor theme/size is duplicated here on purpose: it must be present at
+-- Hyprland level too, kept identical to uwsm/env (canonical). Do not add other
+-- hl.env() calls here — put non-cursor session env in config/uwsm/env instead.
+hl.env("XCURSOR_THEME", "breeze_cursors")
+hl.env("XCURSOR_SIZE", "24")
+
+-----------------------
+---- LOOK AND FEEL ----
+-----------------------
+
+-- Palette generated by scripts/generate-colors; dofile (not require) so a
+-- hyprctl reload after apply-theme re-reads the file instead of hitting the
+-- package.loaded cache.
+local c = dofile(confdir .. "colors.lua")
+local function rgb(hex) return "rgb(" .. hex .. ")" end
+local function rgba(hex, alpha) return "rgba(" .. hex .. alpha .. ")" end -- alpha: 2 hex digits
+
+hl.config({
+    cursor = {
+        inactive_timeout = 0,
+    },
+
+    general = {
+        gaps_in = 6,
+        gaps_out = { top = 0, right = 12, bottom = 12, left = 12 },
+        border_size = 3,
+        col = {
+            active_border = rgb(c.accent2),
+            inactive_border = rgb(c.bg3),
+        },
+    },
+
+    decoration = {
+        rounding = 13,
+        -- Blur "amount" is size * passes, but size over ~5 produces artifacts;
+        -- for heavier blur raise passes instead.
+        blur = {
+            enabled = true,
+            size = 3,
+            passes = 3,
+            new_optimizations = true,
+        },
+        -- Soft drop shadow for depth. Shadows are on by default (range 4, which
+        -- reads flat); this widens them. range = spread in px, render_power =
+        -- falloff exponent (low = soft and airy, high = tight hug of the edge).
+        -- 20px (plus the 2,6 offset) fills the 12px outer gaps; it is wider than
+        -- the 12px inner gap (gaps_in 6 x 2) too, so neighbouring shadows do tint
+        -- it, softly thanks to the low render_power. Geometry follows `rounding`,
+        -- so corners match automatically.
+        -- Layer surfaces (eww) get no compositor shadow; they draw their
+        -- own in GTK CSS from the same $shadow palette color.
+        shadow = {
+            enabled        = true,
+            range          = 20,
+            render_power   = 2,
+            sharp          = false,
+            scale          = 1.0,
+            offset         = { 2, 6 },                -- light from top, slightly top-left: shadow falls down and a bit right
+            color          = rgba(c.shadow, "b3"),    -- focused: raised
+            color_inactive = rgba(c.shadow, "59"),    -- unfocused: flatter (depth cue instead of dim_inactive)
+        },
+    },
+
+    animations = {
+        enabled = true,
+    },
+
+    misc = {
+        disable_hyprland_logo = true,
+        disable_splash_rendering = true,
+        -- Off while docked (external panels), on for the laptop panel alone;
+        -- mirrors what hypr-monitor-hotplug sets at runtime so a reload does
+        -- not undo it. `docked` is computed in the MONITORS section.
+        vrr = docked and 0 or 1,
+        -- Wake displays on input in Hyprland itself: hypridle's on-resume only
+        -- fires for its own dpms-off timeout, so a manual blank (Escape on the
+        -- lock screen, below) would otherwise stay black.
+        key_press_enables_dpms = true,
+        mouse_move_enables_dpms = true,
+    },
+
+    -- Don't bitmap-upscale XWayland surfaces on a fractional-scale eDP-1 panel —
+    -- that makes Qt4 (Segger Ozone) and other X11 apps look blurry. Apps render at
+    -- native pixels; per-state Xft.dpi in hypr-monitor-hotplug keeps them correctly
+    -- sized (96 docked; undocked = round(96 * eDP scale), per hypr-display-profile.sh).
+    xwayland = {
+        force_zero_scaling = true,
+    },
+})
+
+-- Ported from the legacy animation=NAME,1,SPEED,default lines.
+hl.animation({ leaf = "windows",    enabled = true, speed = 3,  bezier = "default" })
+hl.animation({ leaf = "border",     enabled = true, speed = 10, bezier = "default" })
+hl.animation({ leaf = "fadeIn",     enabled = true, speed = 10, bezier = "default" })
+hl.animation({ leaf = "workspaces", enabled = true, speed = 1,  bezier = "default" })
+-- Layer-shell fades (eww OSD, and any layer rule using animation = "fade"):
+-- quick in, slightly slower out so the volume/brightness popup feels snappy.
+-- The "fade" style animates alpha only, and alpha is driven by fadeLayersIn/Out
+-- (layersIn/Out govern the slide/popin position+size). 1 speed unit = 100 ms.
+hl.animation({ leaf = "fadeLayersIn",  enabled = true, speed = 2, bezier = "default" })
+hl.animation({ leaf = "fadeLayersOut", enabled = true, speed = 3, bezier = "default" })
+-- Layer slide/popin position (the eww notification center/popups' "slide
+-- right" below): 200 ms in to match the 200 ms revealer slide of the eww
+-- notification cards.
+-- The notification center surface spans the whole monitor, so its panel is only on
+-- screen for the first ~20% of the slide-out; "default" is fast at the start
+-- and left it gone in a frame. An ease-in curve (slow start) keeps the panel
+-- visibly travelling for most of the 300 ms instead.
+hl.curve("easeInCubic", { type = "bezier", points = { {0.32, 0}, {0.67, 0} } })
+hl.animation({ leaf = "layersIn",  enabled = true, speed = 2, bezier = "default" })
+hl.animation({ leaf = "layersOut", enabled = true, speed = 3, bezier = "easeInCubic" })
+
+---------------
+---- RULES ----
+---------------
+
+-- XWayland popups/menus surface with empty class and title — don't blur or
+-- shadow them (they are transient menus, not windows).
+hl.window_rule({
+    name  = "xwayland-popup-undecorated",
+    match = { class = "^()$", title = "^()$" },
+    no_blur = true,
+    no_shadow = true,
+})
+
+hl.layer_rule({
+    name  = "rofi",
+    match = { namespace = "rofi" },
+    blur = true,
+    ignore_alpha = 0.3,
+    animation = "fade", -- layer styles are slide/popin/fade; "fadeIn" was silently ignored
+})
+-- Volume/brightness OSD (config/eww/widgets/osd.yuck). Same blurred, translucent
+-- look as the notifications; "fade" animates both map and unmap.
+hl.layer_rule({
+    name  = "eww-osd",
+    match = { namespace = "eww-osd" },
+    blur = true,
+    -- box is 0.8 alpha (blurred); its two $shadow-osd layers (eww
+    -- styles/_shadows.scss) combine to ~0.37 just below it (left sharp)
+    ignore_alpha = 0.5,
+    animation = "fade",
+})
+-- Full-screen eww dashboard (config/eww/widgets/dashboard.yuck, namespace
+-- "eww-dashboard"): covers the whole monitor, bar included. Same frosted look
+-- as rofi: the bg0 backdrop at 0.4 alpha is blurred, cards are opaque on top.
+-- No ignore_alpha: every pixel is >= 0.4 alpha (card shadows composite OVER
+-- the backdrop and only raise it), so there is nothing to exclude from the
+-- blur; a value above 0.4 would un-blur the backdrop and leave a halo.
+-- "fade" (fadeLayersIn/Out above) — popin would scale a monitor-sized surface
+-- out of its centre.
+hl.layer_rule({
+    name  = "eww-dashboard",
+    match = { namespace = "eww-dashboard" },
+    blur = true,
+    animation = "fade",
+})
+-- eww notification center (config/eww/widgets/notifications.yuck, namespace
+-- "eww-notif-center"): a monitor-sized surface like the dashboard, but the
+-- backdrop is fully transparent (alpha 0, never blurred) and only the panel
+-- shows. Panel and cards are 0.8-0.85 alpha;
+-- their CSS shadows stay under 0.55 and are left sharp.
+hl.layer_rule({
+    name  = "eww-notif-center",
+    match = { namespace = "eww-notif-center" },
+    blur = true,
+    ignore_alpha = 0.55,
+    -- the surface covers the monitor, so the panel travels in from just off-screen
+    animation = "slide right",
+})
+-- eww notification popups (same file, namespace "eww-notif-popups"): only as
+-- tall as its cards, which are 0.8 alpha like the center's; their shadows stay
+-- under 0.55 and are left sharp. notifd maps the window once per burst, so the
+-- first cards slide in from the right edge; cards
+-- that arrive while it is up slide open in place (eww revealer), and it only
+-- unmaps once empty, so the slide-out is never seen.
+hl.layer_rule({
+    name  = "eww-notif-popups",
+    match = { namespace = "eww-notif-popups" },
+    blur = true,
+    ignore_alpha = 0.55,
+    animation = "slide right",
+})
+
+---------------
+---- BINDS ----
+---------------
+
+local dsp = hl.dsp
+
+-- Session
+hl.bind("SUPER + SHIFT + Q", dsp.exit())
+hl.bind("SUPER + CTRL + SHIFT + Q", dsp.exec_cmd("poweroff"))
+hl.bind("SUPER + CTRL + SHIFT + R", dsp.exec_cmd("reboot"))
+hl.bind("CTRL + ALT + L", dsp.exec_cmd("hyprlock")) -- no --grace: deliberate locks require the password immediately
+
+-- Programs
+hl.bind("SUPER + SHIFT + RETURN", dsp.exec_cmd("kitty"))
+hl.bind("SUPER + E", dsp.exec_cmd("dolphin"))
+hl.bind("SUPER + P", dsp.exec_cmd("rofi -show drun"))
+
+-- Windows
+hl.bind("SUPER + C", dsp.window.close())
+hl.bind("SUPER + SHIFT + C", dsp.exec_cmd("hyprctl activewindow -j | jq -r '.pid' | xargs kill -9"))
+hl.bind("SUPER + S", dsp.window.float({ action = "on" }))
+hl.bind("SUPER + T", dsp.window.float({ action = "off" }))
+hl.bind("SUPER + F", dsp.window.fullscreen({ mode = "fullscreen" }))
+hl.bind("SUPER + M", dsp.window.fullscreen({ mode = "maximized" }))
+hl.bind("SUPER + SHIFT + D", dsp.exec_cmd(home .. "/.dotfiles/scripts/hypr-toggle-laptop-display"))
+
+-- Focus
+hl.bind("SUPER + H", dsp.focus({ direction = "left" }))
+hl.bind("SUPER + L", dsp.focus({ direction = "right" }))
+hl.bind("SUPER + K", dsp.focus({ direction = "up" }))
+hl.bind("SUPER + J", dsp.focus({ direction = "down" }))
+
+-- Move window
+hl.bind("SUPER + SHIFT + H", dsp.window.move({ direction = "left" }))
+hl.bind("SUPER + SHIFT + L", dsp.window.move({ direction = "right" }))
+hl.bind("SUPER + SHIFT + K", dsp.window.move({ direction = "up" }))
+hl.bind("SUPER + SHIFT + J", dsp.window.move({ direction = "down" }))
+
+-- Mouse drag / resize
+hl.bind("SUPER + mouse:272", dsp.window.drag(), { mouse = true })
+hl.bind("SUPER + mouse:273", dsp.window.resize(), { mouse = true })
+
+-- Workspaces: SUPER+N focuses on current monitor, SUPER+SHIFT+N moves silently
+for i = 1, 10 do
+    local key = i % 10 -- SUPER+0 maps to workspace 10
+    hl.bind("SUPER + " .. key, dsp.focus({ workspace = i, on_current_monitor = true }))
+    hl.bind("SUPER + SHIFT + " .. key, dsp.window.move({ workspace = i, follow = false }))
+end
+
+-- Brightness and volume go through the eww OSD script, which applies the change
+-- (brightnessctl / pamixer) and pops the on-screen indicator. brightnessctl talks
+-- to /sys/class/backlight directly (via logind), so no X server and no video-group
+-- membership needed; the script keeps a 5% floor so the coarse 10% steps never
+-- land on a fully black panel, and is a no-op on machines without a backlight.
+-- repeating+locked: keys repeat when held and still work on the lock screen.
+-- submap_universal: keep working inside the "dashboard" submap below (a submap
+-- parks every bind that is not in it).
+local OSD = home .. "/.config/eww/scripts/osd"
+local BRIGHT_OPTS = { repeating = true, locked = true, submap_universal = true }
+hl.bind("XF86MonBrightnessDown", dsp.exec_cmd(OSD .. " brightness down 10"), BRIGHT_OPTS)
+hl.bind("XF86MonBrightnessUp",   dsp.exec_cmd(OSD .. " brightness up 10"), BRIGHT_OPTS)
+hl.bind("SHIFT + XF86MonBrightnessDown", dsp.exec_cmd(OSD .. " brightness down 5"), BRIGHT_OPTS)
+hl.bind("SHIFT + XF86MonBrightnessUp",   dsp.exec_cmd(OSD .. " brightness up 5"), BRIGHT_OPTS)
+
+-- Audio (pamixer via the OSD script caps volume at 100%, unlike pactl +N%)
+local VOL_OPTS = { submap_universal = true }
+hl.bind("XF86AudioLowerVolume", dsp.exec_cmd(OSD .. " volume down 5"), VOL_OPTS)
+hl.bind("XF86AudioRaiseVolume", dsp.exec_cmd(OSD .. " volume up 5"), VOL_OPTS)
+hl.bind("XF86AudioMute",        dsp.exec_cmd(OSD .. " volume mute"), VOL_OPTS)
+
+-- Dashboard modal (eww namespace "eww-dashboard", toggled from the bar's Arch
+-- button). Escape closes it; the submap also parks every other bind (only
+-- submap_universal ones, like the OSD keys, keep working). Typing is kept out
+-- of the window underneath by the eww window itself: it is :focusable, so the
+-- layer holds keyboard focus and GTK drops the keys. No "catchall" here: it
+-- also catches mouse *presses* (releases pass), which killed slider drags
+-- while eww buttons -- release-driven -- kept working. The submap follows the
+-- layer's own lifecycle rather than the toggle script, so click-outside,
+-- `eww kill` (launch-eww-bars on a dock change) and an eww crash all leave
+-- it: no stuck submap.
+local DASHBOARD = home .. "/.config/eww/scripts/dashboard"
+hl.define_submap("dashboard", function()
+    hl.bind("Escape", dsp.exec_cmd(DASHBOARD .. " close"))
+end)
+hl.on("layer.opened", function(ls)
+    if ls.namespace == "eww-dashboard" then hl.dispatch(dsp.submap("dashboard")) end
+end)
+hl.on("layer.closed", function(ls)
+    if ls.namespace == "eww-dashboard" and hl.get_current_submap() == "dashboard" then
+        hl.dispatch(dsp.submap("reset"))
+    end
+end)
+
+-- Notification center (eww namespace "eww-notif-center", scripts/notif-center),
+-- same modal pattern as the dashboard: Escape closes it, the submap follows the
+-- layer's lifecycle. On close notifd is told too, so an `eww kill`
+-- (launch-eww-bars) or a crash can't leave its popups muted for good.
+local NOTIF_CENTER = home .. "/.config/eww/scripts/notif-center"
+local NOTIFCTL = home .. "/.dotfiles/scripts/notifctl"
+hl.define_submap("notifcenter", function()
+    hl.bind("Escape", dsp.exec_cmd(NOTIF_CENTER .. " close"))
+    hl.bind("SUPER + N", dsp.exec_cmd(NOTIF_CENTER .. " close"))
+end)
+hl.on("layer.opened", function(ls)
+    if ls.namespace == "eww-notif-center" then hl.dispatch(dsp.submap("notifcenter")) end
+end)
+hl.on("layer.closed", function(ls)
+    if ls.namespace ~= "eww-notif-center" then return end
+    hl.exec_cmd(NOTIFCTL .. " center close")
+    if hl.get_current_submap() == "notifcenter" then hl.dispatch(dsp.submap("reset")) end
+end)
+hl.bind("SUPER + N", dsp.exec_cmd(NOTIF_CENTER .. " toggle"))
+hl.bind("SUPER + SHIFT + N", dsp.exec_cmd(NOTIFCTL .. " dnd toggle"), { submap_universal = true })
+
+-- Escape on the lock screen blanks the displays right away (Plasma-style)
+-- instead of waiting for hypridle's dpms timeout. non_consuming so Escape still
+-- reaches apps; the pidof guard makes it a no-op while unlocked. Fires on
+-- release so the key-up can't count as the wake press (key_press_enables_dpms).
+hl.bind("Escape", dsp.exec_cmd([[pidof -q hyprlock && hyprctl dispatch 'hl.dsp.dpms({ action = "off" })']]),
+        { locked = true, non_consuming = true, release = true, submap_universal = true })
+
+-- Lid switch (disabled, kept from the hyprlang config)
+-- hl.bind("switch:Lid Switch", dsp.exec_cmd("hyprlock"), { locked = true })
+-- hl.bind("switch:on:Lid Switch", dsp.exec_cmd("hyprctl keyword monitor \"eDP-1, disable\""), { locked = true })
+-- hl.bind("switch:off:Lid Switch", dsp.exec_cmd("hyprctl keyword monitor \"eDP-1, 2560x1440, 0x0, 1\""), { locked = true })
+
+-------------------
+---- AUTOSTART ----
+-------------------
+
+-- HYPR_NO_AUTOSTART=1 skips autostart so a nested test session
+-- (Hyprland --config .../hyprland.lua) doesn't double-launch daemons or
+-- clobber the live session's eww bars.
+if os.getenv("HYPR_NO_AUTOSTART") ~= "1" then
+    hl.on("hyprland.start", function()
+        -- Keep kded6's gtkconfig module off in this session: it rewrites the
+        -- dotfiles-linked GTK settings.ini from kdeglobals and rescales XWayland
+        -- apps via xsettingsd. Plasma turns it back on via config/autostart.
+        hl.exec_cmd(home .. "/.dotfiles/scripts/kded-gtkconfig off")
+        -- hl.exec_cmd(home .. "/.dotfiles/scripts/launchportals.sh")
+        hl.exec_cmd("uwsm app -- hyprpaper")
+        -- notifd (scripts/notifd) is the notification server; the same unit is the D-Bus activation target
+        hl.exec_cmd("systemctl --user start notifd.service")
+        hl.exec_cmd("uwsm app -- nm-applet")
+        hl.exec_cmd("uwsm app -- gammastep-indicator")
+        hl.exec_cmd("uwsm app -- blueman-applet")
+        hl.exec_cmd("/usr/lib/geoclue-2.0/demos/agent")
+        hl.exec_cmd("uwsm app -- udiskie")
+        hl.exec_cmd("pactl load-module module-switch-on-connect")
+        hl.exec_cmd("uwsm app -- hypridle")
+        hl.exec_cmd("uwsm app -- playerctld daemon") -- media controls in the dashboard follow the last active player
+        -- hypr-monitor-hotplug owns the eww bars: it launches them itself once it
+        -- has settled the eDP-1 state, and again on every dock change. Launching
+        -- launch-eww-bars directly here as well used to race that first run on a
+        -- docked login -- two launchers, two eww daemons, one orphaned with a bar
+        -- nobody could address, so one monitor ended up with two bars. The flock
+        -- in launch-eww-bars now also serialises its remaining callers.
+        hl.exec_cmd(home .. "/.dotfiles/scripts/hypr-monitor-hotplug")
+        -- Keyboard-layout OSD. SUPER+SPACE is the xkb grp:win_space_toggle option
+        -- (see input.lua), not a bind, so the only hook is Hyprland's activelayout
+        -- event on socket2; this listener turns it into `osd layout <name>`.
+        hl.exec_cmd(home .. "/.config/eww/scripts/osd-layout-listener")
+    end)
+end

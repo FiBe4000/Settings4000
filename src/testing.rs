@@ -65,6 +65,20 @@ pub const HOME_PLACEHOLDER: &str = "/home/user";
 /// checks existence, readability, and extension only).
 const WALLPAPER_RELATIVE: &str = "Pictures/wallpaper/wallpaper.jpg";
 
+/// The deployment links that live under `$HOME` itself rather than under
+/// `$XDG_CONFIG_HOME`, as `(link relative to home, target relative to the repo)`.
+///
+/// Everything under the repo's `config/` is linked per file by
+/// [`deploy_config_symlinks`]; these are the only other links the real
+/// `setup.sh` creates that the app reads or writes (analysis §1, §8.4):
+/// the generated zsh color partial, and the XCursor fallback theme that is
+/// part of the R3.4 cursor write set. The link's parent directories are
+/// created plain, as `setup.sh` does (`mkdir -p ~/.icons/default`).
+const HOME_LINKS: &[(&str, &str)] = &[
+    (".zsh_colors", "zsh/colors.zsh"),
+    (".icons/default/index.theme", "icons/default/index.theme"),
+];
+
 /// An installed fixture dotfiles tree (task 7.1, R6.1).
 ///
 /// Owns the backing [`TempDir`]: the whole tree is deleted when the handle is
@@ -75,14 +89,16 @@ const WALLPAPER_RELATIVE: &str = "Pictures/wallpaper/wallpaper.jpg";
 /// <temp>/home/                     — the fake $HOME
 /// ├── .dotfiles/                   — the repo (copied from tests/fixtures/dotfiles)
 /// │   ├── colors/{everforest,nord,README.md}
-/// │   ├── scripts/generate-colors
+/// │   ├── scripts/{generate-colors,hypr-toggle-laptop-display,notifctl}
 /// │   ├── state/active-scheme
 /// │   ├── theme/fonts
+/// │   ├── icons/default/index.theme
 /// │   ├── zsh/colors.zsh
-/// │   └── config/{hypr,gtk-3.0,gtk-4.0,uwsm,swaync,kitty,eww,rofi}/…
+/// │   └── config/{hypr,gtk-3.0,gtk-4.0,uwsm,notifd,swaync,kitty,eww,rofi}/…
 /// ├── .config/                     — the fake $XDG_CONFIG_HOME; every file under
 /// │   │                              the repo's config/ is symlinked here per-file
 /// │   └── hypr/colors.conf -> …/.dotfiles/config/hypr/colors.conf   (etc.)
+/// ├── .icons/default/index.theme -> …/.dotfiles/icons/default/index.theme
 /// ├── .zsh_colors -> .dotfiles/zsh/colors.zsh
 /// └── Pictures/wallpaper/wallpaper.jpg   — stub the configs point at
 /// ```
@@ -105,13 +121,14 @@ impl FixtureDotfiles {
     ///
     /// 1. copy `tests/fixtures/dotfiles/` to `<home>/.dotfiles`, substituting the
     ///    [`HOME_PLACEHOLDER`] prefix in every file for the temp home and
-    ///    preserving each file's permissions (`generate-colors` stays executable);
+    ///    preserving each file's permissions (the `scripts/` stubs stay executable);
     /// 2. symlink every file under the repo's `config/` from `<home>/.config`,
     ///    per file, exactly like the real `setup.sh` deployment (analysis §1) —
     ///    so e.g. `<home>/.config/hypr/colors.conf` is a symlink the repo-root
     ///    discovery (R8.5) can canonicalize and the atomic writer follows (R5.4);
-    /// 3. symlink `<home>/.zsh_colors` to the repo's `zsh/colors.zsh` (the one
-    ///    deployed link that lives at the home level rather than under XDG);
+    /// 3. create the home-level deployment links in [`HOME_LINKS`]
+    ///    (`<home>/.zsh_colors`, `<home>/.icons/default/index.theme`), which
+    ///    live outside `$XDG_CONFIG_HOME`;
     /// 4. create the stub wallpaper file the substituted configs point at.
     ///
     /// Each call builds a completely independent tree, so parallel tests never
@@ -146,17 +163,18 @@ impl FixtureDotfiles {
         copy_tree_substituting(&fixture_root, &repo_root, home_str);
         deploy_config_symlinks(&repo_root.join("config"), &config_root);
 
-        // The single home-level deployment link: `~/.zsh_colors` → the generated
-        // zsh color partial (analysis §1).
-        let zsh_link = home.join(".zsh_colors");
-        let zsh_target = repo_root.join("zsh").join("colors.zsh");
-        symlink(&zsh_target, &zsh_link).unwrap_or_else(|e| {
-            panic!(
-                "failed to symlink {} -> {}: {e}",
-                zsh_link.display(),
-                zsh_target.display()
-            )
-        });
+        for (link_relative, target_relative) in HOME_LINKS {
+            let link = home.join(link_relative);
+            let target = repo_root.join(target_relative);
+            create_parent_dirs(&link);
+            symlink(&target, &link).unwrap_or_else(|e| {
+                panic!(
+                    "failed to symlink {} -> {}: {e}",
+                    link.display(),
+                    target.display()
+                )
+            });
+        }
 
         // The wallpaper the substituted hyprpaper/hyprlock configs reference.
         let wallpaper = home.join(WALLPAPER_RELATIVE);
@@ -239,7 +257,7 @@ fn copy_tree_substituting(from: &Path, to: &Path, home: &str) {
             .unwrap_or_else(|e| panic!("failed to write {}: {e}", target.display()));
 
         // Substitution went through read/write, which does not carry the mode
-        // over — restore it so `scripts/generate-colors` stays executable.
+        // over — restore it so the `scripts/` stubs stay executable.
         let permissions = fs::metadata(&source)
             .unwrap_or_else(|e| panic!("failed to stat {}: {e}", source.display()))
             .permissions();

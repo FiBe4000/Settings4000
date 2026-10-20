@@ -9,9 +9,16 @@
 //! byte-identical round-trips, and per-test installs are isolated. Deeper
 //! behavior — staging, Apply, rollback, reload sequences — is task 7.2's job,
 //! not this file's.
+//!
+//! Since task 11.1 this file also holds the only tests that execute the fixture
+//! shell stubs (`scripts/generate-colors`, `scripts/hypr-toggle-laptop-display`,
+//! `scripts/notifctl`) as real subprocesses, to prove the stubs behave as their
+//! headers promise. Every other suite drives those scripts through
+//! `MockCommandRunner` and must never spawn them.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::process::Command;
 
 use settings4000::core::detect::{Capabilities, DetectionInputs};
 use settings4000::core::model::validate_image_path;
@@ -22,7 +29,9 @@ use settings4000::parsers::ini::IniFile;
 use settings4000::parsers::monitors::{MonitorField, MonitorsFile};
 use settings4000::parsers::palette::PaletteFile;
 use settings4000::parsers::swaync::SwayncConfigFile;
-use settings4000::testing::{FixtureDotfiles, HOME_PLACEHOLDER};
+use settings4000::testing::{
+    FixtureDotfiles, HOME_PLACEHOLDER, assert_repo_untouched_except, repo_snapshot,
+};
 
 /// Reads a file, panicking with the path on failure (test-only convenience).
 fn read(path: &std::path::Path) -> String {
@@ -373,4 +382,153 @@ fn installs_are_isolated_and_symlinks_write_through_to_the_repo() {
         "input {\n}\n"
     );
     assert_eq!(read(&fx_b.config_path("hypr/input.conf")), original);
+}
+
+/// The files the `wayland-dev` dotfiles added (task 11.1, analysis §7–§8) are
+/// deployed at their live paths: the Lua Hyprland config and its two
+/// `dofile`d companions plus the notifd config under `$XDG_CONFIG_HOME`, and
+/// the XCursor fallback theme under `$HOME/.icons` — each a symlink into the
+/// repo, as `setup.sh` links them.
+#[test]
+fn wayland_dev_files_are_deployed_at_their_live_paths() {
+    let fx = FixtureDotfiles::install();
+
+    let mut links: Vec<(std::path::PathBuf, std::path::PathBuf)> = [
+        "hypr/hyprland.lua",
+        "hypr/input.lua",
+        "hypr/colors.lua",
+        "notifd/config",
+    ]
+    .iter()
+    .map(|relative| {
+        (
+            fx.config_path(relative),
+            fx.repo_path(&format!("config/{relative}")),
+        )
+    })
+    .collect();
+    links.push((
+        fx.home().join(".icons/default/index.theme"),
+        fx.repo_path("icons/default/index.theme"),
+    ));
+
+    for (live, expected_target) in links {
+        let meta = fs::symlink_metadata(&live)
+            .unwrap_or_else(|e| panic!("missing deployed path {}: {e}", live.display()));
+        assert!(
+            meta.file_type().is_symlink(),
+            "{} should be a deployment symlink",
+            live.display()
+        );
+        assert_eq!(
+            fs::canonicalize(&live)
+                .unwrap_or_else(|e| panic!("dangling symlink {}: {e}", live.display())),
+            expected_target,
+            "{} should resolve into the repo",
+            live.display()
+        );
+    }
+
+    // Only the file is linked; its directory is a plain one (`setup.sh` runs
+    // `mkdir -p ~/.icons/default`), so a writer can never replace the link's
+    // parent with a repo directory.
+    let icons_dir = fs::symlink_metadata(fx.home().join(".icons/default"))
+        .expect("~/.icons/default should exist");
+    assert!(icons_dir.is_dir() && !icons_dir.file_type().is_symlink());
+}
+
+/// The XCursor fallback theme reads as INI with the cursor theme in
+/// `[Icon Theme]` `Inherits=` and round-trips byte-identically — the shape the
+/// R3.4 cursor write set edits through the INI writer (analysis §8.4).
+#[test]
+fn the_cursor_fallback_theme_parses_as_ini() {
+    let fx = FixtureDotfiles::install();
+
+    let input = read(&fx.home().join(".icons/default/index.theme"));
+    let (ini, warnings) = IniFile::parse(&input);
+    assert!(warnings.is_empty(), "unexpected {warnings:?}");
+    assert_eq!(ini.emit(), input, "index.theme should round-trip");
+    assert_eq!(ini.value("Icon Theme", "Inherits"), Some("breeze_cursors"));
+}
+
+/// The generator stub carries the real script's `NAMES=(…)` schema line
+/// verbatim — exactly once, 18 keys with `shadow` last (analysis §7.6) — yet
+/// stays inert when executed: it exits 2 before reaching the copied body, so
+/// no generated file is touched.
+#[test]
+fn the_generator_stub_carries_the_real_schema_line_and_stays_inert() {
+    let fx = FixtureDotfiles::install();
+    let generator = fx.repo_path("scripts/generate-colors");
+
+    let script = read(&generator);
+    let names_lines: Vec<&str> = script
+        .lines()
+        .filter(|line| line.starts_with("NAMES=("))
+        .collect();
+    assert_eq!(
+        names_lines,
+        [
+            "NAMES=(bg0 bg1 bg2 bg3 fg0 fg1 fg2 accent0 accent1 accent2 accent3 \
+          red orange yellow green blue purple shadow)"
+        ],
+        "the stub must carry exactly one, verbatim, NAMES line"
+    );
+
+    let before = repo_snapshot(&fx);
+    let output = Command::new(&generator)
+        .arg("nord")
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {}: {e}", generator.display()));
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "the stub must keep failing with 2"
+    );
+    assert!(output.stdout.is_empty(), "no generator output may appear");
+    assert_repo_untouched_except(&fx, &before, &[]);
+}
+
+/// The two action-script stubs are executable no-ops that succeed and record
+/// their argv (task 11.1): one line per call, script name plus shell-quoted
+/// arguments, appended to the file named by `SETTINGS4000_FIXTURE_STUB_LOG`.
+/// Running them changes nothing in the repo.
+#[test]
+fn the_action_script_stubs_record_their_argv_and_succeed() {
+    let fx = FixtureDotfiles::install();
+    // Outside the repo, so the untouched-repo assertion below stays meaningful.
+    let log = fx.home().join("stub-calls.log");
+    let before = repo_snapshot(&fx);
+
+    let calls: [(&str, &[&str]); 3] = [
+        ("hypr-toggle-laptop-display", &[]),
+        ("notifctl", &["dnd", "on"]),
+        ("notifctl", &["inhibit", "add", "two words"]),
+    ];
+    for (script, args) in calls {
+        let path = fx.repo_path(&format!("scripts/{script}"));
+        let mode = fs::metadata(&path)
+            .unwrap_or_else(|e| panic!("{} should exist: {e}", path.display()))
+            .permissions()
+            .mode();
+        assert!(mode & 0o111 != 0, "{script} should be executable");
+
+        let output = Command::new(&path)
+            .args(args)
+            .env("SETTINGS4000_FIXTURE_STUB_LOG", &log)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run {}: {e}", path.display()));
+        assert!(output.status.success(), "{script} stub should exit 0");
+        // The same record goes to stderr, where a command runner logs it.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.starts_with(&format!("settings4000 fixture stub: {script}")),
+            "{script} should announce itself on stderr, got {stderr:?}"
+        );
+    }
+
+    assert_eq!(
+        read(&log),
+        "hypr-toggle-laptop-display\nnotifctl dnd on\nnotifctl inhibit add two\\ words\n"
+    );
+    assert_repo_untouched_except(&fx, &before, &[]);
 }

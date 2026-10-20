@@ -1,0 +1,37 @@
+# notifd settings (scripts/notifd), read when notifd starts and again on
+# `notifctl reload` (or `systemctl --user reload notifd.service`), which
+# applies a change without dropping popups, timers or history.
+#
+# One key=value per line; blank lines and lines starting with # are ignored.
+# Every key is optional and falls back to its default, which is the value
+# written here. A malformed line, an unknown key or a value outside its range
+# is logged to the journal (journalctl --user -u notifd) and leaves that key
+# at its default. Keep every key listed: the settings app reads them from here.
+#
+# Not settable here: the number of popup slots (5; duplicated in
+# notifications.yuck, notif-popups and notifd-listen), the popup anchor, width
+# and monitor and the center geometry (eww widgets), the state-write throttles.
+
+# Popup timeout per urgency, in milliseconds; 0 = stays until dismissed.
+# Applies to notifications that arrive after the file is (re)read, popups
+# already on screen keep their timer; an app's own expire_timeout always wins.
+timeout_low_ms=5000
+timeout_normal_ms=10000
+timeout_critical_ms=0
+
+# Notifications kept in the center and in ~/.local/state/notifd/history.json;
+# the oldest drop off. At least 1.
+history_max=100
+
+# Critical popups one app may hold on screen at once (1..5, the slot count);
+# its oldest makes room for the next.
+critical_per_app=3
+
+# After the pointer leaves a popup it stays at least this long, in
+# milliseconds (its remaining timeout, if that is longer).
+hold_min_ms=1500
+
+# Offer a "Copy NNNN" action when a notification carries a 2FA code next to a
+# word that says it is one ("code 123456", "kod 4711"); needs wl-clipboard.
+# true|false (1|0 also accepted).
+copy_codes=true

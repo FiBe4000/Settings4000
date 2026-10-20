@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Fixture stand-in for the real dotfiles scripts/hypr-toggle-laptop-display.
+#
+# The real script is a pure toggle (it takes no arguments): it reads the eDP-1
+# state from `hyprctl monitors -j`, flips the panel with
+# `hyprctl eval 'hl.monitor({ … })'`, creates or removes
+# /tmp/hypr-laptop-display-forced, sends a desktop notification and relaunches
+# the eww bars (docs/dotfiles_analysis.md §7.3, §8.1). None of that may happen
+# from a test.
+#
+# The app finds this script under the repo root (R8.5), shows the
+# laptop-display control only when it exists, and runs it through the
+# CommandRunner seam (task 11.8); tests replace that seam with
+# MockCommandRunner, so normally this file never runs. When a test does run it
+# for real on purpose, the stub is a no-op that records how it was called:
+#
+# - one line naming the script and its shell-quoted arguments goes to stderr,
+#   which the command runner captures and logs;
+# - the same line is appended to the file named by SETTINGS4000_FIXTURE_STUB_LOG
+#   when that variable is set, so the test can assert the exact argv;
+#
+# and it exits 0, because a successful toggle is the outcome such a test needs.
+# (The generate-colors stub fails instead: a palette apply that reaches the
+# real generator is always a test bug.)
+record="${0##*/}"
+for arg in "$@"; do
+    record+=" $(printf '%q' "$arg")"
+done
+printf 'settings4000 fixture stub: %s\n' "$record" >&2
+if [[ -n "${SETTINGS4000_FIXTURE_STUB_LOG:-}" ]]; then
+    printf '%s\n' "$record" >>"$SETTINGS4000_FIXTURE_STUB_LOG"
+fi
+exit 0

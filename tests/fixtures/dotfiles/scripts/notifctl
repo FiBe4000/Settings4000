@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Fixture stand-in for the real dotfiles scripts/notifctl.
+#
+# The real script wraps the private se.dotfiles.Notifd D-Bus interface of the
+# notifd notification daemon with `busctl --user --auto-start=no`
+# (`notifctl dnd on|off|toggle`, `clear`, `center open|close|toggle`,
+# `reload`, `status`, …; docs/dotfiles_analysis.md §7.5, §8.2). It is not on
+# $PATH: the dotfiles invoke it by its repo path. Running it from a test would
+# change the live session's notification state.
+#
+# The app talks to notifd through `busctl` calls on the CommandRunner seam
+# (task 11.7), which tests replace with MockCommandRunner; the fixture carries
+# this script so the repo tree has the real layout. When a test does run it for
+# real on purpose, the stub is a no-op that records how it was called:
+#
+# - one line naming the script and its shell-quoted arguments goes to stderr,
+#   which the command runner captures and logs;
+# - the same line is appended to the file named by SETTINGS4000_FIXTURE_STUB_LOG
+#   when that variable is set, so the test can assert the exact argv;
+#
+# and it exits 0. (The generate-colors stub fails instead: a palette apply that
+# reaches the real generator is always a test bug.)
+record="${0##*/}"
+for arg in "$@"; do
+    record+=" $(printf '%q' "$arg")"
+done
+printf 'settings4000 fixture stub: %s\n' "$record" >&2
+if [[ -n "${SETTINGS4000_FIXTURE_STUB_LOG:-}" ]]; then
+    printf '%s\n' "$record" >>"$SETTINGS4000_FIXTURE_STUB_LOG"
+fi
+exit 0
