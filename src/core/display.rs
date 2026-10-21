@@ -1,5 +1,5 @@
-//! GTK-free Display-page domain model (tasks 6.1, 11.8; architecture §6 "Staging" +
-//! the Display page; R2.3, R4.2, R4.4, R5.2, R5.4, R8.3, R8.5, R6.2).
+//! GTK-free Display-page domain model (tasks 6.1, 11.8, 11.9; architecture §6
+//! "Staging" + the Display page; R2.3, R4.2, R4.4, R5.2, R5.4, R8.3, R8.5, R6.2).
 //!
 //! # What this module is
 //!
@@ -42,20 +42,50 @@
 //!
 //! An output with no specific record is still shown (configured by the catch-all or
 //! defaults); editing it appends a specific record. When `monitors.conf` cannot be
-//! read at all (R4.4), the file-backed drop-downs are hidden ([`Self::records_editable`]
-//! is `false`) but the runtime laptop toggle still works.
+//! read at all (R4.4), or breaks its frozen grammar (see below), the file-backed
+//! drop-downs are hidden ([`DisplayModel::records_editable`] is `false`) but the
+//! runtime laptop toggle still works.
 //!
-//! # Keeping the edited record awk-parseable (CRITICAL)
+//! # Keeping `monitors.conf` inside its frozen grammar (CRITICAL; task 11.9, R8.3)
 //!
-//! `scripts/hypr-display-profile.sh` is the single source for the eDP panel's mode
-//! and scale: it `awk`-parses the matching `monitor=` record (name field 1, mode
-//! field 2, scale field 4, extras after — analysis §6.2). Edits therefore go through
-//! the [`monitors`](crate::parsers::monitors) parser, which rewrites only the target
-//! field's byte span in place ([`set_field`](crate::parsers::monitors::MonitorsFile::set_field),
-//! extras-preserving) or the whole record body when (re-)enabling a monitor
-//! ([`set_state`](crate::parsers::monitors::MonitorsFile::set_state)); it rejects a
-//! comma/newline/`#` in any written value, so the record stays awk-parseable. The
-//! app never touches the script.
+//! Hyprland no longer reads `monitors.conf` itself: the monitor loader in
+//! `hyprland.lua` turns each record into an `hl.monitor({ … })` call, and
+//! `scripts/hypr-display-profile.sh` `awk`-parses the laptop panel's record (the
+//! single source for its mode and scale, analysis §6.2). Both rely on the file's
+//! **frozen grammar** `monitor=<output>,<mode>,<position>,<scale>[,<key>,<value>…]`
+//! (analysis §7.2), which the [`monitors`](crate::parsers::monitors) parser
+//! enforces as named [`GrammarRule`]s. This model applies it at three points:
+//!
+//! - **at load** — a `monitors.conf` that already breaks the grammar (a hand
+//!   edit) is logged at `warn` and makes the page **read-only**
+//!   ([`DisplayModel::records_editable`] is `false`, [`DisplayModel::records_problem`]
+//!   names the line and rule). The app never "fixes" a record it did not write,
+//!   and every write re-validates the whole file, so editing *around* a broken
+//!   line could never be applied anyway; refusing up front is the same graceful
+//!   degradation as an unreadable file (R4.4), with the reason shown;
+//! - **at stage time** — every `stage_*` call renders the edit into a copy of the
+//!   file and validates the *whole result* (the touched record, its untouched
+//!   extras, and the file-level rules), refusing the stage with a
+//!   [`StageRefusal`] naming the rule (R8.3), in addition to the per-value
+//!   validators for mode, position and scale;
+//! - **before the write** — [`DisplayModel::apply_contribution`] validates the
+//!   emitted bytes once more, and the parser's edit methods refuse any edit that
+//!   leaves a broken record, as the last line of defence.
+//!
+//! Edits go through the parser surgically: an in-place field edit
+//! ([`set_field`](crate::parsers::monitors::MonitorsFile::set_field)) keeps the
+//! record's other fields and extras byte-identical, a (re-)enable or first
+//! configure writes a whole record
+//! ([`set_record`](crate::parsers::monitors::MonitorsFile::set_record)). The app
+//! never touches either downstream script.
+//!
+//! **Disabling a non-laptop output is refused.** The only on-disk "off" form the
+//! app used to write, `monitor=<output>,disable`, is outside the grammar: the Lua
+//! loader would pass `disable` to Hyprland as a *mode*, which Hyprland rejects
+//! with a config error while leaving the output on ([`GrammarRule::DisableForm`]).
+//! So [`DisplayModel::stage_enabled`] refuses `false` with that rule named rather
+//! than write a record that does not do what it says. Enabling (writing a
+//! complete record for an output that is off) still works.
 //!
 //! # The laptop-display toggle runs the dotfiles script (R5.2; task 11.8)
 //!
@@ -88,11 +118,14 @@ use serde_json::Value as JsonValue;
 use crate::core::apply::{FileWrite, WriteMode, WriteValidation, stderr_excerpt};
 use crate::core::freshness::FreshnessTracker;
 use crate::core::model::{
-    SCALE_RANGE, SettingId, Value, validate_float_range, validate_monitor_mode,
+    SCALE_RANGE, SettingId, ValidationError, Value, validate_float_range, validate_monitor_mode,
     validate_monitor_position,
 };
 use crate::core::reload::BackingFile;
-use crate::parsers::monitors::{EditError, MonitorField, MonitorState, MonitorsFile};
+use crate::parsers::monitors::{
+    EditError, GrammarRule, GrammarViolation, MonitorField, MonitorRecord, MonitorsFile,
+    check_value,
+};
 use crate::system::command::{Command, CommandError, CommandRunner};
 
 /// The output the dotfiles' toggle script switches. `scripts/hypr-toggle-laptop-display`
@@ -179,7 +212,7 @@ struct Monitor {
     /// Whether a specific record for this output exists **and is enabled** — the
     /// condition under which an in-place [`set_field`](crate::parsers::monitors::MonitorsFile::set_field)
     /// edit applies; otherwise a full record is written with
-    /// [`set_state`](crate::parsers::monitors::MonitorsFile::set_state).
+    /// [`set_record`](crate::parsers::monitors::MonitorsFile::set_record).
     has_enabled_record: bool,
     /// The modes the compositor reports this output supports (for the drop-downs).
     available: Vec<Mode>,
@@ -224,6 +257,11 @@ pub struct DisplayModel {
     /// which case the file-backed controls are hidden but the laptop toggle still
     /// works.
     records: Option<MonitorsFile>,
+    /// The first frozen-grammar rule the loaded `monitors.conf` breaks, or `None`
+    /// when it follows the grammar (task 11.9). `Some` makes the page read-only:
+    /// staging is refused and the file-backed controls are hidden (see the module
+    /// docs for why the app does not edit around a broken record).
+    records_problem: Option<GrammarViolation>,
     /// The live XDG path of `monitors.conf`, the target of the produced [`FileWrite`]
     /// (R8.5). The writer canonicalizes it, so a symlink into a dotfiles repo has its
     /// real target rewritten and the link preserved.
@@ -260,10 +298,14 @@ pub struct DisplayModel {
 /// which stays a plain `Ok(None)`.
 #[derive(Debug)]
 pub enum DisplayWriteError {
-    /// The `monitors.conf` writer rejected an edit — a value it cannot represent
-    /// without breaking the record's positional structure, or a record shape it cannot
-    /// edit in place (e.g. a hand-written record with no scale field).
+    /// The `monitors.conf` writer rejected an edit — a value or record that would
+    /// break the frozen grammar ([`EditError::Grammar`]), or a record shape it cannot
+    /// edit in place.
     Render(EditError),
+    /// The rendered file breaks the frozen grammar (analysis §7.2) somewhere — the
+    /// whole-file re-validation of the bytes about to be written, the last line of
+    /// defence of R8.3 "validate all before any write".
+    Grammar(GrammarViolation),
 }
 
 impl fmt::Display for DisplayWriteError {
@@ -272,11 +314,103 @@ impl fmt::Display for DisplayWriteError {
             DisplayWriteError::Render(error) => {
                 write!(f, "the monitors.conf edit could not be applied: {error}")
             }
+            DisplayWriteError::Grammar(violation) => write!(
+                f,
+                "the monitors.conf edit was refused because the result would break its \
+                 frozen format at {violation}"
+            ),
         }
     }
 }
 
-impl std::error::Error for DisplayWriteError {}
+impl std::error::Error for DisplayWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DisplayWriteError::Render(error) => Some(error),
+            DisplayWriteError::Grammar(violation) => Some(violation),
+        }
+    }
+}
+
+/// Why a `stage_*` call on [`DisplayModel`] refused an edit (R8.3; task 11.9).
+///
+/// A refused edit leaves the model exactly as it was — nothing is staged, so the
+/// page's control snaps back when it re-renders — and the page shows this
+/// reason under the monitor, so the user learns which rule the value broke
+/// instead of seeing the control silently revert.
+#[derive(Debug)]
+pub enum StageRefusal {
+    /// A mode, position or scale value failed the typed settings validators
+    /// ([`validate_monitor_mode`], [`validate_monitor_position`], the
+    /// [`SCALE_RANGE`] check).
+    Value(ValidationError),
+    /// The scale is not a number at all.
+    ScaleNotANumber(String),
+    /// `monitors.conf` could not be read at load, so there is no record to edit
+    /// (R4.4).
+    RecordsUnavailable,
+    /// The loaded `monitors.conf` already breaks the frozen grammar, so the page is
+    /// read-only until the file is fixed (see the module docs).
+    FileBreaksGrammar(GrammarViolation),
+    /// The edit would produce a `monitors.conf` that breaks the frozen grammar
+    /// (analysis §7.2) — the named rule. This is the whole-record check: it covers
+    /// the record's untouched fields and the file-level rules, not only the value
+    /// that changed.
+    Grammar(GrammarRule),
+    /// The writer could not render the edit for a reason other than the grammar.
+    /// Not reachable from a grammar-clean file today (every record then has the
+    /// fields an edit addresses), kept so a refusal never panics.
+    Render(EditError),
+    /// The output is a laptop panel, whose on/off state is the runtime toggle
+    /// ([`DisplayModel::toggle_laptop`], R5.2), never a staged record edit.
+    LaptopEnablement,
+}
+
+impl fmt::Display for StageRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StageRefusal::Value(error) => write!(f, "{error}"),
+            StageRefusal::ScaleNotANumber(scale) => {
+                write!(f, "the scale `{scale}` is not a number")
+            }
+            StageRefusal::RecordsUnavailable => write!(
+                f,
+                "monitors.conf could not be read, so there is no record to edit"
+            ),
+            StageRefusal::FileBreaksGrammar(violation) => write!(
+                f,
+                "monitors.conf is read-only because it breaks its frozen format at \
+                 {violation}"
+            ),
+            StageRefusal::Grammar(rule) => {
+                write!(f, "monitors.conf format: {rule}")
+            }
+            StageRefusal::Render(error) => write!(f, "{error}"),
+            StageRefusal::LaptopEnablement => write!(
+                f,
+                "the laptop panel is switched on and off with its runtime toggle, not a \
+                 monitors.conf record"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StageRefusal {}
+
+impl From<DisplayWriteError> for StageRefusal {
+    /// A trial render's failure, as the stage refusal that names it: a grammar
+    /// rule (from either the writer's own check or the whole-file check) becomes
+    /// [`StageRefusal::Grammar`], any other writer error [`StageRefusal::Render`].
+    fn from(error: DisplayWriteError) -> Self {
+        match error {
+            DisplayWriteError::Render(EditError::Grammar(rule)) => StageRefusal::Grammar(rule),
+            DisplayWriteError::Render(error) => StageRefusal::Render(error),
+            DisplayWriteError::Grammar(violation) => {
+                StageRefusal::Grammar(violation.rule().clone())
+            }
+        }
+    }
+}
 
 /// Why [`DisplayModel::toggle_laptop`] did not leave the laptop panel in the
 /// requested state (task 11.8).
@@ -544,7 +678,20 @@ impl DisplayModel {
         monitors_conf_path: PathBuf,
         laptop_toggle_script: Option<PathBuf>,
     ) -> Self {
+        // The parser logs every grammar violation at `warn` with its line and rule;
+        // the first one decides that the page is read-only (task 11.9).
         let records = monitors_conf.map(|text| MonitorsFile::parse(text).0);
+        let records_problem = records
+            .as_ref()
+            .and_then(|file| file.grammar_violations().into_iter().next());
+        if let Some(violation) = &records_problem {
+            tracing::warn!(
+                path = %monitors_conf_path.display(),
+                %violation,
+                "monitors.conf breaks its frozen grammar; per-monitor settings are read-only \
+                 until the file is fixed (R8.3)"
+            );
+        }
         let live = parse_hyprctl_monitors(hyprctl_json);
 
         let monitors: Vec<Monitor> = live
@@ -579,6 +726,7 @@ impl DisplayModel {
         DisplayModel {
             monitors,
             records,
+            records_problem,
             monitors_conf_path,
             laptop_toggle_script,
             freshness,
@@ -591,9 +739,17 @@ impl DisplayModel {
     }
 
     /// Whether the per-monitor file-backed controls should be shown: `monitors.conf`
-    /// was readable, so edits can be written (R4.4).
+    /// was readable (R4.4) **and** follows its frozen grammar (task 11.9), so edits
+    /// can be written. When `false`, every `stage_*` call is refused.
     pub fn records_editable(&self) -> bool {
-        self.records.is_some()
+        self.records.is_some() && self.records_problem.is_none()
+    }
+
+    /// The first frozen-grammar rule the loaded `monitors.conf` breaks — the reason
+    /// the page is read-only, for the page to show — or `None` when the file follows
+    /// the grammar or could not be read at all.
+    pub fn records_problem(&self) -> Option<&GrammarViolation> {
+        self.records_problem.as_ref()
     }
 
     /// The live output name of monitor `index` (e.g. `eDP-1`).
@@ -736,7 +892,14 @@ impl DisplayModel {
     /// Stages a new resolution for monitor `index`, composing it with a refresh rate
     /// valid for that resolution (keeping the current one when still available, else
     /// the first the compositor reports) into the mode field.
-    pub fn stage_resolution(&mut self, index: usize, resolution: String) {
+    ///
+    /// Refused (nothing staged) when the composed mode is malformed or the resulting
+    /// `monitors.conf` would break its frozen grammar (R8.3; see [`StageRefusal`]).
+    pub fn stage_resolution(
+        &mut self,
+        index: usize,
+        resolution: String,
+    ) -> Result<(), StageRefusal> {
         let refresh = {
             let current = self.effective_refresh(index);
             let available = self.refresh_options_for(index, &resolution);
@@ -745,32 +908,34 @@ impl DisplayModel {
                 _ => available.into_iter().next(),
             }
         };
-        self.stage_mode(index, compose_mode(&resolution, refresh.as_deref()));
+        self.stage_mode(index, compose_mode(&resolution, refresh.as_deref()))
     }
 
     /// Stages a new refresh rate for monitor `index`, keeping its current resolution.
-    pub fn stage_refresh(&mut self, index: usize, refresh: String) {
+    /// Refused like [`Self::stage_resolution`].
+    pub fn stage_refresh(&mut self, index: usize, refresh: String) -> Result<(), StageRefusal> {
         let resolution = self.effective_resolution(index);
-        self.stage_mode(index, compose_mode(&resolution, Some(&refresh)));
+        self.stage_mode(index, compose_mode(&resolution, Some(&refresh)))
     }
 
-    /// Stages a new scale for monitor `index`, rejecting a value outside the plausible
-    /// range (R8.3) so the drop-down snaps back rather than writing a broken scale.
-    pub fn stage_scale(&mut self, index: usize, scale: String) {
-        match scale.parse::<f64>() {
-            Ok(value) if validate_float_range(value, &SCALE_RANGE).is_ok() => {}
-            _ => {
-                tracing::warn!(scale = %scale, "rejecting an out-of-range monitor scale (R8.3)");
-                return;
-            }
-        }
-        self.ensure_staged(index).scale = scale;
-        self.clear_if_unchanged(index);
+    /// Stages a new scale for monitor `index`, refusing a value that is not a number or
+    /// lies outside the plausible range (R8.3), or whose record would break the frozen
+    /// grammar, so the drop-down snaps back rather than writing a broken scale.
+    pub fn stage_scale(&mut self, index: usize, scale: String) -> Result<(), StageRefusal> {
+        let valid = check_value(&scale)
+            .map_err(StageRefusal::Grammar)
+            .and_then(|()| {
+                let value = scale
+                    .parse::<f64>()
+                    .map_err(|_| StageRefusal::ScaleNotANumber(scale.clone()))?;
+                validate_float_range(value, &SCALE_RANGE).map_err(StageRefusal::Value)
+            });
+        self.stage_checked(index, valid, |config| config.scale = scale)
     }
 
-    /// Stages a new position for monitor `index`, rejecting a malformed position (R8.3)
-    /// so the drop-down snaps back rather than writing a record neither Hyprland nor
-    /// `scripts/hypr-display-profile.sh`'s awk could parse.
+    /// Stages a new position for monitor `index`, refusing a malformed position (R8.3)
+    /// so the drop-down snaps back rather than writing a record neither
+    /// `hyprland.lua`'s loader nor `scripts/hypr-display-profile.sh`'s awk could parse.
     ///
     /// The check is here, in the model, rather than being left to the curated
     /// [`Self::position_options`] drop-down that feeds it today: the model is the
@@ -778,47 +943,113 @@ impl DisplayModel {
     /// up from a hand-edited `monitors.conf` — cannot bypass it. See
     /// [`validate_monitor_position`] for what a position may look like and why a comma
     /// or `#` in one would break the record.
-    pub fn stage_position(&mut self, index: usize, position: String) {
-        if validate_monitor_position(&position).is_err() {
-            tracing::warn!(position = %position, "rejecting a malformed monitor position (R8.3)");
-            return;
-        }
-        self.ensure_staged(index).position = position;
-        self.clear_if_unchanged(index);
+    pub fn stage_position(&mut self, index: usize, position: String) -> Result<(), StageRefusal> {
+        let valid = check_value(&position)
+            .map_err(StageRefusal::Grammar)
+            .and_then(|()| validate_monitor_position(&position).map_err(StageRefusal::Value));
+        self.stage_checked(index, valid, |config| config.position = position)
     }
 
     /// Stages an enable/disable edit for a **non-laptop** monitor `index` (a staged
-    /// `monitors.conf` change). A laptop panel must use [`Self::toggle_laptop`]
-    /// instead; calling this for one is a no-op guarded by a debug assertion.
-    pub fn stage_enabled(&mut self, index: usize, enabled: bool) {
-        debug_assert!(
-            !self.monitors[index].is_laptop,
-            "a laptop panel's enablement is runtime-only (R5.2); use toggle_laptop"
-        );
-        if self.monitors[index].is_laptop {
-            return;
-        }
-        self.ensure_staged(index).enabled = enabled;
-        self.clear_if_unchanged(index);
+    /// `monitors.conf` change).
+    ///
+    /// Refused for a laptop panel, whose on/off state is the runtime toggle
+    /// ([`Self::toggle_laptop`], R5.2). Disabling is refused with
+    /// [`GrammarRule::DisableForm`] named: the frozen grammar has no record form that
+    /// turns an output off (the legacy `<output>,disable` record would leave it on
+    /// under `hyprland.lua`'s loader — see the module docs). Enabling an output that is
+    /// off writes a complete record and stages normally.
+    pub fn stage_enabled(&mut self, index: usize, enabled: bool) -> Result<(), StageRefusal> {
+        let valid = if self.monitors[index].is_laptop {
+            Err(StageRefusal::LaptopEnablement)
+        } else {
+            Ok(())
+        };
+        self.stage_checked(index, valid, |config| config.enabled = enabled)
     }
 
-    /// Stages the mode field for monitor `index`, rejecting a malformed mode (R8.3).
-    fn stage_mode(&mut self, index: usize, mode: String) {
-        if validate_monitor_mode(&mode).is_err() {
-            tracing::warn!(mode = %mode, "rejecting a malformed monitor mode (R8.3)");
-            return;
-        }
-        self.ensure_staged(index).mode = mode;
-        self.clear_if_unchanged(index);
+    /// Stages the mode field for monitor `index`, refusing a malformed mode (R8.3).
+    ///
+    /// Like every `stage_*` value, the raw mode is first checked for a character the
+    /// frozen grammar cannot carry ([`check_value`]), so a value such as
+    /// `1920x1080@60,bitdepth` — which would insert a `bitdepth` key without a value —
+    /// is refused naming that grammar rule rather than a generic format error.
+    fn stage_mode(&mut self, index: usize, mode: String) -> Result<(), StageRefusal> {
+        let valid = check_value(&mode)
+            .map_err(StageRefusal::Grammar)
+            .and_then(|()| validate_monitor_mode(&mode).map_err(StageRefusal::Value));
+        self.stage_checked(index, valid, |config| config.mode = mode)
     }
 
-    /// Returns a mutable reference to monitor `index`'s staged config, initialising it
-    /// from the original on first edit.
-    fn ensure_staged(&mut self, index: usize) -> &mut MonitorConfig {
+    /// The shared tail of every `stage_*` call: when the caller's value checks
+    /// (`valid`) passed, applies `edit` to a copy of monitor `index`'s effective config
+    /// and stages it only when the whole resulting `monitors.conf` follows the frozen
+    /// grammar (task 11.9, R8.3).
+    ///
+    /// The check is a trial render of every pending edit — this one included — into a
+    /// copy of the parsed file, followed by the same whole-file validation
+    /// [`Self::apply_contribution`] runs before writing. Validating the rendered file
+    /// rather than the changed value is what makes it a whole-record check: the
+    /// record's untouched fields and extras, and the file-level rules (one record per
+    /// laptop-panel key, the catch-all first), are covered too. An edit back to the
+    /// original needs no check — it unstages. A refused edit — by the value checks or
+    /// the render — leaves the model unchanged and is logged at `warn`.
+    fn stage_checked(
+        &mut self,
+        index: usize,
+        valid: Result<(), StageRefusal>,
+        edit: impl FnOnce(&mut MonitorConfig),
+    ) -> Result<(), StageRefusal> {
+        let result = valid.and_then(|()| self.try_stage(index, edit));
+        if let Err(refusal) = &result {
+            tracing::warn!(
+                output = %self.monitors[index].output_name,
+                %refusal,
+                "refusing a monitor edit (R8.3)"
+            );
+        }
+        result
+    }
+
+    /// Stages `scale` for monitor `index` **without any check**, for tests of the
+    /// writer's last line of defence (R8.3, task 11.9).
+    ///
+    /// Every real `stage_*` call trial-renders its edit, so a staged state the writer
+    /// refuses cannot be reached through them; this seam lets an integration test
+    /// craft one and prove [`Self::apply_contribution`] still refuses it before any
+    /// write. Compiled only for tests and the `testing` feature.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn stage_scale_unchecked_for_tests(&mut self, index: usize, scale: &str) {
         let monitor = &mut self.monitors[index];
-        monitor
-            .staged
-            .get_or_insert_with(|| monitor.original.clone())
+        let mut staged = monitor.effective().clone();
+        staged.scale = scale.to_string();
+        monitor.staged = Some(staged);
+    }
+
+    /// [`Self::stage_checked`] without the logging.
+    fn try_stage(
+        &mut self,
+        index: usize,
+        edit: impl FnOnce(&mut MonitorConfig),
+    ) -> Result<(), StageRefusal> {
+        if let Some(violation) = &self.records_problem {
+            return Err(StageRefusal::FileBreaksGrammar(violation.clone()));
+        }
+        let Some(records) = &self.records else {
+            return Err(StageRefusal::RecordsUnavailable);
+        };
+
+        let mut candidate = self.monitors[index].effective().clone();
+        edit(&mut candidate);
+        if candidate != self.monitors[index].original {
+            let mut monitors = self.monitors.clone();
+            monitors[index].staged = Some(candidate.clone());
+            render_checked(&mut records.clone(), &monitors)?;
+        }
+
+        self.monitors[index].staged = Some(candidate);
+        self.clear_if_unchanged(index);
+        Ok(())
     }
 
     /// Drops monitor `index`'s staged config when it has been edited back to equal the
@@ -872,7 +1103,8 @@ impl DisplayModel {
     ///
     /// It clones the parsed file, applies each dirty monitor's edits through the
     /// surgical [`monitors`](crate::parsers::monitors) parser (so only the targeted
-    /// records change and stay awk-parseable), and emits the complete new bytes as a
+    /// records change), re-validates the whole result against the frozen grammar (the
+    /// last line of defence of R8.3, task 11.9), and emits the complete new bytes as a
     /// [`FileWrite`] for the shared pipeline, alongside the value validations (R8.3).
     ///
     /// Returns:
@@ -885,8 +1117,9 @@ impl DisplayModel {
     ///   cannot be produced. The caller must **abort the Apply** in this case rather
     ///   than skip the write, since [`Self::commit`] would otherwise promote the staged
     ///   monitor values and re-baseline the file's freshness against bytes that were
-    ///   never written (see [`DisplayWriteError`]). Near-unreachable in practice: staged
-    ///   values are validated (R8.3), so this needs an unusual on-disk record shape.
+    ///   never written (see [`DisplayWriteError`]). Near-unreachable in practice: every
+    ///   stage already passed the same render and grammar check (R8.3), so this needs a
+    ///   staged state that bypassed the `stage_*` methods.
     pub fn apply_contribution(&self) -> Result<Option<DisplayApply>, DisplayWriteError> {
         if !self.is_dirty() {
             return Ok(None);
@@ -894,19 +1127,19 @@ impl DisplayModel {
         let Some(mut file) = self.records.clone() else {
             return Ok(None);
         };
-        let changed_keys = apply_edits(&mut file, &self.monitors).map_err(|error| {
-            tracing::error!(%error, "failed to render a monitors.conf edit; aborting the apply (R8.3)");
-            DisplayWriteError::Render(error)
+        let changed_keys = render_checked(&mut file, &self.monitors).inspect_err(|error| {
+            tracing::error!(%error, "refusing to write monitors.conf; aborting the apply (R8.3)");
         })?;
-        // A dirty monitor does not always render an edit: if its record is in the
-        // `,disable` form on disk, the staged and original `enabled` flags are both
-        // false and `apply_edits` writes no field (see its `else if staged.enabled`
-        // guard), so a staged mode/scale edit on such an output leaves `changed_keys`
-        // empty. That is reachable through this model's API — the Display page hides the
-        // mode/scale rows of a disabled output, so it cannot happen from the UI today.
-        // `Ok(None)` is the right answer: nothing is written, so the window commits
-        // nothing and the staged edit simply stays pending (no desync), which is
-        // preferable to emitting a byte-identical no-op write.
+        // A dirty monitor does not always render an edit. A `,disable` record on disk
+        // makes the page read-only, so the remaining case is an output that is off with
+        // no specific record (only the catch-all configures it): the staged and original
+        // `enabled` flags are both false and `apply_edits` writes nothing for it (see its
+        // `else if staged.enabled` guard), so a staged mode/scale edit on such an output
+        // leaves `changed_keys` empty. That is reachable through this model's API — the
+        // Display page hides the mode/scale rows of a disabled output, so it cannot
+        // happen from the UI today. `Ok(None)` is the right answer: nothing is written,
+        // so the window commits nothing and the staged edit simply stays pending (no
+        // desync), which is preferable to emitting a byte-identical no-op write.
         if changed_keys.is_empty() {
             return Ok(None);
         }
@@ -1171,9 +1404,10 @@ fn run_toggle_script(runner: &dyn CommandRunner, program: &str) -> Result<(), To
 ///
 /// An in-place field edit ([`MonitorField`]) preserves trailing extras such as
 /// `bitdepth,10`; a (re-)enable or a first-time configure writes the whole record body
-/// with [`MonitorState::Active`]; a disable collapses it to the disable form. A laptop
-/// panel's enablement is never staged (it is runtime-only), so this never writes a
-/// disable record for it.
+/// with [`MonitorsFile::set_record`]. A staged disable is refused with
+/// [`GrammarRule::DisableForm`]: the frozen grammar has no form that turns an output
+/// off (see the module docs), so there is nothing valid to write. A laptop panel's
+/// enablement is never staged (it is runtime-only) and never reaches this.
 fn apply_edits(file: &mut MonitorsFile, monitors: &[Monitor]) -> Result<Vec<String>, EditError> {
     let mut changed = Vec::new();
     for monitor in monitors {
@@ -1186,13 +1420,11 @@ fn apply_edits(file: &mut MonitorsFile, monitors: &[Monitor]) -> Result<Vec<Stri
         let name = monitor.address();
 
         if staged.enabled != monitor.original.enabled {
-            if staged.enabled {
-                file.set_state(name, &active_state(staged))?;
-                changed.push(format!("monitor {} enabled", monitor.output_name));
-            } else {
-                file.set_state(name, &MonitorState::Disabled)?;
-                changed.push(format!("monitor {} disabled", monitor.output_name));
+            if !staged.enabled {
+                return Err(EditError::Grammar(GrammarRule::DisableForm));
             }
+            file.set_record(name, &active_record(staged))?;
+            changed.push(format!("monitor {} enabled", monitor.output_name));
         } else if staged.enabled {
             if monitor.has_enabled_record {
                 // In-place field edits preserve the leading `monitor=<name>` token,
@@ -1212,7 +1444,7 @@ fn apply_edits(file: &mut MonitorsFile, monitors: &[Monitor]) -> Result<Vec<Stri
             } else {
                 // No enabled record yet (catch-all configured, or none): write a full
                 // specific record so this output wins later-rule precedence.
-                file.set_state(name, &active_state(staged))?;
+                file.set_record(name, &active_record(staged))?;
                 changed.push(format!("monitor {} configured", monitor.output_name));
             }
         }
@@ -1220,13 +1452,34 @@ fn apply_edits(file: &mut MonitorsFile, monitors: &[Monitor]) -> Result<Vec<Stri
     Ok(changed)
 }
 
-/// The [`MonitorState::Active`] form of a config, sourcing mode/position/scale from
-/// the (staged) values — used when (re-)enabling or first-configuring an output.
-fn active_state(config: &MonitorConfig) -> MonitorState {
-    MonitorState::Active {
+/// The [`MonitorRecord`] of a config, sourcing mode/position/scale from the (staged)
+/// values — used when (re-)enabling or first-configuring an output.
+fn active_record(config: &MonitorConfig) -> MonitorRecord {
+    MonitorRecord {
         mode: config.mode.clone(),
         position: config.position.clone(),
         scale: config.scale.clone(),
+    }
+}
+
+/// Renders every staged edit of `monitors` into `file` ([`apply_edits`]) and then
+/// validates the **whole** result against the frozen grammar, returning the changed
+/// keys only when both succeed (task 11.9, R8.3).
+///
+/// The parser's edit methods already refuse a record they would break, but only by
+/// the rules located on the edited line; this whole-file pass is what guarantees the
+/// bytes handed to the writer are readable by both downstream parsers, whatever
+/// combination of edits produced them. Shared by the stage-time trial render
+/// ([`DisplayModel::stage_checked`]) and [`DisplayModel::apply_contribution`], so a
+/// stage that was accepted always renders at Apply.
+fn render_checked(
+    file: &mut MonitorsFile,
+    monitors: &[Monitor],
+) -> Result<Vec<String>, DisplayWriteError> {
+    let changed = apply_edits(file, monitors).map_err(DisplayWriteError::Render)?;
+    match file.grammar_violations().into_iter().next() {
+        Some(violation) => Err(DisplayWriteError::Grammar(violation)),
+        None => Ok(changed),
     }
 }
 
@@ -1346,11 +1599,9 @@ fn merge_monitor(live: LiveMonitor, records: Option<&MonitorsFile>) -> Monitor {
     // A laptop panel's enablement is the runtime toggle, not a staged record edit, so
     // its *config* enabled flag always reads as enabled and is never staged — this
     // assumes the eDP `monitor=` record is kept in active form (the single-source
-    // invariant, analysis §6.2). If that record were instead in `,disable` form,
-    // `has_enabled_record` would be false and a mode/scale edit would re-activate the
-    // record in `monitors.conf` via `set_state` (see `apply_edits`); that is the
-    // intended, if unusual, behaviour, not a bug. A non-laptop output follows its
-    // record, falling back to the live `disabled` flag when no record configures it.
+    // invariant, analysis §6.2; a `,disable` record breaks the frozen grammar and
+    // makes the page read-only). A non-laptop output follows its record, falling back
+    // to the live `disabled` flag when no record configures it.
     let enabled = if is_laptop {
         true
     } else {
@@ -1605,8 +1856,12 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             !model.records_editable(),
             "an unreadable monitors.conf hides the file-backed rows (R4.4)"
         );
-        // Even a staged edit produces no write when there is no file to edit.
-        model.stage_scale(0, "1.5".to_string());
+        // An edit is refused — there is no record to edit — and produces no write.
+        assert!(matches!(
+            model.stage_scale(0, "1.5".to_string()),
+            Err(StageRefusal::RecordsUnavailable)
+        ));
+        assert!(!model.is_dirty());
         assert!(matches!(model.apply_contribution(), Ok(None)));
     }
 
@@ -1619,7 +1874,9 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         let dir = tempfile::tempdir().expect("temp dir");
         let mut model = laptop_model(dir.path());
 
-        model.stage_scale(0, "1.25".to_string());
+        model
+            .stage_scale(0, "1.25".to_string())
+            .expect("the edit stages");
         assert!(model.is_dirty());
 
         let contribution = rendered_contribution(&model);
@@ -1676,7 +1933,9 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         let mut model =
             DisplayModel::from_sources(Some(conf), hyprctl, dir.path().join("monitors.conf"), None);
 
-        model.stage_resolution(0, "1920x1200".to_string());
+        model
+            .stage_resolution(0, "1920x1200".to_string())
+            .expect("the edit stages");
         let emitted = rendered_text(&model);
         assert_eq!(
             emitted, "monitor=eDP-1,1920x1200@60,auto,1.333333,bitdepth,10\n",
@@ -1690,9 +1949,13 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         // not dirty (mirrors the store).
         let dir = tempfile::tempdir().expect("temp dir");
         let mut model = laptop_model(dir.path());
-        model.stage_scale(0, "1.25".to_string());
+        model
+            .stage_scale(0, "1.25".to_string())
+            .expect("the edit stages");
         assert!(model.is_dirty());
-        model.stage_scale(0, "1.066667".to_string());
+        model
+            .stage_scale(0, "1.066667".to_string())
+            .expect("the edit stages");
         assert!(
             !model.is_dirty(),
             "editing back to the original clears dirty"
@@ -1704,7 +1967,9 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     fn reset_discards_staged_edits() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut model = laptop_model(dir.path());
-        model.stage_scale(0, "1.5".to_string());
+        model
+            .stage_scale(0, "1.5".to_string())
+            .expect("the edit stages");
         assert!(model.is_dirty());
         model.reset();
         assert!(!model.is_dirty());
@@ -1717,7 +1982,9 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         // keeps the in-memory records in step, so a further edit builds on it.
         let dir = tempfile::tempdir().expect("temp dir");
         let mut model = laptop_model(dir.path());
-        model.stage_scale(0, "1.5".to_string());
+        model
+            .stage_scale(0, "1.5".to_string())
+            .expect("the edit stages");
         model.commit();
         assert!(!model.is_dirty(), "commit clears dirty");
         assert_eq!(
@@ -1728,7 +1995,9 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
 
         // A subsequent write renders from the committed records: only the scale differs
         // from the committed state.
-        model.stage_position(0, "0x0".to_string());
+        model
+            .stage_position(0, "0x0".to_string())
+            .expect("the edit stages");
         let emitted = rendered_text(&model);
         assert!(emitted.contains("monitor=desc:AU Optronics 0x2036,2560x1440,0x0,1.5"));
     }
@@ -1738,8 +2007,16 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         // R8.3: an implausible scale is refused on stage, so it never reaches a write.
         let dir = tempfile::tempdir().expect("temp dir");
         let mut model = laptop_model(dir.path());
-        model.stage_scale(0, "9".to_string());
+        assert!(matches!(
+            model.stage_scale(0, "9".to_string()),
+            Err(StageRefusal::Value(ValidationError::OutOfRange { .. }))
+        ));
         assert!(!model.is_dirty(), "an out-of-range scale must not stage");
+        assert!(matches!(
+            model.stage_scale(0, "large".to_string()),
+            Err(StageRefusal::ScaleNotANumber(_))
+        ));
+        assert!(!model.is_dirty(), "a non-numeric scale must not stage");
     }
 
     #[test]
@@ -1752,16 +2029,36 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         let mut model = laptop_model(dir.path());
 
         for malformed in [
-            // A comma would add a positional field and desync the awk parse in
-            // scripts/hypr-display-profile.sh (analysis §6.2).
+            // A comma would add a positional field and shift the fields both downstream
+            // parsers read (analysis §7.2): refused by the frozen grammar, named as such.
             "1920,0",
-            // A `#` would turn the rest of the record into a hyprlang inline comment.
+            // A `#` would start a comment that both parsers strip: the grammar again.
             "0x0 # here",
+            // The rest are well-formed for the grammar but not positions.
             "left",
             "1920",
             "1920.5x0",
         ] {
-            model.stage_position(0, malformed.to_string());
+            let refusal = model
+                .stage_position(0, malformed.to_string())
+                .expect_err("a malformed position is refused");
+            if malformed.contains([',', '#']) {
+                assert!(
+                    matches!(
+                        refusal,
+                        StageRefusal::Grammar(GrammarRule::ForbiddenCharacter { .. })
+                    ),
+                    "`{malformed}` is refused by the grammar: {refusal:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        refusal,
+                        StageRefusal::Value(ValidationError::InvalidMonitorPosition { .. })
+                    ),
+                    "`{malformed}` is refused by the position validator: {refusal:?}"
+                );
+            }
             assert!(
                 !model.is_dirty(),
                 "`{malformed}` must not stage as a position"
@@ -1774,7 +2071,9 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         }
 
         // A well-formed coordinate pair still stages, and reaches the record.
-        model.stage_position(0, "-1920x0".to_string());
+        model
+            .stage_position(0, "-1920x0".to_string())
+            .expect("the edit stages");
         assert!(model.is_dirty());
         assert!(
             rendered_text(&model)
@@ -1807,7 +2106,9 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             "the empty position field is read as an empty value"
         );
 
-        model.stage_scale(0, "1.25".to_string());
+        model
+            .stage_scale(0, "1.25".to_string())
+            .expect("the edit stages");
         let contribution = rendered_contribution(&model);
         // The scale edit itself renders (the record has a scale field to rewrite)…
         assert!(
@@ -1828,46 +2129,118 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         );
     }
 
+    /// A one-output `hyprctl monitors all -j` reply for an external `DP-1`.
+    const HYPRCTL_EXTERNAL: &str = r#"[{"name":"DP-1","description":"Ext","width":1920,"height":1080,"refreshRate":60.0,"x":0,"y":0,"scale":1.0,"disabled":false,"availableModes":["1920x1080@60.00Hz"]}]"#;
+
     #[test]
     fn a_render_failure_aborts_the_apply_and_keeps_the_staged_edit() {
         // Task 9.5: when the writer cannot render a dirty edit, the contribution is an
         // Err — not an `Ok(None)` the window would read as "nothing to write" and follow
         // with a commit, promoting values that reached no file (R8.3).
         //
-        // The injected failure is a hand-written record with only a name and a mode: it
-        // is enabled (so edits go through the surgical in-place `set_field` path) but has
-        // no scale field to rewrite, which the monitors parser reports as an edit error.
+        // Every `stage_*` call already trial-renders its edit (task 11.9), so the failure
+        // is injected by crafting the staged state directly, bypassing them: a staged
+        // disable, which the writer refuses because the frozen grammar has no record
+        // form that turns an output off.
         let dir = tempfile::tempdir().expect("temp dir");
-        let conf = "monitor=DP-1,1920x1080\n";
-        let hyprctl = r#"[{"name":"DP-1","description":"Ext","width":1920,"height":1080,"refreshRate":60.0,"x":0,"y":0,"scale":1.0,"disabled":false,"availableModes":["1920x1080@60.00Hz"]}]"#;
-        let mut model =
-            DisplayModel::from_sources(Some(conf), hyprctl, dir.path().join("monitors.conf"), None);
-
-        model.stage_scale(0, "1.25".to_string());
+        let conf = "monitor=,preferred,auto,1\nmonitor=DP-1,1920x1080@60,0x0,1\n";
+        let mut model = DisplayModel::from_sources(
+            Some(conf),
+            HYPRCTL_EXTERNAL,
+            dir.path().join("monitors.conf"),
+            None,
+        );
+        let mut crafted = model.monitors[0].original.clone();
+        crafted.enabled = false;
+        model.monitors[0].staged = Some(crafted);
         assert!(model.is_dirty());
 
         let error = model
             .apply_contribution()
             .expect_err("an unrenderable edit must abort the apply, not look like a no-op");
         assert!(
-            matches!(error, DisplayWriteError::Render(_)),
-            "the failure is a writer rejection, reported as such: {error}"
+            matches!(
+                error,
+                DisplayWriteError::Render(EditError::Grammar(GrammarRule::DisableForm))
+            ),
+            "the failure is a writer rejection naming the rule: {error}"
         );
 
-        // The staged edit survives the aborted Apply, so the user can fix the record and
-        // try again.
+        // The staged edit survives the aborted Apply, so the user can change it and try
+        // again.
         assert!(model.is_dirty(), "the staged edit must be retained");
-        assert_eq!(model.effective_scale(0), "1.25");
+        assert!(!model.effective_enabled(0));
         // Nothing was promoted: dropping the staged edit restores the on-disk baseline,
         // proving the model was never re-baselined against unwritten bytes.
         model.reset();
-        assert_eq!(model.effective_scale(0), "1");
+        assert!(model.effective_enabled(0));
     }
 
     #[test]
-    fn disabling_a_non_laptop_monitor_writes_the_disable_form() {
-        // A non-laptop output's enable switch stages a monitors.conf edit. Disabling it
-        // collapses its record to the disable form.
+    fn the_writer_refuses_a_crafted_record_as_the_last_line_of_defence() {
+        // R8.3 "validate all before any write": whatever reached the staged state, the
+        // bytes handed to the writer are checked once more. Both injections bypass the
+        // `stage_*` methods.
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        // (a) A value with a comma — it would insert a `bitdepth` key without a value
+        // into the record — is refused by the parser's own value check.
+        let conf = "monitor=,preferred,auto,1\nmonitor=DP-1,1920x1080@60,0x0,1\n";
+        let mut model = DisplayModel::from_sources(
+            Some(conf),
+            HYPRCTL_EXTERNAL,
+            dir.path().join("monitors.conf"),
+            None,
+        );
+        let mut crafted = model.monitors[0].original.clone();
+        crafted.scale = "1.25,bitdepth".to_string();
+        model.monitors[0].staged = Some(crafted);
+        assert!(matches!(
+            model.apply_contribution(),
+            Err(DisplayWriteError::Render(EditError::Grammar(
+                GrammarRule::ForbiddenCharacter { character: ',' }
+            )))
+        ));
+
+        // (b) A file-level rule broken on a line the edit never touches (a catch-all
+        // after a specific rule) is caught by the whole-file pass, which the parser's
+        // per-line check alone would miss. Such a file loads read-only, so the staged
+        // edit can only be crafted.
+        let conf = "monitor=DP-1,1920x1080@60,0x0,1\nmonitor=,preferred,auto,1\n";
+        let mut model = DisplayModel::from_sources(
+            Some(conf),
+            HYPRCTL_EXTERNAL,
+            dir.path().join("monitors.conf"),
+            None,
+        );
+        let mut crafted = model.monitors[0].original.clone();
+        crafted.scale = "1.25".to_string();
+        model.monitors[0].staged = Some(crafted);
+        let error = model
+            .apply_contribution()
+            .expect_err("the whole-file check refuses the write");
+        match &error {
+            DisplayWriteError::Grammar(violation) => {
+                assert_eq!(violation.line(), 2);
+                assert_eq!(
+                    violation.rule(),
+                    &GrammarRule::CatchAllNotFirst {
+                        first_record_line: 1
+                    }
+                );
+            }
+            other => panic!("expected the whole-file grammar refusal, got {other:?}"),
+        }
+        assert!(error.to_string().contains("monitors.conf"), "{error}");
+    }
+
+    #[test]
+    fn disabling_a_non_laptop_monitor_is_refused_with_the_rule_named() {
+        // A non-laptop output's enable switch stages a monitors.conf edit, but the frozen
+        // grammar has no record form that turns an output off: the legacy
+        // `<output>,disable` record would reach Hyprland through hyprland.lua's loader as
+        // `mode = "disable"`, which Hyprland rejects while leaving the output on. The
+        // stage is refused, naming that rule, and nothing becomes dirty.
         let dir = tempfile::tempdir().expect("temp dir");
         let hyprctl = r#"[{"name":"DP-1","description":"Lenovo Group Limited P24q-10 U4P00001","width":2560,"height":1440,"refreshRate":60.0,"x":0,"y":0,"scale":1.0,"disabled":false,"availableModes":["2560x1440@60.00Hz"]}]"#;
         let mut model = DisplayModel::from_sources(
@@ -1879,11 +2252,188 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         assert!(!model.is_laptop(0));
         assert!(model.effective_enabled(0));
 
-        model.stage_enabled(0, false);
-        let emitted = rendered_text(&model);
+        let refusal = model
+            .stage_enabled(0, false)
+            .expect_err("a disable has no valid record form");
         assert!(
-            emitted.contains("monitor=desc:Lenovo Group Limited P24q-10 U4P00001,disable"),
-            "the external monitor's record collapses to the disable form:\n{emitted}"
+            matches!(refusal, StageRefusal::Grammar(GrammarRule::DisableForm)),
+            "{refusal:?}"
+        );
+        assert!(
+            refusal.to_string().contains("`<output>,disable`"),
+            "the refusal names the rule: {refusal}"
+        );
+        assert!(!model.is_dirty());
+        assert!(model.effective_enabled(0));
+    }
+
+    #[test]
+    fn a_value_that_would_insert_a_key_without_a_value_is_refused_naming_the_rule() {
+        // Acceptance (task 11.9): an edit that would insert `bitdepth` without a value
+        // is refused at stage time with the grammar rule named — the comma is caught
+        // before the scale/mode validators, so the user reads which rule was broken.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut model = laptop_model(dir.path());
+
+        let refusal = model
+            .stage_scale(0, "1.25,bitdepth".to_string())
+            .expect_err("a scale with a comma is refused");
+        assert!(
+            matches!(
+                refusal,
+                StageRefusal::Grammar(GrammarRule::ForbiddenCharacter { character: ',' })
+            ),
+            "{refusal:?}"
+        );
+        assert!(
+            refusal.to_string().contains("`,`"),
+            "the message names the rule: {refusal}"
+        );
+        assert!(
+            model
+                .stage_refresh(0, "60,bitdepth".to_string())
+                .is_err_and(|refusal| matches!(
+                    refusal,
+                    StageRefusal::Grammar(GrammarRule::ForbiddenCharacter { character: ',' })
+                ))
+        );
+        assert!(!model.is_dirty(), "nothing was staged");
+    }
+
+    #[test]
+    fn a_refused_stage_is_logged_at_warn_and_keeps_an_earlier_staged_edit() {
+        // A refusal leaves the model exactly as it was: an edit staged before it
+        // survives, and the refusal is in the journal.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut model = laptop_model(dir.path());
+        model
+            .stage_scale(0, "1.25".to_string())
+            .expect("the edit stages");
+
+        let events = crate::testing::capture_logs(|| {
+            let _ = model.stage_position(0, "0,0".to_string());
+        });
+        let warning = events
+            .iter()
+            .find(|event| event.message == "refusing a monitor edit (R8.3)")
+            .expect("the refusal is logged");
+        assert_eq!(warning.level, tracing::Level::WARN);
+        assert!(warning.fields.contains("eDP-1"), "{}", warning.fields);
+
+        assert_eq!(model.effective_scale(0), "1.25");
+        assert_eq!(model.effective_position(0), "auto");
+    }
+
+    #[test]
+    fn staging_on_a_laptop_panel_enablement_is_refused() {
+        // The laptop panel's on/off state is the runtime toggle (R5.2), never a record.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut model = laptop_model(dir.path());
+        assert!(matches!(
+            model.stage_enabled(0, false),
+            Err(StageRefusal::LaptopEnablement)
+        ));
+        assert!(!model.is_dirty());
+    }
+
+    #[test]
+    fn an_output_token_with_a_comma_is_refused_at_stage_time() {
+        // A first configure appends a record keyed on the output's name, written
+        // verbatim, so the token is checked like every value. Here it is a `desc:`
+        // string carrying a comma, which would split into an extra field and shift
+        // mode, position and scale. hyprctl never reports such a name, but the model
+        // may not rely on that: the stage is refused, naming the rule.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let hyprctl = r#"[{"name":"desc:Example Corp, Inc 0x0001","description":"Ext","width":1920,"height":1080,"refreshRate":60.0,"x":0,"y":0,"scale":1.0,"disabled":false,"availableModes":["1920x1080@60.00Hz"]}]"#;
+        let mut model = DisplayModel::from_sources(
+            Some("monitor=,preferred,auto,1\n"),
+            hyprctl,
+            dir.path().join("monitors.conf"),
+            None,
+        );
+        let refusal = model
+            .stage_scale(0, "1.25".to_string())
+            .expect_err("the appended record would break the grammar");
+        assert!(
+            matches!(
+                refusal,
+                StageRefusal::Grammar(GrammarRule::ForbiddenCharacter { character: ',' })
+            ),
+            "{refusal:?}"
+        );
+        assert!(!model.is_dirty());
+    }
+
+    #[test]
+    fn a_hand_edited_record_breaking_the_grammar_makes_the_page_read_only() {
+        // The hand-edited invalid record decision (task 11.9): an eDP record with a
+        // `bitdepth` key but no value breaks the frozen grammar, so the file loads
+        // read-only — logged at `warn` with the line and the rule — and every edit is
+        // refused naming them, rather than editing around a record the app would never
+        // write. The runtime laptop toggle is unaffected.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conf =
+            "monitor=,preferred,auto,1\nmonitor=eDP-1,2880x1800@120,auto,1.333333,bitdepth\n";
+        let hyprctl = HYPRCTL_LAPTOP.replace("AU Optronics 0x2036", "Internal Panel");
+        let mut model = None;
+        let events = crate::testing::capture_logs(|| {
+            model = Some(DisplayModel::from_sources(
+                Some(conf),
+                &hyprctl,
+                dir.path().join("monitors.conf"),
+                Some(PathBuf::from(TOGGLE_SCRIPT)),
+            ));
+        });
+        let mut model = model.expect("the model was built");
+
+        let read_only = events
+            .iter()
+            .find(|event| event.message.contains("per-monitor settings are read-only"))
+            .expect("the read-only decision is logged");
+        assert_eq!(read_only.level, tracing::Level::WARN);
+        assert!(read_only.fields.contains("line 2"), "{}", read_only.fields);
+        assert!(
+            read_only.fields.contains("key,value"),
+            "{}",
+            read_only.fields
+        );
+
+        assert!(!model.records_editable());
+        let problem = model.records_problem().expect("the violation is reported");
+        assert_eq!(problem.line(), 2);
+        assert_eq!(problem.rule(), &GrammarRule::IncompleteExtra);
+        assert!(model.laptop_toggle_available(0), "the runtime toggle stays");
+
+        let refusal = model
+            .stage_scale(0, "1.25".to_string())
+            .expect_err("a read-only page refuses every edit");
+        match &refusal {
+            StageRefusal::FileBreaksGrammar(violation) => {
+                assert_eq!(violation.rule(), &GrammarRule::IncompleteExtra);
+            }
+            other => panic!("expected the read-only refusal, got {other:?}"),
+        }
+        assert!(refusal.to_string().contains("line 2"), "{refusal}");
+        assert!(!model.is_dirty());
+        assert!(matches!(model.apply_contribution(), Ok(None)));
+    }
+
+    #[test]
+    fn a_legacy_disable_record_makes_the_page_read_only() {
+        // A hand-written `<output>,disable` record is outside the grammar too: the file
+        // loads read-only rather than letting the app edit around it.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conf = "monitor=,preferred,auto,1\nmonitor=DP-1,disable\n";
+        let model = DisplayModel::from_sources(
+            Some(conf),
+            HYPRCTL_EXTERNAL,
+            dir.path().join("monitors.conf"),
+            None,
+        );
+        assert!(!model.records_editable());
+        assert_eq!(
+            model.records_problem().map(GrammarViolation::rule),
+            Some(&GrammarRule::DisableForm)
         );
     }
 
@@ -2262,7 +2812,9 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             !model.check_conflict(),
             "an untouched file is not a conflict"
         );
-        model.stage_scale(0, "1.25".to_string());
+        model
+            .stage_scale(0, "1.25".to_string())
+            .expect("the edit stages");
 
         // Another program rewrites monitors.conf after the load-time baseline.
         std::fs::write(&conf_path, "monitor=,preferred,auto,1\n").expect("external edit");
@@ -2287,7 +2839,9 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         let mut model =
             DisplayModel::load(&runner, conf_path.clone(), None).expect("the probe succeeded");
 
-        model.stage_scale(0, "1.25".to_string());
+        model
+            .stage_scale(0, "1.25".to_string())
+            .expect("the edit stages");
         let contribution = rendered_contribution(&model);
         // Mimic the pipeline writing the produced bytes to disk, then commit.
         std::fs::write(&conf_path, &contribution.write.contents).expect("apply writes the file");
@@ -2314,7 +2868,9 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
 
         // 60 is not offered for 2560x1440 (which offers 144 and 120), so the first
         // available (144) is chosen.
-        model.stage_resolution(0, "2560x1440".to_string());
+        model
+            .stage_resolution(0, "2560x1440".to_string())
+            .expect("the edit stages");
         assert_eq!(model.effective_resolution(0), "2560x1440");
         assert_eq!(model.effective_refresh(0), Some("144".to_string()));
         assert_eq!(
@@ -2370,7 +2926,9 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
 
         // Editing appends a specific DP-5 record after the last monitor= line, leaving
         // the catch-all and eDP lines untouched.
-        model.stage_scale(0, "1.25".to_string());
+        model
+            .stage_scale(0, "1.25".to_string())
+            .expect("the edit stages");
         let emitted = rendered_text(&model);
         assert_eq!(
             emitted,
@@ -2381,11 +2939,11 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
 
     #[test]
     fn re_enabling_a_disabled_monitor_sources_mode_and_scale_from_live() {
-        // F3(b): a monitor whose record is in the disable form takes its baseline from
-        // the live `hyprctl` state, and re-enabling it writes a full record with those
-        // live-sourced mode/position/scale via set_state.
+        // F3(b): an output that is off with no specific record (configured by the
+        // catch-all only) takes its baseline from the live `hyprctl` state, and enabling
+        // it appends a complete record with those live-sourced mode/position/scale.
         let dir = tempfile::tempdir().expect("temp dir");
-        let conf = "monitor=desc:Ext Vendor Model,disable\nmonitor=,preferred,auto,1\n";
+        let conf = "monitor=,preferred,auto,1\n";
         // The disabled output still reports its last-known mode via `monitors all -j`.
         let hyprctl = r#"[{"name":"DP-2","description":"Ext Vendor Model","width":3440,"height":1440,"refreshRate":100.0,"x":0,"y":0,"scale":1.0,"disabled":true,"availableModes":["3440x1440@100.00Hz"]}]"#;
         let mut model =
@@ -2393,19 +2951,17 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         assert!(!model.is_laptop(0));
         assert!(
             !model.effective_enabled(0),
-            "the record disable form reads as off"
+            "with no record, the live disabled flag reads as off"
         );
-        // The mode/scale baseline is the live state, since the disabled record exposes
-        // no fields to read.
         assert_eq!(model.effective_resolution(0), "3440x1440");
         assert_eq!(model.effective_scale(0), "1");
 
-        // Re-enabling writes a full record sourced from those live values.
-        model.stage_enabled(0, true);
+        // Enabling writes a full record sourced from those live values.
+        model.stage_enabled(0, true).expect("the edit stages");
         let emitted = rendered_text(&model);
-        assert!(
-            emitted.contains("monitor=desc:Ext Vendor Model,3440x1440@100,0x0,1"),
-            "re-enable writes the live-sourced mode/position/scale via set_state:\n{emitted}"
+        assert_eq!(
+            emitted, "monitor=,preferred,auto,1\nmonitor=DP-2,3440x1440@100,0x0,1\n",
+            "enabling appends the live-sourced record via set_record"
         );
     }
 
@@ -2421,12 +2977,16 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             DisplayModel::from_sources(Some(conf), hyprctl, dir.path().join("monitors.conf"), None);
 
         // First edit: appends a specific DP-7 record, then commit.
-        model.stage_scale(0, "1.25".to_string());
+        model
+            .stage_scale(0, "1.25".to_string())
+            .expect("the edit stages");
         model.commit();
 
         // Second edit: must edit the appended record in place, so there is exactly one
         // DP-7 record (no duplicate append).
-        model.stage_scale(0, "1.5".to_string());
+        model
+            .stage_scale(0, "1.5".to_string())
+            .expect("the edit stages");
         let emitted = rendered_text(&model);
         assert_eq!(
             emitted.matches("monitor=DP-7,").count(),

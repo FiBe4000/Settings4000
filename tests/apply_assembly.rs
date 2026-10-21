@@ -67,9 +67,6 @@ const HYPRCTL_MONITORS_JSON: &str = r#"[{
     "availableModes": ["2880x1800@120.00Hz", "1920x1200@60.00Hz"]
 }]"#;
 
-/// The fixture's generic eDP-1 record, as installed.
-const EDP_RECORD: &str = "monitor=eDP-1,2880x1800@120,auto,1.333333,bitdepth,10";
-
 /// The store loaded with both store-backed backing files through the app's own loaders,
 /// mirroring the startup wiring (task 5.4).
 fn loaded_store(fx: &FixtureDotfiles) -> SettingsStore {
@@ -289,7 +286,9 @@ fn the_commit_snapshot_covers_the_stores_own_files_only() {
 
     let input = input_model(&fx);
     let mut display = display_model(&fx);
-    display.stage_scale(0, "1.5".to_string());
+    display
+        .stage_scale(0, "1.5".to_string())
+        .expect("the edit stages");
 
     let assembled = assemble_apply_plan(ApplySources {
         input: Some(&input),
@@ -335,7 +334,9 @@ fn the_bespoke_models_compose_into_one_plan() {
 
     let store = loaded_store(&fx);
     let mut display = display_model(&fx);
-    display.stage_scale(0, "1.5".to_string());
+    display
+        .stage_scale(0, "1.5".to_string())
+        .expect("the edit stages");
     let mut palette = palette_model(&fx);
     palette.stage("nord");
     let mut themes = themes_model(&fx);
@@ -445,7 +446,9 @@ fn no_assembled_write_ever_targets_a_generated_file() {
         .expect("a touchpad toggle stages");
     let input = input_model(&fx);
     let mut display = display_model(&fx);
-    display.stage_scale(0, "1.5".to_string());
+    display
+        .stage_scale(0, "1.5".to_string())
+        .expect("the edit stages");
     let mut palette = palette_model(&fx);
     palette.stage("nord");
     let mut themes = themes_model(&fx);
@@ -532,7 +535,9 @@ fn a_dirty_models_externally_changed_file_aborts_the_apply() {
         .expect("a touchpad toggle stages");
     let input = input_model(&fx);
     let mut display = display_model(&fx);
-    display.stage_scale(0, "1.5".to_string());
+    display
+        .stage_scale(0, "1.5".to_string())
+        .expect("the edit stages");
 
     fs::write(
         &path,
@@ -675,7 +680,9 @@ fn the_conflict_guards_run_before_any_write_is_prepared() {
         .expect("a touchpad toggle stages");
     let input = input_model(&fx);
     let mut display = display_model(&fx);
-    display.stage_scale(0, "1.5".to_string());
+    display
+        .stage_scale(0, "1.5".to_string())
+        .expect("the edit stages");
 
     let monitors = fx.config_path("hypr/monitors.conf");
     fs::write(
@@ -788,16 +795,14 @@ fn staged_power_edits_without_a_power_model_abort_the_whole_apply() {
 #[test]
 fn an_unrenderable_monitor_record_aborts_the_whole_apply() {
     // The Display flavour of the same contract (task 9.5): the file is perfectly
-    // readable, but the record the user edited has no scale field to rewrite, so the
-    // writer cannot render the edit. The abort must come before the pipeline runs — and
+    // readable, but the staged monitor edit is one the writer refuses — a scale carrying
+    // a comma, which would insert a `bitdepth` key without a value into the record and
+    // break the frozen grammar (task 11.9). Every real `stage_*` call refuses that at
+    // stage time, so the state is crafted through the test-only seam to reach the
+    // writer's last line of defence. The abort must come before the pipeline runs — and
     // in particular before the Input write that was already folded into the plan reaches
     // disk, which is what "abort the whole Apply" means.
     let fx = FixtureDotfiles::install();
-    let path = fx.config_path("hypr/monitors.conf");
-    let shortened = fs::read_to_string(&path)
-        .expect("read the fixture monitors.conf")
-        .replace(EDP_RECORD, "monitor=eDP-1,2880x1800@120");
-    fs::write(&path, &shortened).expect("install the shortened record");
     let before = repo_snapshot(&fx);
 
     let mut store = loaded_store(&fx);
@@ -806,7 +811,7 @@ fn an_unrenderable_monitor_record_aborts_the_whole_apply() {
         .expect("a touchpad toggle stages");
     let input = input_model(&fx);
     let mut display = display_model(&fx);
-    display.stage_scale(0, "1.25".to_string());
+    display.stage_scale_unchecked_for_tests(0, "1.25,bitdepth");
 
     let failure = assemble_apply_plan(ApplySources {
         display: Some(&display),
@@ -840,7 +845,9 @@ fn an_assembled_plan_applies_and_reconciles_every_source() {
         .expect("a touchpad toggle stages");
     let input = input_model(&fx);
     let mut display = display_model(&fx);
-    display.stage_scale(0, "1.5".to_string());
+    display
+        .stage_scale(0, "1.5".to_string())
+        .expect("the edit stages");
 
     let AssembledPlan {
         plan,

@@ -1,5 +1,5 @@
-//! The Display page's bespoke GTK glue (tasks 6.1, 11.8; architecture §7; R2.3,
-//! R4.2, R4.4, R5.2).
+//! The Display page's bespoke GTK glue (tasks 6.1, 11.8, 11.9; architecture §7;
+//! R2.3, R4.2, R4.4, R5.2, R8.3).
 //!
 //! # Why this page is bespoke, not declarative
 //!
@@ -30,10 +30,25 @@
 //! [`DisplayPage::rerender`], mirroring the `PageMsg::Rerender` broadcast the
 //! declarative pages receive.
 //!
+//! # Refused edits (R8.3; task 11.9)
+//!
+//! The model refuses an edit whose value is malformed or whose resulting
+//! `monitors.conf` would break the file's frozen grammar, returning a
+//! [`StageRefusal`](crate::core::display::StageRefusal) that names the rule. The
+//! rebuild then shows the control at its unchanged value with a "Not staged: …"
+//! note under that monitor, the same note-under-the-control pattern the laptop
+//! toggle uses for a switch that did not take (R5.5). The note stays until the
+//! next edit, Reset or Apply. A `monitors.conf` that already breaks the grammar
+//! makes the whole page read-only: the per-monitor controls are hidden, as for
+//! an unreadable file (R4.4), with a note naming the offending line and rule.
+//!
 //! # Staged vs. runtime controls (R5.1/R5.2)
 //!
-//! A non-laptop monitor's resolution/refresh/scale/position/enable edits are **staged**
-//! into the model and written to `monitors.conf` on Apply; the page reports each
+//! A non-laptop monitor's resolution/refresh/scale/position edits, and switching an
+//! output that is off back on, are **staged** into the model and written to
+//! `monitors.conf` on Apply (there is no switch to turn a running external output off:
+//! `monitors.conf`'s frozen grammar has no record form for it, task 11.9); the page
+//! reports each
 //! through the shared `on_changed` callback so the window's Apply/Reset chrome lights
 //! up (as the declarative pages do). The laptop panel's enable control is
 //! **runtime-only**: toggling it calls [`DisplayModel::toggle_laptop`] immediately,
@@ -62,7 +77,7 @@ use gtk4::{
     Widget,
 };
 
-use crate::core::display::DisplayModel;
+use crate::core::display::{DisplayModel, StageRefusal};
 use crate::system::command::SystemCommandRunner;
 
 /// Outer margin, in pixels, around the page content.
@@ -94,9 +109,10 @@ impl DisplayPage {
     /// Rebuilds the controls from the current model — called by the window after a
     /// Reset or a committed Apply so the drop-downs snap to the model's values.
     pub(crate) fn rerender(&self) {
-        // A Reset or Apply is unrelated to the last laptop toggle, so its failure
-        // note must not survive into the re-rendered page.
+        // A Reset or Apply is unrelated to the last laptop toggle or refused edit,
+        // so their notes must not survive into the re-rendered page.
         self.inner.laptop_error.replace(None);
+        self.inner.stage_error.replace(None);
         self.inner.rebuild();
     }
 }
@@ -119,6 +135,10 @@ struct Inner {
     /// Why the last laptop toggle did not take, shown under the switch until the
     /// next toggle (R5.5), or `None` after a successful one.
     laptop_error: RefCell<Option<String>>,
+    /// The monitor index and reason of the last refused staged edit (R8.3), shown
+    /// under that monitor's controls until the next edit, or `None` after an
+    /// accepted one.
+    stage_error: RefCell<Option<(usize, String)>>,
 }
 
 impl Inner {
@@ -140,7 +160,16 @@ impl Inner {
             return;
         }
 
-        if !model.records_editable() {
+        if let Some(problem) = model.records_problem() {
+            // Task 11.9: monitors.conf breaks the frozen grammar its two parsers rely
+            // on, so the page is read-only — the app never edits around a record it
+            // would refuse to write. The runtime laptop toggle is still offered below.
+            self.content.append(&note(&format!(
+                "monitors.conf breaks the format that hyprland.lua and \
+                 hypr-display-profile.sh rely on ({problem}), so per-monitor settings are \
+                 unavailable until that line is fixed."
+            )));
+        } else if !model.records_editable() {
             // R4.4: monitors.conf is unreadable, so the file-backed per-monitor
             // controls are hidden. The runtime laptop toggle is still offered below.
             self.content.append(&note(
@@ -170,8 +199,11 @@ impl Inner {
         section.set_margin_end(SECTION_SPACING);
 
         // The enable control. A laptop panel's is the runtime toggle (R5.2), shown
-        // only when the dotfiles script behind it was detected (R4.2); a non-laptop's
-        // is a staged monitors.conf edit (only when the file is editable).
+        // only when the dotfiles script behind it was detected (R4.2). A non-laptop's
+        // is a staged monitors.conf edit (only when the file is editable), offered
+        // only while the output is off: the frozen grammar has no record form that
+        // turns an output off (task 11.9), so a switch on a running output could only
+        // ever refuse. The model refuses a disable too, as the defence behind this.
         if model.is_laptop(index) {
             if model.laptop_toggle_available(index) {
                 section.append(&self.build_laptop_toggle(model, index));
@@ -180,7 +212,13 @@ impl Inner {
                 }
             }
         } else if model.records_editable() {
-            section.append(&self.build_enable_switch(model, index));
+            if model.effective_enabled(index) {
+                section.append(&note(
+                    "Turning an external monitor off is not supported yet.",
+                ));
+            } else {
+                section.append(&self.build_enable_switch(model, index));
+            }
         }
 
         // The mode/scale/position drop-downs appear only while the output is enabled
@@ -194,6 +232,16 @@ impl Inner {
             }
             section.append(&self.build_scale_row(model, index));
             section.append(&self.build_position_row(model, index));
+        }
+
+        // Why the last edit on this monitor was refused (R8.3).
+        if let Some((_, reason)) = self
+            .stage_error
+            .borrow()
+            .as_ref()
+            .filter(|(refused, _)| *refused == index)
+        {
+            section.append(&note(reason));
         }
 
         frame.set_child(Some(&section));
@@ -219,7 +267,11 @@ impl Inner {
         labelled_row("Enabled", &switch)
     }
 
-    /// A non-laptop monitor's staged enable switch.
+    /// A non-laptop monitor's staged enable switch, built only while the output is
+    /// off, so turning it on stages a complete record for the output (see
+    /// [`DisplayModel::stage_enabled`]). Once it is staged on, the rebuild shows the
+    /// "not supported yet" note and the output's mode/scale rows in its place; Reset
+    /// discards the staged enable.
     fn build_enable_switch(self: &Rc<Self>, model: &DisplayModel, index: usize) -> GtkBox {
         let switch = Switch::new();
         switch.set_halign(Align::End);
@@ -297,41 +349,47 @@ impl Inner {
 
     /// Stages a resolution edit and re-renders.
     fn stage_resolution(self: &Rc<Self>, index: usize, resolution: String) {
-        self.stage(|model| model.stage_resolution(index, resolution));
+        self.stage(index, |model| model.stage_resolution(index, resolution));
     }
 
     /// Stages a refresh-rate edit and re-renders.
     fn stage_refresh(self: &Rc<Self>, index: usize, refresh: String) {
-        self.stage(|model| model.stage_refresh(index, refresh));
+        self.stage(index, |model| model.stage_refresh(index, refresh));
     }
 
     /// Stages a scale edit and re-renders.
     fn stage_scale(self: &Rc<Self>, index: usize, scale: String) {
-        self.stage(|model| model.stage_scale(index, scale));
+        self.stage(index, |model| model.stage_scale(index, scale));
     }
 
     /// Stages a position edit and re-renders.
     fn stage_position(self: &Rc<Self>, index: usize, position: String) {
-        self.stage(|model| model.stage_position(index, position));
+        self.stage(index, |model| model.stage_position(index, position));
     }
 
     /// Stages a non-laptop enable edit and re-renders (the dropdowns appear/disappear
     /// with the enabled state).
     fn stage_enabled(self: &Rc<Self>, index: usize, enabled: bool) {
-        self.stage(|model| model.stage_enabled(index, enabled));
+        self.stage(index, |model| model.stage_enabled(index, enabled));
     }
 
-    /// Applies a staged edit through `edit`, notifies the chrome, then rebuilds.
+    /// Applies a staged edit to monitor `index` through `edit`, records why it was
+    /// refused (if it was), notifies the chrome, then rebuilds.
     ///
+    /// The model has already logged a refusal; here it is only kept for the rebuild
+    /// to show under the monitor, whose control re-renders at its unchanged value.
     /// The mutable model borrow is released before `on_changed` runs (which re-reads
     /// the model to derive the chrome) and before the rebuild re-reads it.
-    fn stage(self: &Rc<Self>, edit: impl FnOnce(&mut DisplayModel)) {
-        {
-            let mut model = self.model.borrow_mut();
-            if let Some(model) = model.as_mut() {
-                edit(model);
-            }
-        }
+    fn stage(
+        self: &Rc<Self>,
+        index: usize,
+        edit: impl FnOnce(&mut DisplayModel) -> Result<(), StageRefusal>,
+    ) {
+        let result = self.model.borrow_mut().as_mut().map(edit);
+        self.stage_error.replace(match result {
+            Some(Err(refusal)) => Some((index, format!("Not staged: {refusal}."))),
+            Some(Ok(())) | None => None,
+        });
         (self.on_changed)();
         self.rebuild();
     }
@@ -379,6 +437,7 @@ pub(crate) fn build(
         model,
         on_changed,
         laptop_error: RefCell::new(None),
+        stage_error: RefCell::new(None),
     });
     inner.rebuild();
 

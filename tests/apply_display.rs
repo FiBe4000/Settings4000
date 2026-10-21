@@ -115,8 +115,12 @@ fn a_mode_and_scale_edit_rewrites_only_the_edp_record_and_reloads() {
     let mut model = load_model(&fx);
     // Staging the second available resolution composes it with that resolution's
     // reported refresh (60), and the new scale replaces the fourth field.
-    model.stage_resolution(0, "1920x1200".to_string());
-    model.stage_scale(0, "1.25".to_string());
+    model
+        .stage_resolution(0, "1920x1200".to_string())
+        .expect("the edit stages");
+    model
+        .stage_scale(0, "1.25".to_string())
+        .expect("the edit stages");
 
     let plan = plan_from(&model);
     // Empty tracker: monitors.conf freshness is model-owned (see the module docs).
@@ -175,7 +179,9 @@ fn a_failed_hyprctl_reload_is_non_fatal_and_the_write_stands() {
     let original = fs::read_to_string(&path).expect("read the fixture monitors.conf");
 
     let mut model = load_model(&fx);
-    model.stage_scale(0, "1.5".to_string());
+    model
+        .stage_scale(0, "1.5".to_string())
+        .expect("the edit stages");
 
     let plan = plan_from(&model);
     let freshness = FreshnessTracker::new();
@@ -199,28 +205,24 @@ fn a_failed_hyprctl_reload_is_non_fatal_and_the_write_stands() {
 
 #[test]
 fn an_unrenderable_record_aborts_the_contribution_leaving_the_file_untouched() {
-    // Failure injection (4), task 9.5: when the writer cannot render a dirty edit, the
-    // contribution is an Err the window aborts on — so the pipeline never runs and
+    // Failure injection (4), tasks 9.5 and 11.9: when the writer refuses a dirty edit,
+    // the contribution is an Err the window aborts on — so the pipeline never runs and
     // `monitors.conf` keeps its bytes. Without that (a bare `None`), the window would
     // read "nothing to write", apply successfully, and commit the Display model against
     // a file it never wrote.
+    //
+    // The injected edit is a scale carrying a comma, which would insert a `bitdepth`
+    // key without a value into the eDP record and break the frozen grammar both
+    // downstream parsers rely on (analysis §7.2). Every real `stage_*` call refuses it
+    // at stage time, so it is crafted through the test-only seam to reach the writer's
+    // last line of defence (R8.3).
     let fx = FixtureDotfiles::install();
     let path = fx.config_path("hypr/monitors.conf");
-
-    // The injected shape: the eDP record shortened to just a name and a mode. It is
-    // enabled, so an edit takes the surgical in-place `set_field` path, but it has no
-    // scale field to rewrite. Written through the deployed symlink before the load, so
-    // the model parses it as its baseline.
-    let shortened = replace_once(
-        &fs::read_to_string(&path).expect("read the fixture monitors.conf"),
-        EDP_RECORD,
-        "monitor=eDP-1,2880x1800@120",
-    );
-    fs::write(&path, &shortened).expect("install the shortened record");
+    let original = fs::read_to_string(&path).expect("read the fixture monitors.conf");
     let before = repo_snapshot(&fx);
 
     let mut model = load_model(&fx);
-    model.stage_scale(0, "1.25".to_string());
+    model.stage_scale_unchecked_for_tests(0, "1.25,bitdepth");
     assert!(model.is_dirty());
 
     let error = model
@@ -230,15 +232,120 @@ fn an_unrenderable_record_aborts_the_contribution_leaving_the_file_untouched() {
         error.to_string().contains("monitors.conf"),
         "the message must name the file the user has to fix: {error}"
     );
+    assert!(
+        error.to_string().contains("`,`"),
+        "the message must name the broken rule: {error}"
+    );
 
-    // Nothing reached the disk, and the staged edit is still pending for a retry.
+    // Nothing reached the disk, and the staged edit is still pending.
     assert_eq!(
         fs::read_to_string(&path).expect("read the file"),
-        shortened,
+        original,
         "an aborted contribution must leave monitors.conf byte-identical"
     );
     assert_repo_untouched_except(&fx, &before, &[]);
     assert!(model.is_dirty(), "the staged edit must be retained");
+}
+
+#[test]
+fn an_edit_that_would_break_the_grammar_is_refused_at_stage_time() {
+    // Task 11.9 acceptance on the live fixture: an edit that would insert `bitdepth`
+    // without a value is refused when it is staged, naming the rule (R8.3). Nothing
+    // becomes dirty, so nothing can reach the file.
+    let fx = FixtureDotfiles::install();
+    let mut model = load_model(&fx);
+
+    let refusal = model
+        .stage_scale(0, "1.25,bitdepth".to_string())
+        .expect_err("a comma in a value is refused");
+    assert!(
+        refusal.to_string().contains("monitors.conf format: "),
+        "the refusal names the grammar: {refusal}"
+    );
+    assert!(!model.is_dirty());
+
+    // A valid edit on the same record still stages and renders.
+    model
+        .stage_scale(0, "1.25".to_string())
+        .expect("the edit stages");
+    assert_eq!(
+        plan_from(&model).writes[0].changed_keys,
+        vec!["monitor eDP-1 scale"]
+    );
+}
+
+#[test]
+fn a_hand_edited_record_breaking_the_grammar_makes_the_page_read_only() {
+    // Task 11.9's degradation for a hand-edited `monitors.conf`: the eDP record lost
+    // the value of its `bitdepth` extra. Loaded through the deployed symlink, the file
+    // is logged at `warn` (line and rule, no contents), the per-monitor controls are
+    // not offered, every edit is refused naming the line, and the file is never
+    // written — the app does not edit around a record it would refuse to write.
+    let fx = FixtureDotfiles::install();
+    let path = fx.config_path("hypr/monitors.conf");
+    let broken = replace_once(
+        &fs::read_to_string(&path).expect("read the fixture monitors.conf"),
+        EDP_RECORD,
+        "monitor=eDP-1,2880x1800@120,auto,1.333333,bitdepth",
+    );
+    fs::write(&path, &broken).expect("install the hand edit");
+    let before = repo_snapshot(&fx);
+    let broken_line = broken
+        .lines()
+        .position(|line| line.ends_with(",bitdepth"))
+        .expect("the edited line")
+        + 1;
+
+    let mut model = None;
+    let events = capture_logs(|| {
+        let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake_with_streams(
+            0,
+            HYPRCTL_MONITORS_JSON,
+            "",
+        ))]);
+        model = DisplayModel::load(&runner, fx.config_path("hypr/monitors.conf"), None);
+    });
+    let mut model = model.expect("the probe succeeded");
+
+    let line_field = format!("line {broken_line}");
+    let warnings: Vec<_> = events
+        .iter()
+        .filter(|event| event.level == tracing::Level::WARN)
+        .collect();
+    assert!(
+        warnings
+            .iter()
+            .any(|event| event.message == "monitors.conf parse warning"
+                && event.fields.contains(&line_field)),
+        "the parser logs the broken record: {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|event| event.message.contains("per-monitor settings are read-only")),
+        "the read-only decision is logged: {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .all(|event| !event.fields.contains("2880x1800")),
+        "no file contents in the log (R7.3)"
+    );
+
+    assert!(!model.records_editable());
+    let problem = model.records_problem().expect("the problem is reported");
+    assert_eq!(problem.line(), broken_line);
+
+    let refusal = model
+        .stage_scale(0, "1.25".to_string())
+        .expect_err("a read-only page refuses edits");
+    assert!(
+        refusal.to_string().contains(&line_field),
+        "the refusal names the line: {refusal}"
+    );
+    assert!(!model.is_dirty());
+    assert!(matches!(model.apply_contribution(), Ok(None)));
+    assert_repo_untouched_except(&fx, &before, &[]);
 }
 
 #[test]
@@ -251,7 +358,9 @@ fn an_external_edit_trips_the_models_conflict_guard_before_any_write() {
     let path = fx.config_path("hypr/monitors.conf");
 
     let mut model = load_model(&fx);
-    model.stage_scale(0, "1.5".to_string());
+    model
+        .stage_scale(0, "1.5".to_string())
+        .expect("the edit stages");
     assert!(
         !model.check_conflict(),
         "an untouched file is not a conflict"

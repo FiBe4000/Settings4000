@@ -337,7 +337,9 @@ fn lua_configs_parse_losslessly_at_their_deployed_paths() {
 }
 
 /// `monitors.conf` parses warning-free with the awk-shaped eDP record
-/// `hypr-display-profile.sh` derives from (analysis §6.2).
+/// `hypr-display-profile.sh` derives from (analysis §6.2), and validates clean
+/// against the frozen grammar both downstream parsers rely on (analysis §7.2,
+/// task 11.9) — read at its deployed path, as the app reads it.
 #[test]
 fn monitors_conf_parses_with_the_awk_shaped_edp_record() {
     let fx = FixtureDotfiles::install();
@@ -345,7 +347,18 @@ fn monitors_conf_parses_with_the_awk_shaped_edp_record() {
     let input = read(&fx.config_path("hypr/monitors.conf"));
     let (monitors, warnings) = MonitorsFile::parse(&input);
     assert!(warnings.is_empty(), "unexpected {warnings:?}");
+    assert_eq!(
+        monitors.grammar_violations(),
+        Vec::new(),
+        "the live fixture follows the frozen grammar"
+    );
     assert_eq!(monitors.emit(), input, "monitors.conf should round-trip");
+    // The rules the grammar has to allow are all present in the real file: the
+    // catch-all first, `bitdepth,10` extras, and `eDP-1` beside the `desc:` rule for
+    // the other laptop's panel.
+    let names = monitors.record_names();
+    assert_eq!(names.first(), Some(&""), "the catch-all comes first");
+    assert!(names.contains(&"desc:Example Panel Vendor 0x2036"));
 
     assert!(monitors.record_names().contains(&"eDP-1"));
     assert_eq!(

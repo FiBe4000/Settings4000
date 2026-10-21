@@ -147,7 +147,8 @@ pub enum ConflictedSource {
 ///
 /// One variant per source that can fail while *rendering* its write: the two
 /// store-backed pages (the file is unreadable, or the writer rejects an edit) and the
-/// Display model (a record it cannot edit in place). The remaining contributions cannot
+/// Display model (its writer refuses an edit, e.g. one that would break the frozen
+/// `monitors.conf` grammar). The remaining contributions cannot
 /// fail — a palette switch runs a script and the two Theme models skip a value they
 /// cannot write (task 9.6), which task 9.28 will surface separately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
