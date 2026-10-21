@@ -3,13 +3,14 @@
 //!
 //! # What this module is
 //!
-//! The Power & Idle page edits the three idle timeouts (dim / lock / DPMS) and the
-//! session lock command, all staged to `config/hypr/hypridle.conf`. Like the Input page
-//! these settings map cleanly onto the fixed
-//! [`SettingId`](crate::core::model::SettingId) enum, so they are staged in the shared
-//! [`SettingsStore`](crate::core::store) and rendered by the declarative row framework
-//! (task 5.2 — three [`WidgetKind::Scale`](crate::ui::row::WidgetKind::Scale) sliders and
-//! a [`WidgetKind::Entry`](crate::ui::row::WidgetKind::Entry) text field). This module
+//! The Power & Idle page edits the three idle timeouts (dim / lock / DPMS), the
+//! session lock command and hyprlock's grace period, all staged to
+//! `config/hypr/hypridle.conf`. Like the Input page these settings map cleanly onto the
+//! fixed [`SettingId`](crate::core::model::SettingId) enum, so they are staged in the
+//! shared [`SettingsStore`](crate::core::store) and rendered by the declarative row
+//! framework (task 5.2 — three [`WidgetKind::Scale`](crate::ui::row::WidgetKind::Scale)
+//! sliders, a [`WidgetKind::Entry`](crate::ui::row::WidgetKind::Entry) text field and a
+//! `WidgetKind::Spin` spin button for the grace period, all in `ui::row`). This module
 //! supplies the one Power-specific piece the store cannot: the **store-`SettingId` →
 //! `hypridle.conf` write glue**. [`render_hypridle_conf`] takes the store's dirty Power &
 //! Idle settings and applies each to the file through the surgical hyprlang writer
@@ -47,11 +48,28 @@
 //! # Where the lock command lives
 //!
 //! The user-facing "lock command" is hypridle's `general { }` `lock_cmd` — the command
-//! hypridle actually runs to lock the session (`pidof hyprlock || hyprlock` in the real
+//! hypridle actually runs to lock the session (`pidof hyprlock || hyprlock --grace 10` in the real
 //! config). It is **not** `listener[1]`'s `on-timeout`, which is `loginctl lock-session`:
 //! that only asks logind to emit a lock signal, which hypridle catches and answers by
 //! running `lock_cmd`. So [`SettingId::LockCommand`] edits `general.lock_cmd`, verified
 //! against the live file (analysis §6).
+//!
+//! # The grace period is a token inside the lock command
+//!
+//! hyprlock ≥ 0.9 takes its grace period only on the command line, so
+//! [`SettingId::LockGracePeriod`] has no key of its own: it is the `--grace N` token of
+//! that same `general.lock_cmd` value (`pidof hyprlock || hyprlock --grace 10`, analysis
+//! §7, §8). [`power_key_path`] therefore gives both settings the same address, and
+//! [`render_hypridle_conf`] writes the grace period as a token edit on the value string
+//! ([`set_grace`], architecture §3), leaving the rest of the command and the line's
+//! trailing comment untouched.
+//!
+//! When the lock command and the grace period are both dirty in one Apply, the **lock
+//! command is written first and the grace token is then applied to the result**. The
+//! store already keeps the two in step whenever either is staged (see the store's docs on
+//! linked settings), so in practice the second step finds its number in place and
+//! changes nothing; the fixed order is what makes the outcome well-defined for any
+//! caller, and the one `general.lock_cmd` line is reported as changed once.
 //!
 //! # Conflict safety comes from the store (R5.6)
 //!
@@ -64,9 +82,11 @@
 //! externally — nothing here can clobber an external edit (the same contract as the Input
 //! page).
 
+use std::fmt;
 use std::path::PathBuf;
 
 use crate::core::apply::{FileWrite, WriteValidation};
+use crate::core::lock_grace::{GraceError, set_grace};
 use crate::core::model::{SettingId, Value};
 use crate::core::reload::BackingFile;
 use crate::core::store_write::{RenderedEdit, StoreBackedFile, StoreWriteError};
@@ -93,16 +113,25 @@ const DPMS_LISTENER: usize = 2;
 /// This is the store-`SettingId` → hyprlang address map, the single definition of the
 /// positional-matching assumption (see the module docs): the three timeouts resolve to
 /// the `timeout` key of a specific `listener { }` occurrence, and the lock command to
-/// `general.lock_cmd`. The read side ([`crate::ui::startup`]) uses this same map, so a
-/// value is parsed from and written back to the identical address.
+/// `general.lock_cmd`. The grace period resolves to `general.lock_cmd` as well, because
+/// it is a token inside that value rather than a key (see the module docs). The read
+/// side ([`crate::ui::startup`]) uses this same map, so a value is parsed from and
+/// written back to the identical address.
 pub fn power_key_path(id: SettingId) -> Option<KeyPath> {
     match id {
         SettingId::DimTimeout => Some(listener_timeout_path(DIM_LISTENER)),
         SettingId::LockTimeout => Some(listener_timeout_path(LOCK_LISTENER)),
         SettingId::DpmsTimeout => Some(listener_timeout_path(DPMS_LISTENER)),
-        SettingId::LockCommand => Some(KeyPath::at(&["general"], "lock_cmd")),
+        SettingId::LockCommand | SettingId::LockGracePeriod => Some(lock_cmd_path()),
         _ => None,
     }
+}
+
+/// The [`KeyPath`] of `general.lock_cmd`, the one value the lock command and the grace
+/// period share. A function of its own so [`apply_grace`] can address it directly
+/// instead of unwrapping [`power_key_path`]'s `Option`.
+fn lock_cmd_path() -> KeyPath {
+    KeyPath::at(&["general"], "lock_cmd")
 }
 
 /// The [`KeyPath`] addressing the `timeout` key of the `occurrence`-th `listener { }`
@@ -134,7 +163,8 @@ fn value_to_hypr_string(id: SettingId, value: &Value) -> Option<String> {
 /// Applies the store's dirty Power & Idle `edits` to the current `hypridle.conf` `bytes`,
 /// returning the complete new bytes plus the rendered section paths it changed (e.g.
 /// `listener[1].timeout`, `general.lock_cmd`) for the apply-level log line (task 6.8;
-/// R5.3 item 1).
+/// R5.3 item 1). Each path is listed once, even when the lock command and the grace
+/// period both changed its one line.
 ///
 /// This is the pure store-`SettingId` → `hypridle.conf` glue. It parses the current file
 /// losslessly, then for each `(id, value)` rewrites **only** that setting's value span
@@ -144,19 +174,33 @@ fn value_to_hypr_string(id: SettingId, value: &Value) -> Option<String> {
 /// Because each timeout addresses a specific `listener { }` occurrence (§3.2), editing
 /// one leaves the other listener blocks byte-identical (the headline task-6.8 criterion).
 ///
-/// Returns an [`EditError`] if the writer rejects an edit — a lock command containing a
-/// newline/`#` (R8.3), or an addressed `listener`/`general` section that does not exist —
-/// leaving the caller to abort the apply rather than emit a partial file. A setting with
-/// no Power & Idle address is ignored (it does not belong to this file).
+/// The grace period ([`SettingId::LockGracePeriod`]) is applied **after** every other
+/// edit, as a token edit ([`set_grace`]) on the `general.lock_cmd` value those edits
+/// leave — so with a lock-command edit in the same batch, the new command is written
+/// first and its grace token then set (see the module docs). A grace edit that leaves
+/// the value unchanged reports no changed key.
+///
+/// Returns a [`HypridleRenderError`] if an edit is refused — a lock command containing a
+/// newline/`#` (R8.3), an addressed `listener`/`general` section that does not exist, or
+/// a grace period for a lock command that does not start hyprlock in a shape the token
+/// editor accepts — leaving the caller to abort the apply rather than emit a partial
+/// file. A setting with no Power & Idle address is ignored (it does not belong to this
+/// file).
 pub fn render_hypridle_conf(
     bytes: &[u8],
     edits: &[(SettingId, Value)],
-) -> Result<RenderedEdit, EditError> {
+) -> Result<RenderedEdit, HypridleRenderError> {
     let text = String::from_utf8_lossy(bytes);
     let (mut file, _warnings) = HyprlangFile::parse(&text);
 
     let mut changed_keys = Vec::new();
+    let mut grace = None;
     for (id, value) in edits {
+        if *id == SettingId::LockGracePeriod {
+            // Applied after the loop, on top of whatever lock command this batch leaves.
+            grace = Some(value);
+            continue;
+        }
         let (Some(path), Some(rendered)) = (power_key_path(*id), value_to_hypr_string(*id, value))
         else {
             // Not a Power & Idle-backed setting, or a kind mismatch the store would have
@@ -167,17 +211,115 @@ pub fn render_hypridle_conf(
         changed_keys.push(path.to_string());
     }
 
+    if let Some(value) = grace {
+        if let Some(path) = apply_grace(&mut file, value)? {
+            let key = path.to_string();
+            if !changed_keys.contains(&key) {
+                changed_keys.push(key);
+            }
+        }
+    }
+
     Ok(RenderedEdit {
         contents: file.emit().into_bytes(),
         changed_keys,
     })
 }
 
+/// Sets the grace token of `file`'s current `general.lock_cmd` value to the staged
+/// grace `value`, returning the edited address, or `None` when the value already
+/// carried that grace period (nothing to write).
+fn apply_grace(
+    file: &mut HyprlangFile,
+    value: &Value,
+) -> Result<Option<KeyPath>, HypridleRenderError> {
+    let seconds = value
+        .as_integer()
+        .and_then(|seconds| u32::try_from(seconds).ok())
+        .ok_or_else(|| HypridleRenderError::GraceValue(value.clone()))?;
+    let path = lock_cmd_path();
+    let current = file
+        .value(&path)
+        .ok_or(HypridleRenderError::MissingLockCommand)?
+        .to_string();
+    let edited = set_grace(&current, seconds)?;
+    if edited == current {
+        return Ok(None);
+    }
+    file.set_value(&path, &edited)?;
+    Ok(Some(path))
+}
+
+/// Why [`render_hypridle_conf`] could not apply the staged Power & Idle edits to
+/// `hypridle.conf`. Its message is quoted in the Apply-failure dialog, prefixed with the
+/// file name.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HypridleRenderError {
+    /// The hyprlang writer refused an edit (see [`EditError`]).
+    Edit(EditError),
+    /// A grace period was staged, but the lock command offers no `--grace N` token the
+    /// app can edit (see [`GraceError`]). The store refuses such an edit when it is
+    /// staged; this is the backstop for a lock command changed on disk since.
+    Grace(GraceError),
+    /// A grace period was staged, but the file has no `general.lock_cmd` to carry it.
+    MissingLockCommand,
+    /// The staged grace value is not a non-negative whole number of seconds — a kind or
+    /// range the store rejects on stage, guarded here rather than written.
+    GraceValue(Value),
+}
+
+impl fmt::Display for HypridleRenderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HypridleRenderError::Edit(error) => write!(f, "{error}"),
+            HypridleRenderError::Grace(error) => {
+                write!(f, "the grace period cannot be written: {error}")
+            }
+            HypridleRenderError::MissingLockCommand => write!(
+                f,
+                "the grace period cannot be written: there is no `lock_cmd` in the `general` section"
+            ),
+            HypridleRenderError::GraceValue(Value::Integer(seconds)) => write!(
+                f,
+                "{seconds} is not a whole, non-negative number of seconds for the grace period"
+            ),
+            HypridleRenderError::GraceValue(other) => write!(
+                f,
+                "a {} value cannot be a grace period, which is a whole number of seconds",
+                other.kind()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HypridleRenderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            HypridleRenderError::Edit(error) => Some(error),
+            HypridleRenderError::Grace(error) => Some(error),
+            HypridleRenderError::MissingLockCommand | HypridleRenderError::GraceValue(_) => None,
+        }
+    }
+}
+
+impl From<EditError> for HypridleRenderError {
+    fn from(error: EditError) -> Self {
+        HypridleRenderError::Edit(error)
+    }
+}
+
+impl From<GraceError> for HypridleRenderError {
+    fn from(error: GraceError) -> Self {
+        HypridleRenderError::Grace(error)
+    }
+}
+
 /// The Power & Idle page's Apply-time write glue for `hypridle.conf` (task 6.8).
 ///
 /// Built once on the startup worker when hypridle is present, and held by the window.
 /// Like the Input page's helper it is **not** a staging model — the
-/// three timeouts and the lock command are staged in the shared store, so dirty tracking,
+/// three timeouts, the lock command and its grace period are staged in the shared store,
+/// so dirty tracking,
 /// validation, reset, and commit all flow through the store — and it owns **no**
 /// [`FreshnessTracker`](crate::core::freshness::FreshnessTracker): `hypridle.conf` is
 /// store-loaded, so the store baselines it and the Apply pipeline conflict-checks it. This
@@ -218,7 +360,7 @@ impl PowerModel {
     pub fn apply_contribution(
         &self,
         dirty: &[(SettingId, Value)],
-    ) -> Result<Option<FileWrite>, StoreWriteError<EditError>> {
+    ) -> Result<Option<FileWrite>, StoreWriteError<HypridleRenderError>> {
         self.hypridle_conf.render_write(dirty, render_hypridle_conf)
     }
 }
@@ -258,13 +400,13 @@ mod tests {
     use crate::system::signal::MockProcessSignaller;
     use crate::testing::differing_lines;
 
-    /// A realistic `hypridle.conf` fixture in the real dotfiles' shape (analysis §6): a
-    /// `general { }` block with the lock command, then three `listener { }` blocks in the
-    /// dim / lock / DPMS order, each carrying an inline comment so comment preservation is
-    /// exercised.
+    /// A realistic `hypridle.conf` fixture in the real dotfiles' shape (analysis §6, §7):
+    /// a `general { }` block with the lock command (carrying hyprlock's `--grace 10`),
+    /// then three `listener { }` blocks in the dim / lock / DPMS order, each carrying an
+    /// inline comment so comment preservation is exercised.
     const HYPRIDLE_CONF: &str = "\
 general {
-    lock_cmd = pidof hyprlock || hyprlock
+    lock_cmd = pidof hyprlock || hyprlock --grace 10
     before_sleep_cmd = loginctl lock-session
     after_sleep_cmd = hyprctl dispatch dpms on
 }
@@ -382,12 +524,210 @@ listener {
         )]);
         let target = HYPRIDLE_CONF
             .lines()
-            .position(|l| l == "    lock_cmd = pidof hyprlock || hyprlock")
+            .position(|l| l == "    lock_cmd = pidof hyprlock || hyprlock --grace 10")
             .expect("fixture has the lock command");
         assert_eq!(differing_lines(HYPRIDLE_CONF, &edited), vec![target]);
         assert_eq!(
             edited.lines().nth(target),
             Some("    lock_cmd = hyprlock --immediate")
+        );
+    }
+
+    /// A `hypridle.conf` whose lock command has no grace flag and a trailing comment,
+    /// for the insert / remove byte-diff tests (the real file's `lock_cmd` line carries
+    /// no comment, so this proves the hyprlang writer keeps one beside a token edit).
+    const COMMENTED_LOCK_CMD: &str = "\
+general {
+    lock_cmd = pidof hyprlock || hyprlock    # lock unless already locked
+    before_sleep_cmd = loginctl lock-session
+}
+
+listener {
+    timeout = 300                                # 5min
+    on-timeout = loginctl lock-session           # lock the session.
+}
+";
+
+    /// The one line of `original` that changed in `edited`, asserting nothing else did.
+    fn single_changed_line(original: &str, edited: &str) -> String {
+        let changed = differing_lines(original, edited);
+        assert_eq!(changed.len(), 1, "exactly one line may change: {changed:?}");
+        edited
+            .lines()
+            .nth(changed[0])
+            .expect("the changed line exists")
+            .to_string()
+    }
+
+    #[test]
+    fn the_grace_period_shares_the_lock_command_address() {
+        assert_eq!(
+            power_key_path(SettingId::LockGracePeriod).map(|p| p.to_string()),
+            Some("general.lock_cmd".to_string())
+        );
+    }
+
+    #[test]
+    fn a_grace_edit_changes_only_the_number_on_the_lock_cmd_line() {
+        // Change (task 11.13): `--grace 10` -> `--grace 30`; the `pidof hyprlock ||`
+        // guard and every other line stay byte-identical.
+        let edit = render_hypridle_conf(
+            HYPRIDLE_CONF.as_bytes(),
+            &[(SettingId::LockGracePeriod, Value::Integer(30))],
+        )
+        .expect("a grace edit renders");
+        let edited = String::from_utf8(edit.contents).expect("valid utf-8");
+        assert_eq!(
+            single_changed_line(HYPRIDLE_CONF, &edited),
+            "    lock_cmd = pidof hyprlock || hyprlock --grace 30"
+        );
+        assert_eq!(edit.changed_keys, vec!["general.lock_cmd".to_string()]);
+    }
+
+    #[test]
+    fn a_grace_edit_inserts_the_flag_and_keeps_the_trailing_comment() {
+        // Insert: no flag yet, so ` --grace 15` goes right after the `hyprlock` word;
+        // the alignment spaces and the `#` comment after the value survive.
+        let edited = String::from_utf8(
+            render_hypridle_conf(
+                COMMENTED_LOCK_CMD.as_bytes(),
+                &[(SettingId::LockGracePeriod, Value::Integer(15))],
+            )
+            .expect("a grace insert renders")
+            .contents,
+        )
+        .expect("valid utf-8");
+        assert_eq!(
+            single_changed_line(COMMENTED_LOCK_CMD, &edited),
+            "    lock_cmd = pidof hyprlock || hyprlock --grace 15    # lock unless already locked"
+        );
+    }
+
+    #[test]
+    fn a_zero_grace_removes_the_flag_and_keeps_the_trailing_comment() {
+        // Remove: grace 0 is hyprlock's default, so the token goes instead of reading
+        // `--grace 0`; the rest of the line, comment included, is unchanged.
+        let with_grace =
+            COMMENTED_LOCK_CMD.replace("|| hyprlock    #", "|| hyprlock --grace 10    #");
+        let edited = String::from_utf8(
+            render_hypridle_conf(
+                with_grace.as_bytes(),
+                &[(SettingId::LockGracePeriod, Value::Integer(0))],
+            )
+            .expect("a grace removal renders")
+            .contents,
+        )
+        .expect("valid utf-8");
+        assert_eq!(
+            edited, COMMENTED_LOCK_CMD,
+            "removal restores the flagless line"
+        );
+    }
+
+    #[test]
+    fn a_lock_command_and_grace_edit_apply_the_command_first() {
+        // The interaction rule: the staged lock command is written, then the grace
+        // token is set on that new value — and the one line is reported once.
+        let edit = render_hypridle_conf(
+            HYPRIDLE_CONF.as_bytes(),
+            &[
+                (
+                    SettingId::LockCommand,
+                    Value::String("hyprlock --no-fade-in".to_string()),
+                ),
+                (SettingId::LockGracePeriod, Value::Integer(20)),
+            ],
+        )
+        .expect("the combined edit renders");
+        let edited = String::from_utf8(edit.contents).expect("valid utf-8");
+        assert_eq!(
+            single_changed_line(HYPRIDLE_CONF, &edited),
+            "    lock_cmd = hyprlock --grace 20 --no-fade-in"
+        );
+        assert_eq!(edit.changed_keys, vec!["general.lock_cmd".to_string()]);
+
+        // The order of the batch does not matter: the grace token always goes last.
+        let reversed = render_hypridle_conf(
+            HYPRIDLE_CONF.as_bytes(),
+            &[
+                (SettingId::LockGracePeriod, Value::Integer(20)),
+                (
+                    SettingId::LockCommand,
+                    Value::String("hyprlock --no-fade-in".to_string()),
+                ),
+            ],
+        )
+        .expect("the reversed batch renders");
+        assert_eq!(reversed.contents, edited.as_bytes());
+    }
+
+    #[test]
+    fn a_grace_already_in_place_reports_no_change() {
+        // The store stages both views together, so the lock command usually already
+        // carries the staged grace; the grace step then adds no second changed key, and
+        // a grace-only batch with nothing to change yields no changed key at all (so the
+        // shared glue writes nothing and no restart is planned).
+        let edit = render_hypridle_conf(
+            HYPRIDLE_CONF.as_bytes(),
+            &[(SettingId::LockGracePeriod, Value::Integer(10))],
+        )
+        .expect("renders");
+        assert_eq!(edit.contents, HYPRIDLE_CONF.as_bytes());
+        assert!(edit.changed_keys.is_empty());
+    }
+
+    #[test]
+    fn a_grace_for_a_command_without_hyprlock_is_refused() {
+        // Backstop for a lock command changed on disk since the grace was staged: the
+        // Apply aborts rather than guess where a grace period would go.
+        const SWAYLOCK: &str = "general {\n    lock_cmd = swaylock -f\n}\n";
+        assert_eq!(
+            render_hypridle_conf(
+                SWAYLOCK.as_bytes(),
+                &[(SettingId::LockGracePeriod, Value::Integer(5))],
+            )
+            .map(|edit| edit.contents),
+            Err(HypridleRenderError::Grace(GraceError::NoHyprlock))
+        );
+        // No lock command at all.
+        assert_eq!(
+            render_hypridle_conf(
+                b"listener {\n    timeout = 1\n}\n",
+                &[(SettingId::LockGracePeriod, Value::Integer(5))],
+            )
+            .map(|edit| edit.contents),
+            Err(HypridleRenderError::MissingLockCommand)
+        );
+        // A negative grace never reaches the token editor.
+        assert!(matches!(
+            render_hypridle_conf(
+                HYPRIDLE_CONF.as_bytes(),
+                &[(SettingId::LockGracePeriod, Value::Integer(-1))],
+            ),
+            Err(HypridleRenderError::GraceValue(Value::Integer(-1)))
+        ));
+    }
+
+    #[test]
+    fn grace_render_errors_read_as_plain_sentences() {
+        // These messages are quoted verbatim in the Apply-failure dialog, so pin them
+        // exactly: no stray whitespace from a broken line continuation, and the grace
+        // number shown as a number rather than a debug-formatted `Value`.
+        assert_eq!(
+            HypridleRenderError::MissingLockCommand.to_string(),
+            "the grace period cannot be written: there is no `lock_cmd` in the `general` section"
+        );
+        assert_eq!(
+            HypridleRenderError::GraceValue(Value::Integer(-1)).to_string(),
+            "-1 is not a whole, non-negative number of seconds for the grace period"
+        );
+        assert_eq!(
+            HypridleRenderError::GraceValue(Value::Bool(true)).to_string(),
+            "a boolean value cannot be a grace period, which is a whole number of seconds"
+        );
+        assert_eq!(
+            HypridleRenderError::Grace(GraceError::NoHyprlock).to_string(),
+            "the grace period cannot be written: the lock command does not start hyprlock"
         );
     }
 
@@ -451,7 +791,10 @@ listener {
             ONE_LISTENER.as_bytes(),
             &[(SettingId::DpmsTimeout, Value::Integer(900))],
         );
-        assert!(matches!(result, Err(EditError::SectionNotFound(_))));
+        assert!(matches!(
+            result,
+            Err(HypridleRenderError::Edit(EditError::SectionNotFound(_)))
+        ));
     }
 
     #[test]
@@ -506,7 +849,7 @@ listener {
         assert!(matches!(
             model.apply_contribution(&dirty),
             Err(StoreWriteError::Render {
-                error: EditError::InvalidValue(_),
+                error: HypridleRenderError::Edit(EditError::InvalidValue(_)),
                 ..
             })
         ));
@@ -668,8 +1011,9 @@ listener {
                     (SettingId::DpmsTimeout, Value::Integer(330)),
                     (
                         SettingId::LockCommand,
-                        Value::String("pidof hyprlock || hyprlock".to_string()),
+                        Value::String("pidof hyprlock || hyprlock --grace 10".to_string()),
                     ),
+                    (SettingId::LockGracePeriod, Value::Integer(10)),
                 ],
             },
             reader,

@@ -50,7 +50,9 @@
 //! task-5.1 placeholder until §6 fills it in.
 
 use crate::core::detect::{Binary, Capabilities};
+use crate::core::lock_grace::grace_of;
 use crate::core::model::{SettingId, Value, ValueKind};
+use crate::core::store::SettingsStore;
 
 /// A user-originated edit flowing from a widget to the store (architecture §7).
 ///
@@ -142,6 +144,19 @@ pub(crate) enum WidgetKind {
     /// (task 6.8). The stored value is the entry's text verbatim; validation (if any) is
     /// the setting's concern, not the widget's.
     Entry,
+    /// A `GtkSpinButton`, editing a [`Value::Integer`] over `min..=max` in whole steps.
+    /// Used where the exact number matters more than dragging speed and a slider's pixel
+    /// resolution would make it fiddly to hit — the hyprlock grace period, in seconds
+    /// (task 11.13). The spin button rounds to whole numbers itself, and its value is
+    /// converted like a scale's ([`value_from_scale`]).
+    Spin {
+        /// Inclusive lower bound.
+        min: f64,
+        /// Inclusive upper bound.
+        max: f64,
+        /// The increment of one arrow click or arrow-key press.
+        step: f64,
+    },
 }
 
 impl WidgetKind {
@@ -156,6 +171,7 @@ impl WidgetKind {
         match self {
             WidgetKind::Switch => kind == ValueKind::Bool,
             WidgetKind::Scale { .. } => matches!(kind, ValueKind::Float | ValueKind::Integer),
+            WidgetKind::Spin { .. } => kind == ValueKind::Integer,
             WidgetKind::ReorderableList { .. }
             | WidgetKind::TokenSwitch { .. }
             | WidgetKind::Entry => kind == ValueKind::String,
@@ -195,6 +211,51 @@ impl RowCapability {
     }
 }
 
+/// A condition on the *loaded configuration* that a row needs on top of its
+/// [`RowCapability`] (R4.2, task 11.13).
+///
+/// A [`RowCapability`] describes the machine — a binary on `$PATH` — and is decided by
+/// detection before any file is read. Some controls also depend on what the user's
+/// config says: the hyprlock grace period only exists when the lock command actually
+/// starts hyprlock. Such a row declares a gate, evaluated against the store the startup
+/// load populated ([`content_visible_rows`]), and is hidden — never greyed out — when
+/// the gate fails, exactly like a row whose capability is absent.
+///
+/// The gate is evaluated when the page is built (at startup and on each detection
+/// refresh), not on every edit: a page never adds or drops rows while the user edits it.
+/// A control whose gate stops holding mid-session stays visible until the next rebuild,
+/// and the store refuses its edits.
+///
+/// The concrete case is the lock grace period. Suppose the user edits the lock command to
+/// one that does not start hyprlock, and applies it. The commit makes that command the
+/// stored original, but the grace period's stored original is left at its old number,
+/// because the store discarded only the *staged* grace edit. The grace row built at
+/// startup therefore keeps showing that old number, and every edit to it is refused
+/// (there is no `--grace` token to write it into), until the next Refresh rebuilds the
+/// page and this gate hides the row. After that rebuild, and at every later launch, the
+/// row is hidden.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContentGate {
+    /// The lock command starts hyprlock in a shape whose `--grace N` token the token
+    /// editor can edit ([`grace_of`] is `Some`), and the loader seeded a grace value.
+    LockCommandStartsHyprlock,
+}
+
+impl ContentGate {
+    /// Whether the configuration loaded into `store` satisfies this gate.
+    pub(crate) fn is_met(&self, store: &SettingsStore) -> bool {
+        match self {
+            ContentGate::LockCommandStartsHyprlock => {
+                store.value(SettingId::LockGracePeriod).is_some()
+                    && store
+                        .value(SettingId::LockCommand)
+                        .and_then(Value::as_str)
+                        .is_some_and(|command| grace_of(command).is_some())
+            }
+        }
+    }
+}
+
 /// A declarative description of one settings row (task 5.2, architecture §7).
 ///
 /// A page is built from a `Vec<RowDescriptor>`: the framework renders each into a
@@ -211,6 +272,9 @@ pub(crate) struct RowDescriptor {
     pub(crate) setting: SettingId,
     /// The capability that must be present for the row to appear (R4.2).
     pub(crate) capability: RowCapability,
+    /// The condition on the loaded configuration the row additionally needs, if any
+    /// (see [`ContentGate`]); `None` for almost every row.
+    pub(crate) content_gate: Option<ContentGate>,
 }
 
 impl RowDescriptor {
@@ -226,7 +290,15 @@ impl RowDescriptor {
             widget,
             setting,
             capability,
+            content_gate: None,
         }
+    }
+
+    /// The same descriptor, additionally gated on the loaded configuration (see
+    /// [`ContentGate`]).
+    pub(crate) fn with_content_gate(mut self, gate: ContentGate) -> Self {
+        self.content_gate = Some(gate);
+        self
     }
 
     /// Whether this row should be shown for the detected `capabilities` (R4.2).
@@ -273,6 +345,34 @@ pub(crate) fn visible_rows(
             visible
         })
         .cloned()
+        .collect()
+}
+
+/// Filters `descriptors` down to the rows whose [`ContentGate`] (if any) the loaded
+/// configuration in `store` satisfies, preserving order (R4.2, task 11.13).
+///
+/// The second half of the per-row gate, applied after [`visible_rows`] once the store is
+/// populated. Each dropped row is logged at `info` with its label and gate, following the
+/// same "hidden state is logged at info" convention as [`visible_rows`]; the specific
+/// reason (e.g. why a lock command offers no editable grace period) was already logged at
+/// `debug` by the loader.
+pub(crate) fn content_visible_rows(
+    descriptors: Vec<RowDescriptor>,
+    store: &SettingsStore,
+) -> Vec<RowDescriptor> {
+    descriptors
+        .into_iter()
+        .filter(|descriptor| match descriptor.content_gate {
+            Some(gate) if !gate.is_met(store) => {
+                tracing::info!(
+                    row = %descriptor.label,
+                    gate = ?gate,
+                    "row hidden: the loaded configuration does not support it (R4.2)"
+                );
+                false
+            }
+            _ => true,
+        })
         .collect()
 }
 
@@ -484,6 +584,15 @@ mod tests {
         // A text entry edits a free-text String setting (the lock command, task 6.8).
         assert!(WidgetKind::Entry.is_compatible_with(ValueKind::String));
         assert!(!WidgetKind::Entry.is_compatible_with(ValueKind::Integer));
+
+        // The spin button edits whole numbers only (the grace period, task 11.13).
+        let spin = WidgetKind::Spin {
+            min: 0.0,
+            max: 600.0,
+            step: 1.0,
+        };
+        assert!(spin.is_compatible_with(ValueKind::Integer));
+        assert!(!spin.is_compatible_with(ValueKind::Float));
     }
 
     #[test]
@@ -754,5 +863,89 @@ mod tests {
             vec!["us".to_string(), "se".to_string()]
         );
         assert!(list_items_from_value(None).is_empty());
+    }
+
+    /// A store holding `command` as the lock command and, when given, a grace period —
+    /// what the `hypridle.conf` loader produces (task 11.13).
+    fn lock_store(command: &str, grace: Option<i64>) -> SettingsStore {
+        use crate::core::store::FileValues;
+        use std::path::Path;
+
+        let mut values = vec![(SettingId::LockCommand, Value::String(command.to_string()))];
+        if let Some(seconds) = grace {
+            values.push((SettingId::LockGracePeriod, Value::Integer(seconds)));
+        }
+        let mut store = SettingsStore::new();
+        store.load_file(
+            "<row test seed>",
+            FileValues {
+                bytes: Vec::new(),
+                values,
+            },
+            Box::new(|_: &Path| Err(std::io::Error::other("never re-read"))),
+        );
+        store
+    }
+
+    fn grace_row() -> RowDescriptor {
+        RowDescriptor::new(
+            "Grace",
+            WidgetKind::Spin {
+                min: 0.0,
+                max: 600.0,
+                step: 1.0,
+            },
+            SettingId::LockGracePeriod,
+            RowCapability::Always,
+        )
+        .with_content_gate(ContentGate::LockCommandStartsHyprlock)
+    }
+
+    fn plain_row() -> RowDescriptor {
+        RowDescriptor::new(
+            "Lock command",
+            WidgetKind::Entry,
+            SettingId::LockCommand,
+            RowCapability::Always,
+        )
+    }
+
+    #[test]
+    fn the_grace_row_shows_when_the_lock_command_starts_hyprlock() {
+        let store = lock_store("pidof hyprlock || hyprlock --grace 10", Some(10));
+        let rows = content_visible_rows(vec![plain_row(), grace_row()], &store);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn the_grace_row_is_hidden_and_logged_when_hyprlock_is_not_started() {
+        // R4.2: hidden (not greyed out), with an `info` line naming the row; rows
+        // without a gate are unaffected.
+        for (command, grace) in [
+            // What the loader yields for such a command: no grace value at all.
+            ("swaylock -f", None),
+            // A grace value the store still holds while the command no longer fits it
+            // (e.g. after an external edit) must not show the row either.
+            ("swaylock -f", Some(10)),
+        ] {
+            let store = lock_store(command, grace);
+            let mut rows = Vec::new();
+            let events = crate::testing::capture_logs(|| {
+                rows = content_visible_rows(vec![plain_row(), grace_row()], &store);
+            });
+            assert_eq!(
+                rows.iter().map(|row| row.setting).collect::<Vec<_>>(),
+                vec![SettingId::LockCommand],
+                "{command:?} with grace {grace:?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.level == tracing::Level::INFO
+                        && event.message.contains("row hidden")
+                        && event.fields.contains("Grace")),
+                "the hidden row is logged at info: {events:?}"
+            );
+        }
     }
 }

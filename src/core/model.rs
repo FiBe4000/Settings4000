@@ -60,6 +60,7 @@ use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 use crate::core::home_path::{self, expand_home, is_home_relative};
+use crate::core::lock_grace::GraceError;
 use crate::parsers::palette::is_bare_hex;
 
 /// A top-level settings category — one entry per sidebar page (R2.4, requirements
@@ -88,7 +89,8 @@ pub enum Category {
     Theme,
     /// Keyboard, mouse, and touchpad settings backed by `input.lua` (tasks 6.6, 11.4).
     Input,
-    /// Idle timeouts and the lock command backed by `hypridle.conf` (task 6.8).
+    /// Idle timeouts, the lock command and its grace period, backed by `hypridle.conf`
+    /// (tasks 6.8, 11.13).
     PowerAndIdle,
 }
 
@@ -197,9 +199,24 @@ pub enum SettingId {
     LockTimeout,
     /// Idle seconds before displays are switched off (DPMS).
     DpmsTimeout,
-    /// The command hypridle runs to lock the session — free text, so unvalidated
-    /// beyond its kind.
+    /// The command hypridle runs to lock the session (`general.lock_cmd`) — free text,
+    /// validated only against bytes that would break the hyprlang line.
     LockCommand,
+    /// hyprlock's grace period in whole seconds: how long after locking any input
+    /// unlocks again without a password, `0` locking immediately (task 11.13).
+    ///
+    /// hyprlock ≥ 0.9 reads it only from its command line, so on disk it is not a key
+    /// of its own but the `--grace N` token inside [`Self::LockCommand`]'s value
+    /// (analysis §7, §8). It is therefore a second view of the same `general.lock_cmd`
+    /// value: the loader derives it with [`grace_of`](crate::core::lock_grace::grace_of),
+    /// the store keeps the two in step whenever either is staged (see
+    /// [`SettingsStore::stage`](crate::core::store::SettingsStore::stage)), and the
+    /// writer applies it as a token edit on the lock command
+    /// ([`render_hypridle_conf`](crate::core::power::render_hypridle_conf)). Validated
+    /// against [`LOCK_GRACE_SECONDS_RANGE`]. A grace already on disk beyond that range
+    /// loads verbatim and blocks lock-command edits until it is lowered. The store's
+    /// `linked_edit` documents this corner case.
+    LockGracePeriod,
 }
 
 impl SettingId {
@@ -212,9 +229,10 @@ impl SettingId {
         match self {
             SettingId::MonitorMode | SettingId::MonitorPosition => ValueKind::Enum,
             SettingId::MonitorScale | SettingId::MouseSensitivity => ValueKind::Float,
-            SettingId::DimTimeout | SettingId::LockTimeout | SettingId::DpmsTimeout => {
-                ValueKind::Integer
-            }
+            SettingId::DimTimeout
+            | SettingId::LockTimeout
+            | SettingId::DpmsTimeout
+            | SettingId::LockGracePeriod => ValueKind::Integer,
             SettingId::TouchpadNaturalScroll
             | SettingId::TouchpadTapToClick
             | SettingId::LaptopDisplayEnabled => ValueKind::Bool,
@@ -248,7 +266,8 @@ impl SettingId {
             SettingId::DimTimeout
             | SettingId::LockTimeout
             | SettingId::DpmsTimeout
-            | SettingId::LockCommand => Category::PowerAndIdle,
+            | SettingId::LockCommand
+            | SettingId::LockGracePeriod => Category::PowerAndIdle,
         }
     }
 
@@ -281,7 +300,8 @@ impl SettingId {
             | SettingId::DimTimeout
             | SettingId::LockTimeout
             | SettingId::DpmsTimeout
-            | SettingId::LockCommand => Backing::FileBacked,
+            | SettingId::LockCommand
+            | SettingId::LockGracePeriod => Backing::FileBacked,
         }
     }
 
@@ -323,6 +343,9 @@ impl SettingId {
                 SettingId::DimTimeout | SettingId::LockTimeout | SettingId::DpmsTimeout,
                 Value::Integer(seconds),
             ) => validate_int_range(*seconds, &TIMEOUT_SECONDS_RANGE),
+            (SettingId::LockGracePeriod, Value::Integer(seconds)) => {
+                validate_int_range(*seconds, &LOCK_GRACE_SECONDS_RANGE)
+            }
             // No value-format rule: a boolean switch, a free-text command, or a
             // drop-down whose every option is valid. The kind match above is the
             // only constraint. `LaptopDisplayEnabled` is runtime-only (R5.2) and
@@ -512,6 +535,12 @@ pub enum ValidationError {
         /// The offending value as supplied.
         value: String,
     },
+    /// A grace period was staged, but the lock command it would be written into offers
+    /// no `--grace N` token the app can edit — it does not start hyprlock, or starts it
+    /// in a shape the token editor refuses (task 11.13; see
+    /// [`crate::core::lock_grace`]). Raised by the store, which knows the lock command,
+    /// rather than by [`SettingId::validate`], which sees one value at a time.
+    LockGraceUnavailable(GraceError),
     /// A monitor mode string is not a recognised `WxH@Hz` mode (or special token),
     /// or its numbers are outside the plausible range.
     InvalidMonitorMode {
@@ -590,6 +619,9 @@ impl fmt::Display for ValidationError {
                 f,
                 "`{value}` cannot be used as a command: it must not contain a line break or `#`"
             ),
+            ValidationError::LockGraceUnavailable(error) => {
+                write!(f, "no grace period can be set: {error}")
+            }
             ValidationError::InvalidMonitorMode { value, detail } => {
                 write!(f, "`{value}` is not a valid display mode: {detail}")
             }
@@ -653,6 +685,16 @@ pub const SCALE_RANGE: RangeInclusive<f64> = 0.5..=3.0;
 /// (dim/lock/DPMS in `hypridle.conf`); the
 /// requirement asks only that timeouts be positive with a sensible maximum.
 pub const TIMEOUT_SECONDS_RANGE: RangeInclusive<i64> = 1..=86_400;
+
+/// Allowed hyprlock grace periods, in whole seconds (task 11.13, R8.3).
+///
+/// `0` is valid and means "lock immediately" (hyprlock's behaviour without a grace
+/// flag). The ceiling of ten minutes is a safety bound rather than a hyprlock limit:
+/// during the grace period *any* mouse movement or key press unlocks the session
+/// without a password, so a longer grace would quietly leave an apparently locked
+/// session open. The Power & Idle page's spin control covers exactly this range, and
+/// a grace period typed into the free-text lock command is held to it as well.
+pub const LOCK_GRACE_SECONDS_RANGE: RangeInclusive<i64> = 0..=600;
 
 /// Plausible pixels per axis for a monitor resolution. `16384` is generous
 /// headroom beyond current panels (8K is 7680×4320); the point is to reject a
@@ -1066,6 +1108,7 @@ mod tests {
         SettingId::LockTimeout,
         SettingId::DpmsTimeout,
         SettingId::LockCommand,
+        SettingId::LockGracePeriod,
     ];
 
     /// Fails to compile if [`ALL_SETTING_IDS`] omits a variant, guaranteeing the
@@ -1088,7 +1131,8 @@ mod tests {
             | SettingId::DimTimeout
             | SettingId::LockTimeout
             | SettingId::DpmsTimeout
-            | SettingId::LockCommand => {}
+            | SettingId::LockCommand
+            | SettingId::LockGracePeriod => {}
         }
     }
 
@@ -1117,6 +1161,7 @@ mod tests {
                 Value::Integer(300)
             }
             SettingId::LockCommand => Value::String("hyprlock".to_string()),
+            SettingId::LockGracePeriod => Value::Integer(10),
         }
     }
 
@@ -1557,6 +1602,36 @@ mod tests {
                 .expect_err("zero is not a positive timeout");
             assert!(matches!(error, ValidationError::OutOfRange { .. }));
         }
+    }
+
+    #[test]
+    fn lock_grace_accepts_zero_up_to_ten_minutes() {
+        // Unlike a timeout, zero is a real grace period (lock immediately); the ceiling
+        // is the ten-minute safety bound (task 11.13, R8.3).
+        for seconds in [0, 10, 600] {
+            assert!(
+                SettingId::LockGracePeriod
+                    .validate(&Value::Integer(seconds))
+                    .is_ok(),
+                "{seconds} s is a valid grace period"
+            );
+        }
+        for seconds in [-1, 601] {
+            assert!(matches!(
+                SettingId::LockGracePeriod.validate(&Value::Integer(seconds)),
+                Err(ValidationError::OutOfRange { .. })
+            ));
+        }
+        assert!(matches!(
+            SettingId::LockGracePeriod.validate(&Value::String("10".into())),
+            Err(ValidationError::WrongKind { .. })
+        ));
+        assert_eq!(SettingId::LockGracePeriod.kind(), ValueKind::Integer);
+        assert_eq!(
+            SettingId::LockGracePeriod.category(),
+            Category::PowerAndIdle
+        );
+        assert_eq!(SettingId::LockGracePeriod.backing(), Backing::FileBacked);
     }
 
     #[test]

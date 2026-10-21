@@ -9,7 +9,7 @@
 //! contract:
 //!
 //! - **Build.** From a list of visible [`RowDescriptor`]s it constructs one control
-//!   per row — a `GtkSwitch`, `GtkScale`, `GtkEntry`, or the `GtkListBox`-backed
+//!   per row — a `GtkSwitch`, `GtkScale`, `GtkSpinButton`, `GtkEntry`, or the `GtkListBox`-backed
 //!   reorderable editable list (R2.3) — via [`build_control`].
 //! - **Emit.** On a user change a control emits a [`SetValue`] as the component's
 //!   [`PageMsg::Set`] input. The component relays it to
@@ -54,8 +54,9 @@
 //!
 //! [`category_rows`] returns the declarative descriptor list for a category whose
 //! settings map onto the fixed [`SettingId`] with a *static* control set. Today that is
-//! the Power & Idle page (task 6.8): three idle-timeout sliders and the lock-command
-//! entry, rendered through the generic framework and driven by the store. A category
+//! the Power & Idle page (task 6.8): three idle-timeout sliders, the lock-command
+//! entry and the lock grace period's spin button (task 11.13), rendered through the
+//! generic framework and driven by the store. A category
 //! with a dynamic control set (Input's XKB layouts, task 6.6) or with runtime-only
 //! controls (Sound, Notifications, Network) is built by its own glue instead, and one
 //! with no framework rows yet keeps its task-5.1 placeholder.
@@ -72,19 +73,20 @@ use std::rc::Rc;
 use gtk4::prelude::*;
 use gtk4::{
     Adjustment, Align, Box as GtkBox, Button, DropDown, Entry, Label, ListBox, Orientation, Scale,
-    SelectionMode, StringList, Switch, Widget, glib,
+    SelectionMode, SpinButton, StringList, Switch, Widget, glib,
 };
 use relm4::{Component, ComponentParts, ComponentSender, Controller, SimpleComponent};
 
 use crate::core::detect::{Binary, Capabilities};
-use crate::core::model::{Backing, SettingId, Value, ValueKind};
+use crate::core::model::{Backing, LOCK_GRACE_SECONDS_RANGE, SettingId, Value, ValueKind};
 use crate::core::store::{SettingsStore, StageError, StageOutcome};
 use crate::ui::category::SidebarCategory;
 use crate::ui::row::{
-    DropDownOption, RowCapability, RowDescriptor, SetValue, WidgetKind, entry_text_from_value,
-    list_items_from_value, list_with_added, list_with_swapped, list_without,
-    scale_position_from_value, switch_active_from_value, token_switch_active_from_value,
-    value_from_entry, value_from_scale, value_from_switch, value_from_token_toggle, visible_rows,
+    ContentGate, DropDownOption, RowCapability, RowDescriptor, SetValue, WidgetKind,
+    content_visible_rows, entry_text_from_value, list_items_from_value, list_with_added,
+    list_with_swapped, list_without, scale_position_from_value, switch_active_from_value,
+    token_switch_active_from_value, value_from_entry, value_from_scale, value_from_switch,
+    value_from_token_toggle, visible_rows,
 };
 
 /// Vertical spacing, in pixels, between rows on a page.
@@ -319,6 +321,16 @@ enum BoundControl {
         /// direct access to the store).
         current: Rc<RefCell<String>>,
     },
+    /// A `GtkSpinButton` for a whole-number [`Value::Integer`] setting (the lock grace
+    /// period, task 11.13).
+    Spin {
+        /// The setting this control edits.
+        setting: SettingId,
+        /// The spin button widget.
+        widget: SpinButton,
+        /// The `value-changed` handler, blocked while rendering to avoid feedback.
+        handler: glib::SignalHandlerId,
+    },
     /// A `GtkEntry` for a free-text [`Value::String`] setting (the lock command,
     /// task 6.8).
     Entry {
@@ -337,6 +349,7 @@ impl BoundControl {
         match self {
             BoundControl::Switch { setting, .. }
             | BoundControl::Scale { setting, .. }
+            | BoundControl::Spin { setting, .. }
             | BoundControl::TokenSwitch { setting, .. }
             | BoundControl::Entry { setting, .. } => *setting,
             BoundControl::List(list) => list.setting,
@@ -360,6 +373,18 @@ impl BoundControl {
             BoundControl::Scale {
                 widget, handler, ..
             } => {
+                if let Some(position) = scale_position_from_value(value) {
+                    widget.block_signal(handler);
+                    widget.set_value(position);
+                    widget.unblock_signal(handler);
+                }
+            }
+            BoundControl::Spin {
+                widget, handler, ..
+            } => {
+                // Like a scale: an absent value leaves the control as it is. Setting an
+                // equal value emits no signal, so a render after the spin's own edit is a
+                // no-op; the block covers a store change from elsewhere.
                 if let Some(position) = scale_position_from_value(value) {
                     widget.block_signal(handler);
                     widget.set_value(position);
@@ -550,7 +575,52 @@ fn build_control(
         }
         WidgetKind::TokenSwitch { token } => build_token_switch(descriptor, token.clone(), emit),
         WidgetKind::Entry => build_entry(descriptor, emit),
+        WidgetKind::Spin { min, max, step } => build_spin(descriptor, *min, *max, *step, emit),
     }
+}
+
+/// Builds a `GtkSpinButton` row over the whole numbers `min..=max`, stepping by `step`
+/// (task 11.13).
+///
+/// The spin button is numeric-only and snaps to whole steps, so typed text that is not a
+/// number in range is corrected by GTK before any value is emitted; the setting's own
+/// validation still decides what may be staged (R8.3).
+fn build_spin(
+    descriptor: &RowDescriptor,
+    min: f64,
+    max: f64,
+    step: f64,
+    emit: &Rc<dyn Fn(SetValue)>,
+) -> (GtkBox, BoundControl) {
+    let setting = descriptor.setting;
+    let kind = setting.kind();
+
+    // Page increment (Page Up/Down) of ten steps; no page size, which only scrollbars use.
+    let adjustment = Adjustment::new(min, min, max, step, step * 10.0, 0.0);
+    let widget = SpinButton::new(Some(&adjustment), step, 0);
+    widget.set_numeric(true);
+    widget.set_snap_to_ticks(true);
+    widget.set_valign(Align::Center);
+
+    let handler = {
+        let emit = emit.clone();
+        widget.connect_value_changed(move |spin| {
+            emit(SetValue {
+                id: setting,
+                value: value_from_scale(kind, spin.value()),
+            });
+        })
+    };
+
+    let row = labelled_row(&descriptor.label, &widget);
+    (
+        row,
+        BoundControl::Spin {
+            setting,
+            widget,
+            handler,
+        },
+    )
 }
 
 /// Builds a `GtkSwitch` row.
@@ -800,8 +870,8 @@ fn string_list(options: &[DropDownOption]) -> StringList {
 /// page is not built here — its layout list needs runtime XKB candidates, so the window
 /// builds it directly (task 6.6, see [`super::input`]), and the Notifications page is
 /// runtime-only (task 11.7, see [`super::notifications`]). Power & Idle (task 6.8) is
-/// fully static — three idle-timeout sliders and a free-text lock-command entry — so it
-/// lives here and is built entirely through the generic framework path with no bespoke
+/// fully static — three idle-timeout sliders, a free-text lock-command entry and the
+/// lock grace period's spin button (task 11.13) — so it lives here and is built entirely through the generic framework path with no bespoke
 /// glue.
 fn category_rows(category: SidebarCategory) -> Vec<RowDescriptor> {
     match category {
@@ -811,7 +881,9 @@ fn category_rows(category: SidebarCategory) -> Vec<RowDescriptor> {
         // dynamic XKB layout list. Each row is gated on the hypridle binary, matching the
         // category gate (task 5.1); when hypridle.conf is missing/unreadable the rows still
         // build and render their defaults, rejecting edits until the file appears (R4.4) —
-        // the same graceful degradation the Input page uses.
+        // the same graceful degradation the Input page uses. The grace row is the
+        // exception: it only exists when the loaded lock command starts hyprlock, so it is
+        // hidden instead (its content gate).
         SidebarCategory::PowerAndIdle => vec![
             RowDescriptor::new(
                 "Dim screen after (seconds)",
@@ -837,6 +909,16 @@ fn category_rows(category: SidebarCategory) -> Vec<RowDescriptor> {
                 SettingId::LockCommand,
                 RowCapability::Binary(Binary::Hypridle),
             ),
+            // The `--grace N` token of the lock command (task 11.13). Shown only when the
+            // loaded lock command starts hyprlock in a shape whose token the app can edit;
+            // otherwise there is no grace period to set.
+            RowDescriptor::new(
+                "Unlock without password within (seconds of locking)",
+                lock_grace_spin(),
+                SettingId::LockGracePeriod,
+                RowCapability::Binary(Binary::Hypridle),
+            )
+            .with_content_gate(ContentGate::LockCommandStartsHyprlock),
         ],
         // The remaining categories have no framework rows yet; §6 fills them in, and
         // until then the window shows task 5.1's placeholder for them.
@@ -860,6 +942,21 @@ fn idle_timeout_scale() -> WidgetKind {
     }
 }
 
+/// The lock grace period's spin control (task 11.13): whole seconds over exactly the
+/// validator's [`LOCK_GRACE_SECONDS_RANGE`] (`0` = lock immediately), one second per step.
+///
+/// Unlike the idle-timeout sliders there is no narrower ergonomic span — the useful values
+/// are a handful of seconds, which a spin button hits exactly. A value on disk above the
+/// range (written by hand) is shown clamped to the maximum but stays the stored original
+/// until the user changes the control.
+fn lock_grace_spin() -> WidgetKind {
+    WidgetKind::Spin {
+        min: *LOCK_GRACE_SECONDS_RANGE.start() as f64,
+        max: *LOCK_GRACE_SECONDS_RANGE.end() as f64,
+        step: 1.0,
+    }
+}
+
 /// What a category's page should be, once per-row gating (R4.2) is applied to its
 /// interim descriptor list — the pure, GTK-free half of the window's page-building
 /// decision (task 5.3), split out so the composition is unit-tested headlessly (R6.2).
@@ -880,15 +977,22 @@ pub(crate) enum PagePlan {
     NoSpec,
 }
 
-/// Decides how `category`'s page should be built under the detected `capabilities`,
-/// composing per-row gating with task 5.1's category gate (R4.2).
+/// Decides how `category`'s page should be built under the detected `capabilities` and
+/// the configuration loaded into `store`, composing per-row gating with task 5.1's
+/// category gate (R4.2).
 ///
 /// A category with no interim descriptors yields [`PagePlan::NoSpec`]; one whose every
 /// row is gated out yields [`PagePlan::Emptied`] (logged at `info` as a hidden
 /// category); otherwise the visible rows are returned as [`PagePlan::Framework`] for
-/// [`build_page`] to render. Keeping the decision GTK-free is what lets it be tested
-/// without a display (R6.2).
-pub(crate) fn plan_category(category: SidebarCategory, capabilities: &Capabilities) -> PagePlan {
+/// [`build_page`] to render. A row is visible when its capability is present
+/// ([`visible_rows`]) and its content gate, if it has one, holds for the loaded
+/// configuration ([`content_visible_rows`] — e.g. the lock grace period, task 11.13).
+/// Keeping the decision GTK-free is what lets it be tested without a display (R6.2).
+pub(crate) fn plan_category(
+    category: SidebarCategory,
+    capabilities: &Capabilities,
+    store: &SettingsStore,
+) -> PagePlan {
     let descriptors = category_rows(category);
     if descriptors.is_empty() {
         return PagePlan::NoSpec;
@@ -896,7 +1000,7 @@ pub(crate) fn plan_category(category: SidebarCategory, capabilities: &Capabiliti
 
     // The per-row gate (R4.2). Its result composes with task 5.1's category gate: an
     // empty result means the category has been emptied and should be dropped.
-    let visible = visible_rows(&descriptors, capabilities);
+    let visible = content_visible_rows(visible_rows(&descriptors, capabilities), store);
     if visible.is_empty() {
         tracing::info!(
             category = category.title(),
@@ -1128,19 +1232,21 @@ mod tests {
         // and Input, which the window now builds directly with runtime XKB candidates
         // (task 6.6) rather than through this interim list.
         let any = Capabilities::for_tests(&[Binary::Hyprctl, Binary::Hypridle], &[], true);
+        // No loaded configuration: content-gated rows drop out, nothing else changes.
+        let empty = SettingsStore::new();
         assert!(matches!(
-            plan_category(SidebarCategory::Theme, &any),
+            plan_category(SidebarCategory::Theme, &any, &empty),
             PagePlan::NoSpec
         ));
         assert!(matches!(
-            plan_category(SidebarCategory::Input, &any),
+            plan_category(SidebarCategory::Input, &any, &empty),
             PagePlan::NoSpec
         ));
 
         // Framework: a category whose rows are (at least partly) present. Power & Idle's
         // rows need hypridle, which `any` has.
         assert!(matches!(
-            plan_category(SidebarCategory::PowerAndIdle, &any),
+            plan_category(SidebarCategory::PowerAndIdle, &any, &empty),
             PagePlan::Framework(_)
         ));
 
@@ -1148,8 +1254,58 @@ mod tests {
         // hidden, so the whole category is dropped (R4.2) rather than shown empty.
         let nothing = Capabilities::for_tests(&[], &[], false);
         assert!(matches!(
-            plan_category(SidebarCategory::PowerAndIdle, &nothing),
+            plan_category(SidebarCategory::PowerAndIdle, &nothing, &empty),
             PagePlan::Emptied
         ));
+    }
+
+    /// The Power & Idle rows the plan keeps for `store`, by setting.
+    fn planned_power_settings(store: &SettingsStore) -> Vec<SettingId> {
+        let caps = Capabilities::for_tests(&[Binary::Hypridle], &[], false);
+        match plan_category(SidebarCategory::PowerAndIdle, &caps, store) {
+            PagePlan::Framework(rows) => rows.iter().map(|row| row.setting).collect(),
+            _ => panic!("Power & Idle should plan framework rows"),
+        }
+    }
+
+    #[test]
+    fn the_grace_spin_appears_only_for_a_lock_command_that_starts_hyprlock() {
+        // Task 11.13: the grace control is a spin button over exactly the validator's
+        // range, shown when the loaded lock command starts hyprlock, and hidden (the
+        // rest of the page unaffected) when it does not.
+        let power = category_rows(SidebarCategory::PowerAndIdle);
+        let grace = power
+            .iter()
+            .find(|row| row.setting == SettingId::LockGracePeriod)
+            .expect("Power & Idle has a grace row");
+        assert!(matches!(
+            grace.widget,
+            WidgetKind::Spin { min, max, step }
+                if min == 0.0 && max == 600.0 && step == 1.0
+        ));
+
+        let hyprlock = test_store(&[
+            (
+                SettingId::LockCommand,
+                Value::String("pidof hyprlock || hyprlock --grace 10".to_string()),
+            ),
+            (SettingId::LockGracePeriod, Value::Integer(10)),
+        ]);
+        assert!(planned_power_settings(&hyprlock).contains(&SettingId::LockGracePeriod));
+
+        let swaylock = test_store(&[(
+            SettingId::LockCommand,
+            Value::String("swaylock -f".to_string()),
+        )]);
+        assert_eq!(
+            planned_power_settings(&swaylock),
+            vec![
+                SettingId::DimTimeout,
+                SettingId::LockTimeout,
+                SettingId::DpmsTimeout,
+                SettingId::LockCommand,
+            ],
+            "only the grace row is hidden"
+        );
     }
 }

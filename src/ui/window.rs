@@ -746,7 +746,11 @@ impl Shell {
                 self.populate_network(category);
                 continue;
             }
-            match page::plan_category(category, &caps) {
+            // The plan reads the store too: some rows exist only for certain loaded
+            // configurations (the lock grace period, task 11.13). The borrow ends with
+            // the `plan_category` call, before `build_page` takes its own handle.
+            let plan = page::plan_category(category, &caps, &self.store.borrow());
+            match plan {
                 PagePlan::Framework(rows) => {
                     let controller =
                         page::build_page(self.store.clone(), rows, self.update_chrome.clone());

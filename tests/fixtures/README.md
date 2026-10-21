@@ -15,10 +15,23 @@ below — exactly as the real `setup.sh` deployment does.
 The tree was first built in task 7.1 from the §6 layout and refreshed in task
 11.1 from the dotfiles repo at commit **`8a5b20b`** (the head of branch
 `wayland-dev`, 2026-10-20). Files were taken from that commit with
-`git show 8a5b20b:<path>`, never from a working tree. The refresh was
-additions-only apart from the files named below as refreshed, so some fixture
-files are deliberately still in their §6 shape; see "Known divergences from
-`8a5b20b`".
+`git show 8a5b20b:<path>`, never from a working tree. Task 11.1 was
+additions-only; the files whose `8a5b20b` content broke existing tests were
+refreshed later by the tasks that retargeted those tests (11.5, 11.6, 11.10,
+11.13, listed below). Since task 11.13 no fixture file is held in an older
+shape for the sake of a test. The files that still differ from `8a5b20b` are:
+
+- anonymized copies (see "Anonymization rules"): `config/hypr/hyprland.lua`,
+  `config/hypr/monitors.conf`, `config/uwsm/env`;
+- stand-ins and stubs (see "What it contains"): `colors/README.md`,
+  `scripts/generate-colors`, `scripts/hypr-toggle-laptop-display`,
+  `scripts/notifctl`;
+- two task-7.1 copies that were never refreshed because the app reads nothing
+  that changed in them: `config/kitty/kitty.conf` (lacks the later
+  `remember_window_size no` block; the app only sends kitty a signal) and
+  `theme/fonts` (shorter comments; identical keys and values).
+
+Every other file is the `8a5b20b` content byte for byte.
 
 ### What it contains
 
@@ -124,16 +137,21 @@ lines of `hyprland.lua`, and `icons/default/index.theme`.
   placeholder substitution these two files used to need is gone; the installer
   now copies the tree byte for byte.
 
-### Known divergences from `8a5b20b`
+### Refreshed to `8a5b20b` in task 11.13
 
-Each of these files is kept in its §6 shape because the `8a5b20b` version
-breaks an existing test whose expectation is the old content; the task that
-retargets the code updates the file together with those tests. The divergence
-was verified by refreshing each file in turn and running the suite.
+- `config/hypr/hypridle.conf` — verbatim: `lock_cmd = pidof hyprlock ||
+  hyprlock --grace 10` with the comment block above it explaining the grace
+  rule, the dual-form dpms commands (`hyprctl dispatch dpms …` with the Lua
+  `hl.dsp.dpms` fallback), and the dim listener calling
+  `~/.dotfiles/scripts/idle-dim dim` / `restore`. Its home paths are
+  home-relative (`~/.dotfiles/…`) and name the dotfiles repo, not a user, so
+  they needed no anonymization; the fixture omits `scripts/idle-dim` (see
+  "Deployed items the fixture omits"), which no test runs. The Power & Idle
+  page's lock grace control (task 11.13) reads and edits the `--grace 10`
+  token of that line.
 
-| Fixture file | `8a5b20b` has | Existing tests it breaks | Refresh with |
-|---|---|---|---|
-| `config/hypr/hypridle.conf` | `--grace 10` in `lock_cmd`, dual-form dpms commands, `idle-dim` dim/restore, explanatory comments | `apply_power::a_lock_command_edit_restarts_via_the_kill_and_respawn_fallback` (expects the old `lock_cmd` text) | 11.13 |
+The "Known divergences from `8a5b20b`" table that tracked the files still in
+their §6 shape is gone with this refresh: it became empty.
 
 ### Removed
 

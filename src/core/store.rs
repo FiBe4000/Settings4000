@@ -59,6 +59,32 @@
 //! file-backed settings, so dirty tracking, the per-page rollup, and reset all
 //! exclude runtime-only settings automatically.
 //!
+//! # Linked settings: two views of one on-disk value
+//!
+//! Normally each [`SettingId`] owns its own key in its file. One pair does not: the
+//! hyprlock grace period ([`SettingId::LockGracePeriod`], task 11.13) is the `--grace N`
+//! token *inside* the lock command ([`SettingId::LockCommand`], hypridle's
+//! `general.lock_cmd`), because hyprlock ≥ 0.9 reads it only from its command line. If
+//! the two were staged independently they would drift apart: a grace-only Apply would
+//! leave the lock-command field showing the old `--grace` text (and a later edit of that
+//! field would silently write the old number back), and a lock command typed with a new
+//! `--grace` would leave the grace control showing the old value. So
+//! [`SettingsStore::stage`] keeps them in step, as one rule applied at the only place
+//! values enter the store:
+//!
+//! - staging a grace period also stages the lock command rewritten with that grace token
+//!   ([`set_grace`] on the lock command's current value); if that command offers no
+//!   editable grace token the grace edit is refused (R8.3) and nothing is staged;
+//! - staging a lock command also stages the grace period it now carries
+//!   ([`parse_grace`]; no flag reads as `0`), or — if the new command offers no editable
+//!   grace token — discards any staged grace edit, so a grace number can never be
+//!   applied against a command it no longer fits.
+//!
+//! Both halves are computed before anything is recorded, so a refused edit leaves the
+//! store exactly as it was. Because both settings are always staged together, Reset,
+//! commit and dirty tracking need no special case: the pair is dirty, discarded and
+//! promoted as one.
+//!
 //! # Dirty comparison and `NaN` (validate-on-stage)
 //!
 //! [`Value`] derives [`PartialEq`] but not [`Eq`] because it can hold an [`f64`], and
@@ -79,7 +105,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::core::freshness::{ConflictReason, FreshnessTracker};
+use crate::core::lock_grace::{parse_grace, set_grace};
 use crate::core::model::{Backing, Category, SettingId, ValidationError, Value};
+
+/// The effect a staged value has on the setting linked to it (see the module docs on
+/// linked settings): `Some(value)` stages `value` for that setting, `None` discards its
+/// staged edit.
+type LinkedEdit = (SettingId, Option<Value>);
 
 /// The freshly-read contents of one backing file: the raw bytes plus the original
 /// values parsed from them.
@@ -336,6 +368,10 @@ impl SettingsStore {
     /// file-backed setting's staged value is updated and reported as
     /// [`StageOutcome::Staged`]; staging a setting that was never loaded is a
     /// [`StageError::NotLoaded`] guard rather than a silent insert.
+    ///
+    /// Staging the lock command or its grace period also updates the other one, and a
+    /// grace period the lock command cannot carry is refused; see the module docs on
+    /// linked settings (task 11.13).
     pub fn stage(&mut self, id: SettingId, value: Value) -> Result<StageOutcome, StageError> {
         id.validate(&value)?;
 
@@ -343,6 +379,23 @@ impl SettingsStore {
             // Runtime-only (R5.2): applied immediately by the caller, never staged.
             tracing::debug!(?id, "runtime-only edit bypasses staging");
             return Ok(StageOutcome::RuntimeBypass);
+        }
+        if !self.settings.contains_key(&id) {
+            return Err(StageError::NotLoaded(id));
+        }
+
+        // Worked out before anything is recorded, so a refusal stages nothing.
+        let linked = self.linked_edit(id, &value)?;
+        if let Some((linked_id, linked_value)) = linked {
+            if let Some(entry) = self.settings.get_mut(&linked_id) {
+                tracing::debug!(
+                    ?id,
+                    ?linked_id,
+                    staged = ?linked_value,
+                    "kept a linked setting in step"
+                );
+                entry.staged = linked_value;
+            }
         }
 
         match self.settings.get_mut(&id) {
@@ -363,6 +416,73 @@ impl SettingsStore {
                 Ok(StageOutcome::Staged)
             }
             None => Err(StageError::NotLoaded(id)),
+        }
+    }
+
+    /// The edit staging `value` for `id` implies for the setting linked to it, if any
+    /// (see the module docs on linked settings).
+    ///
+    /// **This is the single extension point for linked settings.** Any future pair of
+    /// settings that are two views of one on-disk key gets its rule as another arm of the
+    /// `match` below; every other setting falls through to `_ => Ok(None)` and is staged
+    /// on its own. Keeping the rule here, at the one place values enter the store, is
+    /// what lets Reset, commit, refresh and dirty tracking treat a linked pair like any
+    /// two settings.
+    ///
+    /// Fails — so the whole stage is refused — when a grace period cannot be written into
+    /// the current lock command, or when the rewritten counterpart would itself be
+    /// invalid (a grace period typed into the lock command beyond
+    /// [`LOCK_GRACE_SECONDS_RANGE`](crate::core::model::LOCK_GRACE_SECONDS_RANGE), R8.3).
+    ///
+    /// # The out-of-range grace already on disk
+    ///
+    /// The loader stores what the file says, unvalidated (the store validates only staged
+    /// edits), so a hand-written `--grace 3600` loads verbatim as the grace original. The
+    /// Power & Idle spin button shows it clamped to the 600-second maximum, but nothing is
+    /// staged until the user touches a control. Then the range applies to both views:
+    /// every lock-command edit that keeps the `--grace 3600` token is refused with
+    /// [`ValidationError::OutOfRange`] (the entry snaps back), until the user lowers the
+    /// number, by editing the token in the entry or by moving the spin button, which stages
+    /// an in-range value and rewrites the token with it. This is deliberate: the app never
+    /// writes a grace beyond the range (R8.3), even one it did not choose.
+    fn linked_edit(&self, id: SettingId, value: &Value) -> Result<Option<LinkedEdit>, StageError> {
+        match (id, value) {
+            (SettingId::LockGracePeriod, Value::Integer(seconds)) => {
+                let command = self
+                    .value(SettingId::LockCommand)
+                    .and_then(Value::as_str)
+                    .ok_or(StageError::NotLoaded(SettingId::LockCommand))?;
+                // Already range-checked by `validate`; the conversion only guards the type.
+                let seconds = u32::try_from(*seconds).map_err(|_| {
+                    StageError::Invalid(ValidationError::OutOfRange {
+                        value: seconds.to_string(),
+                        min: "0".to_string(),
+                        max: u32::MAX.to_string(),
+                    })
+                })?;
+                let command = set_grace(command, seconds).map_err(|error| {
+                    StageError::Invalid(ValidationError::LockGraceUnavailable(error))
+                })?;
+                let command = Value::String(command);
+                SettingId::LockCommand.validate(&command)?;
+                Ok(Some((SettingId::LockCommand, Some(command))))
+            }
+            (SettingId::LockCommand, Value::String(command))
+                if self.settings.contains_key(&SettingId::LockGracePeriod) =>
+            {
+                match parse_grace(command) {
+                    Ok(seconds) => {
+                        let grace = Value::Integer(i64::from(seconds.unwrap_or(0)));
+                        SettingId::LockGracePeriod.validate(&grace)?;
+                        Ok(Some((SettingId::LockGracePeriod, Some(grace))))
+                    }
+                    // The new command has no editable grace token (hyprlock removed, or
+                    // written in a refused shape): drop any pending grace edit rather than
+                    // apply it against a command it no longer fits.
+                    Err(_) => Ok(Some((SettingId::LockGracePeriod, None))),
+                }
+            }
+            _ => Ok(None),
         }
     }
 
@@ -1169,6 +1289,292 @@ mod tests {
         assert!(
             store.value(SettingId::LaptopDisplayEnabled).is_none(),
             "the runtime-only setting is skipped, never stored"
+        );
+    }
+
+    // --- Linked settings: the lock command and its grace period (task 11.13) ---
+
+    /// A store loaded with the real dotfiles' lock command and the grace period the
+    /// loader derives from it (`--grace 10`), under a synthetic key that is never read.
+    fn lock_store(command: &str, grace: Option<i64>) -> SettingsStore {
+        let mut values = vec![(SettingId::LockCommand, Value::String(command.to_string()))];
+        if let Some(seconds) = grace {
+            values.push((SettingId::LockGracePeriod, Value::Integer(seconds)));
+        }
+        let mut store = SettingsStore::new();
+        store.load_file(
+            "<lock test seed>",
+            FileValues {
+                bytes: Vec::new(),
+                values,
+            },
+            Box::new(|_: &Path| Err(io::Error::other("never re-read in these tests"))),
+        );
+        store
+    }
+
+    fn lock_command(store: &SettingsStore) -> Option<&str> {
+        store.value(SettingId::LockCommand).and_then(Value::as_str)
+    }
+
+    const REAL_LOCK_CMD: &str = "pidof hyprlock || hyprlock --grace 10";
+
+    #[test]
+    fn staging_a_grace_period_rewrites_the_lock_command_too() {
+        let mut store = lock_store(REAL_LOCK_CMD, Some(10));
+        store
+            .stage(SettingId::LockGracePeriod, Value::Integer(30))
+            .expect("a grace period stages");
+        assert_eq!(
+            lock_command(&store),
+            Some("pidof hyprlock || hyprlock --grace 30"),
+            "the lock-command field must show the new token, not stale text"
+        );
+        assert_eq!(
+            store.dirty_ids(),
+            vec![SettingId::LockCommand, SettingId::LockGracePeriod],
+            "both views of general.lock_cmd are dirty together"
+        );
+
+        // Back to the original: both settle back to clean, byte-identical text.
+        store
+            .stage(SettingId::LockGracePeriod, Value::Integer(10))
+            .expect("the original grace stages");
+        assert_eq!(lock_command(&store), Some(REAL_LOCK_CMD));
+        assert!(!store.is_dirty());
+    }
+
+    #[test]
+    fn staging_a_lock_command_updates_the_grace_period() {
+        let mut store = lock_store(REAL_LOCK_CMD, Some(10));
+        store
+            .stage(
+                SettingId::LockCommand,
+                Value::String("hyprlock --grace 45 --no-fade-in".to_string()),
+            )
+            .expect("a lock command stages");
+        assert_eq!(
+            store.value(SettingId::LockGracePeriod),
+            Some(&Value::Integer(45))
+        );
+
+        // No grace flag reads as zero, which hyprlock does without one.
+        store
+            .stage(
+                SettingId::LockCommand,
+                Value::String("hyprlock".to_string()),
+            )
+            .expect("a lock command stages");
+        assert_eq!(
+            store.value(SettingId::LockGracePeriod),
+            Some(&Value::Integer(0))
+        );
+
+        // Commit promotes both, so the pair stays coherent after an Apply.
+        store.commit_apply(&[]);
+        assert_eq!(
+            store.original(SettingId::LockGracePeriod),
+            Some(&Value::Integer(0))
+        );
+        assert_eq!(
+            store.original(SettingId::LockCommand),
+            Some(&Value::String("hyprlock".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_lock_command_without_hyprlock_discards_a_pending_grace_edit() {
+        let mut store = lock_store(REAL_LOCK_CMD, Some(10));
+        store
+            .stage(SettingId::LockGracePeriod, Value::Integer(30))
+            .expect("a grace period stages");
+        store
+            .stage(
+                SettingId::LockCommand,
+                Value::String("swaylock -f".to_string()),
+            )
+            .expect("a lock command without hyprlock still stages");
+        assert_eq!(
+            store.dirty_ids(),
+            vec![SettingId::LockCommand],
+            "the grace edit no longer fits the command and is dropped"
+        );
+        assert_eq!(
+            store.value(SettingId::LockGracePeriod),
+            Some(&Value::Integer(10))
+        );
+
+        // ...and a new grace period is now refused, leaving everything as it was.
+        let error = store
+            .stage(SettingId::LockGracePeriod, Value::Integer(5))
+            .expect_err("there is no hyprlock to give a grace period");
+        assert!(matches!(
+            error,
+            StageError::Invalid(ValidationError::LockGraceUnavailable(_))
+        ));
+        assert_eq!(lock_command(&store), Some("swaylock -f"));
+        assert_eq!(store.dirty_ids(), vec![SettingId::LockCommand]);
+    }
+
+    #[test]
+    fn a_lock_command_with_an_out_of_range_grace_is_refused_whole() {
+        // R8.3: the grace range binds a grace typed into the free-text command too; the
+        // refusal stages neither half.
+        let mut store = lock_store(REAL_LOCK_CMD, Some(10));
+        let error = store
+            .stage(
+                SettingId::LockCommand,
+                Value::String("hyprlock --grace 3600".to_string()),
+            )
+            .expect_err("an hour of grace is beyond the range");
+        assert!(matches!(
+            error,
+            StageError::Invalid(ValidationError::OutOfRange { .. })
+        ));
+        assert!(!store.is_dirty());
+        assert_eq!(lock_command(&store), Some(REAL_LOCK_CMD));
+    }
+
+    #[test]
+    fn a_lock_command_edit_without_a_loaded_grace_stages_alone() {
+        // The loader seeds no grace period for a command that does not start hyprlock;
+        // its lock-command edits then behave exactly as before task 11.13.
+        let mut store = lock_store("swaylock -f", None);
+        store
+            .stage(
+                SettingId::LockCommand,
+                Value::String("hyprlock --grace 5".to_string()),
+            )
+            .expect("a lock command stages");
+        assert_eq!(store.dirty_ids(), vec![SettingId::LockCommand]);
+        assert!(store.value(SettingId::LockGracePeriod).is_none());
+    }
+
+    #[test]
+    fn reset_after_a_linked_stage_clears_both_settings() {
+        let mut store = lock_store(REAL_LOCK_CMD, Some(10));
+        store
+            .stage(SettingId::LockGracePeriod, Value::Integer(30))
+            .expect("a grace period stages");
+        assert_eq!(store.dirty_ids().len(), 2);
+
+        store.reset();
+        assert!(!store.is_dirty());
+        assert_eq!(lock_command(&store), Some(REAL_LOCK_CMD));
+        assert_eq!(
+            store.value(SettingId::LockGracePeriod),
+            Some(&Value::Integer(10))
+        );
+    }
+
+    #[test]
+    fn retyping_the_original_lock_command_leaves_the_store_clean() {
+        // A pending grace edit, then the user types the lock command back to exactly its
+        // on-disk text: the grace re-derived from that text is the original 10, so
+        // neither view is dirty.
+        let mut store = lock_store(REAL_LOCK_CMD, Some(10));
+        store
+            .stage(SettingId::LockGracePeriod, Value::Integer(30))
+            .expect("a grace period stages");
+        store
+            .stage(
+                SettingId::LockCommand,
+                Value::String(REAL_LOCK_CMD.to_string()),
+            )
+            .expect("the original command stages");
+        assert!(!store.is_dirty(), "dirty: {:?}", store.dirty_ids());
+        assert_eq!(
+            store.value(SettingId::LockGracePeriod),
+            Some(&Value::Integer(10))
+        );
+    }
+
+    #[test]
+    fn a_refresh_while_the_pair_is_dirty_keeps_both_staged_values() {
+        // R5.6: an external edit reloads the originals of both views, and the pending
+        // linked edit survives as a pair, so the two still agree with each other.
+        let dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let path = dir.path().join("lock_cmd");
+        fs::write(&path, REAL_LOCK_CMD).expect("write the fixture");
+        // Mirrors the hypridle.conf loader: the file is just the lock command here, and
+        // the grace period is derived from it.
+        let reader: FileReader = Box::new(|path: &Path| {
+            let bytes = fs::read(path)?;
+            let command = String::from_utf8_lossy(&bytes).into_owned();
+            let mut values = vec![(SettingId::LockCommand, Value::String(command.clone()))];
+            if let Ok(seconds) = parse_grace(&command) {
+                values.push((
+                    SettingId::LockGracePeriod,
+                    Value::Integer(i64::from(seconds.unwrap_or(0))),
+                ));
+            }
+            Ok(FileValues { bytes, values })
+        });
+        let initial = reader(&path).expect("the fixture loads");
+        let mut store = SettingsStore::new();
+        store.load_file(&path, initial, reader);
+
+        store
+            .stage(SettingId::LockGracePeriod, Value::Integer(30))
+            .expect("a grace period stages");
+        fs::write(&path, "hyprlock --grace 5 -q").expect("edit the file externally");
+
+        let report = store.refresh();
+        assert_eq!(report.reloaded(), std::slice::from_ref(&path));
+        assert_eq!(
+            store.original(SettingId::LockCommand),
+            Some(&Value::String("hyprlock --grace 5 -q".to_string()))
+        );
+        assert_eq!(
+            store.original(SettingId::LockGracePeriod),
+            Some(&Value::Integer(5))
+        );
+        assert_eq!(
+            lock_command(&store),
+            Some("pidof hyprlock || hyprlock --grace 30"),
+            "the staged lock command is kept"
+        );
+        assert_eq!(
+            store.value(SettingId::LockGracePeriod),
+            Some(&Value::Integer(30)),
+            "the staged grace is kept"
+        );
+        assert_eq!(
+            store.dirty_ids(),
+            vec![SettingId::LockCommand, SettingId::LockGracePeriod]
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_grace_on_disk_blocks_lock_command_edits_until_lowered() {
+        // The documented corner (see `linked_edit`): a hand-written `--grace 3600` loads
+        // verbatim, an edit that keeps the token is refused, and the spin button's
+        // in-range value is the way out, rewriting the token in place.
+        const ON_DISK: &str = "pidof hyprlock || hyprlock --grace 3600";
+        let mut store = lock_store(ON_DISK, Some(3600));
+        assert_eq!(
+            store.value(SettingId::LockGracePeriod),
+            Some(&Value::Integer(3600))
+        );
+
+        let error = store
+            .stage(
+                SettingId::LockCommand,
+                Value::String(format!("{ON_DISK} -q")),
+            )
+            .expect_err("keeping the out-of-range token is refused");
+        assert!(matches!(
+            error,
+            StageError::Invalid(ValidationError::OutOfRange { .. })
+        ));
+        assert!(!store.is_dirty());
+
+        store
+            .stage(SettingId::LockGracePeriod, Value::Integer(60))
+            .expect("an in-range grace stages");
+        assert_eq!(
+            lock_command(&store),
+            Some("pidof hyprlock || hyprlock --grace 60")
         );
     }
 }

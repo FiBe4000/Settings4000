@@ -3,8 +3,9 @@
 //!
 //! Drives the store-driven pipeline against the installed fixture tree (task
 //! 7.1): `hypridle.conf` is loaded through the app's own loader, timeout /
-//! lock-command edits are staged like the Power & Idle page stages them
-//! (positional `listener` addressing, task 6.8), and [`apply::run`] executes
+//! lock-command / lock-grace edits are staged like the Power & Idle page stages
+//! them (positional `listener` addressing, task 6.8; the `--grace N` token of
+//! `general.lock_cmd`, task 11.13), and [`apply::run`] executes
 //! the plan with mocks — so the suite asserts the exact resulting bytes at the
 //! deployed path (one listener's value changed, the other listener blocks and
 //! their inline comments byte-identical) and the exact hypridle-restart command
@@ -26,6 +27,10 @@ use settings4000::testing::{
     FixtureDotfiles, assert_repo_untouched_except, base_apply_plan, expect_applied,
     load_into_store, loaders, replace_once, repo_snapshot,
 };
+
+/// The fixture's `lock_cmd` assignment, verbatim from the real dotfiles (commit
+/// `8a5b20b`): hyprlock behind a `pidof` guard, with a 10-second grace period.
+const REAL_LOCK_CMD_LINE: &str = "lock_cmd = pidof hyprlock || hyprlock --grace 10";
 
 /// The deployed (live XDG) path of `hypridle.conf` (R8.5).
 fn hypridle_conf(fx: &FixtureDotfiles) -> std::path::PathBuf {
@@ -123,7 +128,9 @@ fn a_lock_command_edit_restarts_via_the_kill_and_respawn_fallback() {
     // The other restart mechanism (task 4.4): no active systemd unit (`is-active`
     // exits non-zero — the dotfiles' exec-once case), so hypridle is SIGTERMed and
     // respawned with a detached `setsid --fork`. Also covers the lock-command edit,
-    // which targets `general.lock_cmd` (not a listener's on-timeout).
+    // which targets `general.lock_cmd` (not a listener's on-timeout). The new
+    // command carries no grace flag, so the store also stages a grace of 0 (task
+    // 11.13), which the writer finds already satisfied: the line is the typed text.
     let fx = FixtureDotfiles::install();
     let path = hypridle_conf(&fx);
     let original = fs::read_to_string(&path).expect("read the fixture hypridle.conf");
@@ -132,9 +139,14 @@ fn a_lock_command_edit_restarts_via_the_kill_and_respawn_fallback() {
     store
         .stage(
             SettingId::LockCommand,
-            Value::String("hyprlock --immediate".to_string()),
+            Value::String("hyprlock --no-fade-in".to_string()),
         )
         .expect("a lock-command edit stages");
+    assert_eq!(
+        store.value(SettingId::LockGracePeriod),
+        Some(&Value::Integer(0)),
+        "the grace control follows the typed command"
+    );
 
     let plan = plan_with_power_write(&store, &model);
     // First command (`is-active`) fails -> the fallback path; the respawn succeeds.
@@ -148,8 +160,8 @@ fn a_lock_command_edit_restarts_via_the_kill_and_respawn_fallback() {
         fs::read_to_string(&path).expect("read the applied file"),
         replace_once(
             &original,
-            "lock_cmd = pidof hyprlock || hyprlock",
-            "lock_cmd = hyprlock --immediate",
+            REAL_LOCK_CMD_LINE,
+            "lock_cmd = hyprlock --no-fade-in"
         ),
         "only general.lock_cmd may change"
     );
@@ -204,5 +216,192 @@ fn a_failed_hypridle_restart_is_non_fatal_and_the_write_stands() {
         fs::read_to_string(&path).expect("read the applied file"),
         replace_once(&original, "timeout = 150", "timeout = 200"),
         "the file keeps its new bytes despite the restart failure (R5.5)"
+    );
+}
+
+/// The exact systemd restart sequence a Power & Idle Apply records: probe the
+/// unit, then restart it — once, however many settings of the file changed.
+fn systemd_restart() -> Vec<Command> {
+    vec![
+        Command::new("systemctl").args(["--user", "is-active", "--quiet", "hypridle"]),
+        Command::new("systemctl").args(["--user", "restart", "hypridle"]),
+    ]
+}
+
+/// Stages `edits` in a fresh store over the installed fixture, applies them with
+/// the systemd restart path, and returns the fixture (to inspect the tree), the
+/// original and resulting `hypridle.conf` text, and the recorded commands.
+fn apply_power_edits(
+    prepare: impl FnOnce(&FixtureDotfiles),
+    edits: &[(SettingId, Value)],
+) -> (FixtureDotfiles, String, String, Vec<Command>) {
+    let fx = FixtureDotfiles::install();
+    prepare(&fx);
+    let path = hypridle_conf(&fx);
+    let original = fs::read_to_string(&path).expect("read the fixture hypridle.conf");
+
+    let (mut store, model) = store_and_model(&fx);
+    for (id, value) in edits {
+        store
+            .stage(*id, value.clone())
+            .unwrap_or_else(|error| panic!("{id:?} = {value:?} must stage: {error}"));
+    }
+    let plan = plan_with_power_write(&store, &model);
+    let runner = MockCommandRunner::new();
+    let signaller = MockProcessSignaller::new();
+    let outcome = apply::run(&plan, store.freshness(), &caps(), &runner, &signaller);
+    let (reload_failures, written) = expect_applied(outcome);
+    assert!(reload_failures.is_empty());
+    assert_eq!(written, vec![path.clone()]);
+    assert!(signaller.calls().is_empty());
+
+    let applied = fs::read_to_string(&path).expect("read the applied file");
+    (fx, original, applied, runner.recorded())
+}
+
+#[test]
+fn a_grace_edit_changes_only_the_number_in_the_fixture_lock_cmd() {
+    // Change (task 11.13): `--grace 10` -> `--grace 30` on the real line. Whole-file
+    // equality against the original with that one token patched proves the
+    // `pidof hyprlock ||` guard, the explanatory comments above it and every other
+    // line (dual-form dpms commands, idle-dim calls, listener comments) are intact.
+    let before_fx = FixtureDotfiles::install();
+    let before = repo_snapshot(&before_fx);
+    drop(before_fx);
+
+    let (fx, original, applied, recorded) =
+        apply_power_edits(|_| {}, &[(SettingId::LockGracePeriod, Value::Integer(30))]);
+    assert_eq!(
+        applied,
+        replace_once(
+            &original,
+            REAL_LOCK_CMD_LINE,
+            "lock_cmd = pidof hyprlock || hyprlock --grace 30",
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(fx.repo_path("config/hypr/hypridle.conf"))
+            .expect("read the repo target"),
+        applied,
+        "the write lands in the repo target behind the deployment symlink"
+    );
+    assert_eq!(recorded, systemd_restart());
+    assert_repo_untouched_except(&fx, &before, &["config/hypr/hypridle.conf"]);
+}
+
+#[test]
+fn a_grace_edit_inserts_the_flag_into_a_lock_cmd_without_one() {
+    // Insert: the deployed lock command has no `--grace` (the shape before the
+    // dotfiles adopted one), so ` --grace 15` goes right after the `hyprlock` word.
+    let (_fx, original, applied, recorded) = apply_power_edits(
+        |fx| {
+            let path = fx.repo_path("config/hypr/hypridle.conf");
+            let text = fs::read_to_string(&path).expect("read the repo hypridle.conf");
+            fs::write(
+                &path,
+                replace_once(
+                    &text,
+                    REAL_LOCK_CMD_LINE,
+                    "lock_cmd = pidof hyprlock || hyprlock",
+                ),
+            )
+            .expect("drop the grace flag from the fixture");
+        },
+        &[(SettingId::LockGracePeriod, Value::Integer(15))],
+    );
+    assert_eq!(
+        applied,
+        replace_once(
+            &original,
+            "lock_cmd = pidof hyprlock || hyprlock\n",
+            "lock_cmd = pidof hyprlock || hyprlock --grace 15\n",
+        )
+    );
+    assert_eq!(recorded, systemd_restart());
+}
+
+#[test]
+fn a_zero_grace_removes_the_flag_from_the_fixture_lock_cmd() {
+    // Remove: 0 is hyprlock's default, so the ` --grace 10` token is dropped rather
+    // than rewritten as `--grace 0`.
+    let (_fx, original, applied, recorded) =
+        apply_power_edits(|_| {}, &[(SettingId::LockGracePeriod, Value::Integer(0))]);
+    assert_eq!(
+        applied,
+        replace_once(
+            &original,
+            REAL_LOCK_CMD_LINE,
+            "lock_cmd = pidof hyprlock || hyprlock",
+        )
+    );
+    assert_eq!(recorded, systemd_restart());
+}
+
+#[test]
+fn a_combined_timeout_and_grace_apply_restarts_hypridle_once() {
+    // Two settings of the one file change — the lock listener's timeout and the
+    // grace token — yet the reload planner dedups by file: exactly one probe and
+    // one restart.
+    let (_fx, original, applied, recorded) = apply_power_edits(
+        |_| {},
+        &[
+            (SettingId::LockTimeout, Value::Integer(600)),
+            (SettingId::LockGracePeriod, Value::Integer(5)),
+        ],
+    );
+    let expected = replace_once(&original, "timeout = 300", "timeout = 600");
+    let expected = replace_once(
+        &expected,
+        REAL_LOCK_CMD_LINE,
+        "lock_cmd = pidof hyprlock || hyprlock --grace 5",
+    );
+    assert_eq!(applied, expected);
+    assert_eq!(
+        recorded,
+        systemd_restart(),
+        "hypridle is restarted exactly once for the combined Apply"
+    );
+}
+
+#[test]
+fn a_lock_command_and_grace_edit_in_one_apply_keep_both() {
+    // The user retypes the lock command, then sets the grace control: the store
+    // rewrites the staged command with the token, and the writer writes the new
+    // command with its grace — the command first, the token on top (task 11.13).
+    let (_fx, original, applied, recorded) = apply_power_edits(
+        |_| {},
+        &[
+            (
+                SettingId::LockCommand,
+                Value::String("hyprlock --no-fade-in".to_string()),
+            ),
+            (SettingId::LockGracePeriod, Value::Integer(20)),
+        ],
+    );
+    assert_eq!(
+        applied,
+        replace_once(
+            &original,
+            REAL_LOCK_CMD_LINE,
+            "lock_cmd = hyprlock --grace 20 --no-fade-in",
+        )
+    );
+    assert_eq!(recorded, systemd_restart());
+}
+
+#[test]
+fn the_fixture_lock_cmd_seeds_a_ten_second_grace() {
+    // Read side: the loader derives the grace control from the real `lock_cmd`.
+    let fx = FixtureDotfiles::install();
+    let (store, _model) = store_and_model(&fx);
+    assert_eq!(
+        store.value(SettingId::LockGracePeriod),
+        Some(&Value::Integer(10))
+    );
+    assert_eq!(
+        store.value(SettingId::LockCommand),
+        Some(&Value::String(
+            "pidof hyprlock || hyprlock --grace 10".to_string()
+        ))
     );
 }

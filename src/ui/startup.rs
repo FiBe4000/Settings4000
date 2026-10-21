@@ -69,6 +69,7 @@ use crate::core::detect::{Binary, Capabilities, Daemon, DetectionInputs, HyprCon
 use crate::core::display::DisplayModel;
 use crate::core::home_path::home_dir;
 use crate::core::input::{InputModel, default_xkb_registry, input_values, read_input_lua};
+use crate::core::lock_grace::parse_grace;
 use crate::core::model::{SettingId, Value};
 use crate::core::power::{PowerModel, power_key_path};
 use crate::core::store::{FileReader, FileValues, RefreshReport, SettingsStore};
@@ -669,7 +670,8 @@ pub(crate) fn load_input_lua(path: &Path) -> io::Result<FileValues> {
 /// parser is lossless and surfaces oddities as warnings. The three idle timeouts are read
 /// by **positional listener matching** (`listener[0]` = dim, `[1]` = lock, `[2]` = DPMS),
 /// through the shared [`power_key_path`] map so a value is parsed from and written back to
-/// the identical address; the lock command comes from `general.lock_cmd`. Only the keys
+/// the identical address; the lock command comes from `general.lock_cmd`, and the lock
+/// grace period from the `--grace N` token inside it (task 11.13). Only the keys
 /// actually present and parseable become settings. An out-of-range value on disk is stored
 /// verbatim as the original (the store validates only staged edits), so a hand-written
 /// config is never rejected at load.
@@ -701,10 +703,25 @@ pub(crate) fn load_hypridle_conf(path: &Path) -> io::Result<FileValues> {
             }
         }
         // The session lock command lives in `general.lock_cmd` (not a listener's
-        // on-timeout — see `core::power`), read verbatim.
+        // on-timeout — see `core::power`), read verbatim. hyprlock's grace period is the
+        // `--grace N` token inside it (task 11.13): seeded only when the command starts
+        // hyprlock in a shape the token editor accepts, which is also what makes the
+        // grace control appear (`ui::row`'s content gate). No flag seeds 0.
         if let Some(path) = power_key_path(SettingId::LockCommand) {
             if let Some(command) = file.value(&path) {
                 values.push((SettingId::LockCommand, Value::String(command.to_string())));
+                match parse_grace(command) {
+                    Ok(seconds) => values.push((
+                        SettingId::LockGracePeriod,
+                        Value::Integer(i64::from(seconds.unwrap_or(0))),
+                    )),
+                    Err(reason) => tracing::debug!(
+                        file = "hypridle.conf",
+                        %reason,
+                        "no editable hyprlock grace period in lock_cmd; the grace control \
+                         stays hidden"
+                    ),
+                }
             }
         }
         values
@@ -933,8 +950,37 @@ mod tests {
                     SettingId::LockCommand,
                     Value::String("pidof hyprlock || hyprlock".to_string())
                 ),
+                // hyprlock is started without a grace flag: that is a grace of 0.
+                (SettingId::LockGracePeriod, Value::Integer(0)),
             ],
         );
+    }
+
+    #[test]
+    fn hypridle_conf_seeds_the_grace_period_from_the_lock_command() {
+        // Task 11.13: the grace period is the `--grace N` token inside
+        // `general.lock_cmd`, seeded only when the command starts hyprlock in a shape
+        // the token editor accepts; otherwise no grace value is loaded (and the control
+        // stays hidden), while the lock command itself always loads.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("hypridle.conf");
+        for (command, grace) in [
+            ("pidof hyprlock || hyprlock --grace 10", Some(10)),
+            ("hyprlock -g 0", Some(0)),
+            ("swaylock -f", None),
+            ("hyprlock --grace=10", None),
+        ] {
+            std::fs::write(&path, format!("general {{\n    lock_cmd = {command}\n}}\n"))
+                .expect("write hypridle.conf fixture");
+            let values = load_hypridle_conf(&path)
+                .expect("hypridle.conf loads")
+                .values;
+            let mut expected = vec![(SettingId::LockCommand, Value::String(command.to_string()))];
+            if let Some(seconds) = grace {
+                expected.push((SettingId::LockGracePeriod, Value::Integer(seconds)));
+            }
+            assert_eq!(values, expected, "{command:?}");
+        }
     }
 
     #[test]

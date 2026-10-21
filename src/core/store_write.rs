@@ -25,8 +25,8 @@
 //! themselves, and [`StoreWriteError`] is the one failure type — generic over the
 //! renderer's own error, which is the only genuinely page-specific piece of it (the
 //! Input renderer's [`InputRenderError`](crate::core::input::InputRenderError) for
-//! `input.lua`, the hyprlang writer's [`EditError`](crate::parsers::hyprlang::EditError)
-//! for `hypridle.conf`).
+//! `input.lua`, the Power & Idle renderer's
+//! [`HypridleRenderError`](crate::core::power::HypridleRenderError) for `hypridle.conf`).
 //!
 //! # Why a failure here must abort the whole Apply, not skip the file
 //!
@@ -191,8 +191,8 @@ impl StoreBackedFile {
 ///
 /// Generic over `E`, the page renderer's own failure: the Input renderer's
 /// [`InputRenderError`](crate::core::input::InputRenderError) for `input.lua`, the
-/// hyprlang writer's [`EditError`](crate::parsers::hyprlang::EditError) for
-/// `hypridle.conf`. Both variants carry the file's display name because the
+/// Power & Idle renderer's [`HypridleRenderError`](crate::core::power::HypridleRenderError)
+/// for `hypridle.conf`. Both variants carry the file's display name because the
 /// [`Display`](fmt::Display) text is quoted verbatim in the dialog the user sees
 /// (`ui::chrome`'s `assembly_warning`), which has to say which file to go and fix.
 ///
