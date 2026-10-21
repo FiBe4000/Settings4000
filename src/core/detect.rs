@@ -1,4 +1,4 @@
-//! Installed-app detection and dynamic visibility (tasks 4.3, 11.2, 11.7, 11.8; architecture
+//! Installed-app detection and dynamic visibility (tasks 4.3, 11.2, 11.7, 11.8, 11.12; architecture
 //! §4; R4.1–R4.4, R2.2, R3.2, R8.5, R6.1, R7.3).
 //!
 //! # What this module is
@@ -11,7 +11,10 @@
 //! 5.x/6.x) consults to hide the rows/pages it cannot support (R4.2), that the
 //! reload table (task 4.4) consults to skip a reload for a component that is not
 //! running, and that the Apply pipeline (task 4.5) consults for the palette
-//! source's repo root (R8.5).
+//! source's repo root (R8.5). Two results only inform the user and gate nothing:
+//! the discovered repo root, which the Theme page compares each live `settings.ini`
+//! with, and whether `xsettingsd` — the trace of an external GTK-settings writer —
+//! runs (task 11.12, analysis §7.7).
 //!
 //! It lives in `core/` because it is pure domain logic driven by injected inputs
 //! (see below), so it is headlessly testable (R6.2) and the layering guard in
@@ -95,7 +98,8 @@
 //!
 //! Absent page-gating binaries, an absent palette source, an absent settings
 //! portal, a non-Lua Hyprland config provider and an absent or stopped notifd are
-//! logged at `info` (the "hidden item" signal, R4.2); a missing or unreadable config
+//! logged at `info` (the "hidden item" signal, R4.2), as is a running `xsettingsd`
+//! (a user-visible Theme-page note, task 11.12); a missing or unreadable config
 //! is logged at `warn` (R4.4); a one-line detection summary, naming the config
 //! provider and the notifd status, is logged at `info` (R7.3). File *contents* are
 //! never logged.
@@ -196,8 +200,10 @@ impl Binary {
     }
 }
 
-/// A long-running component whose *liveness* the app checks, so a reload is issued
-/// only for a component that is actually running (architecture §6, task 4.4).
+/// A long-running component whose *liveness* the app checks: mostly so a reload is
+/// issued only for a component that is actually running (architecture §6, task 4.4),
+/// and in one case ([`Daemon::Xsettingsd`]) only so the Theme page can tell the user
+/// that another program is managing GTK settings (task 11.12).
 ///
 /// Liveness is decided by a procfs "pidof-equivalent" against
 /// [`Daemon::process_name`]. Hyprland itself is intentionally absent here: its
@@ -215,6 +221,14 @@ pub enum Daemon {
     Hyprpaper,
     /// The hypridle idle daemon (restarted on config change).
     Hypridle,
+    /// The `xsettingsd` XSETTINGS daemon. The app never reloads or signals it; it is
+    /// scanned because it is the visible trace of an *external GTK-settings writer*:
+    /// KDE's kded6 `gtkconfig` module starts it while that module manages GTK
+    /// settings, and the dotfiles' `scripts/kded-gtkconfig off` kills it again at
+    /// Hyprland start (analysis §7.7). When it runs, `settings.ini` and the GTK
+    /// gsettings keys may be rewritten behind the app's back, so the Theme page shows
+    /// a note (task 11.12). It gates nothing.
+    Xsettingsd,
 }
 
 impl Daemon {
@@ -224,10 +238,11 @@ impl Daemon {
         Daemon::Eww,
         Daemon::Hyprpaper,
         Daemon::Hypridle,
+        Daemon::Xsettingsd,
     ];
 
     /// The executable name (argv[0] basename, see [`scan_procfs_process_names`])
-    /// that identifies a running instance of this daemon. All four are under 15
+    /// that identifies a running instance of this daemon. All of them are under 15
     /// bytes, so they would survive `/proc/comm` truncation too, but detection
     /// matches them against the untruncated name for uniformity with the portal.
     pub fn process_name(self) -> &'static str {
@@ -236,6 +251,7 @@ impl Daemon {
             Daemon::Eww => "eww",
             Daemon::Hyprpaper => "hyprpaper",
             Daemon::Hypridle => "hypridle",
+            Daemon::Xsettingsd => "xsettingsd",
         }
     }
 }
@@ -479,6 +495,12 @@ pub struct Capabilities {
     /// Whether a live theme-restyle path (settings portal or dconf backend) is
     /// available (R2.2).
     settings_portal: bool,
+    /// The dotfiles repository root resolved behind the deployed config (R8.5), or
+    /// `None` when there is no repo behind it. Kept on its own, beside the sources
+    /// derived from it, because a repo can be present while its palette source is
+    /// incomplete; the Theme page uses it to spot a `settings.ini` that is no longer
+    /// linked to its repo copy (task 11.12).
+    repo_root: Option<PathBuf>,
     /// The dotfiles palette source, or `None` when there is no repo behind the
     /// config (R3.2, R8.5).
     palette_source: Option<PaletteSource>,
@@ -511,6 +533,15 @@ impl Capabilities {
         log_binary_results(&present_binaries);
 
         let live_daemons = scan_daemons(&inputs.running_processes);
+        if live_daemons.contains(&Daemon::Xsettingsd) {
+            // Not a hidden feature but a user-visible note on the Theme page, so it
+            // earns an `info` like the live-restyle downgrade below (R7.3).
+            tracing::info!(
+                "xsettingsd is running: an external GTK-settings writer (usually KDE's \
+                 kded6 gtkconfig module) is active and may rewrite settings.ini and the \
+                 GTK gsettings keys (analysis §7.7)"
+            );
+        }
 
         // Hyprland liveness is the socket's existence on the real filesystem; a
         // `None` anchor (no socket path resolvable) is simply "not live".
@@ -555,6 +586,7 @@ impl Capabilities {
             live_daemons,
             hyprland_ipc,
             settings_portal,
+            repo_root,
             palette_source,
             laptop_toggle_script,
             unreadable_configs,
@@ -584,6 +616,7 @@ impl Capabilities {
             live_daemons: BTreeSet::new(),
             hyprland_ipc: false,
             settings_portal: false,
+            repo_root: None,
             palette_source: None,
             laptop_toggle_script: None,
             unreadable_configs: BTreeSet::new(),
@@ -656,6 +689,19 @@ impl Capabilities {
         self.settings_portal
     }
 
+    /// The dotfiles repository root resolved behind the deployed config symlink, or
+    /// `None` when there is no repo behind the config (R8.5).
+    ///
+    /// The palette source and the laptop-display toggle script are derived from this
+    /// root; it is exposed on its own for consumers that only need to know where the
+    /// repo is — the Theme page compares each live `settings.ini` with its repo copy
+    /// under it to report a file that is no longer linked (task 11.12, R5.6). It is
+    /// equal to [`PaletteSource::repo_root`] of [`Self::palette_source`] whenever that is
+    /// `Some`; it can be `Some` while the palette source is `None` (an incomplete repo).
+    pub fn dotfiles_repo_root(&self) -> Option<&Path> {
+        self.repo_root.as_deref()
+    }
+
     /// The discovered dotfiles palette source, or `None` when the palette switcher
     /// must be hidden (R3.2, R8.5).
     pub fn palette_source(&self) -> Option<&PaletteSource> {
@@ -706,6 +752,7 @@ impl Capabilities {
             daemons = self.live_daemons.len(),
             hyprland_ipc = self.hyprland_ipc,
             settings_portal = self.settings_portal,
+            dotfiles_repo = self.repo_root.is_some(),
             palette_source = self.palette_source.is_some(),
             laptop_toggle_script = self.laptop_toggle_script.is_some(),
             unreadable_configs = self.unreadable_configs.len(),
@@ -744,6 +791,7 @@ impl Capabilities {
             live_daemons: live_daemons.iter().copied().collect(),
             hyprland_ipc,
             settings_portal: false,
+            repo_root: None,
             palette_source: None,
             laptop_toggle_script: None,
             unreadable_configs: BTreeSet::new(),
@@ -780,6 +828,9 @@ impl Capabilities {
     /// builder-style so it chains onto [`Self::for_tests`], keeping that constructor's
     /// signature (and its "absent" defaults) unchanged.
     pub fn with_palette_source_for_tests(mut self) -> Capabilities {
+        // Keep the invariant of `dotfiles_repo_root`: the repo root and the palette
+        // source's root are the same path whenever the source is present.
+        self.repo_root = Some(PathBuf::from("/test/dotfiles"));
         self.palette_source = Some(PaletteSource {
             repo_root: PathBuf::from("/test/dotfiles"),
             colors_dir: PathBuf::from("/test/dotfiles/colors"),
@@ -1584,6 +1635,62 @@ mod tests {
         symlink(&repo_colors_conf, &anchor).expect("symlink the deployed anchor into the repo");
 
         (anchor, repo)
+    }
+
+    #[test]
+    fn a_running_xsettingsd_is_detected_and_logged_at_info() {
+        // Task 11.12 (analysis §7.7): xsettingsd is the trace of KDE's kded6 gtkconfig
+        // module managing GTK settings. It is scanned like the other daemons and its
+        // presence logged at info, so the Theme page note has a logged cause.
+        let mut inputs = base_inputs();
+        inputs.running_processes = vec!["xsettingsd".to_string(), "eww".to_string()];
+        let mut caps = None;
+        let events = crate::testing::capture_logs(|| caps = Some(Capabilities::detect(&inputs)));
+        let caps = caps.expect("detect ran");
+        assert!(caps.is_daemon_live(Daemon::Xsettingsd));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.level == tracing::Level::INFO
+                    && event.message.contains("xsettingsd is running")),
+            "a running xsettingsd must be logged at info, got {events:?}"
+        );
+
+        // Not running: not live, and nothing is said about it.
+        let mut inputs = base_inputs();
+        inputs.running_processes = vec!["eww".to_string()];
+        let events = crate::testing::capture_logs(|| {
+            let caps = Capabilities::detect(&inputs);
+            assert!(!caps.is_daemon_live(Daemon::Xsettingsd));
+        });
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.message.contains("xsettingsd")),
+            "an absent xsettingsd must not be logged, got {events:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_repo_root_is_exposed_even_when_the_palette_source_is_incomplete() {
+        // Task 11.12: the Theme page compares settings.ini with its repo copy under
+        // the discovered root, which must not depend on the palette source being
+        // complete (a repo without colors/ or the generator still has its configs).
+        let root = tempfile::tempdir().expect("temp dir");
+        let (anchor, repo) = build_repo_with_symlinked_anchor(root.path(), false, false);
+        let mut inputs = base_inputs();
+        inputs.palette_config_anchor = anchor;
+        let caps = Capabilities::detect(&inputs);
+
+        assert!(caps.palette_source().is_none());
+        let expected_root = fs::canonicalize(&repo).expect("canonicalize the repo root");
+        assert_eq!(caps.dotfiles_repo_root(), Some(expected_root.as_path()));
+
+        // No symlink behind the anchor: no repo root at all.
+        let caps = Capabilities::detect(&base_inputs());
+        assert_eq!(caps.dotfiles_repo_root(), None);
+        assert_eq!(Capabilities::absent().dotfiles_repo_root(), None);
     }
 
     #[cfg(unix)]

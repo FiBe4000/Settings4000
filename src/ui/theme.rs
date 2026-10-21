@@ -35,7 +35,10 @@
 //! (R2.2). The whole appearance section is only built when `gsettings` is present
 //! (the window gates it, R4.2). Below the cursor drop-downs the section shows the
 //! model's two cursor notes: which of the duplicated cursor copies disagree (R3.4),
-//! and that the session environment copies take effect at the next login.
+//! and that the session environment copies take effect at the next login. Above the
+//! drop-downs it shows the notes that another program is likely to rewrite the GTK
+//! settings (task 11.12): a `settings.ini` no longer linked to its dotfiles repo copy,
+//! and a running `xsettingsd`.
 //!
 //! # Why this page is bespoke, not declarative
 //!
@@ -281,8 +284,9 @@ impl Inner {
 
     /// Builds the GTK/icon/cursor appearance section: the GTK-theme, icon-theme,
     /// cursor-theme, and cursor-size drop-downs, preselected from the backing config,
-    /// with the `GTK_THEME` override banner, the live-restyle note (task 6.4), and the
-    /// cursor-copy and next-login notes (task 11.5).
+    /// with the `GTK_THEME` override banner, the live-restyle note (task 6.4), the
+    /// cursor-copy and next-login notes (task 11.5), and the external-writer notes
+    /// (task 11.12).
     ///
     /// When `settings.ini` is unreadable the rows are hidden behind a note (R4.4); when
     /// a `GTK_THEME` override is active the GTK-theme drop-down is disabled and the
@@ -316,6 +320,18 @@ impl Inner {
         // R3.3: a live GTK_THEME override — show a banner and disable the GTK drop-down.
         if let Some(source) = model.gtk_override() {
             section.append(&override_banner(source));
+        }
+
+        // Task 11.12 (analysis §7.7): say when another program is likely to rewrite the
+        // GTK settings after an Apply — a settings.ini that was replaced by a plain file
+        // (the app still writes it, but the dotfiles repo copy no longer follows) and a
+        // running xsettingsd (KDE's GTK settings module is active). Neither gates a
+        // control.
+        for unlinked in model.unlinked_gtk_settings_notes() {
+            section.append(&note(&unlinked));
+        }
+        if let Some(writer) = model.external_gtk_writer_note() {
+            section.append(&note(&writer));
         }
 
         // GTK theme (disabled under an override).

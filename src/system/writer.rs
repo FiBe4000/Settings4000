@@ -790,6 +790,71 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_through_a_relative_settings_ini_link_never_turns_it_into_a_plain_file() {
+        // Task 11.12 (analysis §7.7): the failure mode this guards against is the one
+        // `nwg-look` caused on the target machine — saving `gtk-4.0/settings.ini` by
+        // replacing the deployment symlink with a plain file, after which the repo copy
+        // silently stops receiving changes. The app's writer must do the opposite: the
+        // link stays a symlink with byte-identical link text (here a *relative* target,
+        // which a careless "resolve, then re-create the link" would rewrite as an
+        // absolute one), the repo file receives the new bytes, and the atomic temp file
+        // is created beside the resolved target — so nothing at all is left in the
+        // live directory besides the link.
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().expect("home temp dir should be creatable");
+        let repo_dir = home.path().join(".dotfiles/config/gtk-4.0");
+        let live_dir = home.path().join(".config/gtk-4.0");
+        fs::create_dir_all(&repo_dir).expect("create the repo gtk-4.0 dir");
+        fs::create_dir_all(&live_dir).expect("create the live gtk-4.0 dir");
+        let repo_copy = repo_dir.join("settings.ini");
+        fs::write(&repo_copy, b"[Settings]\ngtk-theme-name=Old\n").expect("write repo copy");
+
+        let link = live_dir.join("settings.ini");
+        let link_text = Path::new("../../.dotfiles/config/gtk-4.0/settings.ini");
+        symlink(link_text, &link).expect("create the relative deployment link");
+
+        write_atomic(&link, b"[Settings]\ngtk-theme-name=New\n").expect("write via the link");
+
+        assert_eq!(
+            fs::read(&repo_copy).expect("read the repo copy"),
+            b"[Settings]\ngtk-theme-name=New\n",
+            "the repo copy behind the link receives the write"
+        );
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("lstat the link")
+                .file_type()
+                .is_symlink(),
+            "the live path must still be a symlink, never a plain file"
+        );
+        assert_eq!(
+            fs::read_link(&link).expect("read the link"),
+            link_text,
+            "the link text must be unchanged"
+        );
+        let names = |dir: &Path| -> Vec<std::ffi::OsString> {
+            let mut names: Vec<_> = fs::read_dir(dir)
+                .expect("list the directory")
+                .map(|entry| entry.expect("read an entry").file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(&live_dir),
+            vec!["settings.ini"],
+            "no stray file beside the link"
+        );
+        assert_eq!(
+            names(&repo_dir),
+            vec!["settings.ini"],
+            "no leftover temp file"
+        );
+    }
+
     #[test]
     fn write_atomic_rewrites_a_plain_file_in_place() {
         // R5.4: a plain (non-symlink) file resolves to itself and is rewritten in

@@ -213,6 +213,31 @@ impl FixtureDotfiles {
     pub fn wallpaper_path(&self) -> PathBuf {
         self.home.join(WALLPAPER_RELATIVE)
     }
+
+    /// Replaces the deployment symlink at the live path `link` with a plain file
+    /// holding the same bytes, leaving the repo file it pointed at untouched.
+    ///
+    /// This reproduces what a tool that saves a file by replacing it does to a
+    /// dotfiles deployment — `nwg-look` turned `~/.config/gtk-4.0/settings.ini` into a
+    /// plain copy exactly like this on the target machine (analysis §7.7) — so a test
+    /// can check how the app behaves once a live file and its repo copy have come
+    /// apart (task 11.12). Panics if `link` is not a symlink or on any I/O failure
+    /// (see the module docs).
+    pub fn replace_link_with_plain_copy(&self, link: &Path) {
+        let metadata = fs::symlink_metadata(link)
+            .unwrap_or_else(|e| panic!("failed to lstat {}: {e}", link.display()));
+        assert!(
+            metadata.file_type().is_symlink(),
+            "{} is not a deployment symlink",
+            link.display()
+        );
+        let bytes =
+            fs::read(link).unwrap_or_else(|e| panic!("failed to read {}: {e}", link.display()));
+        fs::remove_file(link)
+            .unwrap_or_else(|e| panic!("failed to remove the link {}: {e}", link.display()));
+        fs::write(link, bytes)
+            .unwrap_or_else(|e| panic!("failed to write {}: {e}", link.display()));
+    }
 }
 
 /// Recursively copies the fixture tree at `from` to `to` byte for byte.

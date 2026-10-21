@@ -28,6 +28,7 @@
 //! conflict test asserts that guard.
 
 use std::fs;
+use std::path::Path;
 
 use nix::sys::signal::Signal;
 
@@ -47,8 +48,8 @@ use settings4000::parsers::palette::SchemaSource;
 use settings4000::system::command::{Command, CommandOutput, MockCommandRunner};
 use settings4000::system::signal::{MockProcessSignaller, SignalCall};
 use settings4000::testing::{
-    FixtureDotfiles, assert_repo_untouched_except, differing_lines, expect_applied, replace_once,
-    repo_snapshot,
+    CapturedEvent, FixtureDotfiles, assert_repo_untouched_except, capture_logs, differing_lines,
+    expect_applied, replace_once, repo_snapshot,
 };
 
 /// Builds the palette model exactly as the startup worker does (task 6.3): the
@@ -112,6 +113,8 @@ fn themes_paths(fx: &FixtureDotfiles) -> ThemesPaths {
         hyprland_lua: Some(fx.config_path("hypr/hyprland.lua")),
         uwsm_env: fx.config_path("uwsm/env"),
         cursor_fallback_theme: Some(fx.home().join(".icons/default/index.theme")),
+        dotfiles_repo: Some(fx.repo_root().to_path_buf()),
+        home: Some(fx.home().to_path_buf()),
     }
 }
 
@@ -914,5 +917,226 @@ fn an_external_settings_ini_edit_trips_the_themes_conflict_guard() {
         fs::read_to_string(&live).expect("read the file"),
         edited,
         "nothing was written; the external edit stands"
+    );
+}
+
+/// Runs real detection against the fixture tree (task 11.12): the deployed
+/// `colors.conf` symlink reveals the repo root exactly as at startup (R8.5), and
+/// `running` stands in for the procfs process list.
+fn detect_fixture(fx: &FixtureDotfiles, running: &[&str]) -> Capabilities {
+    Capabilities::detect(&DetectionInputs {
+        path: None,
+        running_processes: running.iter().map(|name| (*name).to_string()).collect(),
+        hyprland_socket: None,
+        palette_config_anchor: fx.config_path("hypr/colors.conf"),
+        config_paths: Vec::new(),
+        hyprctl_status: None,
+        hyprland_lua_config: fx.config_path("hypr/hyprland.lua"),
+        notifd_replies: NotifdReplies::default(),
+        notifd_unit_file: fx.config_path("systemd/user/notifd.service"),
+    })
+}
+
+/// Builds the GTK/icon/cursor model the way the startup loader does from detected
+/// capabilities: the repo root and the `xsettingsd` flag come from `caps`.
+fn load_themes_detected(fx: &FixtureDotfiles, caps: &Capabilities) -> ThemesModel {
+    let roots = ThemeRoots {
+        gtk_theme_dirs: vec![fx.home().join(".themes")],
+        icon_dirs: vec![fx.home().join(".icons")],
+    };
+    let paths = ThemesPaths {
+        dotfiles_repo: caps.dotfiles_repo_root().map(Path::to_path_buf),
+        ..themes_paths(fx)
+    };
+    ThemesModel::load(&roots, paths, false, None)
+        .with_xsettingsd_running(caps.is_daemon_live(Daemon::Xsettingsd))
+}
+
+/// Whether `events` hold the `warn` the themes model logs for an unlinked
+/// `settings.ini`.
+fn unlinked_warnings(events: &[CapturedEvent]) -> Vec<&CapturedEvent> {
+    events
+        .iter()
+        .filter(|event| {
+            event.level == tracing::Level::WARN && event.message.contains("no longer linked")
+        })
+        .collect()
+}
+
+#[test]
+fn a_de_linked_gtk4_settings_ini_is_reported_and_its_live_file_still_written() {
+    // Task 11.12 (analysis §7.7, R5.6/R8.5): the shape `nwg-look` left on the target
+    // machine — the deployed gtk-4.0/settings.ini symlink replaced by a plain copy
+    // while the repo keeps its own. The model reports exactly that file, the note
+    // names it, a `warn` names the paths (never the contents, R7.3), and a GTK-theme
+    // Apply still writes the live plain file (it is what GTK reads) while the repo
+    // copy stays untouched; the still-linked gtk-3.0 copy is written through its link.
+    let fx = FixtureDotfiles::install();
+    fs::create_dir_all(fx.home().join(".themes/Fixture-Theme/gtk-3.0"))
+        .expect("create the fixture GTK theme");
+    let live_gtk4 = fx.config_path("gtk-4.0/settings.ini");
+    fx.replace_link_with_plain_copy(&live_gtk4);
+    let before = repo_snapshot(&fx);
+    let original = fs::read_to_string(&live_gtk4).expect("read the plain live copy");
+
+    let caps = detect_fixture(&fx, &[]);
+    assert_eq!(caps.dotfiles_repo_root(), Some(fx.repo_root()));
+
+    // One load, inside the capture, so the warn count and the note below come from the
+    // same model.
+    let mut loaded = None;
+    let events = capture_logs(|| loaded = Some(load_themes_detected(&fx, &caps)));
+    let mut themes = loaded.expect("the model was loaded");
+    let warnings = unlinked_warnings(&events);
+    assert_eq!(
+        warnings.len(),
+        1,
+        "one warn for the one plain file: {events:?}"
+    );
+    let live_text = live_gtk4.display().to_string();
+    assert!(warnings[0].fields.contains(&live_text), "{:?}", warnings[0]);
+    assert!(
+        !warnings[0].fields.contains("gtk-theme-name")
+            && !warnings[0].message.contains("[Settings]"),
+        "the warning names paths only, never file contents (R7.3): {:?}",
+        warnings[0]
+    );
+
+    assert_eq!(themes.unlinked_gtk_settings(), vec![live_gtk4.as_path()]);
+    // Both paths lie under the fixture home, so the note shows them as `~/…`.
+    assert_eq!(
+        themes.unlinked_gtk_settings_notes(),
+        vec![
+            "~/.config/gtk-4.0/settings.ini is no longer linked to the dotfiles; changes \
+             here will not reach the repo copy at ~/.dotfiles/config/gtk-4.0/settings.ini."
+                .to_string()
+        ]
+    );
+    assert_eq!(themes.external_gtk_writer_note(), None);
+
+    themes.stage_gtk_theme("Fixture-Theme");
+    let mut plan = empty_plan();
+    let contribution = themes
+        .apply_contribution()
+        .expect("a dirty theme contributes");
+    plan.writes.extend(contribution.writes);
+    plan.reload_params = contribution.reload_params;
+    let apply_caps = Capabilities::for_tests(&[Binary::Gsettings], &[], false);
+    let outcome = apply::run(
+        &plan,
+        &FreshnessTracker::new(),
+        &apply_caps,
+        &MockCommandRunner::new(),
+        &MockProcessSignaller::new(),
+    );
+    let (reload_failures, written) = expect_applied(outcome);
+    assert!(reload_failures.is_empty());
+    assert_eq!(written.len(), 2, "both settings.ini files are written");
+
+    // The live plain file got the surgical edit and is still a plain file — the app
+    // never re-links it (nor turns a link into a plain file).
+    assert_eq!(
+        fs::read_to_string(&live_gtk4).expect("read the applied live file"),
+        replace_once(
+            &original,
+            "gtk-theme-name=Everforest-Green-Dark",
+            "gtk-theme-name=Fixture-Theme",
+        )
+    );
+    assert!(
+        !fs::symlink_metadata(&live_gtk4)
+            .expect("lstat the live file")
+            .file_type()
+            .is_symlink()
+    );
+    // Only the still-linked gtk-3.0 copy changed in the repo; the gtk-4.0 repo copy
+    // is byte-identical, which is exactly what the note warns about.
+    assert_repo_untouched_except(&fx, &before, &["config/gtk-3.0/settings.ini"]);
+}
+
+#[test]
+fn a_fully_linked_fixture_tree_reports_no_unlinked_settings_ini() {
+    // Task 11.12: the deployed tree as setup.sh leaves it — both settings.ini are
+    // links into the repo — gets no note and no warning.
+    let fx = FixtureDotfiles::install();
+    let caps = detect_fixture(&fx, &[]);
+    assert!(caps.dotfiles_repo_root().is_some());
+    let events = capture_logs(|| {
+        let themes = load_themes_detected(&fx, &caps);
+        assert!(themes.unlinked_gtk_settings().is_empty());
+        assert!(themes.unlinked_gtk_settings_notes().is_empty());
+        assert_eq!(themes.external_gtk_writer_note(), None);
+    });
+    assert!(unlinked_warnings(&events).is_empty(), "{events:?}");
+}
+
+#[test]
+fn plain_settings_ini_files_without_a_dotfiles_repo_are_not_reported() {
+    // Task 11.12 (R8.5): on a machine without the dotfiles every config is a plain
+    // file and there is no repo root; that is the normal case, not a divergence.
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let config = tmp.path().join("config");
+    for relative in [
+        "gtk-3.0/settings.ini",
+        "gtk-4.0/settings.ini",
+        "hypr/colors.conf",
+    ] {
+        let path = config.join(relative);
+        fs::create_dir_all(path.parent().expect("has a parent")).expect("create a config dir");
+        fs::write(&path, "[Settings]\ngtk-theme-name=Adwaita\n").expect("write a plain config");
+    }
+    let caps = Capabilities::detect(&DetectionInputs {
+        path: None,
+        running_processes: Vec::new(),
+        hyprland_socket: None,
+        palette_config_anchor: config.join("hypr/colors.conf"),
+        config_paths: Vec::new(),
+        hyprctl_status: None,
+        hyprland_lua_config: config.join("hypr/hyprland.lua"),
+        notifd_replies: NotifdReplies::default(),
+        notifd_unit_file: config.join("systemd/user/notifd.service"),
+    });
+    assert_eq!(caps.dotfiles_repo_root(), None);
+
+    let paths = ThemesPaths {
+        gtk3_settings: config.join("gtk-3.0/settings.ini"),
+        gtk4_settings: config.join("gtk-4.0/settings.ini"),
+        hyprland_lua: None,
+        uwsm_env: config.join("uwsm/env"),
+        cursor_fallback_theme: None,
+        dotfiles_repo: caps.dotfiles_repo_root().map(Path::to_path_buf),
+        home: None,
+    };
+    let roots = ThemeRoots {
+        gtk_theme_dirs: Vec::new(),
+        icon_dirs: Vec::new(),
+    };
+    let events = capture_logs(|| {
+        let themes = ThemesModel::load(&roots, paths.clone(), false, None);
+        assert!(
+            themes.themes_editable(),
+            "the plain files are read as usual"
+        );
+        assert!(themes.unlinked_gtk_settings_notes().is_empty());
+    });
+    assert!(unlinked_warnings(&events).is_empty(), "{events:?}");
+}
+
+#[test]
+fn a_running_xsettingsd_in_the_process_list_sets_the_external_writer_note() {
+    // Task 11.12 (analysis §7.7): detection scans for xsettingsd like any daemon,
+    // and a running one turns on the Theme page's external-writer note.
+    let fx = FixtureDotfiles::install();
+    let caps = detect_fixture(&fx, &["kitty", "xsettingsd"]);
+    assert!(caps.is_daemon_live(Daemon::Xsettingsd));
+    let note = load_themes_detected(&fx, &caps)
+        .external_gtk_writer_note()
+        .expect("a running xsettingsd is noted");
+    assert!(note.starts_with("xsettingsd is running"), "got {note}");
+
+    let caps = detect_fixture(&fx, &["kitty"]);
+    assert_eq!(
+        load_themes_detected(&fx, &caps).external_gtk_writer_note(),
+        None
     );
 }

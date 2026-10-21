@@ -621,6 +621,8 @@ fn a_mid_plan_write_failure_rolls_back_the_earlier_input_write() {
             hyprland_lua: Some(fx.config_path("hypr/hyprland.lua")),
             uwsm_env: fx.config_path("uwsm/env"),
             cursor_fallback_theme: Some(fx.home().join(".icons/default/index.theme")),
+            dotfiles_repo: Some(fx.repo_root().to_path_buf()),
+            home: Some(fx.home().to_path_buf()),
         },
         false,
         None,

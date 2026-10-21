@@ -10,12 +10,16 @@
 //! `~/.icons/default/index.theme` (analysis §7.7, §8.4). The model handles the
 //! `GTK_THEME` override (never fight it, R3.3), gates the live-restyle claim on the
 //! settings portal (R2.2), and reports cursor copies that disagree with each other.
-//! [`ThemesModel`]'s own docs carry the rest.
+//! It also reports two conditions that mean another program is likely to rewrite the
+//! GTK settings after the app does (task 11.12, analysis §7.7, §8.4): a `settings.ini`
+//! that is a plain file although the dotfiles repo carries a copy of it, and a running
+//! `xsettingsd`. [`ThemesModel`]'s own docs carry the rest.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::core::apply::{FileWrite, WriteMode, WriteValidation};
+use crate::core::home_path::contract_home;
 use crate::core::reload::{BackingFile, CursorValue, ReloadParams};
 use crate::parsers::env::{EnvFile, GtkThemeOverride};
 use crate::parsers::ini::IniFile;
@@ -53,6 +57,16 @@ const KEY_INHERITS: &str = "Inherits";
 /// two descriptive keys the dotfiles' tracked copy carries (analysis §8.4), so a created
 /// file is byte-identical to the one `setup.sh` would deploy for the same theme.
 const CURSOR_FALLBACK_TEMPLATE: &str = "[Icon Theme]\nName=Default\nComment=Default Cursor Theme\n";
+
+/// Where the dotfiles repo keeps its copy of `~/.config/gtk-3.0/settings.ini`, relative
+/// to the repo root. The dotfiles deploy the live file as a symlink to this copy
+/// (analysis §6.5, §8.4); a plain live file beside it means the link was replaced
+/// (task 11.12).
+const GTK3_SETTINGS_REPO_RELATIVE: &str = "config/gtk-3.0/settings.ini";
+/// Where the dotfiles repo keeps its copy of `~/.config/gtk-4.0/settings.ini`, relative
+/// to the repo root — see [`GTK3_SETTINGS_REPO_RELATIVE`]. This is the file `nwg-look`
+/// replaced with a plain copy on the target machine (analysis §7.7).
+const GTK4_SETTINGS_REPO_RELATIVE: &str = "config/gtk-4.0/settings.ini";
 
 /// Cursor pixel sizes offered in the cursor-size drop-down, in ascending order. The
 /// currently-configured size is added too (see [`ThemesModel::load`]) so an unusual
@@ -149,6 +163,19 @@ pub struct ThemesPaths {
     /// `[Icon Theme]`, analysis §8.4) — created by the cursor write when absent — or
     /// `None` when the home directory is unknown.
     pub cursor_fallback_theme: Option<PathBuf>,
+    /// The dotfiles repository root discovered behind the deployed config (R8.5,
+    /// [`Capabilities::dotfiles_repo_root`](crate::core::detect::Capabilities::dotfiles_repo_root)),
+    /// or `None` when there is no repo. Nothing under it is ever read or written by
+    /// this model: it is only used to notice a `settings.ini` that is a plain file
+    /// while the repo still carries its copy (see
+    /// [`ThemesModel::unlinked_gtk_settings`], task 11.12).
+    pub dotfiles_repo: Option<PathBuf>,
+    /// The user's home directory, or `None` when it is unknown. Used only to show paths
+    /// in the Theme page's notes in the familiar `~/…` form
+    /// ([`ThemesModel::unlinked_gtk_settings_notes`]); a path outside it, or any path
+    /// when it is `None`, is shown absolute. Like `WallpaperPaths::home` (task 11.10) it
+    /// is passed in rather than read from `$HOME` here, so the model stays pure.
+    pub home: Option<PathBuf>,
 }
 
 /// One of the places the cursor theme and size are duplicated (R3.4), named so the
@@ -387,6 +414,23 @@ pub struct ThemesModel {
     /// override (the app's own environment does not change during the session, but the
     /// override is recomputed with the freshly re-read `uwsm/env`).
     app_env_gtk_theme: Option<String>,
+    /// The `settings.ini` files that are plain files although the dotfiles repo has a
+    /// copy of them, found at load (task 11.12; see [`Self::unlinked_gtk_settings`]).
+    unlinked_gtk_settings: Vec<UnlinkedSettingsIni>,
+    /// Whether detection found `xsettingsd` running — the trace of an external
+    /// GTK-settings writer (task 11.12; see [`Self::with_xsettingsd_running`]).
+    xsettingsd_running: bool,
+}
+
+/// A live `settings.ini` that is a plain file while the dotfiles repo carries its own
+/// copy, so the two have come apart (task 11.12, analysis §7.7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UnlinkedSettingsIni {
+    /// The live XDG path — still the file the app writes, because it is what GTK reads.
+    live: PathBuf,
+    /// The repo copy the live path used to link to, which the app's writes no longer
+    /// reach.
+    repo_copy: PathBuf,
 }
 
 /// The Theme page's GTK/icon/cursor contribution to an
@@ -477,6 +521,8 @@ impl ThemesModel {
             .map(|s| (*s).to_string())
             .collect();
 
+        let unlinked_gtk_settings = find_unlinked_gtk_settings(&paths);
+
         tracing::info!(
             gtk_themes = gtk_themes.len(),
             icon_themes = icon_themes.len(),
@@ -498,7 +544,90 @@ impl ThemesModel {
             roots: roots.clone(),
             paths,
             app_env_gtk_theme,
+            unlinked_gtk_settings,
+            xsettingsd_running: false,
         }
+    }
+
+    /// Returns `self` recording whether detection found `xsettingsd` running
+    /// ([`Daemon::Xsettingsd`](crate::core::detect::Daemon::Xsettingsd)), which turns on
+    /// [`Self::external_gtk_writer_note`] (task 11.12).
+    ///
+    /// A builder rather than a [`Self::load`] argument because it only feeds a note: it
+    /// changes nothing the model reads or writes. [`Self::reload`] carries it over.
+    pub fn with_xsettingsd_running(mut self, running: bool) -> ThemesModel {
+        self.xsettingsd_running = running;
+        self
+    }
+
+    /// The live `settings.ini` paths that are plain files although the dotfiles repo
+    /// ([`ThemesPaths::dotfiles_repo`]) still carries their copy under
+    /// `config/gtk-N.0/settings.ini`, in GTK 3, GTK 4 order (task 11.12; R5.6, R8.5).
+    ///
+    /// The dotfiles deploy both files as symlinks into the repo, so an edit made through
+    /// the app reaches the repo. A tool that writes the file by replacing it — `nwg-look`
+    /// did exactly that to `gtk-4.0/settings.ini` on the target machine (analysis §7.7) —
+    /// leaves a plain file behind, and from then on the live file and the repo copy drift
+    /// apart. The app keeps writing the live file (it is what GTK reads) but says so on
+    /// the Theme page ([`Self::unlinked_gtk_settings_notes`]).
+    ///
+    /// Not reported: a file that is a symlink (wherever it points), a file that is
+    /// missing, any file when there is no repo (a plain file is then the normal,
+    /// non-dotfiles setup), a file whose repo copy does not exist, and a plain file
+    /// that *is* the repo copy, reached through a symlinked parent directory. Determined
+    /// once per load, so a conflict reload or a refresh re-checks it.
+    ///
+    /// Deliberately limited to the two `settings.ini` files. The other repo-linked file
+    /// the Theme page writes, `~/.icons/default/index.theme`, is not checked: the app
+    /// itself creates that file as a plain file when it is absent (task 11.5), so a plain
+    /// file there is not evidence that another tool replaced a link.
+    pub fn unlinked_gtk_settings(&self) -> Vec<&Path> {
+        self.unlinked_gtk_settings
+            .iter()
+            .map(|unlinked| unlinked.live.as_path())
+            .collect()
+    }
+
+    /// One Theme-page note per entry of [`Self::unlinked_gtk_settings`], naming the live
+    /// file and the repo copy the app's changes will no longer reach (task 11.12). Paths
+    /// under [`ThemesPaths::home`] are shown as `~/…`, any other path absolute.
+    pub fn unlinked_gtk_settings_notes(&self) -> Vec<String> {
+        let shown = |path: &Path| {
+            self.paths
+                .home
+                .as_deref()
+                .and_then(|home| contract_home(path, home))
+                .unwrap_or_else(|| path.display().to_string())
+        };
+        self.unlinked_gtk_settings
+            .iter()
+            .map(|unlinked| {
+                format!(
+                    "{} is no longer linked to the dotfiles; changes here will not reach \
+                     the repo copy at {}.",
+                    shown(&unlinked.live),
+                    shown(&unlinked.repo_copy)
+                )
+            })
+            .collect()
+    }
+
+    /// The Theme-page note shown while `xsettingsd` runs, or `None` when it does not
+    /// (task 11.12).
+    ///
+    /// `xsettingsd` is started by KDE's kded6 `gtkconfig` module, which rewrites
+    /// `settings.ini` and the GTK gsettings keys from KDE's own settings; the dotfiles
+    /// stop both at Hyprland start (`scripts/kded-gtkconfig off`), so a running
+    /// `xsettingsd` means that suppression did not hold — for example after a Plasma
+    /// login (analysis §7.7). The app still writes as usual; the R5.6 freshness check
+    /// catches an external rewrite before it would clobber one. Informational only.
+    pub fn external_gtk_writer_note(&self) -> Option<String> {
+        self.xsettingsd_running.then(|| {
+            "xsettingsd is running, so another program (usually KDE's GTK settings \
+             module) is managing GTK settings and may overwrite the theme and cursor \
+             changes made here."
+                .to_string()
+        })
     }
 
     /// `gtk-3.0/settings.ini`'s current text, or `None` when it was unreadable (R4.4).
@@ -801,6 +930,7 @@ impl ThemesModel {
             self.live_restyle,
             self.app_env_gtk_theme.clone(),
         )
+        .with_xsettingsd_running(self.xsettingsd_running)
     }
 
     /// The Theme page's GTK/icon/cursor contribution to the Apply plan, or `None` when
@@ -1321,6 +1451,60 @@ fn fallback_inherits(ini: Option<&IniFile>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Finds the live `settings.ini` files that are plain files beside a repo copy (task
+/// 11.12) — see [`ThemesModel::unlinked_gtk_settings`] for what counts and why — and
+/// logs each at `warn`, naming the paths only (R7.3: never file contents).
+fn find_unlinked_gtk_settings(paths: &ThemesPaths) -> Vec<UnlinkedSettingsIni> {
+    let Some(repo) = paths.dotfiles_repo.as_deref() else {
+        return Vec::new();
+    };
+    [
+        (&paths.gtk3_settings, GTK3_SETTINGS_REPO_RELATIVE),
+        (&paths.gtk4_settings, GTK4_SETTINGS_REPO_RELATIVE),
+    ]
+    .into_iter()
+    .filter_map(|(live, repo_relative)| {
+        let repo_copy = repo.join(repo_relative);
+        is_plain_file_beside(live, &repo_copy).then(|| UnlinkedSettingsIni {
+            live: live.clone(),
+            repo_copy,
+        })
+    })
+    .inspect(|unlinked| {
+        tracing::warn!(
+            live = %unlinked.live.display(),
+            repo_copy = %unlinked.repo_copy.display(),
+            "GTK settings.ini is a plain file, no longer linked to its dotfiles repo copy; \
+             the app keeps writing the live file, which the repo copy will not receive \
+             (analysis §7.7)"
+        );
+    })
+    .collect()
+}
+
+/// Whether `live` is a regular file (not a symlink) that is a different file from
+/// `repo_copy`, and `repo_copy` exists as a file.
+///
+/// `symlink_metadata` inspects `live` itself without following a final link, so a
+/// deployed symlink is never mistaken for a plain file. The identity check covers a
+/// setup that links a whole directory instead of each file: there `live` is reached
+/// through a symlinked parent, is itself a regular file, and is the very repo copy —
+/// still linked, so not reported. Any I/O error answers `false`: an unreadable or
+/// vanished path is no evidence of divergence, and this check must never fail a load.
+fn is_plain_file_beside(live: &Path, repo_copy: &Path) -> bool {
+    let live_is_plain = std::fs::symlink_metadata(live).is_ok_and(|meta| meta.is_file());
+    if !live_is_plain || !repo_copy.is_file() {
+        return false;
+    }
+    match (
+        std::fs::canonicalize(live),
+        std::fs::canonicalize(repo_copy),
+    ) {
+        (Ok(live), Ok(repo_copy)) => live != repo_copy,
+        _ => false,
+    }
+}
+
 /// Whether nothing at all exists at `path` — not a file, a directory, or a symlink
 /// (dangling or not). Only such a path may be *created*; anything else present is
 /// either someone's file or a link that must never be replaced.
@@ -1563,6 +1747,8 @@ export XCURSOR_SIZE=16
             hyprland_lua: Some(config.join("hypr/hyprland.lua")),
             uwsm_env: config.join("uwsm/env"),
             cursor_fallback_theme: Some(home.join(".icons/default/index.theme")),
+            dotfiles_repo: None,
+            home: Some(home.to_path_buf()),
         }
     }
 
@@ -1600,6 +1786,8 @@ export XCURSOR_SIZE=16
             hyprland_lua: Some(hyprland_lua),
             uwsm_env,
             cursor_fallback_theme: Some(cursor_fallback_theme),
+            dotfiles_repo: None,
+            home: Some(dir.join("home")),
         }
     }
 
@@ -3158,5 +3346,159 @@ export XCURSOR_SIZE=16
                  login."
             )
         );
+    }
+
+    /// Theme roots with nothing to discover, for tests that only look at the backing
+    /// files.
+    fn no_theme_roots() -> ThemeRoots {
+        ThemeRoots {
+            gtk_theme_dirs: Vec::new(),
+            icon_dirs: Vec::new(),
+        }
+    }
+
+    /// The repo copy and live path layout of the unlinked-`settings.ini` tests (task
+    /// 11.12): a repo at `tmp/repo` with both `config/gtk-N.0/settings.ini` copies, and
+    /// a live config root at `tmp/config` whose `gtk-3.0/settings.ini` is a deployment
+    /// symlink into the repo. The caller decides what the live `gtk-4.0` path is.
+    /// Returns `(paths, repo)` with the repo root already set on the paths.
+    #[cfg(unix)]
+    fn linked_gtk3_fixture(tmp: &Path) -> (ThemesPaths, PathBuf) {
+        use std::os::unix::fs::symlink;
+        let repo = tmp.join("repo");
+        for version in ["gtk-3.0", "gtk-4.0"] {
+            let dir = repo.join("config").join(version);
+            fs::create_dir_all(&dir).expect("create a repo gtk dir");
+            fs::write(dir.join("settings.ini"), SETTINGS_INI).expect("write a repo copy");
+        }
+        let config = tmp.join("config");
+        fs::create_dir_all(config.join("gtk-3.0")).expect("create the live gtk-3.0 dir");
+        symlink(
+            repo.join(GTK3_SETTINGS_REPO_RELATIVE),
+            config.join("gtk-3.0/settings.ini"),
+        )
+        .expect("link the live gtk-3.0 settings.ini into the repo");
+        let mut paths = paths_under(&config, &tmp.join("home"));
+        paths.dotfiles_repo = Some(repo.clone());
+        (paths, repo)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_settings_ini_beside_its_repo_copy_is_reported_and_a_linked_one_is_not() {
+        // Task 11.12 (analysis §7.7): the nwg-look shape — gtk-4.0/settings.ini
+        // replaced by a plain copy while the repo still has its own, gtk-3.0 still
+        // linked. Only the plain one is reported, with a note naming both paths.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let (paths, repo) = linked_gtk3_fixture(tmp.path());
+        fs::create_dir_all(paths.gtk4_settings.parent().expect("has a parent"))
+            .expect("create the live gtk-4.0 dir");
+        fs::write(&paths.gtk4_settings, SETTINGS_INI).expect("write the plain live copy");
+
+        let model = ThemesModel::load(&no_theme_roots(), paths.clone(), false, None);
+
+        assert_eq!(
+            model.unlinked_gtk_settings(),
+            vec![paths.gtk4_settings.as_path()]
+        );
+        // Both paths lie outside the fixture's home (`tmp/home`), so they are shown
+        // absolute.
+        let absolute_note = format!(
+            "{} is no longer linked to the dotfiles; changes here will not reach the \
+             repo copy at {}.",
+            paths.gtk4_settings.display(),
+            repo.join(GTK4_SETTINGS_REPO_RELATIVE).display()
+        );
+        assert_eq!(
+            model.unlinked_gtk_settings_notes(),
+            vec![absolute_note.clone()]
+        );
+
+        // With `tmp` as the home, both are shown in the `~/…` form.
+        let mut home_paths = paths.clone();
+        home_paths.home = Some(tmp.path().to_path_buf());
+        let model = ThemesModel::load(&no_theme_roots(), home_paths, false, None);
+        assert_eq!(
+            model.unlinked_gtk_settings_notes(),
+            vec![
+                "~/config/gtk-4.0/settings.ini is no longer linked to the dotfiles; changes \
+                 here will not reach the repo copy at ~/repo/config/gtk-4.0/settings.ini."
+                    .to_string()
+            ]
+        );
+
+        // An unknown home falls back to absolute paths.
+        let mut homeless = paths;
+        homeless.home = None;
+        let model = ThemesModel::load(&no_theme_roots(), homeless, false, None);
+        assert_eq!(model.unlinked_gtk_settings_notes(), vec![absolute_note]);
+    }
+
+    #[test]
+    fn a_plain_settings_ini_without_a_repo_or_repo_copy_is_not_reported() {
+        // Task 11.12: plain files are the normal, non-dotfiles setup, so without a
+        // repo — or with a repo that has no copy of the file — nothing is reported.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut paths = write_backing_fixture(tmp.path(), "");
+        assert_eq!(paths.dotfiles_repo, None);
+        let model = ThemesModel::load(&no_theme_roots(), paths.clone(), false, None);
+        assert!(model.unlinked_gtk_settings().is_empty());
+        assert!(model.unlinked_gtk_settings_notes().is_empty());
+
+        let repo = tmp.path().join("repo-without-gtk-copies");
+        fs::create_dir_all(&repo).expect("create an empty repo");
+        paths.dotfiles_repo = Some(repo);
+        let model = ThemesModel::load(&no_theme_roots(), paths, false, None);
+        assert!(model.unlinked_gtk_settings().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_settings_ini_reached_through_a_symlinked_directory_is_still_linked() {
+        // Task 11.12: a setup that links the whole gtk-4.0 directory into the repo
+        // makes the live file a regular file that *is* the repo copy — not a
+        // divergence. A dangling or missing live file is not one either.
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let (paths, repo) = linked_gtk3_fixture(tmp.path());
+        let live_dir = paths.gtk4_settings.parent().expect("has a parent");
+        symlink(repo.join("config/gtk-4.0"), live_dir).expect("link the gtk-4.0 directory");
+
+        let model = ThemesModel::load(&no_theme_roots(), paths.clone(), false, None);
+        assert!(model.unlinked_gtk_settings().is_empty());
+
+        fs::remove_file(live_dir).expect("remove the directory link");
+        let model = ThemesModel::load(&no_theme_roots(), paths.clone(), false, None);
+        assert!(
+            model.unlinked_gtk_settings().is_empty(),
+            "a missing live file is not a divergence"
+        );
+
+        fs::create_dir_all(live_dir).expect("recreate the live gtk-4.0 dir");
+        symlink(tmp.path().join("nowhere"), &paths.gtk4_settings).expect("dangling link");
+        let model = ThemesModel::load(&no_theme_roots(), paths, false, None);
+        assert!(
+            model.unlinked_gtk_settings().is_empty(),
+            "a dangling live link is not reported"
+        );
+    }
+
+    #[test]
+    fn the_xsettingsd_note_follows_detection_and_survives_a_reload() {
+        // Task 11.12 (analysis §7.7): a running xsettingsd turns on the
+        // external-writer note; it gates nothing and a conflict reload keeps it.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let paths = write_backing_fixture(tmp.path(), "");
+        let quiet = ThemesModel::load(&no_theme_roots(), paths.clone(), false, None);
+        assert_eq!(quiet.external_gtk_writer_note(), None);
+
+        let noted =
+            ThemesModel::load(&no_theme_roots(), paths, false, None).with_xsettingsd_running(true);
+        let note = noted
+            .external_gtk_writer_note()
+            .expect("a running xsettingsd is noted");
+        assert!(note.starts_with("xsettingsd is running"), "got {note}");
+        assert!(noted.themes_editable(), "the note gates no control");
+        assert_eq!(noted.reload().external_gtk_writer_note(), Some(note));
     }
 }
