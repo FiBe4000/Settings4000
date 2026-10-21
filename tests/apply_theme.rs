@@ -32,6 +32,7 @@ use settings4000::core::apply::WriteMode;
 use settings4000::core::apply::{self, ApplyOutcome, ApplyPlan, WriteFailureCause};
 use settings4000::core::detect::{Binary, Capabilities, Daemon, DetectionInputs};
 use settings4000::core::freshness::FreshnessTracker;
+use settings4000::core::notifd::NotifdReplies;
 use settings4000::core::reload::BackingFile;
 use settings4000::core::reload::ReloadParams;
 use settings4000::core::theme::{
@@ -62,6 +63,8 @@ fn load_palette(fx: &FixtureDotfiles) -> PaletteModel {
         config_paths: Vec::new(),
         hyprctl_status: None,
         hyprland_lua_config: fx.config_path("hypr/hyprland.lua"),
+        notifd_replies: NotifdReplies::default(),
+        notifd_unit_file: fx.config_path("systemd/user/notifd.service"),
     };
     let source_caps = Capabilities::detect(&inputs);
     let source = source_caps
@@ -153,11 +156,7 @@ fn a_palette_switch_runs_generate_colors_then_the_reload_chain() {
     plan.palette = palette.apply_contribution();
     assert!(plan.palette.is_some(), "a staged switch contributes");
 
-    let caps = Capabilities::for_tests(
-        &[Binary::Hyprctl],
-        &[Daemon::Eww, Daemon::Swaync, Daemon::Kitty],
-        true,
-    );
+    let caps = Capabilities::for_tests(&[Binary::Hyprctl], &[Daemon::Eww, Daemon::Kitty], true);
     let freshness = FreshnessTracker::new();
     let runner = MockCommandRunner::new();
     let signaller = MockProcessSignaller::with_running([("kitty".to_string(), vec![77])]);
@@ -170,7 +169,10 @@ fn a_palette_switch_runs_generate_colors_then_the_reload_chain() {
     );
 
     // The exact command sequence: the discovered generator path (inside the
-    // fixture repo, no shell) with the scheme argument, then the reload chain.
+    // fixture repo, no shell) with the scheme argument, then the three-step reload
+    // chain — `hyprctl reload`, `eww reload` and (below) SIGUSR1 to kitty. There is
+    // no notification-daemon step (task 11.7): notifd's popups are eww widgets,
+    // recolored by the eww reload.
     let generate_colors = fx.repo_path("scripts/generate-colors");
     assert_eq!(
         runner.recorded(),
@@ -178,7 +180,6 @@ fn a_palette_switch_runs_generate_colors_then_the_reload_chain() {
             Command::new(generate_colors.to_string_lossy()).arg("nord"),
             Command::new("hyprctl").arg("reload"),
             Command::new("eww").arg("reload"),
-            Command::new("swaync-client").arg("-rs"),
         ]
     );
     assert_eq!(
@@ -695,7 +696,7 @@ fn a_generate_colors_failure_rolls_back_the_theme_writes_and_reloads_nothing() {
     // on which generate-colors aborts (the recorded palette gotcha).
     let caps = Capabilities::for_tests(
         &[Binary::Gsettings, Binary::Hyprctl],
-        &[Daemon::Eww, Daemon::Swaync, Daemon::Kitty],
+        &[Daemon::Eww, Daemon::Kitty],
         true,
     );
     let freshness = FreshnessTracker::new();

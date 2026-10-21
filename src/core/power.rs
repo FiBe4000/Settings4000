@@ -4,8 +4,8 @@
 //! # What this module is
 //!
 //! The Power & Idle page edits the three idle timeouts (dim / lock / DPMS) and the
-//! session lock command, all staged to `config/hypr/hypridle.conf`. Like the Input and
-//! Notifications pages these settings map cleanly onto the fixed
+//! session lock command, all staged to `config/hypr/hypridle.conf`. Like the Input page
+//! these settings map cleanly onto the fixed
 //! [`SettingId`](crate::core::model::SettingId) enum, so they are staged in the shared
 //! [`SettingsStore`](crate::core::store) and rendered by the declarative row framework
 //! (task 5.2 — three [`WidgetKind::Scale`](crate::ui::row::WidgetKind::Scale) sliders and
@@ -14,9 +14,8 @@
 //! `hypridle.conf` write glue**. [`render_hypridle_conf`] takes the store's dirty Power &
 //! Idle settings and applies each to the file through the surgical hyprlang writer
 //! (§3.2), producing one lossless [`FileWrite`] whose diff is limited to the touched
-//! value spans (mirroring [`crate::core::input::render_input_lua`] and
-//! [`crate::core::notifications::render_swaync_config`]). The pipeline then restarts
-//! hypridle so it re-reads its config (task 4.4).
+//! value spans (mirroring [`crate::core::input::render_input_lua`]). The pipeline then
+//! restarts hypridle so it re-reads its config (task 4.4).
 //!
 //! It lives in `core/` because every piece is pure domain logic over bytes — no GTK, no
 //! process side effects — so it is unit-tested headlessly (R6.2); the layering guard in
@@ -63,7 +62,7 @@
 //! [`PowerModel::apply_contribution`] just reads the current bytes and renders the edit,
 //! and the pipeline's step-2 conflict check aborts the apply if the file changed
 //! externally — nothing here can clobber an external edit (the same contract as the Input
-//! and Notifications pages).
+//! page).
 
 use std::path::PathBuf;
 
@@ -177,7 +176,7 @@ pub fn render_hypridle_conf(
 /// The Power & Idle page's Apply-time write glue for `hypridle.conf` (task 6.8).
 ///
 /// Built once on the startup worker when hypridle is present, and held by the window.
-/// Like the Input and Notifications pages' helpers it is **not** a staging model — the
+/// Like the Input page's helper it is **not** a staging model — the
 /// three timeouts and the lock command are staged in the shared store, so dirty tracking,
 /// validation, reset, and commit all flow through the store — and it owns **no**
 /// [`FreshnessTracker`](crate::core::freshness::FreshnessTracker): `hypridle.conf` is
@@ -316,7 +315,7 @@ listener {
             power_key_path(SettingId::LockCommand).map(|p| p.to_string()),
             Some("general.lock_cmd".to_string())
         );
-        assert_eq!(power_key_path(SettingId::NotificationTimeout), None);
+        assert_eq!(power_key_path(SettingId::MouseSensitivity), None);
     }
 
     #[test]
@@ -637,7 +636,7 @@ listener {
 
     #[test]
     fn a_second_apply_after_commit_is_not_a_self_conflict_through_the_real_glue() {
-        // Mirrors the Input/Notifications end-to-end self-conflict tests (tasks 6.6/6.7):
+        // Mirrors the Input page's end-to-end self-conflict test (task 6.6):
         // hypridle.conf is store-loaded, so the window folds its write into `apply::run`
         // over the store's freshness and `commit_apply` re-baselines it from the exact
         // bytes written — the app's own first write must NOT read as an external change on

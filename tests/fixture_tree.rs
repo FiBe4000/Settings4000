@@ -22,6 +22,7 @@ use std::process::Command;
 
 use settings4000::core::detect::{Capabilities, DetectionInputs, HyprConfigProvider};
 use settings4000::core::model::validate_image_path;
+use settings4000::core::notifd::NotifdReplies;
 use settings4000::core::theme::load_palette_schema;
 use settings4000::parsers::env::{EnvFile, GtkThemeOverride};
 use settings4000::parsers::generated::{
@@ -33,7 +34,6 @@ use settings4000::parsers::ini::IniFile;
 use settings4000::parsers::lua_literal::{LuaConfigFile, LuaValue, TableStatus};
 use settings4000::parsers::monitors::{MonitorField, MonitorsFile};
 use settings4000::parsers::palette::{PaletteFile, PaletteSchema, SchemaSource};
-use settings4000::parsers::swaync::SwayncConfigFile;
 use settings4000::testing::{
     FixtureDotfiles, HOME_PLACEHOLDER, assert_repo_untouched_except, repo_snapshot,
 };
@@ -100,8 +100,6 @@ fn deployed_config_paths_are_symlinks_into_the_repo() {
         "gtk-3.0/settings.ini",
         "gtk-4.0/settings.ini",
         "uwsm/env",
-        "swaync/config.json",
-        "swaync/style.css",
         "kitty/kitty.conf",
         "kitty/colors.conf",
         "kitty/fonts.conf",
@@ -168,6 +166,8 @@ fn detection_discovers_the_palette_source_behind_the_deployed_symlink() {
         config_paths: vec![input_lua.clone()],
         hyprctl_status: None,
         hyprland_lua_config: fx.config_path("hypr/hyprland.lua"),
+        notifd_replies: NotifdReplies::default(),
+        notifd_unit_file: fx.config_path("systemd/user/notifd.service"),
     };
     let caps = Capabilities::detect(&inputs);
 
@@ -358,21 +358,6 @@ fn monitors_conf_parses_with_the_awk_shaped_edp_record() {
     );
 }
 
-/// The swaync config parses as canonical 2-space-pretty JSON (so the adapter's
-/// normalization round-trips byte-identically) with the keys the Notifications
-/// page edits (task 6.7).
-#[test]
-fn swaync_config_parses_with_stable_shape() {
-    let fx = FixtureDotfiles::install();
-
-    let input = read(&fx.config_path("swaync/config.json"));
-    let config = SwayncConfigFile::parse(&input).expect("config.json should parse");
-    assert_eq!(config.string("positionX"), Some("right"));
-    assert_eq!(config.string("positionY"), Some("top"));
-    assert_eq!(config.integer("timeout"), Some(10));
-    assert_eq!(config.emit(), input, "config.json should round-trip");
-}
-
 /// Both GTK `settings.ini` files parse with the `[Settings]` section holding
 /// the unified cursor values (`breeze_cursors`/24, analysis §7.7) and round-trip
 /// byte-identically. Neither carries `gtk-xft-dpi`, which the app never writes
@@ -466,7 +451,8 @@ fn installs_are_isolated_and_symlinks_write_through_to_the_repo() {
 
 /// The files the `wayland-dev` dotfiles added (task 11.1, analysis §7–§8) are
 /// deployed at their live paths: the Lua Hyprland config and its two
-/// `dofile`d companions plus the notifd config under `$XDG_CONFIG_HOME`, and
+/// `dofile`d companions, the notifd config and the notifd user unit (whose
+/// presence marks notifd as installed, task 11.7) under `$XDG_CONFIG_HOME`, and
 /// the XCursor fallback theme under `$HOME/.icons` — each a symlink into the
 /// repo, as `setup.sh` links them.
 #[test]
@@ -478,6 +464,7 @@ fn wayland_dev_files_are_deployed_at_their_live_paths() {
         "hypr/input.lua",
         "hypr/colors.lua",
         "notifd/config",
+        "systemd/user/notifd.service",
     ]
     .iter()
     .map(|relative| {

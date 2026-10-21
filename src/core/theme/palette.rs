@@ -760,11 +760,7 @@ shadow=0a0c0d
         let tracker = FreshnessTracker::new();
         let runner = MockCommandRunner::new();
         let signaller = MockProcessSignaller::with_running([("kitty".to_string(), vec![4242])]);
-        let caps = Capabilities::for_tests(
-            &[Binary::Hyprctl],
-            &[Daemon::Eww, Daemon::Swaync, Daemon::Kitty],
-            true,
-        );
+        let caps = Capabilities::for_tests(&[Binary::Hyprctl], &[Daemon::Eww, Daemon::Kitty], true);
 
         let outcome = apply::run(&plan, &tracker, &caps, &runner, &signaller);
         match outcome {
@@ -776,14 +772,15 @@ shadow=0a0c0d
             }
             other => panic!("expected Applied, got {other:?}"),
         }
-        // generate-colors runs FIRST (the last write step), then the apply-theme chain.
+        // generate-colors runs FIRST (the last write step), then the three-step
+        // apply-theme chain: hyprctl reload, eww reload, SIGUSR1 to kitty (below) — no
+        // notification-daemon step (task 11.7).
         assert_eq!(
             runner.recorded(),
             vec![
                 Command::new("/repo/scripts/generate-colors").arg("everforest"),
                 Command::new("hyprctl").arg("reload"),
                 Command::new("eww").arg("reload"),
-                Command::new("swaync-client").arg("-rs"),
             ]
         );
         // The palette reload chain finishes by delivering SIGUSR1 to the running

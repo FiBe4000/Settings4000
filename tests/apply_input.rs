@@ -15,14 +15,18 @@
 //! harness, plus the two ways the page refuses: hiding for a file it does not fully
 //! understand, and aborting an Apply whose edit the Lua-literal editor refuses.
 //!
-//! One case here reaches beyond the Input page on purpose: an Input apply made while
+//! Two cases here reach beyond the Input page on purpose: an Input apply made while
 //! *another* page's backing file is missing, which is where the conflict check's
-//! write-target scoping is observable end to end (task 9.11).
+//! write-target scoping is observable end to end (task 9.11), and the shared
+//! **rollback-on-write-failure** injection (R5.4) — an Input write followed by a
+//! Theme write that fails, which must restore the already-written `input.lua`
+//! byte-exactly.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use settings4000::core::apply::{self, ApplyOutcome};
+use settings4000::core::apply::{self, ApplyOutcome, WriteFailureCause};
 use settings4000::core::assemble::{
     ApplySources, FailedWrite, PrepareFailure, assemble_apply_plan,
 };
@@ -31,6 +35,7 @@ use settings4000::core::input::{InputLuaUnavailable, InputModel};
 use settings4000::core::model::{Category, SettingId, Value};
 use settings4000::core::power::PowerModel;
 use settings4000::core::store::SettingsStore;
+use settings4000::core::theme::{ThemeRoots, ThemesModel, ThemesPaths};
 use settings4000::system::command::{Command, CommandOutput, MockCommandRunner};
 use settings4000::system::signal::MockProcessSignaller;
 use settings4000::testing::{
@@ -556,4 +561,124 @@ fn staged_input_edits_whose_page_disappeared_on_refresh_abort_the_apply() {
         other => panic!("expected a write-preparation failure, got {other:?}"),
     }
     assert!(store.is_dirty(), "the staged edit is kept");
+}
+
+/// Restores a fixture directory to writable (`0o755`) on drop.
+///
+/// The rollback test below makes a repo directory read-only as its failure
+/// injection; that must be undone even when an assertion panics mid-test, or the
+/// [`FixtureDotfiles`] `TempDir` cannot delete the directory's contents on drop and
+/// the temp tree leaks. An RAII guard runs on unwind too, which a restore statement
+/// at the end of the test would not.
+struct RestoreWritable<'a> {
+    /// The directory whose permissions are restored on drop.
+    dir: &'a Path,
+}
+
+impl Drop for RestoreWritable<'_> {
+    fn drop(&mut self) {
+        // Best-effort: an error here would only mask the original panic, and the
+        // worst outcome of a failed restore is a leaked temp directory.
+        let _ = fs::set_permissions(self.dir, fs::Permissions::from_mode(0o755));
+    }
+}
+
+#[test]
+fn a_mid_plan_write_failure_rolls_back_the_earlier_input_write() {
+    // Failure injection, R5.4: a two-page plan in the window's fold order — the
+    // store-backed Input write first, then the Theme page's GTK-theme writes — where
+    // the second page's first write fails. The already-written input.lua must be
+    // restored to its pre-apply bytes, the failure surfaced, and no reload attempted.
+    // (This case lived in the Notifications suite until task 11.7 made that page
+    // runtime-only; the Theme write is the remaining file write outside
+    // `config/hypr/`, which the injection needs.)
+    //
+    // The injection: the repo's gtk-3.0/ directory is made read-only, so the atomic
+    // writer cannot create its temp file beside the resolved settings.ini target. The
+    // file itself stays readable, so the pipeline genuinely reaches the write phase.
+    let fx = FixtureDotfiles::install();
+    fs::create_dir_all(fx.home().join(".themes/Fixture-Theme/gtk-3.0"))
+        .expect("create a discoverable GTK theme");
+    let before = repo_snapshot(&fx);
+    let (mut store, model) = store_and_model(&fx);
+    store
+        .stage(
+            SettingId::KeyboardLayouts,
+            Value::String("se,us".to_string()),
+        )
+        .expect("the Input edit stages");
+    let mut plan = plan_with_input_write(&store, &model);
+
+    let gtk3 = fx.config_path("gtk-3.0/settings.ini");
+    let mut themes = ThemesModel::load(
+        &ThemeRoots {
+            gtk_theme_dirs: vec![fx.home().join(".themes")],
+            icon_dirs: vec![fx.home().join(".icons")],
+        },
+        ThemesPaths {
+            gtk3_settings: gtk3.clone(),
+            gtk4_settings: fx.config_path("gtk-4.0/settings.ini"),
+            hyprland_lua: Some(fx.config_path("hypr/hyprland.lua")),
+            uwsm_env: fx.config_path("uwsm/env"),
+            cursor_fallback_theme: Some(fx.home().join(".icons/default/index.theme")),
+        },
+        false,
+        None,
+    );
+    themes.stage_gtk_theme("Fixture-Theme");
+    let contribution = themes
+        .apply_contribution()
+        .expect("a dirty theme contributes");
+    plan.writes.extend(contribution.writes);
+    plan.reload_params = contribution.reload_params;
+
+    let gtk3_dir = fx.repo_path("config/gtk-3.0");
+    fs::set_permissions(&gtk3_dir, fs::Permissions::from_mode(0o555))
+        .expect("make the gtk-3.0 directory read-only");
+    let _restore = RestoreWritable { dir: &gtk3_dir };
+
+    // Guard: running as root bypasses directory modes, so the injection only works
+    // when the directory is genuinely non-writable (probed, mirroring the writer
+    // tests). Skipping must be visible in the test output — a silent "ok" here would
+    // leave R5.4 with no end-to-end coverage and no signal.
+    if fs::File::create(gtk3_dir.join(".probe")).is_ok() {
+        eprintln!(
+            "skipped: directory modes are not enforced (running as root), \
+             so the write-failure injection cannot work"
+        );
+        return;
+    }
+
+    let caps = Capabilities::for_tests(&[Binary::Hyprctl, Binary::Gsettings], &[], true);
+    let runner = MockCommandRunner::new();
+    let signaller = MockProcessSignaller::new();
+    let outcome = apply::run(&plan, store.freshness(), &caps, &runner, &signaller);
+    assert!(
+        runner.recorded().is_empty(),
+        "a write-phase failure must run no reload (R5.4)"
+    );
+    assert!(signaller.calls().is_empty());
+
+    match outcome {
+        ApplyOutcome::WriteFailed(failure) => {
+            match &failure.cause {
+                WriteFailureCause::File { path, .. } => assert_eq!(
+                    path, &gtk3,
+                    "the failure names the write that could not complete"
+                ),
+                other => panic!("expected a File write failure, got {other:?}"),
+            }
+            assert_eq!(
+                failure.rolled_back,
+                vec![fx.repo_path(REPO_INPUT_LUA)],
+                "the already-written input.lua (resolved to its repo target) is rolled back"
+            );
+            assert!(failure.rollback_failures.is_empty());
+        }
+        other => panic!("expected WriteFailed, got {other:?}"),
+    }
+
+    // The rollback restored the desktop exactly as it was: the whole repo tree is
+    // byte-identical to the pre-apply snapshot (R5.4).
+    assert_repo_untouched_except(&fx, &before, &[]);
 }

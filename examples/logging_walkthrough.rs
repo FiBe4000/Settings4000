@@ -47,6 +47,7 @@ use settings4000::core::apply::{self, ApplyOutcome, PaletteSwitch, WriteFailureC
 use settings4000::core::detect::{Binary, Capabilities, DetectionInputs};
 use settings4000::core::input::InputModel;
 use settings4000::core::model::{Category, SettingId, Value};
+use settings4000::core::notifd::NotifdReplies;
 use settings4000::core::store::SettingsStore;
 use settings4000::system::command::{MockCommandRunner, SystemCommandRunner};
 use settings4000::system::logging::{self, LogLevel};
@@ -71,21 +72,22 @@ fn main() {
     // read-only probe of the host, daemon liveness is injected as empty (this
     // driver must not depend on the live desktop), the palette source is
     // discovered through the fixture's deployed `colors.conf` symlink (R8.5),
-    // and the three loaded configs are readability-checked.
+    // and the two loaded configs are readability-checked.
     let inputs = DetectionInputs {
         path: std::env::var("PATH").ok(),
         running_processes: Vec::new(),
         hyprland_socket: None,
         palette_config_anchor: fx.config_path("hypr/colors.conf"),
-        config_paths: vec![
-            input_lua.clone(),
-            fx.config_path("swaync/config.json"),
-            fx.config_path("hypr/hypridle.conf"),
-        ],
+        config_paths: vec![input_lua.clone(), fx.config_path("hypr/hypridle.conf")],
         // No compositor is consulted, so the config provider follows the fixture's
         // deployed `hyprland.lua` (task 11.2).
         hyprctl_status: None,
         hyprland_lua_config: fx.config_path("hypr/hyprland.lua"),
+        // No session bus is consulted either (no probe replies), so notifd reads as
+        // absent and its "Notifications page is hidden" line is logged (task 11.7),
+        // even though the fixture deploys its unit file.
+        notifd_replies: NotifdReplies::default(),
+        notifd_unit_file: fx.config_path("systemd/user/notifd.service"),
     };
     let detected = Capabilities::detect(&inputs);
     let generate_colors = detected
@@ -99,11 +101,6 @@ fn main() {
     // which log each file's parsed (setting, value) pairs at `debug`.
     let mut store = SettingsStore::new();
     load_into_store(&mut store, &input_lua, loaders::input_lua);
-    load_into_store(
-        &mut store,
-        &fx.config_path("swaync/config.json"),
-        loaders::swaync_config,
-    );
     load_into_store(
         &mut store,
         &fx.config_path("hypr/hypridle.conf"),

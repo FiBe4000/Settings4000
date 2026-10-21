@@ -9,7 +9,7 @@
 //! contract:
 //!
 //! - **Build.** From a list of visible [`RowDescriptor`]s it constructs one control
-//!   per row — a `GtkDropDown`, `GtkSwitch`, `GtkScale`, or the `GtkListBox`-backed
+//!   per row — a `GtkSwitch`, `GtkScale`, `GtkEntry`, or the `GtkListBox`-backed
 //!   reorderable editable list (R2.3) — via [`build_control`].
 //! - **Emit.** On a user change a control emits a [`SetValue`] as the component's
 //!   [`PageMsg::Set`] input. The component relays it to
@@ -54,12 +54,11 @@
 //!
 //! [`category_rows`] returns the declarative descriptor list for a category whose
 //! settings map onto the fixed [`SettingId`] with a *static* control set. Today that is
-//! the Notifications page's position and auto-dismiss timeout (task 6.7): fixed anchor
-//! positions and a timeout range, rendered through the generic framework and driven by
-//! the store. The Notifications page (see [`super::notifications`]) builds them via
-//! [`plan_category`] and appends its runtime-only Do-Not-Disturb switch beside them. A
-//! category with a dynamic control set (Input's XKB layouts, task 6.6) is built by its
-//! own glue instead, and one with no framework rows yet keeps its task-5.1 placeholder.
+//! the Power & Idle page (task 6.8): three idle-timeout sliders and the lock-command
+//! entry, rendered through the generic framework and driven by the store. A category
+//! with a dynamic control set (Input's XKB layouts, task 6.6) or with runtime-only
+//! controls (Sound, Notifications, Network) is built by its own glue instead, and one
+//! with no framework rows yet keeps its task-5.1 placeholder.
 //!
 //! The store the pages render from is populated by the worker-thread startup load
 //! (task 5.4, see [`super::startup`]): the initial values are parsed from the real
@@ -82,11 +81,10 @@ use crate::core::model::{Backing, SettingId, Value, ValueKind};
 use crate::core::store::{SettingsStore, StageError, StageOutcome};
 use crate::ui::category::SidebarCategory;
 use crate::ui::row::{
-    DropDownOption, RowCapability, RowDescriptor, SetValue, WidgetKind, dropdown_index_from_value,
-    entry_text_from_value, list_items_from_value, list_with_added, list_with_swapped, list_without,
+    DropDownOption, RowCapability, RowDescriptor, SetValue, WidgetKind, entry_text_from_value,
+    list_items_from_value, list_with_added, list_with_swapped, list_without,
     scale_position_from_value, switch_active_from_value, token_switch_active_from_value,
-    value_from_dropdown_option, value_from_entry, value_from_scale, value_from_switch,
-    value_from_token_toggle, visible_rows,
+    value_from_entry, value_from_scale, value_from_switch, value_from_token_toggle, visible_rows,
 };
 
 /// Vertical spacing, in pixels, between rows on a page.
@@ -292,17 +290,6 @@ enum BoundControl {
         /// The `notify::active` handler, blocked while rendering to avoid feedback.
         handler: glib::SignalHandlerId,
     },
-    /// A `GtkDropDown` for a [`Value::Enum`].
-    DropDown {
-        /// The setting this control edits.
-        setting: SettingId,
-        /// The drop-down widget.
-        widget: DropDown,
-        /// The options, in display order, used to map a stored token to an index.
-        options: Vec<DropDownOption>,
-        /// The `notify::selected` handler, blocked while rendering to avoid feedback.
-        handler: glib::SignalHandlerId,
-    },
     /// A `GtkScale` for a [`Value::Float`] or [`Value::Integer`]. The change handler
     /// captures the setting's value kind, so the variant needs no `kind` field.
     Scale {
@@ -349,7 +336,6 @@ impl BoundControl {
     fn setting(&self) -> SettingId {
         match self {
             BoundControl::Switch { setting, .. }
-            | BoundControl::DropDown { setting, .. }
             | BoundControl::Scale { setting, .. }
             | BoundControl::TokenSwitch { setting, .. }
             | BoundControl::Entry { setting, .. } => *setting,
@@ -360,9 +346,8 @@ impl BoundControl {
     /// Renders the control to show `value` from the store (R5.1).
     ///
     /// Scalar controls block their change signal around the programmatic set so the
-    /// render cannot be mistaken for a user edit (see the module docs). A drop-down
-    /// or scale with no matching/known value is left unchanged rather than forced to
-    /// a default.
+    /// render cannot be mistaken for a user edit (see the module docs). A scale with
+    /// no known value is left unchanged rather than forced to a default.
     fn render(&self, value: Option<&Value>) {
         match self {
             BoundControl::Switch {
@@ -371,18 +356,6 @@ impl BoundControl {
                 widget.block_signal(handler);
                 widget.set_active(switch_active_from_value(value));
                 widget.unblock_signal(handler);
-            }
-            BoundControl::DropDown {
-                widget,
-                options,
-                handler,
-                ..
-            } => {
-                if let Some(index) = dropdown_index_from_value(options, value) {
-                    widget.block_signal(handler);
-                    widget.set_selected(index);
-                    widget.unblock_signal(handler);
-                }
             }
             BoundControl::Scale {
                 widget, handler, ..
@@ -571,7 +544,6 @@ fn build_control(
 
     match &descriptor.widget {
         WidgetKind::Switch => build_switch(descriptor, emit),
-        WidgetKind::DropDown { options } => build_dropdown(descriptor, options.clone(), emit),
         WidgetKind::Scale { min, max, step } => build_scale(descriptor, *min, *max, *step, emit),
         WidgetKind::ReorderableList { candidates } => {
             build_list(descriptor, candidates.clone(), emit)
@@ -686,44 +658,6 @@ fn build_entry(descriptor: &RowDescriptor, emit: &Rc<dyn Fn(SetValue)>) -> (GtkB
         BoundControl::Entry {
             setting,
             widget,
-            handler,
-        },
-    )
-}
-
-/// Builds a `GtkDropDown` row over `options`.
-fn build_dropdown(
-    descriptor: &RowDescriptor,
-    options: Vec<DropDownOption>,
-    emit: &Rc<dyn Fn(SetValue)>,
-) -> (GtkBox, BoundControl) {
-    let model = string_list(&options);
-    let widget = DropDown::builder().model(&model).build();
-    widget.set_halign(Align::End);
-    widget.set_valign(Align::Center);
-
-    let setting = descriptor.setting;
-    let handler = {
-        let emit = emit.clone();
-        let options = options.clone();
-        widget.connect_selected_notify(move |drop_down| {
-            let index = drop_down.selected() as usize;
-            if let Some(option) = options.get(index) {
-                emit(SetValue {
-                    id: setting,
-                    value: value_from_dropdown_option(option),
-                });
-            }
-        })
-    };
-
-    let row = labelled_row(&descriptor.label, &widget);
-    (
-        row,
-        BoundControl::DropDown {
-            setting,
-            widget,
-            options,
             handler,
         },
     )
@@ -864,65 +798,20 @@ fn string_list(options: &[DropDownOption]) -> StringList {
 /// [`SettingId`](crate::core::model::SettingId) with a *static* control set are built
 /// here; the rest fall back to task 5.1's placeholder page or their own glue. The Input
 /// page is not built here — its layout list needs runtime XKB candidates, so the window
-/// builds it directly (task 6.6, see [`super::input`]). Notifications' position and
-/// auto-dismiss timeout, by contrast, are fully static framework rows (a fixed set of
-/// anchor positions and a timeout range), so they live here and are rendered through the
-/// generic framework; the Notifications page (task 6.7) builds them via
-/// [`plan_category`] and appends its runtime-only Do-Not-Disturb switch beside them (see
-/// [`super::notifications`]). Power & Idle (task 6.8) is likewise fully static — three
-/// idle-timeout sliders and a free-text lock-command entry — so it lives here and is built
-/// entirely through the generic framework path with no bespoke glue.
+/// builds it directly (task 6.6, see [`super::input`]), and the Notifications page is
+/// runtime-only (task 11.7, see [`super::notifications`]). Power & Idle (task 6.8) is
+/// fully static — three idle-timeout sliders and a free-text lock-command entry — so it
+/// lives here and is built entirely through the generic framework path with no bespoke
+/// glue.
 fn category_rows(category: SidebarCategory) -> Vec<RowDescriptor> {
     match category {
-        SidebarCategory::Notifications => vec![
-            RowDescriptor::new(
-                "Position",
-                WidgetKind::DropDown {
-                    // swaync anchors a notification by a `positionY` (top/center/bottom)
-                    // × `positionX` (left/center/right) grid — all nine combinations — so
-                    // every one is offered here as the combined `<positionY>-<positionX>`
-                    // token the store carries. Covering all nine is what lets a live
-                    // `positionY: center` config preselect correctly rather than falling
-                    // back to index 0. Ordered top→centre→bottom for
-                    // natural vertical reading; the order is cosmetic (preselect matches by
-                    // token, not index).
-                    options: vec![
-                        DropDownOption::new("top-right", "Top right"),
-                        DropDownOption::new("top-left", "Top left"),
-                        DropDownOption::new("top-center", "Top centre"),
-                        DropDownOption::new("center-right", "Centre right"),
-                        DropDownOption::new("center-left", "Centre left"),
-                        DropDownOption::new("center-center", "Centre"),
-                        DropDownOption::new("bottom-right", "Bottom right"),
-                        DropDownOption::new("bottom-left", "Bottom left"),
-                        DropDownOption::new("bottom-center", "Bottom centre"),
-                    ],
-                },
-                SettingId::NotificationPosition,
-                RowCapability::Binary(Binary::Swaync),
-            ),
-            RowDescriptor::new(
-                "Auto-dismiss timeout (seconds)",
-                // The slider caps at 60 s — an intentional, ergonomic ceiling far narrower
-                // than the validator's 1..=86400 s range (task 4.1). A larger value already
-                // on disk is preserved as the stored original and is only overwritten once
-                // the user actually drags the slider (which can then only produce 1..=60).
-                WidgetKind::Scale {
-                    min: 1.0,
-                    max: 60.0,
-                    step: 1.0,
-                },
-                SettingId::NotificationTimeout,
-                RowCapability::Binary(Binary::Swaync),
-            ),
-        ],
         // Power & Idle (task 6.8): the three idle timeouts as sliders plus the lock command
         // as a free-text entry, all store-backed `hypridle.conf` settings, so they are fully
         // static framework rows built through the generic path — unlike the Input page's
         // dynamic XKB layout list. Each row is gated on the hypridle binary, matching the
         // category gate (task 5.1); when hypridle.conf is missing/unreadable the rows still
         // build and render their defaults, rejecting edits until the file appears (R4.4) —
-        // the same graceful degradation the Input/Notifications pages use.
+        // the same graceful degradation the Input page uses.
         SidebarCategory::PowerAndIdle => vec![
             RowDescriptor::new(
                 "Dim screen after (seconds)",
@@ -959,10 +848,10 @@ fn category_rows(category: SidebarCategory) -> Vec<RowDescriptor> {
 ///
 /// A whole-second range from half a minute to an hour with a half-minute step — a sane,
 /// ergonomic span for a dim/lock/DPMS timeout, far narrower than the validator's
-/// `1..=86400 s` range (task 4.1). Like the Notifications auto-dismiss slider, a value
-/// already on disk *outside* this span (e.g. a two-hour timeout) is preserved as the
-/// stored original and is only overwritten once the user actually drags the slider (which
-/// can then only produce a value within the range).
+/// `1..=86400 s` range (task 4.1). A value already on disk *outside* this span (e.g. a
+/// two-hour timeout) is preserved as the stored original and is only overwritten once the
+/// user actually drags the slider (which can then only produce a value within the
+/// range).
 fn idle_timeout_scale() -> WidgetKind {
     WidgetKind::Scale {
         min: 30.0,
@@ -1092,16 +981,16 @@ mod tests {
     fn set_message_stages_a_file_backed_edit_in_the_store() {
         // The core acceptance: a widget's SetValue reaches the store and is reflected
         // by `store.value` — the round-trip a rendered control then reads back.
-        let mut page = seeded_page(&[(SettingId::NotificationTimeout, Value::Integer(10))]);
+        let mut page = seeded_page(&[(SettingId::DimTimeout, Value::Integer(10))]);
         assert!(!page.store.borrow().is_dirty());
 
         let outcome = page.handle(SetValue {
-            id: SettingId::NotificationTimeout,
+            id: SettingId::DimTimeout,
             value: Value::Integer(30),
         });
         assert_eq!(outcome.ok(), Some(StageOutcome::Staged));
         assert_eq!(
-            page.store.borrow().value(SettingId::NotificationTimeout),
+            page.store.borrow().value(SettingId::DimTimeout),
             Some(&Value::Integer(30)),
             "the store reflects the staged edit, which is what the control renders"
         );
@@ -1109,7 +998,7 @@ mod tests {
         assert!(
             page.store
                 .borrow()
-                .is_category_dirty(Category::Notifications)
+                .is_category_dirty(Category::PowerAndIdle)
         );
     }
 
@@ -1117,7 +1006,7 @@ mod tests {
     fn runtime_only_edit_bypasses_staging_instead_of_being_stored() {
         // A runtime-only setting's SetValue is reported as a bypass (R5.2) and nothing
         // is staged — the store holds no value for it.
-        let mut page = seeded_page(&[(SettingId::NotificationTimeout, Value::Integer(10))]);
+        let mut page = seeded_page(&[(SettingId::DimTimeout, Value::Integer(10))]);
 
         let outcome = page.handle(SetValue {
             id: SettingId::LaptopDisplayEnabled,
@@ -1145,14 +1034,14 @@ mod tests {
         // value, and a store change from another source (here a reset, which task 5.3's
         // Reset button triggers) reverts it — so the control follows the store, never
         // its own state.
-        let mut page = seeded_page(&[(SettingId::NotificationTimeout, Value::Integer(10))]);
+        let mut page = seeded_page(&[(SettingId::DimTimeout, Value::Integer(10))]);
         page.handle(SetValue {
-            id: SettingId::NotificationTimeout,
+            id: SettingId::DimTimeout,
             value: Value::Integer(45),
         })
         .expect("a valid edit stages");
         assert_eq!(
-            page.store.borrow().value(SettingId::NotificationTimeout),
+            page.store.borrow().value(SettingId::DimTimeout),
             Some(&Value::Integer(45)),
             "after an edit the render source is the staged value"
         );
@@ -1163,7 +1052,7 @@ mod tests {
             "a reset clears staged edits"
         );
         assert_eq!(
-            page.store.borrow().value(SettingId::NotificationTimeout),
+            page.store.borrow().value(SettingId::DimTimeout),
             Some(&Value::Integer(10)),
             "after a reset the render source — and thus the control — shows the original"
         );
@@ -1196,10 +1085,7 @@ mod tests {
         // of the real config files — task 5.4 — not a demo seed, so there is no seed
         // to cross-check here; the loader maps each setting to a value of its kind and
         // is tested in `super::super::startup`.)
-        for category in [
-            SidebarCategory::Notifications,
-            SidebarCategory::PowerAndIdle,
-        ] {
+        for category in [SidebarCategory::PowerAndIdle] {
             let descriptors = category_rows(category);
             assert!(
                 !descriptors.is_empty(),
@@ -1224,53 +1110,12 @@ mod tests {
         assert!(matches!(lock.widget, WidgetKind::Entry));
 
         // The categories without interim rows fall back to a placeholder or their own
-        // glue: Theme is placeholder-backed here, and Input is now built directly by the
-        // window (task 6.6), so neither yields interim rows.
+        // glue: Theme is placeholder-backed here, Input is built directly by the window
+        // (task 6.6), and Notifications is runtime-only (task 11.7), so none yields
+        // interim rows.
         assert!(category_rows(SidebarCategory::Theme).is_empty());
         assert!(category_rows(SidebarCategory::Input).is_empty());
-    }
-
-    #[test]
-    fn notifications_position_covers_all_nine_swaync_positions_and_preselects() {
-        // The position drop-down must offer swaync's full positionY × positionX
-        // grid (top/center/bottom × left/center/right = 9 combinations), so a live
-        // `positionY: center` config preselects the matching option rather than silently
-        // falling back to index 0 ("Top right").
-        let rows = category_rows(SidebarCategory::Notifications);
-        let position = rows
-            .iter()
-            .find(|row| row.setting == SettingId::NotificationPosition)
-            .expect("Notifications has a position row");
-        let WidgetKind::DropDown { options } = &position.widget else {
-            panic!("the position row must be a drop-down");
-        };
-
-        // All nine combined `<positionY>-<positionX>` tokens are offered.
-        let tokens: std::collections::BTreeSet<&str> =
-            options.iter().map(|option| option.token.as_str()).collect();
-        let expected: std::collections::BTreeSet<&str> = [
-            "top-left",
-            "top-center",
-            "top-right",
-            "center-left",
-            "center-center",
-            "center-right",
-            "bottom-left",
-            "bottom-center",
-            "bottom-right",
-        ]
-        .into_iter()
-        .collect();
-        assert_eq!(
-            tokens, expected,
-            "all nine swaync positions must be offered"
-        );
-
-        // A `center-*` value preselects the matching option, not index 0.
-        let index =
-            dropdown_index_from_value(options, Some(&Value::Enum("center-right".to_string())))
-                .expect("a center-right value must match an option");
-        assert_eq!(options[index as usize].token, "center-right");
+        assert!(category_rows(SidebarCategory::Notifications).is_empty());
     }
 
     #[test]
@@ -1282,11 +1127,7 @@ mod tests {
         // NoSpec: a category with no framework descriptors here — Theme (its own glue),
         // and Input, which the window now builds directly with runtime XKB candidates
         // (task 6.6) rather than through this interim list.
-        let any = Capabilities::for_tests(
-            &[Binary::Hyprctl, Binary::Swaync, Binary::Hypridle],
-            &[],
-            true,
-        );
+        let any = Capabilities::for_tests(&[Binary::Hyprctl, Binary::Hypridle], &[], true);
         assert!(matches!(
             plan_category(SidebarCategory::Theme, &any),
             PagePlan::NoSpec
@@ -1296,25 +1137,16 @@ mod tests {
             PagePlan::NoSpec
         ));
 
-        // Framework: a category whose rows are (at least partly) present. Notifications'
-        // rows need swaync; Power & Idle's need hypridle — both present in `any`.
-        assert!(matches!(
-            plan_category(SidebarCategory::Notifications, &any),
-            PagePlan::Framework(_)
-        ));
+        // Framework: a category whose rows are (at least partly) present. Power & Idle's
+        // rows need hypridle, which `any` has.
         assert!(matches!(
             plan_category(SidebarCategory::PowerAndIdle, &any),
             PagePlan::Framework(_)
         ));
 
-        // Emptied: Notifications' rows all require swaync and Power & Idle's all require
-        // hypridle; with neither present every row is hidden, so each whole category is
-        // dropped (R4.2) rather than shown empty.
+        // Emptied: Power & Idle's rows all require hypridle; without it every row is
+        // hidden, so the whole category is dropped (R4.2) rather than shown empty.
         let nothing = Capabilities::for_tests(&[], &[], false);
-        assert!(matches!(
-            plan_category(SidebarCategory::Notifications, &nothing),
-            PagePlan::Emptied
-        ));
         assert!(matches!(
             plan_category(SidebarCategory::PowerAndIdle, &nothing),
             PagePlan::Emptied

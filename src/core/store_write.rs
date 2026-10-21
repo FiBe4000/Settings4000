@@ -4,13 +4,13 @@
 //!
 //! # What this module is
 //!
-//! Three pages are file-backed in the plainest possible way: Input (`input.lua`),
-//! Notifications (swaync's `config.json`) and Power & Idle (`hypridle.conf`). Every one of
+//! Two pages are file-backed in the plainest possible way: Input (`input.lua`) and
+//! Power & Idle (`hypridle.conf`). Every one of
 //! their settings is an ordinary [`SettingId`] staged in the shared store, and an Apply
 //! turns that page's dirty settings into exactly one [`FileWrite`]. The interesting part of
 //! each is its **renderer** — which parser it drives and which addresses it edits — and
-//! that stays with the page ([`crate::core::input::render_input_lua`] and its two
-//! siblings). What is not interesting, and was copied out once per page before this module
+//! that stays with the page ([`crate::core::input::render_input_lua`] and its
+//! sibling). What is not interesting, and was copied out once per page before this module
 //! existed, is the glue around it:
 //!
 //! 1. nothing dirty → no write at all (`Ok(None)`), so the pipeline also plans no reload;
@@ -26,7 +26,7 @@
 //! renderer's own error, which is the only genuinely page-specific piece of it (the
 //! Input renderer's [`InputRenderError`](crate::core::input::InputRenderError) for
 //! `input.lua`, the hyprlang writer's [`EditError`](crate::parsers::hyprlang::EditError)
-//! for `hypridle.conf`, an unparseable-JSON failure for swaync's).
+//! for `hypridle.conf`).
 //!
 //! # Why a failure here must abort the whole Apply, not skip the file
 //!
@@ -89,7 +89,7 @@ pub struct StoreBackedFile {
     /// preserved.
     pub path: PathBuf,
     /// How the file is named in the failure message the user sees, e.g. `input.lua` or
-    /// `swaync config.json`.
+    /// `hypridle.conf`.
     ///
     /// A short display name rather than [`Self::path`]: the dialog's job is to tell the
     /// user which configuration file to go and fix, and the full runtime path (with its
@@ -192,10 +192,9 @@ impl StoreBackedFile {
 /// Generic over `E`, the page renderer's own failure: the Input renderer's
 /// [`InputRenderError`](crate::core::input::InputRenderError) for `input.lua`, the
 /// hyprlang writer's [`EditError`](crate::parsers::hyprlang::EditError) for
-/// `hypridle.conf`, an unparseable-JSON failure for swaync's `config.json`. Both variants
-/// carry the file's display name because the [`Display`](fmt::Display) text is quoted
-/// verbatim in the dialog the user sees (`ui::chrome`'s `assembly_warning`), which has to
-/// say which file to go and fix.
+/// `hypridle.conf`. Both variants carry the file's display name because the
+/// [`Display`](fmt::Display) text is quoted verbatim in the dialog the user sees
+/// (`ui::chrome`'s `assembly_warning`), which has to say which file to go and fix.
 ///
 /// This is distinct from "nothing was dirty", which is a plain `Ok(None)`. Why an error
 /// here has to abort the Apply rather than skip the file is in the module docs.

@@ -38,9 +38,9 @@ use crate::core::detect::{Binary, Capabilities, HyprConfigProvider};
 ///
 /// This is the UI's notion of a sidebar page, and it is intentionally distinct from
 /// [`crate::core::model::Category`], which enumerates only the *file-backed* pages
-/// that carry staged, dirty-tracked values. Sound and Network appear here because
-/// the sidebar still shows them, but they are runtime-only (R3.1/R5.2) and so have
-/// no counterpart in the store's dirty model.
+/// that carry staged, dirty-tracked values. Sound, Notifications and Network appear
+/// here because the sidebar still shows them, but they are runtime-only (R3.1/R5.2)
+/// and so have no counterpart in the store's dirty model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SidebarCategory {
     /// Per-monitor resolution/scale/position and the laptop-display toggle (§6.1).
@@ -53,7 +53,8 @@ pub(crate) enum SidebarCategory {
     Theme,
     /// Keyboard layouts/options, mouse sensitivity and touchpad toggles (§6.6).
     Input,
-    /// swaync notification position, timeouts and do-not-disturb (§6.7).
+    /// The notifd notification daemon's runtime controls: do-not-disturb, the
+    /// notification count and inhibited state, open the center, clear all (task 11.7).
     Notifications,
     /// Idle dim/lock/DPMS timeouts and the lock command (§6.8).
     PowerAndIdle,
@@ -116,10 +117,11 @@ impl SidebarCategory {
     ///
     /// The gate is the presence of the tool or source the category's controls depend
     /// on, matching the per-page hidden-when-absent acceptance criteria of the §6
-    /// tasks. Presence is checked at the binary/source level rather than daemon
-    /// liveness: a page should appear whenever the app it configures is installed,
-    /// while gating an actual *reload* on the daemon running is the separate concern
-    /// of the reload table (task 4.4).
+    /// tasks. Presence is checked at the installed level rather than daemon liveness:
+    /// a page should appear whenever the app it configures is installed, while gating
+    /// an actual *reload* on the daemon running is the separate concern of the reload
+    /// table (task 4.4). Notifications follows the same rule through notifd's own
+    /// installed-or-running capability rather than a binary.
     pub(crate) fn is_visible(self, capabilities: &Capabilities) -> bool {
         match self {
             // Display edits `monitors.conf` and applies via `hyprctl reload`; with no
@@ -152,9 +154,11 @@ impl SidebarCategory {
                 capabilities.has_binary(Binary::Hyprctl)
                     && capabilities.hypr_config_provider() == HyprConfigProvider::Lua
             }
-            // Notifications edits swaync's `config.json` and reloads via
-            // `swaync-client` (§6.7).
-            SidebarCategory::Notifications => capabilities.has_binary(Binary::Swaync),
+            // Notifications drives notifd over D-Bus (task 11.7). Its capability is
+            // present when the daemon runs or is installed (it D-Bus-activates on the
+            // next notification); an installed-but-stopped daemon still gets the page,
+            // which says it is not running (architecture §4). Absent -> hidden (R4.2).
+            SidebarCategory::Notifications => capabilities.notifd().is_present(),
             // Power & Idle edits `hypridle.conf` and restarts hypridle on Apply
             // (§6.8).
             SidebarCategory::PowerAndIdle => capabilities.has_binary(Binary::Hypridle),
@@ -182,17 +186,25 @@ pub(crate) fn visible_categories(capabilities: &Capabilities) -> Vec<SidebarCate
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::notifd::{NotifdStatus, NotifdVersion};
 
-    /// A [`Capabilities`] with every category's gating binary present and audio
-    /// available — the "everything installed" baseline. `hyprland_ipc` is `true`,
-    /// though the shell gates on binary presence rather than liveness.
+    /// A running notifd 1.1 — what the target desktop runs.
+    fn notifd_running() -> NotifdStatus {
+        NotifdStatus::Running {
+            version: Some(NotifdVersion::STATE_AND_RELOAD),
+        }
+    }
+
+    /// A [`Capabilities`] with every category's gating binary present, audio
+    /// available and notifd running — the "everything installed" baseline.
+    /// `hyprland_ipc` is `true`, though the shell gates on binary presence rather than
+    /// liveness.
     fn all_present() -> Capabilities {
         Capabilities::for_tests(
             &[
                 Binary::Hyprctl,
                 Binary::Gsettings,
                 Binary::Wpctl,
-                Binary::Swaync,
                 Binary::Hypridle,
                 Binary::Nmcli,
                 Binary::Hyprpaper,
@@ -201,6 +213,7 @@ mod tests {
             &[],
             true,
         )
+        .with_notifd_for_tests(notifd_running())
     }
 
     #[test]
@@ -242,8 +255,8 @@ mod tests {
         // Notifications, then Network) with the hidden categories' gaps closed up —
         // confirming `visible_categories` filters to the available subset while
         // preserving the `SidebarCategory::ALL` order rather than any input order.
-        let caps =
-            Capabilities::for_tests(&[Binary::Wpctl, Binary::Swaync, Binary::Nmcli], &[], false);
+        let caps = Capabilities::for_tests(&[Binary::Wpctl, Binary::Nmcli], &[], false)
+            .with_notifd_for_tests(notifd_running());
         assert_eq!(
             visible_categories(&caps),
             vec![
@@ -339,13 +352,14 @@ mod tests {
     }
 
     #[test]
-    fn swaync_hypridle_and_nmcli_gate_their_own_categories() {
+    fn notifd_hypridle_and_nmcli_gate_their_own_categories() {
         // Each single-tool category is shown iff its tool is present, and its gate is
         // independent of the others.
-        let swaync = Capabilities::for_tests(&[Binary::Swaync], &[], false);
-        assert!(SidebarCategory::Notifications.is_visible(&swaync));
-        assert!(!SidebarCategory::PowerAndIdle.is_visible(&swaync));
-        assert!(!SidebarCategory::Network.is_visible(&swaync));
+        let notifd =
+            Capabilities::for_tests(&[], &[], false).with_notifd_for_tests(notifd_running());
+        assert!(SidebarCategory::Notifications.is_visible(&notifd));
+        assert!(!SidebarCategory::PowerAndIdle.is_visible(&notifd));
+        assert!(!SidebarCategory::Network.is_visible(&notifd));
 
         let hypridle = Capabilities::for_tests(&[Binary::Hypridle], &[], false);
         assert!(SidebarCategory::PowerAndIdle.is_visible(&hypridle));
@@ -354,6 +368,35 @@ mod tests {
         let nmcli = Capabilities::for_tests(&[Binary::Nmcli], &[], false);
         assert!(SidebarCategory::Network.is_visible(&nmcli));
         assert!(!SidebarCategory::Notifications.is_visible(&nmcli));
+    }
+
+    #[test]
+    fn the_notifications_page_follows_the_notifd_capability() {
+        // Task 11.7 acceptance: hidden when notifd is absent; shown when it runs
+        // (any version) or is installed but stopped (architecture §4). `busctl` on
+        // PATH alone, or any other binary, never reveals it — the gate is the
+        // daemon's bus name, not a binary scan.
+        let absent = Capabilities::for_tests(&[Binary::Busctl, Binary::Hyprctl], &[], true);
+        assert!(!SidebarCategory::Notifications.is_visible(&absent));
+        assert!(!visible_categories(&absent).contains(&SidebarCategory::Notifications));
+
+        for status in [
+            notifd_running(),
+            NotifdStatus::Running {
+                version: NotifdVersion::parse("1.0"),
+            },
+            NotifdStatus::Running { version: None },
+            NotifdStatus::Installed,
+        ] {
+            let caps = Capabilities::for_tests(&[], &[], false).with_notifd_for_tests(status);
+            assert!(
+                SidebarCategory::Notifications.is_visible(&caps),
+                "{status} must show the Notifications page"
+            );
+        }
+        let explicit_absent =
+            Capabilities::for_tests(&[], &[], false).with_notifd_for_tests(NotifdStatus::Absent);
+        assert!(!SidebarCategory::Notifications.is_visible(&explicit_absent));
     }
 
     #[test]

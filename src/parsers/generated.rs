@@ -18,9 +18,9 @@
 //! all** — only parsing/reading — in deliberate contrast to the sibling parsers,
 //! which all expose a surgical writer.
 //!
-//! The former `config/swaync/colors.css` partial is no longer generated (the
-//! swaync notification daemon was replaced, analysis §8.3) and is not part of
-//! the set.
+//! The former notification-daemon stylesheet partial is no longer generated
+//! (that daemon was replaced by notifd, whose popups are eww widgets styled by
+//! `_colors.scss`, analysis §8.3) and is not part of the set.
 //!
 //! # What it provides
 //!
@@ -667,14 +667,23 @@ accent0=83c092
     #[test]
     fn the_generated_file_set_is_the_ten_outputs_of_the_current_generator() {
         // Analysis §8.3: six color partials (with the Lua one, without the retired
-        // swaync stylesheet), three font partials and the marker.
+        // notification-daemon stylesheet), three font partials and the marker —
+        // exactly the ten `cat >` targets of the `8a5b20b` generator.
         let files: Vec<&str> = generated_files().collect();
-        assert_eq!(files.len(), 10);
-        assert!(files.contains(&"config/hypr/colors.lua"));
-        assert!(files.contains(&ACTIVE_SCHEME_MARKER));
-        assert!(
-            !files.iter().any(|file| file.contains("swaync")),
-            "swaync/colors.css is no longer generated"
+        assert_eq!(
+            files,
+            [
+                "config/hypr/colors.conf",
+                "config/hypr/colors.lua",
+                "config/eww/_colors.scss",
+                "config/rofi/colors.rasi",
+                "config/kitty/colors.conf",
+                "zsh/colors.zsh",
+                "config/kitty/fonts.conf",
+                "config/eww/_fonts.scss",
+                "config/rofi/fonts.rasi",
+                "state/active-scheme",
+            ]
         );
     }
 }

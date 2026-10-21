@@ -42,24 +42,25 @@
 //! # Scope: the settings defined so far (§6 extends this)
 //!
 //! The full `SettingId` ↔ file ↔ parser ↔ key mapping grows with the §6 category
-//! pages; today the declarative framework (task 5.2) exercises two files, so those
-//! are what this loads:
+//! pages; today the store-backed pages exercise two files, so those are what this
+//! loads:
 //!
 //! - `~/.config/hypr/input.lua` (the app-owned `hl.config({ input = { … } })` table,
 //!   analysis §7.1) via the Lua-literal editor → the Input page's keyboard layouts,
 //!   keyboard options, mouse sensitivity, and touchpad toggles (tasks 6.6, 11.4);
-//! - `~/.config/swaync/config.json` via the swaync JSON adapter → the Notifications
-//!   page's position and auto-dismiss timeout;
 //! - `~/.config/hypr/hypridle.conf` via the hyprlang parser → the Power & Idle page's
 //!   dim/lock/DPMS timeouts (by positional `listener` matching, §3.2) and lock command
 //!   (task 6.8).
 //!
 //! Each §6 page extends [`load_files`] with its own file loader in the same shape
 //! (read → parse → map keys to `(SettingId, Value)` → build a re-reader). Where a
-//! setting maps to more than one on-disk key — swaync's split `positionX`/`positionY`
-//! composing the single [`SettingId::NotificationPosition`] enum — the composition is
-//! done here for reading; the reverse split for *writing* is the owning §6 page's job
-//! (task 6.7), since v1 startup produces no writes.
+//! setting maps to more than one on-disk key, the composition is done here for
+//! reading; the reverse split for *writing* is the owning page's job, since startup
+//! produces no writes.
+//!
+//! The Notifications page has no startup model: every control on it is runtime-only
+//! (task 11.7), so the window builds its model when it builds the page and the first
+//! daemon query happens on page entry.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -68,14 +69,12 @@ use crate::core::detect::{Binary, Capabilities, DetectionInputs, HyprConfigProvi
 use crate::core::display::DisplayModel;
 use crate::core::input::{InputModel, default_xkb_registry, input_values, read_input_lua};
 use crate::core::model::{SettingId, Value};
-use crate::core::notifications::NotificationsModel;
 use crate::core::power::{PowerModel, power_key_path};
 use crate::core::store::{FileReader, FileValues, RefreshReport, SettingsStore};
 use crate::core::theme::{
     PaletteModel, ThemeRoots, ThemesModel, ThemesPaths, WallpaperModel, WallpaperPaths,
 };
 use crate::parsers::hyprlang::HyprlangFile;
-use crate::parsers::swaync::SwayncConfigFile;
 use crate::system::command::SystemCommandRunner;
 
 /// One backing config file loaded at startup: the live XDG path it was read from,
@@ -118,11 +117,6 @@ pub(crate) struct StartupLoad {
     /// R4.2). It supplies the layout add-list and renders the store's dirty Input
     /// settings into the `input.lua` write on Apply.
     pub(crate) input: Option<InputModel>,
-    /// The Notifications page's helper (task 6.7): the `swaync/config.json` path, or
-    /// `None` when swaync is absent (the Notifications category is then hidden entirely,
-    /// R4.2). It renders the store's dirty position/timeout settings into the
-    /// `config.json` write on Apply; the runtime-only DND switch needs no state here.
-    pub(crate) notifications: Option<NotificationsModel>,
     /// The Power & Idle page's helper (task 6.8): the `hypridle.conf` path, or `None` when
     /// hypridle is absent (the Power & Idle category is then hidden entirely, R4.2). It
     /// renders the store's dirty dim/lock/DPMS timeouts and lock command into the
@@ -153,8 +147,6 @@ pub(crate) struct StartupLoad {
 struct BackingPaths {
     /// `~/.config/hypr/input.lua` — the app-owned Lua input table.
     input_lua: PathBuf,
-    /// `~/.config/swaync/config.json` — the swaync notification config (JSON).
-    swaync_config: PathBuf,
     /// `~/.config/hypr/hypridle.conf` — the idle timeouts + lock command (hyprlang).
     hypridle_conf: PathBuf,
 }
@@ -169,7 +161,6 @@ impl BackingPaths {
         let config_home = config_home();
         BackingPaths {
             input_lua: input_lua_path(&config_home),
-            swaync_config: config_home.join("swaync").join("config.json"),
             hypridle_conf: config_home.join("hypr").join("hypridle.conf"),
         }
     }
@@ -214,7 +205,6 @@ pub(crate) fn load() -> StartupLoad {
     let files = load_files(&BackingPaths::from_system());
     let display = load_display(&capabilities);
     let input = load_input(&capabilities);
-    let notifications = load_notifications(&capabilities);
     let power = load_power(&capabilities);
     let palette = load_palette(&capabilities);
     let themes = load_themes(&capabilities);
@@ -224,7 +214,6 @@ pub(crate) fn load() -> StartupLoad {
         files,
         display,
         input,
-        notifications,
         power,
         palette,
         themes,
@@ -313,23 +302,6 @@ pub(crate) fn adopt_refreshed_model<M>(
             }
         }
     }
-}
-
-/// Builds the Notifications page's helper on the worker thread (task 6.7; R4.2).
-///
-/// Only builds when swaync is present — the Notifications category edits `swaync/config.json`
-/// and reloads via `swaync-client` (task 5.1's category gate), so without swaync there is
-/// nothing to configure and the category is hidden entirely (R4.2). It records the live
-/// `config.json` path (R8.5) for the Apply-time position/timeout write; the runtime-only
-/// DND switch reads and sets live daemon state directly and needs no state here. Building
-/// it here, off the main thread, keeps startup inside the R8.1 budget (architecture §8).
-fn load_notifications(capabilities: &Capabilities) -> Option<NotificationsModel> {
-    if !capabilities.has_binary(Binary::Swaync) {
-        tracing::info!("swaync not found; the Notifications page is hidden (R4.2)");
-        return None;
-    }
-    let swaync_config = config_home().join("swaync").join("config.json");
-    Some(NotificationsModel::load(swaync_config))
 }
 
 /// Builds the Power & Idle page's helper on the worker thread (task 6.8; R4.2).
@@ -616,12 +588,6 @@ fn load_files(paths: &BackingPaths) -> Vec<LoadedFile> {
     push_loaded(&mut files, &paths.input_lua, load_input_lua, "input.lua");
     push_loaded(
         &mut files,
-        &paths.swaync_config,
-        load_swaync_config,
-        "swaync/config.json",
-    );
-    push_loaded(
-        &mut files,
         &paths.hypridle_conf,
         load_hypridle_conf,
         "hypridle.conf",
@@ -679,51 +645,12 @@ fn push_loaded(
 /// [`input_values`], the read half of the same
 /// address map the writer uses.
 ///
-/// Crate-visible (like the other two loaders) so `crate::testing` can re-expose it
+/// Crate-visible (like the `hypridle.conf` loader) so `crate::testing` can re-expose it
 /// to the integration suites, which must load the store through the app's real
 /// loader rather than a test re-implementation (task 7.2).
 pub(crate) fn load_input_lua(path: &Path) -> io::Result<FileValues> {
     let (bytes, file) = read_input_lua(path)?;
     let values = input_values(&file);
-    Ok(FileValues { bytes, values })
-}
-
-/// Reads and parses swaync's `config.json` into the Notifications-page settings it
-/// backs (task 5.2/6.7).
-///
-/// A read error propagates (the caller skips the file). Malformed JSON, or a
-/// non-object root, is treated as "unparseable": it is turned into an
-/// [`io::Error`] so the caller skips the file with a `warn`, consistent with the
-/// other loaders — swaync itself would reject such a file, so there is nothing to
-/// edit.
-///
-/// Crate-visible for the same reason as [`load_input_lua`] (task 7.2).
-pub(crate) fn load_swaync_config(path: &Path) -> io::Result<FileValues> {
-    let bytes = std::fs::read(path)?;
-    let values = {
-        let text = String::from_utf8_lossy(&bytes);
-        let config = SwayncConfigFile::parse(&text)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-
-        let mut values = Vec::new();
-        // swaync stores the anchor as two keys (`positionY` ∈ {top,bottom},
-        // `positionX` ∈ {left,center,right}); the Notifications drop-down (task 5.2)
-        // presents one combined `positionY-positionX` token (e.g. `top-right`). Only
-        // compose when both halves are present; the reverse split for *writing* is
-        // task 6.7's job (v1 startup produces no writes).
-        if let (Some(y), Some(x)) = (config.string("positionY"), config.string("positionX")) {
-            values.push((
-                SettingId::NotificationPosition,
-                Value::Enum(format!("{y}-{x}")),
-            ));
-        }
-        // The auto-dismiss timeout in whole seconds — a single top-level integer key.
-        if let Some(seconds) = config.integer("timeout") {
-            values.push((SettingId::NotificationTimeout, Value::Integer(seconds)));
-        }
-        values
-    };
-
     Ok(FileValues { bytes, values })
 }
 
@@ -876,77 +803,6 @@ mod tests {
     }
 
     #[test]
-    fn swaync_config_parses_position_and_timeout() {
-        // The two Notifications settings: the timeout as a plain integer, and the
-        // position composed from swaync's split positionY/positionX keys into the
-        // combined token the drop-down uses.
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("config.json");
-        std::fs::write(
-            &path,
-            br#"{
-  "positionX": "right",
-  "positionY": "top",
-  "timeout": 8
-}
-"#,
-        )
-        .expect("write swaync config fixture");
-
-        let values = load_swaync_config(&path).expect("swaync config loads");
-        assert_eq!(
-            values.values,
-            vec![
-                (
-                    SettingId::NotificationPosition,
-                    Value::Enum("top-right".to_string())
-                ),
-                (SettingId::NotificationTimeout, Value::Integer(8)),
-            ],
-        );
-    }
-
-    #[test]
-    fn swaync_position_requires_both_halves() {
-        // The position is composed only when BOTH positionY and positionX are present:
-        // a single half cannot form a meaningful `positionY-positionX` token, so
-        // NotificationPosition is omitted (its control degrades to its default) while
-        // an unrelated setting like the timeout still loads.
-        let dir = tempfile::tempdir().expect("temp dir");
-
-        // Only positionY present -> no NotificationPosition, but the timeout loads.
-        let only_y = dir.path().join("only-y.json");
-        std::fs::write(&only_y, br#"{ "positionY": "top", "timeout": 5 }"#)
-            .expect("write only-positionY fixture");
-        let values = load_swaync_config(&only_y).expect("swaync config loads");
-        assert!(
-            !values
-                .values
-                .iter()
-                .any(|(id, _)| *id == SettingId::NotificationPosition),
-            "positionY alone must not compose a NotificationPosition"
-        );
-        assert_eq!(
-            values.values,
-            vec![(SettingId::NotificationTimeout, Value::Integer(5))],
-            "the other settings still load with only one position half"
-        );
-
-        // Only positionX present -> likewise no NotificationPosition.
-        let only_x = dir.path().join("only-x.json");
-        std::fs::write(&only_x, br#"{ "positionX": "right" }"#)
-            .expect("write only-positionX fixture");
-        let values = load_swaync_config(&only_x).expect("swaync config loads");
-        assert!(
-            !values
-                .values
-                .iter()
-                .any(|(id, _)| *id == SettingId::NotificationPosition),
-            "positionX alone must not compose a NotificationPosition"
-        );
-    }
-
-    #[test]
     fn a_missing_file_is_skipped_without_error() {
         // R4.4: a backing config that does not exist yields no LoadedFile, and the
         // orchestration continues — a missing file never aborts the load. Point both
@@ -954,7 +810,6 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let paths = BackingPaths {
             input_lua: dir.path().join("no-input.lua"),
-            swaync_config: dir.path().join("no-swaync.json"),
             hypridle_conf: dir.path().join("no-hypridle.conf"),
         };
         assert!(
@@ -964,34 +819,32 @@ mod tests {
     }
 
     #[test]
-    fn an_unparseable_swaync_config_degrades_to_skipped() {
-        // R4.4: malformed JSON is treated as unparseable — the loader returns an
-        // error so the file is skipped, rather than panicking or loading garbage.
+    fn an_unusable_file_is_skipped_and_the_others_still_load() {
+        // R4.4: an input.lua the editor refuses (an opaque line) is skipped, rather than
+        // panicking or loading garbage, and the readable hypridle.conf beside it still
+        // loads — one bad file never suppresses the others.
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("config.json");
-        std::fs::write(&path, b"{ not valid json ]").expect("write a broken config");
-
-        assert!(
-            load_swaync_config(&path).is_err(),
-            "a malformed swaync config must surface as an error the loader skips"
-        );
-
-        // And through the orchestration: only the readable input.lua loads.
         std::fs::write(
             dir.path().join("input.lua"),
-            input_lua_with_sensitivity("0.0"),
+            input_lua_with_sensitivity("docked and 0 or 0.3"),
         )
-        .expect("write input.lua");
+        .expect("write an unusable input.lua");
+        std::fs::write(
+            dir.path().join("hypridle.conf"),
+            b"listener {\n    timeout = 120\n}\n",
+        )
+        .expect("write hypridle.conf");
         let paths = BackingPaths {
             input_lua: dir.path().join("input.lua"),
-            swaync_config: path,
-            hypridle_conf: dir.path().join("no-hypridle.conf"),
+            hypridle_conf: dir.path().join("hypridle.conf"),
         };
         let loaded = load_files(&paths);
-        assert_eq!(loaded.len(), 1, "only the parseable file loads");
-        // The input.lua yields its sensitivity plus a seeded empty KeyboardOptions
-        // (the `input` table exists but has no `kb_options` field — task 6.6).
-        assert_eq!(loaded[0].initial.values.len(), 2);
+        assert_eq!(loaded.len(), 1, "only the usable file loads");
+        assert_eq!(loaded[0].path, paths.hypridle_conf);
+        assert_eq!(
+            loaded[0].initial.values,
+            vec![(SettingId::DimTimeout, Value::Integer(120))]
+        );
     }
 
     #[test]
@@ -1005,11 +858,13 @@ mod tests {
             "hl.config({\n    input = {\n        kb_layout = \"us\",\n        sensitivity = 0.5,\n    },\n})\n",
         )
         .expect("write input.lua");
-        std::fs::write(dir.path().join("config.json"), br#"{ "timeout": 10 }"#)
-            .expect("write swaync config");
+        std::fs::write(
+            dir.path().join("hypridle.conf"),
+            b"listener {\n    timeout = 10\n}\n",
+        )
+        .expect("write hypridle.conf");
         let paths = BackingPaths {
             input_lua: dir.path().join("input.lua"),
-            swaync_config: dir.path().join("config.json"),
             hypridle_conf: dir.path().join("hypridle.conf"),
         };
 
@@ -1024,7 +879,7 @@ mod tests {
             Some(&Value::Float(0.5))
         );
         assert_eq!(
-            store.value(SettingId::NotificationTimeout),
+            store.value(SettingId::DimTimeout),
             Some(&Value::Integer(10))
         );
         assert!(
@@ -1043,26 +898,6 @@ mod tests {
         assert!(
             load_themes(&caps).is_none(),
             "no gsettings -> no themes model -> appearance section hidden"
-        );
-    }
-
-    #[test]
-    fn notifications_are_hidden_when_swaync_is_absent() {
-        // R4.2 (task 6.7): the Notifications page edits swaync's config.json and reloads
-        // via swaync-client, so without the swaync binary no model is built and the whole
-        // category is hidden (task 5.1's category gate). The gate is checked before any
-        // path is resolved, so this needs no fixture.
-        let caps = Capabilities::for_tests(&[], &[], false);
-        assert!(
-            load_notifications(&caps).is_none(),
-            "no swaync -> no Notifications model -> the category is hidden"
-        );
-
-        // Present -> a model is built (against the resolved config.json path).
-        let caps = Capabilities::for_tests(&[Binary::Swaync], &[], false);
-        assert!(
-            load_notifications(&caps).is_some(),
-            "swaync present -> a Notifications model is built"
         );
     }
 
@@ -1162,7 +997,6 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let paths = BackingPaths {
             input_lua: dir.path().join("input.lua"),
-            swaync_config: dir.path().join("no-swaync.json"),
             hypridle_conf: dir.path().join("hypridle.conf"),
         };
         std::fs::write(&paths.input_lua, input_lua_with_sensitivity("0.3"))
@@ -1217,7 +1051,6 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let paths = BackingPaths {
             input_lua: dir.path().join("input.lua"),
-            swaync_config: dir.path().join("no-swaync.json"),
             hypridle_conf: dir.path().join("no-hypridle.conf"),
         };
         std::fs::write(&paths.input_lua, input_lua_with_sensitivity("0.3"))
@@ -1351,33 +1184,33 @@ mod tests {
 
     #[test]
     fn refresh_rebuilds_a_model_when_its_capability_appears_or_disappears() {
-        // The task-9.3 accept scenario at the capability seam: swaync is installed
-        // between startup and a Refresh. The startup pass built no Notifications model
+        // The task-9.3 accept scenario at the capability seam: hypridle is installed
+        // between startup and a Refresh. The startup pass built no Power & Idle model
         // (category hidden, R4.2); the refresh pass runs the *same* loader against the
         // new capabilities, builds the model, and the category becomes visible.
         use crate::ui::category::{SidebarCategory, visible_categories};
 
         let before = Capabilities::for_tests(&[], &[], false);
-        let mut current = load_notifications(&before);
+        let mut current = load_power(&before);
         assert!(current.is_none(), "absent at startup");
         assert!(
-            !visible_categories(&before).contains(&SidebarCategory::Notifications),
+            !visible_categories(&before).contains(&SidebarCategory::PowerAndIdle),
             "the category is hidden while the capability is absent (R4.2)"
         );
 
-        // swaync installed -> Refresh: the loader now builds the model and the
+        // hypridle installed -> Refresh: the loader now builds the model and the
         // adoption swaps it in (no staged edits to protect).
-        let after = Capabilities::for_tests(&[Binary::Swaync], &[], false);
-        adopt_refreshed_model(&mut current, load_notifications(&after), |_| false);
+        let after = Capabilities::for_tests(&[Binary::Hypridle], &[], false);
+        adopt_refreshed_model(&mut current, load_power(&after), |_| false);
         assert!(current.is_some(), "the model is rebuilt on Refresh (R4.3)");
         assert!(
-            visible_categories(&after).contains(&SidebarCategory::Notifications),
+            visible_categories(&after).contains(&SidebarCategory::PowerAndIdle),
             "the category appears with the refreshed capabilities"
         );
 
-        // swaync uninstalled -> Refresh: the fresh pass yields None and the model is
+        // hypridle uninstalled -> Refresh: the fresh pass yields None and the model is
         // dropped so the section hides again (R4.2).
-        adopt_refreshed_model(&mut current, load_notifications(&before), |_| false);
+        adopt_refreshed_model(&mut current, load_power(&before), |_| false);
         assert!(
             current.is_none(),
             "the model is dropped when its app is gone"

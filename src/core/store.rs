@@ -576,7 +576,7 @@ mod tests {
     use std::fs;
 
     /// A reader for a one-line file holding a single integer, mapped to
-    /// [`SettingId::NotificationTimeout`]. Mirrors what a real parser-backed loader
+    /// [`SettingId::DimTimeout`]. Mirrors what a real parser-backed loader
     /// would provide, but small enough to keep the store tests focused on staging.
     fn timeout_reader() -> FileReader {
         Box::new(|path: &Path| {
@@ -587,7 +587,7 @@ mod tests {
             })?;
             Ok(FileValues {
                 bytes,
-                values: vec![(SettingId::NotificationTimeout, Value::Integer(seconds))],
+                values: vec![(SettingId::DimTimeout, Value::Integer(seconds))],
             })
         })
     }
@@ -609,7 +609,7 @@ mod tests {
         })
     }
 
-    /// Loads a `NotificationTimeout` setting into `store` from a freshly written file,
+    /// Loads a `DimTimeout` setting into `store` from a freshly written file,
     /// returning the file path so a test can edit it externally afterwards.
     fn load_timeout(store: &mut SettingsStore, dir: &Path, seconds: i64) -> PathBuf {
         let path = dir.join("timeout.conf");
@@ -619,7 +619,7 @@ mod tests {
             &path,
             FileValues {
                 bytes,
-                values: vec![(SettingId::NotificationTimeout, Value::Integer(seconds))],
+                values: vec![(SettingId::DimTimeout, Value::Integer(seconds))],
             },
             timeout_reader(),
         );
@@ -636,30 +636,30 @@ mod tests {
 
         assert!(!store.is_dirty(), "a freshly loaded store is clean");
         assert_eq!(
-            store.value(SettingId::NotificationTimeout),
+            store.value(SettingId::DimTimeout),
             Some(&Value::Integer(300))
         );
 
         let outcome = store
-            .stage(SettingId::NotificationTimeout, Value::Integer(120))
+            .stage(SettingId::DimTimeout, Value::Integer(120))
             .expect("a valid file-backed edit stages");
         assert_eq!(outcome, StageOutcome::Staged);
         assert!(
             store.is_dirty(),
             "staging a different value makes the store dirty"
         );
-        assert!(store.is_category_dirty(Category::Notifications));
+        assert!(store.is_category_dirty(Category::PowerAndIdle));
         assert_eq!(
-            store.value(SettingId::NotificationTimeout),
+            store.value(SettingId::DimTimeout),
             Some(&Value::Integer(120))
         );
-        assert_eq!(store.dirty_ids(), vec![SettingId::NotificationTimeout]);
+        assert_eq!(store.dirty_ids(), vec![SettingId::DimTimeout]);
 
         store.reset();
         assert!(!store.is_dirty(), "reset discards staged edits");
         assert!(store.dirty_ids().is_empty());
         assert_eq!(
-            store.value(SettingId::NotificationTimeout),
+            store.value(SettingId::DimTimeout),
             Some(&Value::Integer(300)),
             "after reset the effective value is the original again"
         );
@@ -676,7 +676,7 @@ mod tests {
         let path = load_timeout(&mut store, dir.path(), 300);
 
         store
-            .stage(SettingId::NotificationTimeout, Value::Integer(120))
+            .stage(SettingId::DimTimeout, Value::Integer(120))
             .expect("stage a pending edit");
         assert!(store.is_dirty());
 
@@ -688,7 +688,7 @@ mod tests {
         assert!(!store.is_dirty(), "commit clears dirty");
         assert!(store.dirty_ids().is_empty());
         assert_eq!(
-            store.original(SettingId::NotificationTimeout),
+            store.original(SettingId::DimTimeout),
             Some(&Value::Integer(120)),
             "the staged value is promoted to the original"
         );
@@ -711,7 +711,7 @@ mod tests {
         load_timeout(&mut store, dir.path(), 300);
 
         let outcome = store
-            .stage(SettingId::NotificationTimeout, Value::Integer(300))
+            .stage(SettingId::DimTimeout, Value::Integer(300))
             .expect("staging the original value succeeds");
         assert_eq!(outcome, StageOutcome::Staged);
         assert!(
@@ -742,12 +742,12 @@ mod tests {
         );
 
         store
-            .stage(SettingId::NotificationTimeout, Value::Integer(120))
-            .expect("stage the notification timeout");
-        assert!(store.is_category_dirty(Category::Notifications));
+            .stage(SettingId::DimTimeout, Value::Integer(120))
+            .expect("stage the dim timeout");
+        assert!(store.is_category_dirty(Category::PowerAndIdle));
         assert!(
             !store.is_category_dirty(Category::Display),
-            "editing Notifications must not flag Display"
+            "editing Power & Idle must not flag Display"
         );
 
         store
@@ -756,7 +756,7 @@ mod tests {
         assert!(store.is_category_dirty(Category::Display));
         assert_eq!(
             store.dirty_ids(),
-            vec![SettingId::MonitorScale, SettingId::NotificationTimeout],
+            vec![SettingId::MonitorScale, SettingId::DimTimeout],
             "both settings are dirty, reported in SettingId order"
         );
     }
@@ -784,18 +784,18 @@ mod tests {
         );
 
         // Nothing staged yet: both pages are clean.
-        assert!(store.dirty_in_category(Category::Notifications).is_empty());
+        assert!(store.dirty_in_category(Category::PowerAndIdle).is_empty());
         assert!(store.dirty_in_category(Category::Display).is_empty());
 
         store
-            .stage(SettingId::NotificationTimeout, Value::Integer(120))
-            .expect("stage the notification timeout");
+            .stage(SettingId::DimTimeout, Value::Integer(120))
+            .expect("stage the dim timeout");
 
-        // Only the dirtied Notifications setting is returned, carrying its staged value;
+        // Only the dirtied Power & Idle setting is returned, carrying its staged value;
         // the untouched Display page is still empty.
         assert_eq!(
-            store.dirty_in_category(Category::Notifications),
-            vec![(SettingId::NotificationTimeout, Value::Integer(120))]
+            store.dirty_in_category(Category::PowerAndIdle),
+            vec![(SettingId::DimTimeout, Value::Integer(120))]
         );
         assert!(
             store.dirty_in_category(Category::Display).is_empty(),
@@ -1007,11 +1007,11 @@ mod tests {
         // error (NotLoaded), not a silent insert.
         let mut store = SettingsStore::new();
         let error = store
-            .stage(SettingId::NotificationTimeout, Value::Integer(120))
+            .stage(SettingId::DimTimeout, Value::Integer(120))
             .expect_err("an unloaded setting cannot be staged");
         assert!(matches!(
             error,
-            StageError::NotLoaded(SettingId::NotificationTimeout)
+            StageError::NotLoaded(SettingId::DimTimeout)
         ));
     }
 
@@ -1041,7 +1041,7 @@ mod tests {
         );
         assert!(report.failed().is_empty());
         assert_eq!(
-            store.original(SettingId::NotificationTimeout),
+            store.original(SettingId::DimTimeout),
             Some(&Value::Integer(600)),
             "the original is refreshed from the new file contents"
         );
@@ -1063,7 +1063,7 @@ mod tests {
         let path = load_timeout(&mut store, dir.path(), 300);
 
         store
-            .stage(SettingId::NotificationTimeout, Value::Integer(120))
+            .stage(SettingId::DimTimeout, Value::Integer(120))
             .expect("stage a pending edit");
 
         fs::write(&path, "600").expect("external edit");
@@ -1071,12 +1071,12 @@ mod tests {
         assert_eq!(report.reloaded(), &[path]);
 
         assert_eq!(
-            store.original(SettingId::NotificationTimeout),
+            store.original(SettingId::DimTimeout),
             Some(&Value::Integer(600)),
             "original refreshed to the external value"
         );
         assert_eq!(
-            store.value(SettingId::NotificationTimeout),
+            store.value(SettingId::DimTimeout),
             Some(&Value::Integer(120)),
             "the pending staged edit is preserved"
         );
@@ -1104,7 +1104,7 @@ mod tests {
             "a deleted file is reported as failed"
         );
         assert_eq!(
-            store.original(SettingId::NotificationTimeout),
+            store.original(SettingId::DimTimeout),
             Some(&Value::Integer(300)),
             "the last-known original is retained when reload fails"
         );
@@ -1122,7 +1122,7 @@ mod tests {
         let path = load_timeout(&mut store, dir.path(), 300);
 
         store
-            .stage(SettingId::NotificationTimeout, Value::Integer(120))
+            .stage(SettingId::DimTimeout, Value::Integer(120))
             .expect("stage a pending edit");
 
         fs::write(&path, "600").expect("external edit");
@@ -1131,7 +1131,7 @@ mod tests {
         store.reset();
         assert!(!store.is_dirty(), "reset clears the pending edit");
         assert_eq!(
-            store.value(SettingId::NotificationTimeout),
+            store.value(SettingId::DimTimeout),
             Some(&Value::Integer(600)),
             "after reset the effective value is the re-baselined original, not the \
              stale pre-conflict 300"
@@ -1154,7 +1154,7 @@ mod tests {
             FileValues {
                 bytes,
                 values: vec![
-                    (SettingId::NotificationTimeout, Value::Integer(300)),
+                    (SettingId::DimTimeout, Value::Integer(300)),
                     (SettingId::LaptopDisplayEnabled, Value::Bool(true)),
                 ],
             },
@@ -1162,7 +1162,7 @@ mod tests {
         );
 
         assert_eq!(
-            store.value(SettingId::NotificationTimeout),
+            store.value(SettingId::DimTimeout),
             Some(&Value::Integer(300)),
             "the file-backed setting is stored"
         );

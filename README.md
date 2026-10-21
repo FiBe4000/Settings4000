@@ -8,10 +8,13 @@ documentation, and the code — was written with
 files behind the common user-facing settings — display, sound, theme/palette,
 input, notifications, power/idle, network — with **surgical, comment-preserving
 edits** (never regenerating a hand-written file), and triggers the right live
-reloads (`hyprctl reload`, `swaync-client -rs`, hypridle restart, …) so changes
-take effect without a relogin. File-backed edits are staged and written
-atomically on **Apply**, with validation before any write and per-file rollback
-on failure; controls for tools that aren't installed are simply hidden.
+reloads (`hyprctl reload`, `eww reload`, hypridle restart, …) so changes
+take effect without a relogin. Runtime-only controls — volume and devices, the
+laptop-display toggle, and the notification daemon's do-not-disturb / clear /
+notification-center actions — apply immediately instead. File-backed edits are
+staged and written atomically on **Apply**, with validation before any write and
+per-file rollback on failure; controls for tools that aren't installed are
+simply hidden.
 
 ## Dependencies
 
@@ -31,16 +34,17 @@ on failure; controls for tools that aren't installed are simply hidden.
 
 ### Runtime (all optional)
 
-The app works against whatever is present. At startup it scans `$PATH` and
-checks daemon liveness (`core/detect.rs`); controls whose backing tool is
-missing are hidden — never greyed out — and their absence is logged. None of
-these are build dependencies:
+The app works against whatever is present. At startup it scans `$PATH`,
+checks daemon liveness and asks the session bus whether the notification
+daemon runs (`core/detect.rs`); controls whose backing tool is missing are
+hidden — never greyed out — and their absence is logged. None of these are
+build dependencies:
 
 | Tool | Used for |
 |---|---|
 | `hyprctl` | Hyprland reloads, monitor info, `setcursor`, hyprpaper control |
 | `wpctl` / `pactl` | Sound page (volume, mute, devices) |
-| `swaync` | Notifications page (reloads run through `swaync-client`) |
+| `notifd` (+ `busctl`) | Notifications page: do-not-disturb, notification count, clear all, open the center — detected by its D-Bus name `se.dotfiles.Notifd` (running) or its `~/.config/systemd/user/notifd.service` unit (installed); every call goes through `busctl` with auto-start disabled |
 | `hypridle`, `hyprlock`, `hyprpaper` | Power & Idle, lock background, wallpaper |
 | `nmcli`, `nm-connection-editor` | Network status page + settings launcher |
 | `gsettings`, `dconf` | GTK theme/cursor propagation, live-restyle detection |
@@ -130,15 +134,16 @@ tracked in the dotfiles repo itself, in
 `~/.dotfiles/settings_app_prep_tasks.md` (all completed); the resulting layout
 the app targets is documented in `docs/dotfiles_analysis.md` §6.
 
-**Status (2026-10-20):** the dotfiles have since moved to a Lua Hyprland
+**Status (2026-10-21):** the dotfiles have since moved to a Lua Hyprland
 config (`hyprland.lua` + app-owned `input.lua`; the hyprlang `.conf` files are
-gone) and replaced swaync with a self-written `notifd` daemon that has its own
-small config file. The code here still targets the earlier layout, so on that
-desktop the Input page, the cursor env write and the Notifications page
-currently write files or run commands the session ignores. The new layout is
-analysed in `docs/dotfiles_analysis.md` §7–§8 and the re-alignment work is the
-§11 backlog in `docs/tasks.md`; the mentions of swaync in this README describe
-the code as it is until that backlog lands.
+gone) and replaced their notification daemon with a self-written `notifd`
+that has its own small config file. The new layout is analysed in
+`docs/dotfiles_analysis.md` §7–§8 and the re-alignment work is the §11 backlog
+in `docs/tasks.md`. The Input page, the cursor copies, the palette schema and
+the Notifications page's runtime controls already follow it; the remaining
+§11 items (among them the laptop-display toggle running the dotfiles script,
+notifd's file-backed settings and the follow-up reloads) are still open, and
+until they land those parts of the app keep their earlier behaviour.
 
 ## Documentation
 

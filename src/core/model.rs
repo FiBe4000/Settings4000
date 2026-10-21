@@ -87,8 +87,6 @@ pub enum Category {
     Theme,
     /// Keyboard, mouse, and touchpad settings backed by `input.lua` (tasks 6.6, 11.4).
     Input,
-    /// swaync notification settings backed by `config.json` (task 6.7).
-    Notifications,
     /// Idle timeouts and the lock command backed by `hypridle.conf` (task 6.8).
     PowerAndIdle,
 }
@@ -190,12 +188,6 @@ pub enum SettingId {
     /// Touchpad tap-to-click.
     TouchpadTapToClick,
 
-    // --- Notifications (task 6.7) ---
-    /// swaync notification anchor position — a choice from a small fixed set.
-    NotificationPosition,
-    /// swaync notification auto-dismiss timeout, in whole seconds.
-    NotificationTimeout,
-
     // --- Power & Idle (task 6.8) ---
     /// Idle seconds before the screen dims (`hypridle.conf` listener).
     DimTimeout,
@@ -216,14 +208,11 @@ impl SettingId {
     /// UI/store use it to build the right widget and coerce input.
     pub fn kind(&self) -> ValueKind {
         match self {
-            SettingId::MonitorMode
-            | SettingId::MonitorPosition
-            | SettingId::NotificationPosition => ValueKind::Enum,
+            SettingId::MonitorMode | SettingId::MonitorPosition => ValueKind::Enum,
             SettingId::MonitorScale | SettingId::MouseSensitivity => ValueKind::Float,
-            SettingId::NotificationTimeout
-            | SettingId::DimTimeout
-            | SettingId::LockTimeout
-            | SettingId::DpmsTimeout => ValueKind::Integer,
+            SettingId::DimTimeout | SettingId::LockTimeout | SettingId::DpmsTimeout => {
+                ValueKind::Integer
+            }
             SettingId::TouchpadNaturalScroll
             | SettingId::TouchpadTapToClick
             | SettingId::LaptopDisplayEnabled => ValueKind::Bool,
@@ -254,9 +243,6 @@ impl SettingId {
             | SettingId::MouseSensitivity
             | SettingId::TouchpadNaturalScroll
             | SettingId::TouchpadTapToClick => Category::Input,
-            SettingId::NotificationPosition | SettingId::NotificationTimeout => {
-                Category::Notifications
-            }
             SettingId::DimTimeout
             | SettingId::LockTimeout
             | SettingId::DpmsTimeout
@@ -290,8 +276,6 @@ impl SettingId {
             | SettingId::MouseSensitivity
             | SettingId::TouchpadNaturalScroll
             | SettingId::TouchpadTapToClick
-            | SettingId::NotificationPosition
-            | SettingId::NotificationTimeout
             | SettingId::DimTimeout
             | SettingId::LockTimeout
             | SettingId::DpmsTimeout
@@ -331,10 +315,7 @@ impl SettingId {
                 validate_float_range(*sensitivity, &SENSITIVITY_RANGE)
             }
             (
-                SettingId::NotificationTimeout
-                | SettingId::DimTimeout
-                | SettingId::LockTimeout
-                | SettingId::DpmsTimeout,
+                SettingId::DimTimeout | SettingId::LockTimeout | SettingId::DpmsTimeout,
                 Value::Integer(seconds),
             ) => validate_int_range(*seconds, &TIMEOUT_SECONDS_RANGE),
             // No value-format rule: a boolean switch, a free-text command, or a
@@ -348,7 +329,6 @@ impl SettingId {
                 | SettingId::LaptopDisplayEnabled,
                 Value::Bool(_),
             ) => Ok(()),
-            (SettingId::NotificationPosition, Value::Enum(_)) => Ok(()),
             // The keyboard-layout list must have at least one entry (R8.3): writing an
             // empty `kb_layout=` makes Hyprland silently fall back to its default
             // layout, discarding the user's configured layouts — so an empty list (the
@@ -385,7 +365,7 @@ impl SettingId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValueKind {
     /// A choice from a fixed set, presented as a drop-down (e.g. a monitor mode or
-    /// a notification position). Distinguished from [`ValueKind::String`] to signal
+    /// position). Distinguished from [`ValueKind::String`] to signal
     /// that only a member of a known set is meaningful, even though it is carried
     /// as text.
     Enum,
@@ -654,9 +634,9 @@ pub const SENSITIVITY_RANGE: RangeInclusive<f64> = -1.0..=1.0;
 /// sufficient.
 pub const SCALE_RANGE: RangeInclusive<f64> = 0.5..=3.0;
 
-/// Allowed idle/notification timeouts, in whole seconds: strictly positive (R8.3
-/// "timeout ranges"), up to one day. The upper bound is a sanity ceiling for an
-/// idle timeout (dim/lock/DPMS in `hypridle.conf`, swaync auto-dismiss); the
+/// Allowed idle timeouts, in whole seconds: strictly positive (R8.3 "timeout
+/// ranges"), up to one day. The upper bound is a sanity ceiling for an idle timeout
+/// (dim/lock/DPMS in `hypridle.conf`); the
 /// requirement asks only that timeouts be positive with a sensible maximum.
 pub const TIMEOUT_SECONDS_RANGE: RangeInclusive<i64> = 1..=86_400;
 
@@ -1040,8 +1020,6 @@ mod tests {
         SettingId::MouseSensitivity,
         SettingId::TouchpadNaturalScroll,
         SettingId::TouchpadTapToClick,
-        SettingId::NotificationPosition,
-        SettingId::NotificationTimeout,
         SettingId::DimTimeout,
         SettingId::LockTimeout,
         SettingId::DpmsTimeout,
@@ -1065,8 +1043,6 @@ mod tests {
             | SettingId::MouseSensitivity
             | SettingId::TouchpadNaturalScroll
             | SettingId::TouchpadTapToClick
-            | SettingId::NotificationPosition
-            | SettingId::NotificationTimeout
             | SettingId::DimTimeout
             | SettingId::LockTimeout
             | SettingId::DpmsTimeout
@@ -1095,11 +1071,9 @@ mod tests {
             }
             SettingId::MouseSensitivity => Value::Float(0.3),
             SettingId::TouchpadNaturalScroll | SettingId::TouchpadTapToClick => Value::Bool(true),
-            SettingId::NotificationPosition => Value::Enum("top-right".to_string()),
-            SettingId::NotificationTimeout
-            | SettingId::DimTimeout
-            | SettingId::LockTimeout
-            | SettingId::DpmsTimeout => Value::Integer(300),
+            SettingId::DimTimeout | SettingId::LockTimeout | SettingId::DpmsTimeout => {
+                Value::Integer(300)
+            }
             SettingId::LockCommand => Value::String("hyprlock".to_string()),
         }
     }
@@ -1172,10 +1146,7 @@ mod tests {
         assert_eq!(SettingId::KeyboardLayouts.category(), Category::Input);
         assert_eq!(SettingId::KeyboardOptions.category(), Category::Input);
         assert_eq!(SettingId::MouseSensitivity.category(), Category::Input);
-        assert_eq!(
-            SettingId::NotificationTimeout.category(),
-            Category::Notifications
-        );
+        assert_eq!(SettingId::DimTimeout.category(), Category::PowerAndIdle);
         assert_eq!(SettingId::LockCommand.category(), Category::PowerAndIdle);
     }
 
@@ -1534,7 +1505,6 @@ mod tests {
 
         // Every timeout setting dispatches to this validator.
         for id in [
-            SettingId::NotificationTimeout,
             SettingId::DimTimeout,
             SettingId::LockTimeout,
             SettingId::DpmsTimeout,

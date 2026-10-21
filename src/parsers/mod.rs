@@ -1,7 +1,7 @@
 //! Config-file parsers and surgical writers (architecture §3).
 //!
 //! One submodule per file format the app edits (palette `key=hex`, hyprlang,
-//! Lua literals, `monitors.conf`, swaync JSON, GTK INI, `uwsm/env`). Each parser
+//! Lua literals, `monitors.conf`, GTK INI, `uwsm/env`). Each parser
 //! produces a lossless line/token representation and rewrites only the value span
 //! of a targeted key, leaving comments, ordering, and commented-out lines
 //! byte-identical. Every parser carries round-trip tests (`parse → edit
@@ -42,12 +42,6 @@ pub mod lua_literal;
 // staged mode/scale edits back, keeping the file parseable by the dotfiles'
 // `hypr-display-profile.sh` (which derives eDP mode/scale from it).
 pub mod monitors;
-
-// The swaync JSON adapter (task 3.4). The startup loader reads
-// `swaync/config.json` through it into the store, and the Notifications-page
-// write glue (`core::notifications`) renders the staged position/timeout
-// edits back.
-pub mod swaync;
 
 // The GTK settings.ini editor (task 3.5). The Themes model (`core::theme`)
 // writes the same theme/icon/cursor values into both `gtk-3.0` and `gtk-4.0`

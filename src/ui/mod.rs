@@ -53,12 +53,11 @@
 //!   [`crate::core::network`] status. It is bespoke rather than declarative because the
 //!   page is read-only and runtime-backed (R3.1) — it has no store-backed settings at
 //!   all.
-//! - [`notifications`] — the Notifications page's bespoke Do-Not-Disturb glue (task 6.7):
-//!   the position/timeout controls are ordinary store-backed framework rows (built via
-//!   [`page`]), so this module supplies only the runtime-only DND switch, which reads and
-//!   sets live daemon state via `swaync-client` and bypasses staging (R5.2). The
-//!   store→`config.json` write for position/timeout lives in
-//!   [`crate::core::notifications`].
+//! - [`notifications`] — the Notifications page's bespoke glue (task 11.7): the
+//!   runtime-only notifd controls (do-not-disturb, the notification count and inhibited
+//!   state, open the center, clear all behind a confirmation), rendered from the
+//!   GTK-free [`crate::core::notifications`] model. Bespoke because nothing on it is
+//!   staged (R5.2).
 //!
 //! The real per-category page content (§6) plugs into this shell in later tasks.
 

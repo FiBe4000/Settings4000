@@ -68,7 +68,7 @@
 //! files against the real baselines the startup load recorded (R5.6) rather than an
 //! empty tracker.
 //!
-//! Building that plan out of the store and the seven bespoke page models — which writes to
+//! Building that plan out of the store and the six bespoke page models — which writes to
 //! fold in, in which order, and when to refuse to apply at all — is **not** done here:
 //! it is [`assemble_apply_plan`](crate::core::assemble::assemble_apply_plan) in the
 //! GTK-free [`core::assemble`](crate::core::assemble) module, so those decisions are
@@ -106,7 +106,6 @@ use crate::core::detect::Capabilities;
 use crate::core::display::DisplayModel;
 use crate::core::input::InputModel;
 use crate::core::model::Category;
-use crate::core::notifications::NotificationsModel;
 use crate::core::power::PowerModel;
 use crate::core::store::SettingsStore;
 use crate::core::theme::{PaletteModel, ThemesModel, WallpaperModel};
@@ -187,23 +186,16 @@ struct Shell {
     /// only supplies the keyboard-layout candidates and renders the store's dirty Input
     /// settings into the `input.lua` write on Apply (see [`assemble_apply_plan`]).
     input: Rc<RefCell<Option<InputModel>>>,
-    /// The Notifications page's helper (task 6.7), shared with the Notifications glue.
-    /// `None` until the startup worker builds it, or when swaync is absent. Like the
-    /// [`InputModel`] it is **not** a separate staging source — the position/timeout are
-    /// staged in the shared store — so it feeds neither the dirty rollup nor a bespoke
-    /// commit; it only renders the store's dirty Notifications settings into the
-    /// `config.json` write on Apply (see [`assemble_apply_plan`]). The runtime-only DND
-    /// switch is applied immediately and holds no state here.
-    notifications: Rc<RefCell<Option<NotificationsModel>>>,
-    /// The Notifications page's mounted Do-Not-Disturb control (task 6.7), retained so the
-    /// window can re-query the daemon and re-render the switch when the page is re-shown.
-    /// Rebuilt by [`Shell::populate`]; `None` when the Notifications category is not
-    /// visible. It is runtime-only, so — like the Sound page — it feeds neither the
-    /// Apply/Reset chrome nor a dirty marker (R5.2).
+    /// The mounted Notifications page (task 11.7), retained so the window can read the
+    /// notifd daemon's state when the page is shown — the first read and every later
+    /// one, from the deferred page-entry hook (the task 9.26 rule). Rebuilt by
+    /// [`Shell::populate`]; `None` when the Notifications category is not visible. It is
+    /// runtime-only, so — like the Sound page — it feeds neither the Apply/Reset chrome
+    /// nor a dirty marker (R5.2).
     notifications_page: Rc<RefCell<Option<NotificationsPage>>>,
     /// The Power & Idle page's helper (task 6.8), shared with the Apply wiring. `None`
     /// until the startup worker builds it, or when hypridle is absent. Like the
-    /// [`InputModel`] and [`NotificationsModel`] it is **not** a separate staging source —
+    /// [`InputModel`] it is **not** a separate staging source —
     /// the timeouts and lock command are staged in the shared store as ordinary framework
     /// rows — so it feeds neither the dirty rollup nor a bespoke commit; it only renders
     /// the store's dirty Power & Idle settings into the `hypridle.conf` write on Apply,
@@ -311,11 +303,8 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     // store-backed rows, so no separate page handle is retained (the SettingsPage
     // controller goes in `controllers` like any framework page).
     let input: Rc<RefCell<Option<InputModel>>> = Rc::new(RefCell::new(None));
-    // The Notifications page's helper (task 6.7) — the Apply-time config.json write for the
-    // store-backed position/timeout — plus the runtime-only DND switch page handle. Filled
-    // by the worker; the store-backed rows go through a SettingsPage controller in
-    // `controllers`, while the bespoke DND switch handle is retained here for re-query.
-    let notifications: Rc<RefCell<Option<NotificationsModel>>> = Rc::new(RefCell::new(None));
+    // The Notifications page (task 11.7) — a runtime-only bespoke page rebuilt by
+    // `populate`.
     let notifications_page: Rc<RefCell<Option<NotificationsPage>>> = Rc::new(RefCell::new(None));
     // The Power & Idle page's helper (task 6.8) — the Apply-time hypridle.conf write for the
     // store-backed timeouts + lock command. Filled by the worker; the page's controls are
@@ -449,7 +438,6 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
         display,
         display_page,
         input,
-        notifications,
         notifications_page,
         power,
         sound_page,
@@ -511,11 +499,11 @@ fn spawn_load(on_done: impl FnOnce(Option<StartupLoad>) + 'static) {
 ///
 /// # Why the idle hop
 ///
-/// The runtime-backed pages (Sound, Network) read their live state by spawning a
-/// short-lived command, so the probe must never sit on the populate path: a wedged
-/// PipeWire or NetworkManager holds one for the full 5 s command timeout
-/// ([`CommandRunner`](crate::system::command::CommandRunner)), which would delay every
-/// later category's appearance against the R8.1 cold-start budget. Deferring the *first*
+/// The runtime-backed pages (Sound, Notifications, Network) read their live state by
+/// spawning a short-lived command, so the probe must never sit on the populate path: a
+/// wedged PipeWire, session bus or NetworkManager holds one for the full 5 s command
+/// timeout ([`CommandRunner`](crate::system::command::CommandRunner)), which would delay
+/// every later category's appearance against the R8.1 cold-start budget. Deferring the *first*
 /// read out of the page's `build` is not enough on its own, because
 /// [`Stack::add_titled`] makes the first page added the
 /// visible one and emits `notify::visible-child-name` **synchronously**: when the page
@@ -632,7 +620,6 @@ impl Shell {
             files,
             display,
             input,
-            notifications,
             power,
             palette,
             themes,
@@ -653,12 +640,11 @@ impl Shell {
             }
         }
         *self.capabilities.borrow_mut() = capabilities;
-        // Adopt the worker-built Display, Input, Notifications, Power & Idle, palette,
-        // GTK/icon/cursor theme, and wallpaper models (tasks 6.1/6.3–6.8) before
-        // `populate` builds their pages.
+        // Adopt the worker-built Display, Input, Power & Idle, palette, GTK/icon/cursor
+        // theme, and wallpaper models (tasks 6.1/6.3–6.8) before `populate` builds their
+        // pages.
         *self.display.borrow_mut() = display;
         *self.input.borrow_mut() = input;
-        *self.notifications.borrow_mut() = notifications;
         *self.power.borrow_mut() = power;
         *self.palette.borrow_mut() = palette;
         *self.themes.borrow_mut() = themes;
@@ -701,7 +687,7 @@ impl Shell {
         // page makes GTK pick another child as the visible one, which fires the
         // page-entry hooks ([`Self::wire_sound_page_entry`] and its siblings). With the
         // handles already cleared those hooks find no page to refresh, so tearing the
-        // stack down can never run a `pw-dump`/`nmcli`/`swaync-client` probe for a page
+        // stack down can never run a `pw-dump`/`nmcli`/`busctl` probe for a page
         // that is on its way out (task 9.4).
         *self.display_page.borrow_mut() = None;
         *self.sound_page.borrow_mut() = None;
@@ -747,12 +733,10 @@ impl Shell {
                 self.populate_input(category, &mut controllers);
                 continue;
             }
-            // Notifications is a hybrid (task 6.7): its position/timeout are store-backed
-            // framework rows, but a runtime-only DND switch (NOT a config key) is appended
-            // beside them, so the window special-cases it to build the framework page and
-            // add the bespoke switch.
+            // Notifications is bespoke too (task 11.7): every control is runtime-only
+            // notifd state (R5.2), so it does not use the declarative framework.
             if category == SidebarCategory::Notifications {
-                self.populate_notifications(category, &mut controllers);
+                self.populate_notifications(category);
                 continue;
             }
             // Network is bespoke too (task 6.9): it is read-only, runtime-backed status
@@ -862,66 +846,22 @@ impl Shell {
         controllers.push(controller);
     }
 
-    /// Builds the Notifications category's page (task 6.7).
+    /// Builds the Notifications category's page (task 11.7).
     ///
-    /// The page is a hybrid. Its **position** and **auto-dismiss timeout** are ordinary
-    /// store-backed [`SettingId`](crate::core::model::SettingId)s, so they are built by the
-    /// declarative row framework exactly like the generic path (via [`page::plan_category`]);
-    /// their dirty marker tracks the store's Notifications rollup and their `config.json`
-    /// write is folded into the shared Apply pipeline (see [`assemble_apply_plan`]). The one
-    /// thing the framework cannot build is appended here: the **runtime-only DND switch**
-    /// (task 6.7 gotcha — swaync's do-not-disturb is live daemon state via `swaync-client`,
-    /// **not** a config key), which applies immediately and never stages/dirties (R5.2). The
-    /// framework controller is retained in `controllers` (so a Reset/commit re-renders it)
-    /// and the bespoke switch handle in [`Self::notifications_page`] (so the daemon state is
-    /// re-queried on page entry). The category is only reached when swaync is present (task
-    /// 5.1), so the framework rows are always visible; the defensive arms fall back to a
-    /// placeholder should that ever change.
-    fn populate_notifications(
-        &self,
-        category: SidebarCategory,
-        controllers: &mut Vec<Controller<SettingsPage>>,
-    ) {
-        let plan = {
-            let caps = self.capabilities.borrow();
-            page::plan_category(category, &caps)
-        };
-        let rows = match plan {
-            PagePlan::Framework(rows) => rows,
-            // Notifications always has framework rows and is only reached when swaync is
-            // present, so these arms are not expected; fall back to the task-5.1
-            // placeholder rather than let the page silently vanish.
-            PagePlan::Emptied | PagePlan::NoSpec => {
-                let placeholder = build_placeholder_page(category);
-                self.stack
-                    .add_titled(&placeholder, Some(category.stack_name()), category.title());
-                return;
-            }
-        };
-
-        let controller = page::build_page(self.store.clone(), rows, self.update_chrome.clone());
-        let root = controller.widget().clone();
-
-        // Append the runtime-only Do-Not-Disturb switch beside the store-backed rows. It is
-        // NOT a config setting (swaync's DND is live daemon state), so it is bespoke glue
-        // that applies immediately and never stages/dirties (task 6.7 gotcha, R5.2).
-        let dnd = notifications::build_dnd_section();
-        root.append(dnd.widget());
-        // Stored before the page joins the stack, like the Sound and Network handles:
-        // adding the first page makes it the visible child and fires the page-entry hooks
-        // synchronously, and this page's hook re-queries the daemon straight away — with
-        // the handle still empty it would find no page and the switch would keep the state
-        // it was built with (task 9.4).
-        *self.notifications_page.borrow_mut() = Some(dnd);
-
+    /// Mounts the bespoke [`notifications`] page. No dirty marker is registered: every
+    /// control is runtime-only and never feeds the Apply/Reset chrome (R5.2). The
+    /// category is only reached when detection found notifd running or installed (task
+    /// 5.1's gate). Building runs no `busctl`: the first read is the page-entry hook's
+    /// ([`Self::wire_notifications_page_entry`]), and — as on the Sound and Network
+    /// pages — the handle is stored *before* the page joins the stack, because adding the
+    /// first page fires the entry hooks synchronously and every hook is written to find
+    /// the page it is about to refresh.
+    fn populate_notifications(&self, category: SidebarCategory) {
+        let page = notifications::build();
+        let root = page.root().clone();
+        *self.notifications_page.borrow_mut() = Some(page);
         self.stack
             .add_titled(&root, Some(category.stack_name()), category.title());
-        // The marker tracks the store's Notifications rollup (position/timeout); the DND
-        // switch is runtime-only and contributes no dirty state.
-        self.marked
-            .borrow_mut()
-            .push((Category::Notifications, root.upcast()));
-        controllers.push(controller);
     }
 
     /// Builds the Sound category's page (task 6.2).
@@ -1036,29 +976,22 @@ impl Shell {
         );
     }
 
-    /// Re-queries swaync's do-not-disturb state whenever the Notifications page becomes the
-    /// visible stack child (task 6.7), so the runtime-only DND switch reflects the live
-    /// daemon state on page entry (R5.2) — picking up a change made elsewhere (e.g. a
-    /// compositor keybind) while the app was on another page.
+    /// Reads the notifd daemon's state whenever the Notifications page becomes the
+    /// visible stack child (task 11.7), so the runtime-only controls reflect the live
+    /// daemon on page entry (R5.2) — including a do-not-disturb change made elsewhere,
+    /// or a daemon that started since the page was last shown. This same hook performs
+    /// the page's deferred *first* read: [`notifications::build`] runs no command.
     ///
-    /// The handler is connected once to the persistent stack (never rebuilt) and reads the
-    /// current [`Self::notifications_page`] on each change, so it survives every repopulate
-    /// without accumulating handlers — the same connect-once discipline as
-    /// [`Self::wire_sound_page_entry`]. Unlike that hook it queries the daemon *directly*
-    /// from the notification rather than from the idle queue, because the DND switch is
-    /// also given its initial state synchronously while the page is built; deferring only
-    /// this half would not take any `swaync-client` call off the populate path.
+    /// Like the Sound and Network hooks, the read is handed to the idle queue so it can
+    /// never run on the populate path — see [`wire_deferred_page_entry`]. This is the
+    /// rule task 9.26 asked for.
     fn wire_notifications_page_entry(&self) {
-        let notifications_page = self.notifications_page.clone();
-        self.stack.connect_visible_child_name_notify(move |stack| {
-            if stack.visible_child_name().as_deref()
-                == Some(SidebarCategory::Notifications.stack_name())
-            {
-                if let Some(page) = notifications_page.borrow().as_ref() {
-                    page.refresh_dnd();
-                }
-            }
-        });
+        wire_deferred_page_entry(
+            &self.stack,
+            &self.notifications_page,
+            SidebarCategory::Notifications.stack_name(),
+            NotificationsPage::refresh,
+        );
     }
 
     /// Re-reads the NetworkManager connection status whenever the Network page becomes
@@ -1108,7 +1041,6 @@ impl Shell {
                 let store = shell.store.borrow();
                 let display = shell.display.borrow();
                 let input = shell.input.borrow();
-                let notifications = shell.notifications.borrow();
                 let power = shell.power.borrow();
                 let palette = shell.palette.borrow();
                 let themes = shell.themes.borrow();
@@ -1117,7 +1049,6 @@ impl Shell {
                     store: &store,
                     display: display.as_ref(),
                     input: input.as_ref(),
-                    notifications: notifications.as_ref(),
                     power: power.as_ref(),
                     palette: palette.as_ref(),
                     themes: themes.as_ref(),
@@ -1334,7 +1265,7 @@ impl Shell {
     /// only *newly appeared* files are loaded fresh. The staging models (Display,
     /// palette, GTK/icon/cursor themes, wallpaper) go through
     /// [`startup::adopt_refreshed_model`], which keeps a model holding staged edits
-    /// rather than clobbering in-progress work. The Input/Notifications/Power helpers
+    /// rather than clobbering in-progress work. The Input/Power helpers
     /// hold no staged state (their settings stage in the shared store), so they are
     /// simply replaced.
     fn apply_refresh_load(&self, load: StartupLoad) {
@@ -1343,7 +1274,6 @@ impl Shell {
             files,
             display,
             input,
-            notifications,
             power,
             palette,
             themes,
@@ -1363,7 +1293,6 @@ impl Shell {
             DisplayModel::is_dirty,
         );
         *self.input.borrow_mut() = input;
-        *self.notifications.borrow_mut() = notifications;
         *self.power.borrow_mut() = power;
         startup::adopt_refreshed_model(
             &mut self.palette.borrow_mut(),

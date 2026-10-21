@@ -42,6 +42,10 @@
 //! `pw-dump` enumeration the same way (task 9.4). Deferring costs nothing: the
 //! placeholder is visible at most for the instant before the idle callback runs.
 //!
+//! `tests/page_entry_deferral.rs` guards this at the source level for this page and
+//! its runtime-backed siblings: nothing reachable from [`build`] may spawn a command,
+//! and the page-entry `refresh` must reach the live read.
+//!
 //! # Synchronous on the GTK main thread (deliberate)
 //!
 //! Once the page is actually viewed, the `nmcli` query is short-lived and the

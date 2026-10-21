@@ -67,13 +67,13 @@ pub(crate) struct SetValue {
     pub(crate) value: Value,
 }
 
-/// One selectable entry in a [`WidgetKind::DropDown`] or the add-control of a
+/// One selectable entry in the add-control drop-down of a
 /// [`WidgetKind::ReorderableList`].
 ///
-/// The `token` is what is stored (a [`Value::Enum`] token, or one item of a
-/// comma-joined list); the `label` is what the user reads. They are kept separate so
-/// a stored token like `top-right` can be shown as a friendlier `Top right` without
-/// the store ever seeing the display text.
+/// The `token` is what is stored (one item of a comma-joined list); the `label` is
+/// what the user reads. They are kept separate so a stored token like `se` can be
+/// shown as a friendlier `Swedish (se)` without the store ever seeing the display
+/// text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DropDownOption {
     /// The value stored when this entry is chosen.
@@ -94,18 +94,16 @@ impl DropDownOption {
 
 /// The kind of control a [`RowDescriptor`] renders as (R2.3, architecture §7).
 ///
-/// These are exactly the widget kinds R2.3 prescribes: a drop-down for a single
-/// choice, a switch for a boolean, a scale for a continuous number, and a reorderable
-/// editable list for an ordered multi-value setting. Which one a descriptor may use
-/// is constrained by the setting's [`ValueKind`] — see [`Self::is_compatible_with`].
+/// These are the widget kinds R2.3 prescribes that a store-backed page uses today: a
+/// switch for a boolean, a scale for a continuous number, a reorderable editable list
+/// for an ordered multi-value setting, plus a token switch and a free-text entry. (The
+/// single-choice drop-down R2.3 also names is built by the bespoke pages — Display,
+/// Sound, Theme — that need one; the framework's own drop-down kind was removed with
+/// the last store-backed setting that used it, the retired notification-position row
+/// of task 11.7.) Which kind a descriptor may use is constrained by the setting's
+/// [`ValueKind`] — see [`Self::is_compatible_with`].
 #[derive(Clone, Debug)]
 pub(crate) enum WidgetKind {
-    /// A `GtkDropDown` over a fixed option set, editing a [`Value::Enum`]. The chosen
-    /// option's [`DropDownOption::token`] is the stored value.
-    DropDown {
-        /// The options, in display order.
-        options: Vec<DropDownOption>,
-    },
     /// A `GtkSwitch`, editing a [`Value::Bool`].
     Switch,
     /// A `GtkScale`, editing a [`Value::Float`] or [`Value::Integer`] over the
@@ -156,7 +154,6 @@ impl WidgetKind {
     /// uses this so tests can assert every descriptor is self-consistent.
     pub(crate) fn is_compatible_with(&self, kind: ValueKind) -> bool {
         match self {
-            WidgetKind::DropDown { .. } => kind == ValueKind::Enum,
             WidgetKind::Switch => kind == ValueKind::Bool,
             WidgetKind::Scale { .. } => matches!(kind, ValueKind::Float | ValueKind::Integer),
             WidgetKind::ReorderableList { .. }
@@ -286,11 +283,6 @@ pub(crate) fn value_from_switch(active: bool) -> Value {
     Value::Bool(active)
 }
 
-/// The [`Value`] a drop-down produces when `option` is chosen.
-pub(crate) fn value_from_dropdown_option(option: &DropDownOption) -> Value {
-    Value::Enum(option.token.clone())
-}
-
 /// The [`Value`] a scale produces for its raw slider position `raw`, coerced to the
 /// setting's `kind`.
 ///
@@ -410,19 +402,6 @@ pub(crate) fn switch_active_from_value(value: Option<&Value>) -> bool {
     value.and_then(Value::as_bool).unwrap_or(false)
 }
 
-/// The index of the drop-down option matching the stored `value`, or `None` when no
-/// option matches (an unknown token, or the setting not yet loaded).
-pub(crate) fn dropdown_index_from_value(
-    options: &[DropDownOption],
-    value: Option<&Value>,
-) -> Option<u32> {
-    let token = value.and_then(Value::as_enum)?;
-    options
-        .iter()
-        .position(|option| option.token == token)
-        .map(|index| index as u32)
-}
-
 /// The slider position that shows the stored `value`, or `None` when it is absent.
 ///
 /// Accepts both numeric kinds so the same helper serves a float and an integer scale;
@@ -464,11 +443,11 @@ pub(crate) fn list_items_from_value(value: Option<&Value>) -> Vec<String> {
 mod tests {
     use super::*;
 
-    fn positions() -> Vec<DropDownOption> {
+    fn layout_candidates() -> Vec<DropDownOption> {
         vec![
-            DropDownOption::new("top-right", "Top right"),
-            DropDownOption::new("top-left", "Top left"),
-            DropDownOption::new("bottom-right", "Bottom right"),
+            DropDownOption::new("us", "English (US) (us)"),
+            DropDownOption::new("se", "Swedish (se)"),
+            DropDownOption::new("de", "German (de)"),
         ]
     }
 
@@ -478,12 +457,6 @@ mod tests {
         // the framework relies on this so a widget's output is always the right kind.
         assert!(WidgetKind::Switch.is_compatible_with(ValueKind::Bool));
         assert!(!WidgetKind::Switch.is_compatible_with(ValueKind::Enum));
-
-        let drop_down = WidgetKind::DropDown {
-            options: positions(),
-        };
-        assert!(drop_down.is_compatible_with(ValueKind::Enum));
-        assert!(!drop_down.is_compatible_with(ValueKind::String));
 
         let scale = WidgetKind::Scale {
             min: 0.0,
@@ -496,7 +469,7 @@ mod tests {
         assert!(!scale.is_compatible_with(ValueKind::Bool));
 
         let list = WidgetKind::ReorderableList {
-            candidates: positions(),
+            candidates: layout_candidates(),
         };
         assert!(list.is_compatible_with(ValueKind::String));
         assert!(!list.is_compatible_with(ValueKind::Enum));
@@ -586,10 +559,10 @@ mod tests {
         // when every row of a shown category is gated out, `visible_rows` is empty, and
         // the window builder treats that as an emptied category to drop.
         let descriptors = vec![RowDescriptor::new(
-            "Needs swaync",
+            "Needs hypridle",
             WidgetKind::Switch,
             SettingId::TouchpadNaturalScroll,
-            RowCapability::Binary(Binary::Swaync),
+            RowCapability::Binary(Binary::Hypridle),
         )];
         let without = Capabilities::for_tests(&[], &[], false);
         assert!(visible_rows(&descriptors, &without).is_empty());
@@ -603,27 +576,6 @@ mod tests {
         // A missing or wrong-kind value renders as off, never panics.
         assert!(!switch_active_from_value(None));
         assert!(!switch_active_from_value(Some(&Value::Integer(1))));
-    }
-
-    #[test]
-    fn dropdown_value_round_trips_through_the_token() {
-        let options = positions();
-        // Choosing an option stores its token, not its label.
-        assert_eq!(
-            value_from_dropdown_option(&options[2]),
-            Value::Enum("bottom-right".to_string())
-        );
-        // Rendering finds the option index for the stored token.
-        assert_eq!(
-            dropdown_index_from_value(&options, Some(&Value::Enum("top-left".to_string()))),
-            Some(1)
-        );
-        // An unknown token or a missing value selects nothing.
-        assert_eq!(
-            dropdown_index_from_value(&options, Some(&Value::Enum("centre".to_string()))),
-            None
-        );
-        assert_eq!(dropdown_index_from_value(&options, None), None);
     }
 
     #[test]

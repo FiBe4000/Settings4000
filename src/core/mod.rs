@@ -58,7 +58,7 @@ pub mod reload;
 pub mod apply;
 
 // The write glue shared by the store-backed pages (task 9.17; architecture §6; R5.3, R8.3).
-// `input`, `notifications` and `power` each stage every one of their settings in the shared
+// `input` and `power` each stage every one of their settings in the shared
 // `store` and write exactly one backing file, so the steps around their per-page renderer —
 // no write when nothing is dirty, read the current bytes, render, wrap the result in an
 // `apply::FileWrite` — are one implementation here rather than one copy per page. It also
@@ -93,15 +93,20 @@ pub mod input;
 // exercised in a non-test build too.
 pub mod network;
 
-// The Notifications-page domain logic (task 6.7; R4.2, R4.4, R5.2, R5.6). It provides the
-// store-`SettingId` -> `swaync/config.json` write glue (rendering the store's dirty
-// position/timeout settings into one `FileWrite` through the swaync JSON adapter, position
-// decomposed back into `positionY`/`positionX`) and the runtime-only do-not-disturb
-// commands (`swaync-client --get-dnd`/`--dnd-on`/`--dnd-off`) — DND is live daemon state,
-// not a config key, so it bypasses staging (R5.2). Its `config.json` freshness is the
-// store's, not its own. It is consumed by the Notifications page UI glue
-// (`ui::notifications`) and the plan assembler (`assemble`), so its public surface is
-// exercised in a non-test build too.
+// The D-Bus surface of the notifd notification daemon (task 11.7; R4.1, R5.2, R6.1). It
+// builds the exact `busctl`/`systemctl` argument vectors the app issues to notifd (every
+// call to a notifd name with `--auto-start=no`), parses their replies strictly, and decides
+// the `NotifdStatus` capability from captured probe replies. Detection (`detect`) gathers
+// and resolves the capability with it, and the Notifications page model (`notifications`)
+// drives the daemon through it.
+pub mod notifd;
+
+// The Notifications-page model (task 11.7; R4.2, R5.2). Every control on the page is
+// runtime-only: it reads notifd's state (`GetState`, or `bar.json` on a daemon older than
+// 1.1) on page entry and applies do-not-disturb, "open the notification center" and the
+// confirmation-guarded "clear all" immediately through the `CommandRunner`, bypassing
+// staging. It is consumed by the Notifications page UI glue (`ui::notifications`), so its
+// public surface is exercised in a non-test build too.
 pub mod notifications;
 
 // The Power & Idle-page domain logic (task 6.8; R4.2, R4.4, R5.6, R8.3). It provides the
@@ -134,7 +139,7 @@ pub mod theme;
 
 // The Apply-plan assembler (task 9.16; architecture §6; R5.3–R5.6, R8.3). It sits above
 // every other module here: it asks the store and each bespoke page model (`display`,
-// `input`, `notifications`, `power`, `theme`) for its contribution and folds them into the
+// `input`, `power`, `theme`) for its contribution and folds them into the
 // one `apply::ApplyPlan` the pipeline runs — in a fixed order, refusing to plan anything
 // when a model's files changed on disk or a write cannot be prepared. It is the front half
 // of the window's Apply button, kept here so those decisions are testable without a

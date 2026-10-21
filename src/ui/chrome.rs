@@ -69,18 +69,17 @@ pub(crate) fn actions_enabled(store: &SettingsStore) -> bool {
 ///
 /// The window sets a stack page's `needs-attention` property from
 /// `store.is_category_dirty(category)` for the returned category, so the sidebar shows
-/// a marker on a page with pending edits. [`SidebarCategory::Sound`] and
-/// [`SidebarCategory::Network`] are runtime-only (R3.1) — their controls apply
-/// immediately and are never staged — so they have no [`Category`] and never carry a
-/// dirty marker.
+/// a marker on a page with pending edits. [`SidebarCategory::Sound`],
+/// [`SidebarCategory::Notifications`] and [`SidebarCategory::Network`] are runtime-only
+/// (R3.1, R5.2) — their controls apply immediately and are never staged — so they have
+/// no [`Category`] and never carry a dirty marker.
 pub(crate) fn marker_category(category: SidebarCategory) -> Option<Category> {
     match category {
         SidebarCategory::Display => Some(Category::Display),
         SidebarCategory::Theme => Some(Category::Theme),
         SidebarCategory::Input => Some(Category::Input),
-        SidebarCategory::Notifications => Some(Category::Notifications),
         SidebarCategory::PowerAndIdle => Some(Category::PowerAndIdle),
-        SidebarCategory::Sound | SidebarCategory::Network => None,
+        SidebarCategory::Sound | SidebarCategory::Notifications | SidebarCategory::Network => None,
     }
 }
 
@@ -295,7 +294,6 @@ pub(crate) fn assembly_warning(failure: &PrepareFailure) -> ConflictWarning {
             let (file, noun) = match source {
                 FailedWrite::Display => ("monitors.conf", "display"),
                 FailedWrite::Input => ("input.lua", "input"),
-                FailedWrite::Notifications => ("swaync's config.json", "notification"),
                 FailedWrite::Power => ("hypridle.conf", "power and idle"),
             };
             ConflictWarning {
@@ -537,15 +535,12 @@ mod tests {
             Some(Category::Input)
         );
         assert_eq!(
-            marker_category(SidebarCategory::Notifications),
-            Some(Category::Notifications)
-        );
-        assert_eq!(
             marker_category(SidebarCategory::PowerAndIdle),
             Some(Category::PowerAndIdle)
         );
         // Runtime-only pages carry no staged state, so no marker (R5.2).
         assert_eq!(marker_category(SidebarCategory::Sound), None);
+        assert_eq!(marker_category(SidebarCategory::Notifications), None);
         assert_eq!(marker_category(SidebarCategory::Network), None);
     }
 
@@ -556,7 +551,7 @@ mod tests {
         // is `actions_enabled`; both follow a real stage → reset cycle.
         let mut store = store_with(&[
             (SettingId::MouseSensitivity, Value::Float(0.0)),
-            (SettingId::NotificationTimeout, Value::Integer(10)),
+            (SettingId::DimTimeout, Value::Integer(10)),
         ]);
         assert!(
             !actions_enabled(&store),
@@ -573,7 +568,7 @@ mod tests {
             "the edited page's marker lights up"
         );
         assert!(
-            !store.is_category_dirty(Category::Notifications),
+            !store.is_category_dirty(Category::PowerAndIdle),
             "an unedited page stays unmarked"
         );
 
@@ -826,7 +821,7 @@ mod tests {
                 })?;
             Ok(FileValues {
                 bytes,
-                values: vec![(SettingId::NotificationTimeout, Value::Integer(seconds))],
+                values: vec![(SettingId::DimTimeout, Value::Integer(seconds))],
             })
         });
         let mut store = SettingsStore::new();
@@ -834,7 +829,7 @@ mod tests {
             path.clone(),
             FileValues {
                 bytes,
-                values: vec![(SettingId::NotificationTimeout, Value::Integer(300))],
+                values: vec![(SettingId::DimTimeout, Value::Integer(300))],
             },
             reader,
         );
@@ -886,17 +881,12 @@ mod tests {
 
     #[test]
     fn a_prepare_failure_warning_names_the_file_and_quotes_the_reason() {
-        // Task 9.16: the four write-preparation failures each name the file the user has
+        // Task 9.16: the three write-preparation failures each name the file the user has
         // to fix, quote the underlying reason, and promise the edits were kept — the last
         // being the whole point of aborting instead of skipping the write.
         for (source, expected_file, expected_noun) in [
             (FailedWrite::Display, "monitors.conf", "display"),
             (FailedWrite::Input, "input.lua", "input"),
-            (
-                FailedWrite::Notifications,
-                "swaync's config.json",
-                "notification",
-            ),
             (FailedWrite::Power, "hypridle.conf", "power and idle"),
         ] {
             let warning = assembly_warning(&PrepareFailure::Write {

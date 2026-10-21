@@ -96,7 +96,7 @@ const HOME_LINKS: &[(&str, &str)] = &[
 /// │   ├── theme/fonts
 /// │   ├── icons/default/index.theme
 /// │   ├── zsh/colors.zsh
-/// │   └── config/{hypr,gtk-3.0,gtk-4.0,uwsm,notifd,swaync,kitty,eww,rofi}/…
+/// │   └── config/{hypr,gtk-3.0,gtk-4.0,uwsm,notifd,systemd,kitty,eww,rofi}/…
 /// ├── .config/                     — the fake $XDG_CONFIG_HOME; every file under
 /// │   │                              the repo's config/ is symlinked here per-file
 /// │   └── hypr/colors.conf -> …/.dotfiles/config/hypr/colors.conf   (etc.)
@@ -329,11 +329,6 @@ pub mod loaders {
     /// The app's `~/.config/hypr/input.lua` loader (Input page, tasks 6.6, 11.4).
     pub fn input_lua(path: &Path) -> io::Result<FileValues> {
         crate::ui::startup::load_input_lua(path)
-    }
-
-    /// The app's `~/.config/swaync/config.json` loader (Notifications page, task 6.7).
-    pub fn swaync_config(path: &Path) -> io::Result<FileValues> {
-        crate::ui::startup::load_swaync_config(path)
     }
 
     /// The app's `~/.config/hypr/hypridle.conf` loader (Power & Idle page, task 6.8).

@@ -2,8 +2,8 @@
 //! implementation (task 2.1, architecture §6).
 //!
 //! Every side effect that runs an external program — the reload commands
-//! (`hyprctl reload`, `swaync-client -rs`, …), `gsettings`, `wpctl`, and the
-//! palette `generate-colors` script — goes through this trait rather than
+//! (`hyprctl reload`, `eww reload`, …), the notifd `busctl` calls, `gsettings`,
+//! `wpctl`, and the palette `generate-colors` script — goes through this trait rather than
 //! touching [`std::process`] directly. Concentrating process execution here
 //! buys three things:
 //!
@@ -38,7 +38,7 @@ use wait_timeout::ChildExt;
 /// A child that has not exited within this window is killed and the call
 /// returns [`CommandError::Timeout`]. Five seconds is generous for the
 /// short-lived reload/query commands the app issues (`hyprctl`, `wpctl`,
-/// `swaync-client`, `gsettings`) while still guaranteeing that a wedged or
+/// `busctl`, `gsettings`) while still guaranteeing that a wedged or
 /// interactively-blocked process can never stall Apply or startup. The value is
 /// fixed for production; tests may construct a [`SystemCommandRunner`] with a
 /// shorter limit to exercise the timeout path quickly.
@@ -661,8 +661,8 @@ mod tests {
 
     #[test]
     fn command_display_space_joins_program_and_args() {
-        let command = Command::new("swaync-client").arg("-rs");
-        assert_eq!(command.to_string(), "swaync-client -rs");
+        let command = Command::new("eww").arg("reload");
+        assert_eq!(command.to_string(), "eww reload");
     }
 
     #[test]
@@ -723,7 +723,7 @@ mod tests {
         let runner = MockCommandRunner::new();
 
         let first = Command::new("hyprctl").arg("reload");
-        let second = Command::new("swaync-client").arg("-rs");
+        let second = Command::new("eww").arg("reload");
         let _ = runner.run(&first);
         let _ = runner.run(&second);
 

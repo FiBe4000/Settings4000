@@ -47,10 +47,11 @@ tracing = "0.1.44"
 tracing-journald = "0.3.2"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
-# JSON editing for `swaync/config.json`. `preserve_order` keeps object key
-# order stable across a parse-modify-reserialize cycle so edits stay surgical
-# (architecture §3, task 3.4).
-serde_json = { version = "1.0.150", features = ["preserve_order"] }
+# JSON reading: the `pw-dump` / `hyprctl monitors -j` replies (Sound and
+# Display pages) and notifd's `bar.json` state file (Notifications page on a
+# pre-1.1 daemon). The app writes no JSON file, so object key order does not
+# matter and no `preserve_order` feature is needed.
+serde_json = "1.0.150"
 
 # Direct signal delivery without a shell: the reload path sends SIGUSR1 to
 # kitty PIDs via `nix::sys::signal::kill` (architecture §6, task 4.4). The

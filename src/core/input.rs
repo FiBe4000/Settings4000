@@ -753,7 +753,7 @@ hl.config({
             input_lua_path(SettingId::TouchpadTapToClick),
             Some("input.touchpad.tap_to_click")
         );
-        assert_eq!(input_lua_path(SettingId::NotificationTimeout), None);
+        assert_eq!(input_lua_path(SettingId::DimTimeout), None);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Headless suite for the Apply-plan **assembler** (task 9.16; R5.3–R5.6, R6.2, R8.3).
 //!
 //! [`assemble_apply_plan`] is the front half of the window's Apply button: it asks every
-//! staging source — the shared [`SettingsStore`] plus the seven bespoke page models — for
+//! staging source — the shared [`SettingsStore`] plus the six bespoke page models — for
 //! its contribution, folds them into one [`ApplyPlan`] in a fixed order, and refuses to
 //! plan the Apply at all when a source cannot be prepared. Until task 9.16 that logic sat
 //! inside the button's click handler, so the only way to reach it was to click the button;
@@ -37,7 +37,7 @@ use settings4000::core::detect::{Binary, Capabilities, Daemon, DetectionInputs};
 use settings4000::core::display::DisplayModel;
 use settings4000::core::input::InputModel;
 use settings4000::core::model::{SettingId, Value};
-use settings4000::core::notifications::NotificationsModel;
+use settings4000::core::notifd::NotifdReplies;
 use settings4000::core::power::PowerModel;
 use settings4000::core::store::SettingsStore;
 use settings4000::core::theme::{
@@ -70,19 +70,14 @@ const HYPRCTL_MONITORS_JSON: &str = r#"[{
 /// The fixture's generic eDP-1 record, as installed.
 const EDP_RECORD: &str = "monitor=eDP-1,2880x1800@120,auto,1.333333,bitdepth,10";
 
-/// The store loaded with all three store-backed backing files through the app's own
-/// loaders, mirroring the startup wiring (task 5.4).
+/// The store loaded with both store-backed backing files through the app's own loaders,
+/// mirroring the startup wiring (task 5.4).
 fn loaded_store(fx: &FixtureDotfiles) -> SettingsStore {
     let mut store = SettingsStore::new();
     load_into_store(
         &mut store,
         &fx.config_path("hypr/input.lua"),
         loaders::input_lua,
-    );
-    load_into_store(
-        &mut store,
-        &fx.config_path("swaync/config.json"),
-        loaders::swaync_config,
     );
     load_into_store(
         &mut store,
@@ -126,6 +121,8 @@ fn palette_model(fx: &FixtureDotfiles) -> PaletteModel {
         config_paths: Vec::new(),
         hyprctl_status: None,
         hyprland_lua_config: fx.config_path("hypr/hyprland.lua"),
+        notifd_replies: NotifdReplies::default(),
+        notifd_unit_file: fx.config_path("systemd/user/notifd.service"),
     };
     let source = Capabilities::detect(&inputs);
     let source = source
@@ -204,9 +201,6 @@ fn a_clean_desktop_assembles_an_empty_plan() {
     let assembled = assemble_apply_plan(ApplySources {
         display: Some(&display),
         input: Some(&input),
-        notifications: Some(&NotificationsModel::load(
-            fx.config_path("swaync/config.json"),
-        )),
         power: Some(&PowerModel::load(fx.config_path("hypr/hypridle.conf"))),
         palette: Some(&palette),
         themes: Some(&themes),
@@ -227,7 +221,7 @@ fn a_clean_desktop_assembles_an_empty_plan() {
 }
 
 #[test]
-fn the_three_store_backed_pages_fold_one_write_each() {
+fn the_store_backed_pages_fold_one_write_each() {
     // Plan composition, store side (tasks 6.6–6.8): one surgical write per store-backed
     // page, in a fixed order, with the store's dirty values carried as the pipeline's
     // R8.3 validations.
@@ -237,31 +231,25 @@ fn the_three_store_backed_pages_fold_one_write_each() {
         .stage(SettingId::TouchpadNaturalScroll, Value::Bool(false))
         .expect("a touchpad toggle stages");
     store
-        .stage(SettingId::NotificationTimeout, Value::Integer(5))
-        .expect("a timeout change stages");
-    store
         .stage(SettingId::LockTimeout, Value::Integer(600))
         .expect("a lock-timeout change stages");
 
     let input = input_model(&fx);
-    let notifications = NotificationsModel::load(fx.config_path("swaync/config.json"));
     let power = PowerModel::load(fx.config_path("hypr/hypridle.conf"));
     let assembled = assemble_apply_plan(ApplySources {
         input: Some(&input),
-        notifications: Some(&notifications),
         power: Some(&power),
         ..ApplySources::for_store(&store)
     })
-    .expect("three readable files render three writes");
+    .expect("two readable files render two writes");
 
     assert_eq!(
         write_paths(&assembled.plan),
         vec![
             fx.config_path("hypr/input.lua"),
-            fx.config_path("swaync/config.json"),
             fx.config_path("hypr/hypridle.conf"),
         ],
-        "one write per page, Input then Notifications then Power & Idle"
+        "one write per page, Input then Power & Idle"
     );
     let validated: Vec<SettingId> = assembled
         .plan
@@ -269,11 +257,7 @@ fn the_three_store_backed_pages_fold_one_write_each() {
         .iter()
         .map(|(id, _)| *id)
         .collect();
-    for id in [
-        SettingId::TouchpadNaturalScroll,
-        SettingId::NotificationTimeout,
-        SettingId::LockTimeout,
-    ] {
+    for id in [SettingId::TouchpadNaturalScroll, SettingId::LockTimeout] {
         assert!(
             validated.contains(&id),
             "every dirty store value must reach the R8.3 gate: {id:?} missing"
@@ -281,8 +265,8 @@ fn the_three_store_backed_pages_fold_one_write_each() {
     }
     assert_eq!(
         assembled.store_writes.len(),
-        3,
-        "all three files are store-tracked, so all three are committed"
+        2,
+        "both files are store-tracked, so both are committed"
     );
     assert_eq!(
         assembled.commits,
@@ -755,29 +739,6 @@ fn an_unreadable_input_lua_aborts_the_whole_apply() {
         store.is_dirty(),
         "both pages' staged edits are kept for a retry"
     );
-}
-
-#[test]
-fn an_unparseable_swaync_config_aborts_the_whole_apply() {
-    // The same contract for the Notifications page (task 6.7): `config.json` is still
-    // readable but no longer JSON, so the write cannot be rendered.
-    let fx = FixtureDotfiles::install();
-    let mut store = loaded_store(&fx);
-    store
-        .stage(SettingId::NotificationTimeout, Value::Integer(5))
-        .expect("a timeout change stages");
-    let notifications = NotificationsModel::load(fx.config_path("swaync/config.json"));
-
-    fs::write(fx.config_path("swaync/config.json"), b"{ not json at all")
-        .expect("corrupt the config");
-
-    let failure = assemble_apply_plan(ApplySources {
-        notifications: Some(&notifications),
-        ..ApplySources::for_store(&store)
-    })
-    .expect_err("a pending Notifications edit with unparseable JSON must abort");
-    expect_write_failure(failure, FailedWrite::Notifications);
-    assert!(store.is_dirty(), "the staged edit is kept for a retry");
 }
 
 #[test]

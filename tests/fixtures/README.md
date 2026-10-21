@@ -47,8 +47,8 @@ files are deliberately still in their §6 shape; see "Known divergences from
   (analysis §8.4; a write target of the cursor setting since task 11.5).
 - `config/` — every file the app parses or writes plus the generated
   color/font partials with their `# Generated from …` headers, and the
-  non-target files deployment also symlinks (`kitty.conf`, swaync's
-  `style.css`, …) so the tree is deployment-faithful. New in task 11.1:
+  non-target files deployment also symlinks (`kitty.conf`, …) so the tree is
+  deployment-faithful. New in task 11.1:
   - `hypr/hyprland.lua` — the real Lua Hyprland config (485 lines), anonymized
     only in its laptop-panel `desc:` key. It is the realistic fixture for the
     Lua-literal editor (task 11.3): nested tables, the two cursor `hl.env`
@@ -61,6 +61,13 @@ files are deliberately still in their §6 shape; see "Known divergences from
     prefix `-- `, includes `shadow`); a read-only generated input.
   - `notifd/config` — the notifd daemon's seven-key `key=value` file with its
     comments (verbatim).
+
+  New in task 11.7:
+  - `systemd/user/notifd.service` — the notifd user unit (verbatim
+    `8a5b20b`; its only path is `%h/.dotfiles/scripts/notifd`, which systemd
+    expands and the fixture never runs). Deployed like every `config/` file, as
+    `~/.config/systemd/user/notifd.service`; detection counts its presence as
+    "notifd installed, will activate" when the daemon's bus name has no owner.
 - `zsh/colors.zsh` — a generated color partial (deployed as `~/.zsh_colors`).
 
 The installer creates two links outside `$XDG_CONFIG_HOME`: `~/.zsh_colors`
@@ -118,22 +125,15 @@ was verified by refreshing each file in turn and running the suite.
 | `config/hypr/hypridle.conf` | `--grace 10` in `lock_cmd`, dual-form dpms commands, `idle-dim` dim/restore, explanatory comments | `apply_power::a_lock_command_edit_restarts_via_the_kill_and_respawn_fallback` (expects the old `lock_cmd` text) | 11.13 |
 | `config/hypr/hyprlock.conf`, `config/hypr/hyprpaper.conf` | `path = ~/Pictures/wallpaper/18.jpg` | `fixture_tree::hyprlang_configs_parse_losslessly_at_their_deployed_paths`, `apply_theme::a_wallpaper_change_dual_writes_hyprpaper_and_hyprlock_and_reloads`, `apply_theme::a_tilde_shaped_wallpaper_original_is_replaced_surgically` (all expect the substituted absolute path of an existing file) | 11.10 |
 
-### Scheduled for removal
+### Removed
 
-The live tree no longer has these (analysis §8.3, §8.6). They stay in the
-fixture until the tasks that retire the code and tests targeting them:
-
-| Fixture file | Removed by |
-|---|---|
-| `config/swaync/` (`config.json`, `style.css`, `colors.css`) | 11.7 (swaync replaced by notifd) |
-
-`swaync/colors.css` is no longer a generator output (analysis §8.3): since
-task 11.6 no test expects it to exist or to be deployed, and it is not in the
-app's generated-file set; the copy only waits for the directory's removal.
-
-The hyprlang input file went with task 11.4 and the hyprlang main config with
-task 11.5 (its cursor copy now lives in `hyprland.lua`), together with every
-test that targeted them.
+The live tree no longer has these (analysis §8.3, §8.6), and they left the
+fixture together with the code and tests that targeted them: the hyprlang
+input file with task 11.4, the hyprlang main config with task 11.5 (its
+cursor copy now lives in `hyprland.lua`), and the previous notification
+daemon's config directory (its JSON config, stylesheet and generated color
+stylesheet) with task 11.7, which replaced that daemon's page with the
+runtime-only notifd controls.
 
 ### Anonymization rules
 
@@ -166,8 +166,8 @@ sync invariants). Everything identifying is replaced:
   application the user runs or a machine-specific value is reworded without
   them: the Electron note in `uwsm/env` omits the real comment's example
   application and the laptop's scale factor, and is otherwise unchanged.
-- **Long freeform files are trimmed stand-ins** (swaync's `style.css` keeps
-  only the palette import) rather than full copies. The exception is
+- **Long freeform files are trimmed stand-ins** rather than full copies. The
+  exception is
   `hyprland.lua`, copied whole because the Lua-literal editor must be tested
   against the real mix of addressable lines and opaque code. It has no
   literal home path to anonymize: it builds paths from `os.getenv("HOME")`.
@@ -180,11 +180,11 @@ code rather than config: `eww/eww.scss`, `eww/eww.yuck`, `eww/scripts` (a
 whole-**directory** symlink — a link shape the installer never creates; it
 links files only), `rofi/config.rasi`, and the home-level `~/.zshrc`. Since
 task 11.1 the same holds for the `wayland-dev` additions the app does not read
-yet: `scripts/notifd` itself, `config/systemd/user/notifd.service` and the
-D-Bus activation file
-`local/share/dbus-1/services/org.freedesktop.Notifications.service` (task 11.7
-counts a present `~/.config/systemd/user/notifd.service` as "notifd
-installed", so it will need the unit), the remaining display/idle scripts
+yet: `scripts/notifd` itself and the D-Bus activation file
+`local/share/dbus-1/services/org.freedesktop.Notifications.service` (the app
+talks to the daemon only over D-Bus and never reads either; the unit file, which
+detection does read, joined the fixture with task 11.7), the remaining
+display/idle scripts
 (`hypr-display-profile.sh`, `hypr-monitor-hotplug`, `launch-eww-bars`,
 `idle-dim`, `apply-theme`) and `config/environment.d/`. Do not assume they
 exist in an installed tree; if a future suite needs one, add it to the fixture

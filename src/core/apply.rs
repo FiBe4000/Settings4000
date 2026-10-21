@@ -754,7 +754,11 @@ fn write_phase(plan: &ApplyPlan, runner: &dyn CommandRunner) -> Result<(), Write
 ///   interpreted — it is the generator's own message about its own failure, which is
 ///   what makes it actionable. Note this stays within R7.3: what must never be echoed
 ///   is *config file contents*, and a tool's error output about itself is not that.
-fn stderr_excerpt(stderr: &[u8]) -> Option<String> {
+///
+/// Crate-visible because the Notifications page quotes a failed `busctl` call's
+/// stderr the same way ([`crate::core::notifications::NotifdActionError`]), so both
+/// places bound and mark their excerpts identically.
+pub(crate) fn stderr_excerpt(stderr: &[u8]) -> Option<String> {
     let end = stderr.len().min(STDERR_EXCERPT_LIMIT);
     let mut excerpt = String::from_utf8_lossy(&stderr[..end])
         .trim_end()
@@ -877,11 +881,7 @@ mod tests {
 
     /// Capabilities with everything a palette reload chain needs live.
     fn palette_capabilities() -> Capabilities {
-        Capabilities::for_tests(
-            &[Binary::Hyprctl],
-            &[Daemon::Eww, Daemon::Swaync, Daemon::Kitty],
-            true,
-        )
+        Capabilities::for_tests(&[Binary::Hyprctl], &[Daemon::Eww, Daemon::Kitty], true)
     }
 
     // --- (a) a display-class change: exact writes + `hyprctl reload`, nothing else -
@@ -990,14 +990,14 @@ mod tests {
             other => panic!("expected Applied, got {other:?}"),
         }
         // generate-colors is recorded FIRST (it is the last *write* step), and the
-        // reload chain — hyprctl reload, eww reload, swaync -rs — follows in order.
+        // reload chain — hyprctl reload, eww reload (kitty is signalled) — follows in
+        // order; there is no notification-daemon step (task 11.7).
         assert_eq!(
             runner.recorded(),
             vec![
                 Command::new("/fake/repo/scripts/generate-colors").arg("nord"),
                 Command::new("hyprctl").arg("reload"),
                 Command::new("eww").arg("reload"),
-                Command::new("swaync-client").arg("-rs"),
             ]
         );
         // kitty is reloaded by a SIGUSR1 signal, not a subprocess.
@@ -1121,7 +1121,7 @@ mod tests {
     /// with both baselined in the returned tracker.
     ///
     /// The scoping tests all need the same two-file shape: the store tracks every backing
-    /// file it loaded (`input.lua`, swaync's `config.json`, `hypridle.conf`), while any
+    /// file it loaded (`input.lua`, `hypridle.conf`), while any
     /// single apply writes only the files whose category the user actually edited. Which of
     /// the two a given test makes its write target is the test's choice — deliberately not
     /// baked into these names, since the blocking and non-blocking tests swap the roles.
@@ -1850,7 +1850,7 @@ mod tests {
             reload_params: ReloadParams::default(),
         };
         let tracker = FreshnessTracker::new();
-        // generate-colors OK, then `hyprctl reload` FAILS; eww/swaync default to OK.
+        // generate-colors OK, then `hyprctl reload` FAILS; eww defaults to OK.
         let runner = MockCommandRunner::with_outcomes([
             Ok(CommandOutput::fake(0)),
             Ok(CommandOutput::fake(1)),
@@ -1879,7 +1879,7 @@ mod tests {
             }
             other => panic!("expected Applied, got {other:?}"),
         }
-        // Even though `hyprctl reload` failed, eww and swaync were still attempted
+        // Even though `hyprctl reload` failed, eww was still attempted
         // and kitty was still signalled — the whole plan runs.
         assert_eq!(
             runner.recorded(),
@@ -1887,7 +1887,6 @@ mod tests {
                 Command::new("/fake/generate-colors").arg("nord"),
                 Command::new("hyprctl").arg("reload"),
                 Command::new("eww").arg("reload"),
-                Command::new("swaync-client").arg("-rs"),
             ]
         );
         assert_eq!(
@@ -1965,7 +1964,6 @@ mod tests {
                 Command::new("/fake/repo/scripts/generate-colors").arg("nord"),
                 Command::new("hyprctl").arg("reload"),
                 Command::new("eww").arg("reload"),
-                Command::new("swaync-client").arg("-rs"),
             ]
         );
         assert_eq!(
@@ -1974,77 +1972,6 @@ mod tests {
                 process_name: "kitty".to_string(),
                 signal: Signal::SIGUSR1,
                 pids: vec![9],
-            }]
-        );
-    }
-
-    #[test]
-    fn a_palette_switch_plus_a_swaync_config_write_runs_both_swaync_reloads_in_order() {
-        // Task 9.9: swaync's config reload (`-R`) and its CSS reload (`-rs`) are two
-        // different commands, so an Apply that both switched the palette and edited
-        // `swaync/config.json` must execute both — the config reload before the CSS
-        // reload — with nothing duplicated. Asserting it here, at the pipeline level,
-        // pins the executed command sequence end to end; `core::reload` covers the
-        // planning and the individual arg vectors.
-        let dir = tempfile::tempdir().expect("temp dir should be creatable");
-        let config = write_file(&dir, "config.json", b"{\n  \"positionX\": \"right\"\n}\n");
-        let tracker = record_baseline(&[&config]);
-
-        let plan = ApplyPlan {
-            validations: Vec::new(),
-            writes: vec![FileWrite {
-                path: config.clone(),
-                contents: b"{\n  \"positionX\": \"left\"\n}\n".to_vec(),
-                changed_keys: vec!["positionX".to_string()],
-                backing: BackingFile::SwayncConfig,
-                validation: WriteValidation::InPlan,
-                mode: WriteMode::Replace,
-            }],
-            palette: Some(PaletteSwitch {
-                scheme: "nord".to_string(),
-                generate_colors: PathBuf::from("/fake/repo/scripts/generate-colors"),
-            }),
-            reload_params: ReloadParams::default(),
-        };
-        let runner = MockCommandRunner::new();
-        let signaller = MockProcessSignaller::with_running([("kitty".to_string(), vec![11])]);
-
-        let outcome = run(
-            &plan,
-            &tracker,
-            &palette_capabilities(),
-            &runner,
-            &signaller,
-        );
-
-        match outcome {
-            ApplyOutcome::Applied {
-                reload_failures,
-                written,
-                ..
-            } => {
-                assert!(reload_failures.is_empty());
-                assert_eq!(written, vec![config.clone()]);
-            }
-            other => panic!("expected Applied, got {other:?}"),
-        }
-        assert_eq!(
-            runner.recorded(),
-            vec![
-                Command::new("/fake/repo/scripts/generate-colors").arg("nord"),
-                Command::new("hyprctl").arg("reload"),
-                Command::new("eww").arg("reload"),
-                Command::new("swaync-client").arg("-R"),
-                Command::new("swaync-client").arg("-rs"),
-            ],
-            "both swaync reloads must run, config before CSS, each exactly once"
-        );
-        assert_eq!(
-            signaller.calls(),
-            vec![SignalCall {
-                process_name: "kitty".to_string(),
-                signal: Signal::SIGUSR1,
-                pids: vec![11],
             }]
         );
     }

@@ -72,8 +72,8 @@ pub fn rust_sources(dir: &Path) -> Vec<PathBuf> {
 ///   (Both were demonstrated against the earlier version of this lexer; the
 ///   tests below reproduce them.)
 /// - **Character literals**, because `'"'` and `b'"'` would otherwise open a
-///   phantom string that runs to the next quote — `src/parsers/swaync.rs` has
-///   two such literals four lines apart.
+///   phantom string that runs to the next quote — the `busctl` reply tokenizer
+///   in `src/core/notifd.rs` has several such literals a few lines apart.
 ///
 /// Blanked spans become spaces, with newlines preserved, rather than being
 /// deleted: byte and line positions survive, so the guards can quote the
@@ -428,7 +428,7 @@ fn a_raw_identifier_is_not_mistaken_for_a_raw_string() {
 #[test]
 fn quote_characters_and_lifetimes_are_told_apart() {
     // A `'"'` literal must be consumed (else it opens a phantom string that runs
-    // to the next quote — `src/parsers/swaync.rs` has two, five lines apart),
+    // to the next quote — `src/core/notifd.rs` has several, a few lines apart),
     // while a lifetime has no closing quote and must be left alone, or the code
     // after it would be blanked.
     let source = "if c == '\"' { one() }\nfn f<'a>(w: &'a gtk4::Widget) {}\n";

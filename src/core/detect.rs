@@ -1,5 +1,5 @@
-//! Installed-app detection and dynamic visibility (tasks 4.3, 11.2; architecture §4;
-//! R4.1–R4.4, R2.2, R3.2, R8.5, R6.1, R7.3).
+//! Installed-app detection and dynamic visibility (tasks 4.3, 11.2, 11.7; architecture
+//! §4; R4.1–R4.4, R2.2, R3.2, R8.5, R6.1, R7.3).
 //!
 //! # What this module is
 //!
@@ -26,13 +26,21 @@
 //! a procfs scan, and everything else is a filesystem stat/read. Avoiding a
 //! `which` subprocess per binary also keeps cold start inside the budget (R8.1).
 //!
-//! The one exception is Hyprland's **config provider** (task 11.2), which a
-//! running compositor reports only over its IPC (`hyprctl status` →
-//! `configProvider: lua`). That single query is issued by
-//! [`DetectionInputs::from_system`] through the injected
-//! [`CommandRunner`] (arg vector, no shell, the usual timeout) and only when the
-//! IPC socket exists; its stdout is then just another input. [`Capabilities::detect`]
-//! itself still spawns nothing.
+//! Two probes are exceptions, because the answer is only available from a running
+//! program:
+//!
+//! - Hyprland's **config provider** (task 11.2), which a running compositor reports
+//!   only over its IPC (`hyprctl status` → `configProvider: lua`), asked only when
+//!   the IPC socket exists and `hyprctl` is on `$PATH`;
+//! - the **notifd** notification daemon (task 11.7), whose liveness is ownership of
+//!   its D-Bus name and whose version comes from `GetServerInformation` — two
+//!   `busctl`/`systemctl` calls, asked only when `busctl` is on `$PATH` (see
+//!   [`NotifdReplies::gather`] for the exact sequence and why none of them can start
+//!   the daemon).
+//!
+//! Both are issued by [`DetectionInputs::from_system`] through the injected
+//! [`CommandRunner`] (arg vectors, no shell, the usual timeout); their stdout is then
+//! just another input. [`Capabilities::detect`] itself still spawns nothing.
 //!
 //! # The config provider is a guard, not a router (analysis §8.6)
 //!
@@ -64,12 +72,14 @@
 //!   fake socket file, a config symlinked into a fake repo, an unreadable config)
 //!   and gets faithful behavior;
 //! - the compositor's own config-provider report is given as the captured
-//!   **text** of `hyprctl status` ([`DetectionInputs::hyprctl_status`]), so a test
-//!   injects a fake reply.
+//!   **text** of `hyprctl status` ([`DetectionInputs::hyprctl_status`]), and the
+//!   notifd probe replies likewise ([`DetectionInputs::notifd_replies`], with the
+//!   unit-file path [`DetectionInputs::notifd_unit_file`]), so a test injects fake
+//!   replies.
 //!
 //! [`DetectionInputs::from_system`] gathers the real inputs (env `$PATH`, a procfs
-//! scan, the `$XDG_RUNTIME_DIR` socket path, the XDG config paths, and the
-//! `hyprctl status` reply);
+//! scan, the `$XDG_RUNTIME_DIR` socket path, the XDG config paths, the
+//! `hyprctl status` reply and the notifd probe replies);
 //! [`Capabilities::detect`] is the pure, re-runnable routine over any inputs. A
 //! manual refresh (R4.3) simply re-gathers the inputs and calls it again.
 //!
@@ -83,15 +93,17 @@
 //! # Logging (R4.2, R7.3)
 //!
 //! Absent page-gating binaries, an absent palette source, an absent settings
-//! portal, and a non-Lua Hyprland config provider are logged at `info` (the
-//! "hidden item" signal, R4.2); a missing or unreadable config is logged at `warn`
-//! (R4.4); a one-line detection summary, naming the config provider, is logged at
-//! `info` (R7.3). File *contents* are never logged.
+//! portal, a non-Lua Hyprland config provider and an absent or stopped notifd are
+//! logged at `info` (the "hidden item" signal, R4.2); a missing or unreadable config
+//! is logged at `warn` (R4.4); a one-line detection summary, naming the config
+//! provider and the notifd status, is logged at `info` (R7.3). File *contents* are
+//! never logged.
 
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::core::notifd::{NotifdReplies, NotifdStatus};
 use crate::system::command::{Command, CommandRunner};
 
 /// An external program the app scans for on `$PATH`.
@@ -121,8 +133,10 @@ pub enum Binary {
     Kitty,
     /// The eww bar daemon — reloaded via `eww reload`.
     Eww,
-    /// The swaync notification daemon (Notifications page, task 6.7).
-    Swaync,
+    /// systemd's D-Bus client. Every notifd probe and control call goes through it
+    /// (task 11.7), so without it the notifd capability is
+    /// [`NotifdStatus::Absent`] and the Notifications page is hidden.
+    Busctl,
     /// The hyprpaper wallpaper daemon (Wallpaper controls, task 6.5).
     Hyprpaper,
     /// The hypridle idle daemon (Power & Idle page, task 6.8).
@@ -152,7 +166,7 @@ impl Binary {
         Binary::Wpctl,
         Binary::Kitty,
         Binary::Eww,
-        Binary::Swaync,
+        Binary::Busctl,
         Binary::Hyprpaper,
         Binary::Hypridle,
         Binary::Hyprlock,
@@ -170,7 +184,7 @@ impl Binary {
             Binary::Wpctl => "wpctl",
             Binary::Kitty => "kitty",
             Binary::Eww => "eww",
-            Binary::Swaync => "swaync",
+            Binary::Busctl => "busctl",
             Binary::Hyprpaper => "hyprpaper",
             Binary::Hypridle => "hypridle",
             Binary::Hyprlock => "hyprlock",
@@ -196,9 +210,6 @@ pub enum Daemon {
     Kitty,
     /// The eww bar daemon (`eww reload`).
     Eww,
-    /// The swaync notification daemon (`swaync-client -R` for a config change,
-    /// `-rs` for a stylesheet change).
-    Swaync,
     /// The hyprpaper wallpaper daemon (`hyprctl hyprpaper …`).
     Hyprpaper,
     /// The hypridle idle daemon (restarted on config change).
@@ -210,20 +221,18 @@ impl Daemon {
     const ALL: &'static [Daemon] = &[
         Daemon::Kitty,
         Daemon::Eww,
-        Daemon::Swaync,
         Daemon::Hyprpaper,
         Daemon::Hypridle,
     ];
 
     /// The executable name (argv[0] basename, see [`scan_procfs_process_names`])
-    /// that identifies a running instance of this daemon. All five are under 15
+    /// that identifies a running instance of this daemon. All four are under 15
     /// bytes, so they would survive `/proc/comm` truncation too, but detection
     /// matches them against the untruncated name for uniformity with the portal.
     pub fn process_name(self) -> &'static str {
         match self {
             Daemon::Kitty => "kitty",
             Daemon::Eww => "eww",
-            Daemon::Swaync => "swaync",
             Daemon::Hyprpaper => "hyprpaper",
             Daemon::Hypridle => "hypridle",
         }
@@ -388,6 +397,14 @@ pub struct DetectionInputs {
     /// the file's existence decides it: Hyprland itself prefers this file whenever it
     /// exists (analysis §7.1).
     pub hyprland_lua_config: PathBuf,
+    /// The captured replies of the notifd probes (task 11.7); all `None` when they
+    /// were not gathered (no `busctl` on `$PATH`), which resolves to
+    /// [`NotifdStatus::Absent`].
+    pub notifd_replies: NotifdReplies,
+    /// The live path of notifd's systemd user unit, conventionally
+    /// `~/.config/systemd/user/notifd.service` (the dotfiles link it there). Its
+    /// existence marks notifd as installed when the daemon is not running.
+    pub notifd_unit_file: PathBuf,
 }
 
 impl DetectionInputs {
@@ -403,11 +420,17 @@ impl DetectionInputs {
     /// [`Capabilities::detect`] turns into the "absent" capability rather than an
     /// error.
     ///
-    /// `runner` is used for exactly one command, `hyprctl status`, issued only when
-    /// the Hyprland IPC socket exists and `hyprctl` is on `$PATH` — so a session
-    /// without Hyprland spawns nothing; a failed query degrades to `None`.
+    /// `runner` is used for `hyprctl status`, issued only when the Hyprland IPC
+    /// socket exists and `hyprctl` is on `$PATH`, and for the two notifd probes
+    /// ([`NotifdReplies::gather`]), issued only when `busctl` is on `$PATH` — so a
+    /// session with neither spawns nothing; a failed query degrades to `None`.
     pub fn from_system(runner: &dyn CommandRunner, config_paths: Vec<PathBuf>) -> Self {
         let path = std::env::var("PATH").ok();
+        let notifd_replies = if is_on_path(path.as_deref(), Binary::Busctl.command_name()) {
+            NotifdReplies::gather(runner)
+        } else {
+            NotifdReplies::default()
+        };
         let hyprland_socket = hyprland_socket_path();
         let hyprctl_status = if hyprland_socket.as_deref().is_some_and(Path::exists)
             && is_on_path(path.as_deref(), Binary::Hyprctl.command_name())
@@ -424,6 +447,8 @@ impl DetectionInputs {
             config_paths,
             hyprctl_status,
             hyprland_lua_config: default_config_path(&["hypr", "hyprland.lua"]),
+            notifd_replies,
+            notifd_unit_file: default_config_path(&["systemd", "user", "notifd.service"]),
         }
     }
 }
@@ -453,6 +478,9 @@ pub struct Capabilities {
     /// The Hyprland config provider in use, the guard for the Lua-only input and
     /// cursor writes (task 11.2).
     hypr_config_provider: HyprConfigProvider,
+    /// Whether the notifd notification daemon runs (and which version) or is
+    /// installed, the gate of the Notifications page (task 11.7).
+    notifd: NotifdStatus,
 }
 
 impl Capabilities {
@@ -503,6 +531,10 @@ impl Capabilities {
 
         let unreadable_configs = check_configs(&inputs.config_paths);
 
+        let notifd =
+            NotifdStatus::resolve(&inputs.notifd_replies, inputs.notifd_unit_file.exists());
+        log_notifd_status(notifd);
+
         let capabilities = Capabilities {
             present_binaries,
             live_daemons,
@@ -511,6 +543,7 @@ impl Capabilities {
             palette_source,
             unreadable_configs,
             hypr_config_provider,
+            notifd,
         };
         capabilities.log_summary();
         capabilities
@@ -528,7 +561,7 @@ impl Capabilities {
     /// a usable (if empty) window with a working Refresh action (R4.3). Unlike
     /// [`Capabilities::detect`] it runs no probes and logs nothing. Its config
     /// provider is [`HyprConfigProvider::Hyprlang`], the value that keeps the
-    /// Lua-only controls hidden.
+    /// Lua-only controls hidden, and notifd is [`NotifdStatus::Absent`].
     pub fn absent() -> Capabilities {
         Capabilities {
             present_binaries: BTreeSet::new(),
@@ -538,6 +571,7 @@ impl Capabilities {
             palette_source: None,
             unreadable_configs: BTreeSet::new(),
             hypr_config_provider: HyprConfigProvider::Hyprlang,
+            notifd: NotifdStatus::Absent,
         }
     }
 
@@ -587,6 +621,17 @@ impl Capabilities {
         self.hypr_config_provider
     }
 
+    /// Whether the notifd notification daemon runs, and which version, or is only
+    /// installed (task 11.7; analysis §8.2).
+    ///
+    /// The Notifications page is offered when it runs or is installed
+    /// ([`NotifdStatus::is_present`]); the `GetState`/`Reload` methods and the
+    /// file-backed notification rows need a running daemon ≥ 1.1
+    /// ([`NotifdStatus::supports_state_and_reload`]).
+    pub fn notifd(&self) -> NotifdStatus {
+        self.notifd
+    }
+
     /// Whether a live theme-restyle path is available — the GTK settings portal is
     /// running or a dconf GSettings backend is present (R2.2). Gates whether the
     /// Theme page may claim a live restyle versus "takes effect at next launch".
@@ -634,6 +679,7 @@ impl Capabilities {
             palette_source = self.palette_source.is_some(),
             unreadable_configs = self.unreadable_configs.len(),
             hypr_config_provider = %self.hypr_config_provider,
+            notifd = %self.notifd,
             "capabilities detection complete"
         );
     }
@@ -656,6 +702,7 @@ impl Capabilities {
     /// [`Capabilities::detect`] path instead. The config provider is fixed to
     /// [`HyprConfigProvider::Lua`], the target dotfiles' provider; a test of the
     /// hyprlang guard switches it with [`Self::with_hypr_config_provider_for_tests`].
+    /// notifd is [`NotifdStatus::Absent`]; [`Self::with_notifd_for_tests`] sets it.
     pub fn for_tests(
         binaries: &[Binary],
         live_daemons: &[Daemon],
@@ -669,7 +716,16 @@ impl Capabilities {
             palette_source: None,
             unreadable_configs: BTreeSet::new(),
             hypr_config_provider: HyprConfigProvider::Lua,
+            notifd: NotifdStatus::Absent,
         }
+    }
+
+    /// Returns `self` with the given notifd status, for tests of the Notifications
+    /// page gate (task 11.7) — builder-style, like
+    /// [`Self::with_hypr_config_provider_for_tests`].
+    pub fn with_notifd_for_tests(mut self, notifd: NotifdStatus) -> Capabilities {
+        self.notifd = notifd;
+        self
     }
 
     /// Returns `self` with the given Hyprland config provider, for tests of the
@@ -857,6 +913,29 @@ fn log_binary_results(present: &BTreeSet<Binary>) {
                 "not found on PATH; dependent settings will be hidden (R4.2)"
             );
         }
+    }
+}
+
+/// Logs the notifd status: an absent daemon at `info` as a hidden item (R4.2), a
+/// stopped or unversioned one at `info` because the page then offers less, and a
+/// running versioned one at `debug`.
+fn log_notifd_status(status: NotifdStatus) {
+    match status {
+        NotifdStatus::Absent => tracing::info!(
+            "notifd not found (its D-Bus name has no owner and no notifd.service unit is \
+             installed, or the session bus could not be queried); the Notifications page is \
+             hidden (R4.2)"
+        ),
+        NotifdStatus::Installed => tracing::info!(
+            "notifd is installed but not running; it starts with the next notification, and \
+             the Notifications page reports it as not running until then"
+        ),
+        NotifdStatus::Running { version: None } => tracing::info!(
+            "notifd is running but did not report a version; treating it as older than 1.1"
+        ),
+        NotifdStatus::Running {
+            version: Some(version),
+        } => tracing::debug!(%version, "notifd is running"),
     }
 }
 
@@ -1150,6 +1229,10 @@ mod tests {
             config_paths: Vec::new(),
             hyprctl_status: None,
             hyprland_lua_config: PathBuf::from("/nonexistent/settings4000/hypr/hyprland.lua"),
+            notifd_replies: NotifdReplies::default(),
+            notifd_unit_file: PathBuf::from(
+                "/nonexistent/settings4000/systemd/user/notifd.service",
+            ),
         }
     }
 
@@ -1263,10 +1346,10 @@ mod tests {
         // Accept criterion (liveness injectable): a supplied process list flips
         // daemon liveness without a live daemon.
         let mut inputs = base_inputs();
-        inputs.running_processes = vec!["swaync".to_string(), "eww".to_string()];
+        inputs.running_processes = vec!["hyprpaper".to_string(), "eww".to_string()];
         let caps = Capabilities::detect(&inputs);
 
-        assert!(caps.is_daemon_live(Daemon::Swaync));
+        assert!(caps.is_daemon_live(Daemon::Hyprpaper));
         assert!(caps.is_daemon_live(Daemon::Eww));
         assert!(
             !caps.is_daemon_live(Daemon::Hypridle),
@@ -1606,13 +1689,20 @@ mod tests {
         // The production gathering path must run on the real system without failing,
         // producing a usable Capabilities value. We assert only that it completes —
         // the machine running the test may or may not have any given tool. The mock
-        // runner keeps the test from spawning a real `hyprctl`; whatever it was asked
-        // to run can only be the one config-provider query.
+        // runner keeps the test from spawning a real `hyprctl`, `busctl` or
+        // `systemctl`; whatever it was asked to run can only be the config-provider
+        // query and the notifd probes.
         let runner = MockCommandRunner::new();
         let inputs = DetectionInputs::from_system(&runner, Vec::new());
         let _ = Capabilities::detect(&inputs);
+        let allowed = [
+            Command::new("hyprctl").arg("status"),
+            crate::core::notifd::name_has_owner_command(),
+            crate::core::notifd::server_information_command(),
+            crate::core::notifd::unit_is_active_command(),
+        ];
         for command in runner.recorded() {
-            assert_eq!(command, Command::new("hyprctl").arg("status"));
+            assert!(allowed.contains(&command), "unexpected probe {command}");
         }
     }
 
@@ -1765,6 +1855,176 @@ mod tests {
         );
     }
 
+    // --- notifd (task 11.7) ---
+
+    /// Detection inputs carrying the given notifd probe replies (stdout as the mock
+    /// runner would have captured it) and the given unit-file path.
+    fn notifd_inputs(
+        owner: Option<&str>,
+        info: Option<&str>,
+        active: Option<&str>,
+        unit_file: PathBuf,
+    ) -> DetectionInputs {
+        let mut inputs = base_inputs();
+        inputs.notifd_replies = NotifdReplies {
+            name_has_owner: owner.map(str::to_string),
+            server_information: info.map(str::to_string),
+            unit_active: active.map(str::to_string),
+        };
+        inputs.notifd_unit_file = unit_file;
+        inputs
+    }
+
+    /// Gathers the notifd replies from a mock runner scripted with `outcomes`, the
+    /// way `from_system` does, and returns them with the commands it issued.
+    fn gather_from(
+        outcomes: Vec<Result<CommandOutput, crate::system::command::CommandError>>,
+    ) -> (NotifdReplies, Vec<Command>) {
+        let runner = MockCommandRunner::with_outcomes(outcomes);
+        let replies = NotifdReplies::gather(&runner);
+        (replies, runner.recorded())
+    }
+
+    #[test]
+    fn a_running_1_1_notifd_is_detected_with_its_version() {
+        let (replies, issued) = gather_from(vec![
+            Ok(CommandOutput::fake_with_streams(0, "b true\n", "")),
+            Ok(CommandOutput::fake_with_streams(
+                0,
+                "ssss \"notifd\" \"dotfiles\" \"1.1\" \"1.3\"\n",
+                "",
+            )),
+        ]);
+        assert_eq!(issued.len(), 2, "NameHasOwner then GetServerInformation");
+        let mut inputs = base_inputs();
+        inputs.notifd_replies = replies;
+        let caps = Capabilities::detect(&inputs);
+        assert_eq!(
+            caps.notifd(),
+            NotifdStatus::Running {
+                version: crate::core::notifd::NotifdVersion::parse("1.1")
+            }
+        );
+        assert!(caps.notifd().is_present());
+        assert!(caps.notifd().supports_state_and_reload());
+    }
+
+    #[test]
+    fn a_running_1_0_notifd_is_present_without_state_and_reload() {
+        let caps = Capabilities::detect(&notifd_inputs(
+            Some("b true\n"),
+            Some("ssss \"notifd\" \"dotfiles\" \"1.0\" \"1.3\"\n"),
+            None,
+            PathBuf::from("/nonexistent/notifd.service"),
+        ));
+        assert_eq!(
+            caps.notifd().version(),
+            crate::core::notifd::NotifdVersion::parse("1.0")
+        );
+        assert!(caps.notifd().is_present());
+        assert!(!caps.notifd().supports_state_and_reload());
+    }
+
+    #[test]
+    fn an_installed_but_stopped_notifd_is_installed() {
+        // Unit file present, `is-active` reports inactive (exit 3), name not owned.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let unit = dir.path().join("notifd.service");
+        fs::write(&unit, b"[Service]\n").expect("write a unit file");
+        let (replies, issued) = gather_from(vec![
+            Ok(CommandOutput::fake_with_streams(0, "b false\n", "")),
+            Ok(CommandOutput::fake_with_streams(3, "inactive\n", "")),
+        ]);
+        assert_eq!(
+            issued,
+            vec![
+                crate::core::notifd::name_has_owner_command(),
+                crate::core::notifd::unit_is_active_command()
+            ]
+        );
+        let mut inputs = base_inputs();
+        inputs.notifd_replies = replies;
+        inputs.notifd_unit_file = unit.clone();
+        let caps = Capabilities::detect(&inputs);
+        assert_eq!(caps.notifd(), NotifdStatus::Installed);
+        assert!(caps.notifd().is_present());
+        assert_eq!(caps.notifd().version(), None);
+
+        // The same replies without the unit file: nothing says notifd is installed.
+        fs::remove_file(&unit).expect("remove the unit file");
+        assert_eq!(Capabilities::detect(&inputs).notifd(), NotifdStatus::Absent);
+    }
+
+    #[test]
+    fn the_fixture_tree_unit_file_marks_notifd_installed() {
+        // The deployed fixture links config/systemd/user/notifd.service like the
+        // dotfiles' installer does.
+        let fx = crate::testing::FixtureDotfiles::install();
+        let caps = Capabilities::detect(&notifd_inputs(
+            Some("b false\n"),
+            None,
+            Some("inactive\n"),
+            fx.config_path("systemd/user/notifd.service"),
+        ));
+        assert_eq!(caps.notifd(), NotifdStatus::Installed);
+    }
+
+    #[test]
+    fn an_absent_or_unqueryable_notifd_is_absent() {
+        // Nothing gathered (no busctl on PATH) — the base inputs.
+        assert_eq!(
+            Capabilities::detect(&base_inputs()).notifd(),
+            NotifdStatus::Absent
+        );
+        // Bus answered "no owner", systemd does not know the unit, no unit file.
+        let caps = Capabilities::detect(&notifd_inputs(
+            Some("b false\n"),
+            None,
+            Some("inactive\n"),
+            PathBuf::from("/nonexistent/notifd.service"),
+        ));
+        assert_eq!(caps.notifd(), NotifdStatus::Absent);
+        assert!(!caps.notifd().is_present());
+    }
+
+    #[test]
+    fn a_malformed_notifd_reply_degrades_instead_of_guessing() {
+        // A garbled NameHasOwner reply: the bus cannot be trusted, so Absent — even
+        // with a unit file and an active unit.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let unit = dir.path().join("notifd.service");
+        fs::write(&unit, b"").expect("write a unit file");
+        let garbled_owner = notifd_inputs(Some("b maybe\n"), None, Some("active\n"), unit);
+        assert_eq!(
+            Capabilities::detect(&garbled_owner).notifd(),
+            NotifdStatus::Absent
+        );
+
+        // A garbled GetServerInformation reply: running, version unknown (pre-1.1).
+        let garbled_info = notifd_inputs(
+            Some("b true\n"),
+            Some("ssss \"notifd\" \"dotfiles\""),
+            None,
+            PathBuf::from("/nonexistent/notifd.service"),
+        );
+        let caps = Capabilities::detect(&garbled_info);
+        assert_eq!(caps.notifd(), NotifdStatus::Running { version: None });
+        assert!(!caps.notifd().supports_state_and_reload());
+    }
+
+    #[test]
+    fn detection_never_scans_for_a_notification_daemon_binary() {
+        // notifd is found by its bus name only: a binary of the daemon it replaced may
+        // still be installed, so no notification-daemon binary is in the scan list.
+        for binary in Binary::ALL {
+            assert!(
+                !binary.command_name().starts_with("sway"),
+                "{binary:?} must not be scanned"
+            );
+        }
+        assert_eq!(Capabilities::absent().notifd(), NotifdStatus::Absent);
+    }
+
     #[test]
     fn hidden_items_log_info_and_unreadable_configs_log_warn() {
         // Accept criterion (logging): a hidden item (absent binary, absent palette
@@ -1891,6 +2151,24 @@ mod tests {
                     && message.contains("detection complete")
                     && fields.contains("hypr_config_provider=hyprlang")),
             "the detection summary must name the config provider"
+        );
+        // Task 11.7: nothing gathered -> notifd absent, logged as a hidden page, and
+        // the summary carries the status.
+        assert!(
+            events
+                .iter()
+                .any(|(level, message, _)| *level == Level::INFO
+                    && message.contains("notifd not found")
+                    && message.contains("Notifications page is hidden")),
+            "an absent notifd must be logged at info as a hidden page"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(level, message, fields)| *level == Level::INFO
+                    && message.contains("detection complete")
+                    && fields.contains("notifd=absent")),
+            "the detection summary must name the notifd status"
         );
     }
 
