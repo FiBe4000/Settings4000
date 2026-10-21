@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::core::apply::{FileWrite, WriteValidation};
+use crate::core::apply::{FileWrite, WriteMode, WriteValidation};
 use crate::core::model::{SettingId, ValidationError, Value, validate_image_path};
 use crate::core::reload::{BackingFile, ReloadParams};
 use crate::parsers::hyprlang::{HyprlangFile, KeyPath};
@@ -532,6 +532,7 @@ impl WallpaperModel {
                 } else {
                     WriteValidation::NotNeeded
                 },
+                mode: WriteMode::Replace,
             }),
             written,
         )
@@ -557,6 +558,7 @@ impl WallpaperModel {
                 // exactly the condition under which [`Self::validations`] re-checks that
                 // path (R8.3) — so its value is always covered by the plan.
                 validation: WriteValidation::InPlan,
+                mode: WriteMode::Replace,
             }),
             Err(error) => {
                 tracing::warn!(%error, "could not set the lock background path in hyprlock.conf");

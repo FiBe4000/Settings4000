@@ -53,7 +53,7 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
-use crate::core::apply::{FileWrite, WriteValidation};
+use crate::core::apply::{FileWrite, WriteMode, WriteValidation};
 use crate::core::model::{SettingId, Value};
 use crate::core::reload::BackingFile;
 
@@ -181,6 +181,7 @@ impl StoreBackedFile {
             changed_keys: edit.changed_keys,
             backing: self.backing,
             validation: self.validation,
+            mode: WriteMode::Replace,
         }))
     }
 }

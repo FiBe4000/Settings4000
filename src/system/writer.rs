@@ -40,12 +40,41 @@
 //! atomic rename, any failure before that step leaves the original file
 //! byte-for-byte intact, and the `NamedTempFile` is deleted on drop so no stray
 //! temp file is left behind.
+//!
+//! # Creating a file that does not exist yet
+//!
+//! [`write_atomic`] only ever *rewrites*: a missing target is an error, which is
+//! the right default because every backing file the app edits is expected to
+//! exist, and silently creating one at a mistyped path would hide a bug. One
+//! write target is different: the XCursor fallback theme
+//! `~/.icons/default/index.theme` (analysis §8.4) belongs to the R3.4 cursor write
+//! set but is legitimately absent on a host without the dotfiles deployment, and
+//! the app then creates it. [`create_atomic`] is that explicit, separate entry
+//! point, with the same guarantees turned around:
+//!
+//! - It is **exclusive**: it refuses with [`WriteError::AlreadyExists`] when
+//!   anything is at the target — a file, a directory, or a symlink, dangling or
+//!   not — so it can never clobber a file another program created since the app
+//!   looked, and never replaces a symlink with a plain file. The final step is a
+//!   no-clobber rename (`persist_noclobber`), so this also holds against a file
+//!   that appears in the window between that check and the rename.
+//! - It **creates missing parent directories** as plain directories (as the
+//!   dotfiles' `setup.sh` does with `mkdir -p ~/.icons/default`). An existing
+//!   parent that is a symlink is followed, so the file lands in the directory it
+//!   points to.
+//! - It is **atomic** in the same way: the content is staged in a temp file in
+//!   the (resolved) parent directory, fsynced, and only then given its name.
+//! - Its [`FileSnapshot`] records that the file was **absent**, so a rollback
+//!   deletes the created file and removes the parent directories this call
+//!   created (only while they are still empty) — the pre-write state was "no
+//!   file", and restoring it means exactly that.
 
 use std::fmt;
 use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use tempfile::NamedTempFile;
@@ -85,6 +114,15 @@ pub enum WriteError {
         /// The underlying OS error.
         source: io::Error,
     },
+    /// [`create_atomic`] found something already at the path it was asked to
+    /// create (a file, a directory, or a symlink). Creation is exclusive, so
+    /// nothing was written: an existing entry is either another program's file,
+    /// which must not be clobbered (R5.6), or a symlink, which must never be
+    /// replaced by a plain file.
+    AlreadyExists {
+        /// The path that was to be created.
+        target: PathBuf,
+    },
 }
 
 impl fmt::Display for WriteError {
@@ -103,6 +141,11 @@ impl fmt::Display for WriteError {
             WriteError::Write { path, source } => {
                 write!(f, "failed to atomically write {}: {source}", path.display())
             }
+            WriteError::AlreadyExists { target } => write!(
+                f,
+                "refused to create {}: something already exists at that path",
+                target.display()
+            ),
         }
     }
 }
@@ -115,6 +158,7 @@ impl std::error::Error for WriteError {
             WriteError::Resolve { source, .. }
             | WriteError::Snapshot { source, .. }
             | WriteError::Write { source, .. } => Some(source),
+            WriteError::AlreadyExists { .. } => None,
         }
     }
 }
@@ -135,6 +179,9 @@ impl std::error::Error for WriteError {
 /// bytes would keep that wrong mode; capturing the mode here lets
 /// [`restore`](FileSnapshot::restore) reapply it faithfully rather than trusting
 /// whatever mode happens to be on disk at rollback time.
+///
+/// A snapshot returned by [`create_atomic`] instead records that there was **no
+/// file**; restoring it deletes the created file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileSnapshot {
     /// The canonicalized real path these bytes were read from and are restored
@@ -142,14 +189,37 @@ pub struct FileSnapshot {
     /// rewrites the same real file (preserving any symlink that points at it),
     /// without re-canonicalizing.
     resolved_path: PathBuf,
-    /// The file's exact bytes at snapshot time, restored verbatim on rollback.
-    contents: Vec<u8>,
-    /// The file's permissions at snapshot time (on Unix, the `0644`-style mode
-    /// bits), reapplied to the new content on rollback so the file's permissions
-    /// are restored alongside its bytes. `None` when the permissions could not be
-    /// read at snapshot time; the restore then falls back to the temp file's
-    /// default permissions, exactly as the forward write does (R8.3).
-    permissions: Option<fs::Permissions>,
+    /// What the path held before the write.
+    prior: PriorState,
+}
+
+/// What a write target held before the write, so [`FileSnapshot::restore`]
+/// returns it to exactly that state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PriorState {
+    /// The file existed ([`write_atomic`]).
+    Existed {
+        /// The file's exact bytes at snapshot time, restored verbatim on rollback.
+        contents: Vec<u8>,
+        /// The file's permissions at snapshot time (on Unix, the `0644`-style
+        /// mode bits), reapplied to the new content on rollback so the file's
+        /// permissions are restored alongside its bytes. `None` when the
+        /// permissions could not be read at snapshot time; the restore then falls
+        /// back to the temp file's default permissions, exactly as the forward
+        /// write does (R8.3).
+        permissions: Option<fs::Permissions>,
+    },
+    /// The file did not exist and [`create_atomic`] created it.
+    Absent {
+        /// The bytes [`create_atomic`] wrote. A rollback deletes the file only
+        /// while it still holds exactly these bytes, so a file another program
+        /// rewrote in the meantime is never deleted.
+        written: Vec<u8>,
+        /// The parent directories that call created because they were missing
+        /// too, outermost first. A rollback removes them innermost first, and only
+        /// while they are empty, so it never deletes anything it did not create.
+        created_dirs: Vec<PathBuf>,
+    },
 }
 
 impl FileSnapshot {
@@ -158,38 +228,99 @@ impl FileSnapshot {
         &self.resolved_path
     }
 
-    /// The captured original bytes.
-    pub fn contents(&self) -> &[u8] {
-        &self.contents
+    /// The captured original bytes, or `None` when the write created the file
+    /// (there were no original bytes to capture).
+    pub fn contents(&self) -> Option<&[u8]> {
+        match &self.prior {
+            PriorState::Existed { contents, .. } => Some(contents),
+            PriorState::Absent { .. } => None,
+        }
     }
 
-    /// Restores the file to its snapshotted contents and permission mode,
-    /// atomically.
+    /// Restores the file to its snapshotted state, atomically.
     ///
     /// Used by the Apply pipeline's per-file rollback (task 4.5): after a later
     /// file in the same Apply fails, each already-written file is put back with
-    /// this. The restore uses the identical atomic temp→fsync→rename mechanism as
-    /// the forward write and targets the stored resolved path, so a symlinked
-    /// file's link is preserved here too. Reapplying the snapshotted mode is
-    /// best-effort, matching the forward write: a chmod failure logs at `debug`
-    /// and does not fail the restore (R8.3).
+    /// this.
+    ///
+    /// For a file that existed, the restore uses the identical atomic
+    /// temp→fsync→rename mechanism as the forward write and targets the stored
+    /// resolved path, so a symlinked file's link is preserved here too.
+    /// Reapplying the snapshotted mode is best-effort, matching the forward write:
+    /// a chmod failure logs at `debug` and does not fail the restore (R8.3).
+    ///
+    /// For a file [`create_atomic`] created, restoring means removing it (a file
+    /// that is already gone counts as restored) and then removing the parent
+    /// directories that call created, innermost first. The file is removed only
+    /// while it still holds exactly the bytes the creation wrote: if another program
+    /// has rewritten it since, it is no longer the app's file, so it is left in place
+    /// and the skipped removal logged at `warn` (R5.6 — never clobber an external
+    /// change, and deleting is the strongest clobber there is). Directory removal is
+    /// best-effort: `remove_dir` only removes an empty directory, so one that has
+    /// meanwhile gained other content is left alone and logged at `debug`.
     pub fn restore(&self) -> Result<(), WriteError> {
-        // Restore both the bytes and the snapshotted permission mode, so rollback
-        // returns the file's full pre-write state rather than trusting the mode
-        // currently on disk (which may have been tightened, see the type docs).
-        atomic_write_bytes(
-            &self.resolved_path,
-            &self.contents,
-            self.permissions.clone(),
-        )?;
-        // R7.3: log the rollback write with its resolved path (byte count only,
-        // never contents). The "why we rolled back" context belongs to the Apply
-        // orchestrator (task 4.5).
-        tracing::info!(
-            path = %self.resolved_path.display(),
-            bytes = self.contents.len(),
-            "restored file to its pre-write contents"
-        );
+        match &self.prior {
+            PriorState::Existed {
+                contents,
+                permissions,
+            } => {
+                // Restore both the bytes and the snapshotted permission mode, so
+                // rollback returns the file's full pre-write state rather than
+                // trusting the mode currently on disk (which may have been
+                // tightened, see the type docs).
+                atomic_write_bytes(&self.resolved_path, contents, permissions.clone())?;
+                // R7.3: log the rollback write with its resolved path (byte count
+                // only, never contents). The "why we rolled back" context belongs
+                // to the Apply orchestrator (task 4.5).
+                tracing::info!(
+                    path = %self.resolved_path.display(),
+                    bytes = contents.len(),
+                    "restored file to its pre-write contents"
+                );
+            }
+            PriorState::Absent {
+                written,
+                created_dirs,
+            } => {
+                match fs::read(&self.resolved_path) {
+                    Ok(current) if current == *written => {
+                        match fs::remove_file(&self.resolved_path) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                            Err(source) => {
+                                return Err(WriteError::Write {
+                                    path: self.resolved_path.clone(),
+                                    source,
+                                });
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Ok(_) => {
+                        tracing::warn!(
+                            path = %self.resolved_path.display(),
+                            "the file this apply created was changed by another program \
+                             before the rollback; leaving it in place"
+                        );
+                        return Ok(());
+                    }
+                    Err(source) => {
+                        return Err(WriteError::Snapshot {
+                            path: self.resolved_path.clone(),
+                            source,
+                        });
+                    }
+                }
+                if let Some(dir) = self.resolved_path.parent() {
+                    fsync_dir(dir);
+                }
+                remove_created_dirs(created_dirs);
+                tracing::info!(
+                    path = %self.resolved_path.display(),
+                    "removed the file this apply had created"
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -235,9 +366,158 @@ pub fn write_atomic(target: &Path, contents: &[u8]) -> Result<FileSnapshot, Writ
 
     Ok(FileSnapshot {
         resolved_path: resolved,
-        contents: original,
-        permissions: original_permissions,
+        prior: PriorState::Existed {
+            contents: original,
+            permissions: original_permissions,
+        },
     })
+}
+
+/// The permission mode given to a file [`create_atomic`] creates: owner
+/// read/write, everyone else read — what an ordinary config file gets under the
+/// usual `022` umask. Set explicitly because the staging temp file is created
+/// `0600`, which would otherwise make the new file unreadable to other users for
+/// no reason (the files the dotfiles deploy are all `0644`).
+///
+/// The mode is applied with `chmod` after the temp file exists, so it holds
+/// **regardless of the process umask** — a stricter umask (say `077`) is not
+/// honoured. That is acceptable here: the only file created this way is
+/// `~/.icons/default/index.theme`, which holds nothing but a cursor theme name and
+/// must be readable by every program in the session; the parent directories are
+/// created with `create_dir` and do follow the umask.
+const NEW_FILE_MODE: u32 = 0o644;
+
+/// Atomically creates `target` with `contents`, refusing if anything already
+/// exists at that path (see the module section "Creating a file that does not
+/// exist yet").
+///
+/// Missing parent directories are created as plain directories; an existing
+/// symlinked parent is followed, so the returned snapshot's
+/// [`resolved_path`](FileSnapshot::resolved_path) is the real location. The new
+/// file gets mode `0644` (see `NEW_FILE_MODE`). On success the [`FileSnapshot`] records the
+/// file as absent, so [`FileSnapshot::restore`] deletes it again (with the
+/// directories this call created).
+///
+/// Errors: [`WriteError::AlreadyExists`] when the target exists (checked first,
+/// and again atomically by the final no-clobber rename); [`WriteError::Write`]
+/// when a directory, the temp file or the rename fails — including a parent path
+/// that runs through a dangling symlink: the directory walk stops at the link, and
+/// `create_dir` below it follows the link and fails with `NotFound`, before any
+/// canonicalization; [`WriteError::Resolve`] when the parent directory cannot be
+/// canonicalized after the directories exist. On every error nothing is left
+/// behind: directories this call created are removed again, and no symlink is ever
+/// replaced.
+pub fn create_atomic(target: &Path, contents: &[u8]) -> Result<FileSnapshot, WriteError> {
+    // `symlink_metadata` does not follow a final symlink, so a dangling link
+    // counts as "something is here" too — it must never be replaced.
+    if fs::symlink_metadata(target).is_ok() {
+        return Err(WriteError::AlreadyExists {
+            target: target.to_path_buf(),
+        });
+    }
+    let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
+        return Err(WriteError::Write {
+            path: target.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the path to create has no parent directory or file name",
+            ),
+        });
+    };
+
+    let created_dirs = create_missing_dirs(parent).map_err(|source| WriteError::Write {
+        path: target.to_path_buf(),
+        source,
+    })?;
+
+    let resolved = match fs::canonicalize(parent) {
+        Ok(dir) => dir.join(name),
+        Err(source) => {
+            remove_created_dirs(&created_dirs);
+            return Err(WriteError::Resolve {
+                target: target.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    let permissions = Some(fs::Permissions::from_mode(NEW_FILE_MODE));
+    if let Err(error) = atomic_write_with(&resolved, permissions, Persist::NoClobber, |file| {
+        file.write_all(contents)
+    }) {
+        remove_created_dirs(&created_dirs);
+        return Err(error);
+    }
+
+    // R7.3: path, byte count and how many directories were needed — never contents.
+    tracing::info!(
+        path = %resolved.display(),
+        bytes = contents.len(),
+        created_dirs = created_dirs.len(),
+        "created configuration file atomically"
+    );
+
+    Ok(FileSnapshot {
+        resolved_path: resolved,
+        prior: PriorState::Absent {
+            written: contents.to_vec(),
+            created_dirs,
+        },
+    })
+}
+
+/// Creates every missing directory on the way to `dir`, outermost first, and
+/// returns the ones it created (outermost first).
+///
+/// Walks up from `dir` with `symlink_metadata` until it meets an existing entry,
+/// so an existing symlink — dangling or not — ends the walk instead of being
+/// replaced by a directory. Below a dangling link, the first `create_dir` follows
+/// the link to its missing target and fails with `NotFound`, so the caller reports
+/// a [`WriteError::Write`] with the link untouched. Each directory is created individually with
+/// `create_dir` rather than `create_dir_all`, so the list of created directories
+/// is exact; on a failure partway, the ones already created are removed again.
+fn create_missing_dirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut missing = Vec::new();
+    let mut current = Some(dir);
+    while let Some(path) = current {
+        if path.as_os_str().is_empty() {
+            break;
+        }
+        match fs::symlink_metadata(path) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(path.to_path_buf());
+                current = path.parent();
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    missing.reverse();
+    for (index, path) in missing.iter().enumerate() {
+        if let Err(error) = fs::create_dir(path) {
+            remove_created_dirs(&missing[..index]);
+            return Err(error);
+        }
+    }
+    Ok(missing)
+}
+
+/// Removes directories a [`create_atomic`] call created, innermost first.
+///
+/// Best-effort and conservative: `remove_dir` only removes an *empty*
+/// directory, so if something else has been put inside one meanwhile it stays,
+/// and the failure is logged at `debug` — leaving an empty-looking directory
+/// behind is harmless, deleting someone's file would not be.
+fn remove_created_dirs(created_dirs: &[PathBuf]) {
+    for dir in created_dirs.iter().rev() {
+        if let Err(error) = fs::remove_dir(dir) {
+            tracing::debug!(
+                dir = %dir.display(),
+                %error,
+                "could not remove a directory created for a new file; leaving it"
+            );
+        }
+    }
 }
 
 /// Canonicalizes `target` to the real path whose bytes will be rewritten.
@@ -266,7 +546,20 @@ fn atomic_write_bytes(
     contents: &[u8],
     permissions: Option<fs::Permissions>,
 ) -> Result<(), WriteError> {
-    atomic_write_with(resolved, permissions, |file| file.write_all(contents))
+    atomic_write_with(resolved, permissions, Persist::Replace, |file| {
+        file.write_all(contents)
+    })
+}
+
+/// How [`atomic_write_with`] gives the staged temp file its final name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Persist {
+    /// `rename(2)` over the existing target — the rewrite path.
+    Replace,
+    /// Fail if the target exists (`persist_noclobber`) — the [`create_atomic`]
+    /// path, which must never clobber a file that appeared after its existence
+    /// check.
+    NoClobber,
 }
 
 /// The atomic-write core: stage into a temp file, fsync, and rename over the
@@ -283,6 +576,7 @@ fn atomic_write_bytes(
 fn atomic_write_with<F>(
     resolved: &Path,
     permissions: Option<fs::Permissions>,
+    persist: Persist,
     fill: F,
 ) -> Result<(), WriteError>
 where
@@ -328,12 +622,26 @@ where
     // The atomic step: rename the fully-written temp file over the resolved
     // target. `rename(2)` is atomic within a filesystem, so a reader only ever
     // sees either the whole old file or the whole new one. If it fails, the returned
-    // `PersistError` (dropped here) carries the temp file, which is deleted.
-    temp.persist(resolved)
-        .map_err(|persist_error| WriteError::Write {
-            path: resolved.to_path_buf(),
-            source: persist_error.error,
-        })?;
+    // `PersistError` (dropped here) carries the temp file, which is deleted. The
+    // no-clobber form gives a file its name only if none exists, atomically.
+    let persisted = match persist {
+        Persist::Replace => temp.persist(resolved),
+        Persist::NoClobber => temp.persist_noclobber(resolved),
+    };
+    persisted.map_err(|persist_error| {
+        if persist == Persist::NoClobber
+            && persist_error.error.kind() == io::ErrorKind::AlreadyExists
+        {
+            WriteError::AlreadyExists {
+                target: resolved.to_path_buf(),
+            }
+        } else {
+            WriteError::Write {
+                path: resolved.to_path_buf(),
+                source: persist_error.error,
+            }
+        }
+    })?;
 
     // Durability of the rename itself needs the *directory* fsynced; best-effort,
     // since the new content is already the live file on a running system.
@@ -452,7 +760,7 @@ mod tests {
                 .expect("canonicalize real file")
                 .as_path()
         );
-        assert_eq!(snapshot.contents(), b"scheme = nord\n");
+        assert_eq!(snapshot.contents(), Some(&b"scheme = nord\n"[..]));
         // ...and the XDG path is still a symlink pointing at the same real file
         // (never replaced by a regular file).
         let link_meta = fs::symlink_metadata(&link).expect("lstat the link");
@@ -521,7 +829,7 @@ mod tests {
         fs::write(&target, b"original\n").expect("write original file");
         let resolved = fs::canonicalize(&target).expect("canonicalize target");
 
-        let result = atomic_write_with(&resolved, None, |_file| {
+        let result = atomic_write_with(&resolved, None, Persist::Replace, |_file| {
             Err(io::Error::other("injected write failure"))
         });
         assert!(
@@ -556,7 +864,7 @@ mod tests {
 
         let snapshot = write_atomic(&target, b"{\"n\":2}\n").expect("atomic write");
         assert_eq!(fs::read(&target).expect("read after write"), b"{\"n\":2}\n");
-        assert_eq!(snapshot.contents(), b"{\"n\":1}\n");
+        assert_eq!(snapshot.contents(), Some(&b"{\"n\":1}\n"[..]));
 
         snapshot.restore().expect("restore original contents");
         assert_eq!(
@@ -616,15 +924,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("temp dir should be creatable");
-        let target = dir.path().join("hyprland.conf");
-        fs::write(&target, b"env = XCURSOR_THEME,Nordic-cursors\n").expect("write file");
+        let target = dir.path().join("hypridle.conf");
+        fs::write(&target, b"general {\n}\n").expect("write file");
         fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
 
-        write_atomic(
-            &target,
-            b"env = XCURSOR_THEME,Nordic-cursors\nenv = XCURSOR_SIZE,16\n",
-        )
-        .expect("atomic write");
+        write_atomic(&target, b"general {\n    lock_cmd = hyprlock\n}\n").expect("atomic write");
 
         let mode = fs::metadata(&target)
             .expect("stat rewritten file")
@@ -658,5 +962,178 @@ mod tests {
             0,
             "nothing should have been created in the directory"
         );
+    }
+
+    #[test]
+    fn create_atomic_creates_the_file_and_its_missing_parents_and_restore_removes_them() {
+        // The XCursor fallback theme is created when absent (task 11.5, analysis
+        // §8.4): `~/.icons` may exist while `default/` does not. The file lands with
+        // the given bytes and a normal 0644 mode, the snapshot records "absent", and
+        // a rollback deletes the file plus exactly the directories it had to create
+        // — never the pre-existing `icons` directory.
+        let home = tempfile::tempdir().expect("temp dir should be creatable");
+        let icons = home.path().join(".icons");
+        fs::create_dir(&icons).expect("create the existing parent");
+        let target = icons.join("default").join("nested").join("index.theme");
+
+        let snapshot = create_atomic(&target, b"[Icon Theme]\n").expect("create the file");
+        assert_eq!(fs::read(&target).expect("read created"), b"[Icon Theme]\n");
+        assert_eq!(snapshot.contents(), None, "there were no original bytes");
+        assert_eq!(
+            snapshot.resolved_path(),
+            fs::canonicalize(&target).expect("canonicalize").as_path()
+        );
+        let mode = fs::metadata(&target)
+            .expect("stat created")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, NEW_FILE_MODE,
+            "a created config file is 0644, not 0600"
+        );
+        let created_dir = fs::symlink_metadata(icons.join("default")).expect("dir exists");
+        assert!(created_dir.is_dir() && !created_dir.file_type().is_symlink());
+
+        snapshot.restore().expect("roll the creation back");
+        assert!(!target.exists(), "the created file is removed");
+        assert!(
+            !icons.join("default").exists(),
+            "the directories the call created are removed"
+        );
+        assert!(icons.is_dir(), "the pre-existing parent is kept");
+        // Restoring twice is harmless: a file that is already gone counts as restored.
+        snapshot.restore().expect("a second restore is a no-op");
+    }
+
+    #[test]
+    fn create_atomic_refuses_an_existing_file_without_touching_it() {
+        // Creation is exclusive: a file that exists (for instance one another
+        // program created after the app looked) is never clobbered.
+        let dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let target = dir.path().join("index.theme");
+        fs::write(&target, b"theirs\n").expect("write the existing file");
+
+        let result = create_atomic(&target, b"ours\n");
+        assert!(
+            matches!(result, Err(WriteError::AlreadyExists { .. })),
+            "an existing target must be refused, got {result:?}"
+        );
+        assert_eq!(fs::read(&target).expect("read"), b"theirs\n");
+        assert_eq!(
+            fs::read_dir(dir.path()).expect("read dir").count(),
+            1,
+            "no temp file is left behind"
+        );
+    }
+
+    #[test]
+    fn create_atomic_never_replaces_a_dangling_symlink() {
+        // A deployed link whose repo target is missing is still a link the user (or
+        // setup.sh) made; replacing it with a plain file is exactly the breakage the
+        // symlink-following rule exists to prevent.
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let link = dir.path().join("index.theme");
+        symlink(dir.path().join("missing-target"), &link).expect("create a dangling link");
+
+        let result = create_atomic(&link, b"ours\n");
+        assert!(
+            matches!(result, Err(WriteError::AlreadyExists { .. })),
+            "a dangling symlink must be refused, got {result:?}"
+        );
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("the link is still there")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!dir.path().join("missing-target").exists());
+    }
+
+    #[test]
+    fn create_atomic_below_a_dangling_symlinked_parent_creates_nothing() {
+        // `~/.icons` is a deployment link whose target is missing. The directory walk
+        // stops at the link; creating `default/` below it follows the link and fails,
+        // so the call is a Write error that creates nothing and keeps the link.
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().expect("temp dir should be creatable");
+        let icons = home.path().join(".icons");
+        let missing = home.path().join("missing-icons-target");
+        symlink(&missing, &icons).expect("create a dangling parent link");
+        let target = icons.join("default").join("index.theme");
+
+        let result = create_atomic(&target, b"[Icon Theme]\n");
+        assert!(
+            matches!(result, Err(WriteError::Write { .. })),
+            "a dangling parent must fail the directory creation, got {result:?}"
+        );
+        assert!(
+            fs::symlink_metadata(&icons)
+                .expect("the link is still there")
+                .file_type()
+                .is_symlink(),
+            "the dangling link is preserved"
+        );
+        assert!(!missing.exists(), "the link target is not created");
+        let entries: Vec<_> = fs::read_dir(home.path())
+            .expect("read dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from(".icons")]);
+    }
+
+    #[test]
+    fn rollback_keeps_a_created_file_that_another_program_rewrote() {
+        // The rollback of a creation deletes the file only while it holds the bytes
+        // the app wrote. A file rewritten by someone else in between is theirs now.
+        let dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let target = dir.path().join("default").join("index.theme");
+
+        let snapshot = create_atomic(&target, b"ours\n").expect("create the file");
+        fs::write(&target, b"theirs\n").expect("an external rewrite");
+
+        snapshot.restore().expect("the rollback itself succeeds");
+        assert_eq!(
+            fs::read(&target).expect("the file survives"),
+            b"theirs\n",
+            "a file changed by another program is never deleted"
+        );
+        assert!(dir.path().join("default").is_dir());
+    }
+
+    #[test]
+    fn create_atomic_follows_a_symlinked_parent_directory() {
+        // A parent directory deployed as a symlink is followed like any other link:
+        // the new file is created in the directory it points to.
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let real = dir.path().join("real-default");
+        fs::create_dir(&real).expect("create the real directory");
+        let linked = dir.path().join("default");
+        symlink(&real, &linked).expect("link the parent directory");
+
+        let snapshot =
+            create_atomic(&linked.join("index.theme"), b"x\n").expect("create through the link");
+        assert_eq!(fs::read(real.join("index.theme")).expect("read"), b"x\n");
+        assert_eq!(
+            snapshot.resolved_path(),
+            fs::canonicalize(&real)
+                .expect("canonicalize")
+                .join("index.theme")
+        );
+        assert!(
+            fs::symlink_metadata(&linked)
+                .expect("the link is kept")
+                .file_type()
+                .is_symlink()
+        );
+
+        snapshot.restore().expect("roll back");
+        assert!(!real.join("index.theme").exists());
+        assert!(real.is_dir(), "a directory the call did not create is kept");
     }
 }

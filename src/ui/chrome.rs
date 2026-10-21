@@ -488,7 +488,7 @@ mod tests {
 
     use super::*;
     use crate::core::apply::{
-        self, ApplyPlan, FileWrite, InvalidSetting, WriteFailure, WriteFailureCause,
+        self, ApplyPlan, FileWrite, InvalidSetting, WriteFailure, WriteFailureCause, WriteMode,
         WriteValidation,
     };
     use crate::core::detect::{Binary, Capabilities};
@@ -653,6 +653,7 @@ mod tests {
                 changed_keys: vec!["kb_layout".to_string()],
                 backing: BackingFile::InputLua,
                 validation: WriteValidation::InPlan,
+                mode: WriteMode::Replace,
             }],
             palette: None,
             reload_params: ReloadParams::default(),
@@ -779,6 +780,7 @@ mod tests {
                 changed_keys: vec!["kb_layout".to_string()],
                 backing: BackingFile::InputLua,
                 validation: WriteValidation::InPlan,
+                mode: WriteMode::Replace,
             }],
             palette: None,
             reload_params: ReloadParams::default(),

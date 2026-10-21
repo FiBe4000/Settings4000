@@ -18,11 +18,11 @@
 //!   name may appear more than once (hypridle has three `listener { }` blocks).
 //!
 //! This module edits the hyprlang files the settings GUI manages:
-//! `hypridle.conf`, `hyprlock.conf`, `hyprpaper.conf`, and `hyprland.conf` (only
-//! the two cursor `env =` lines, until task 11.5 moves that write to
-//! `hyprland.lua`). Hyprland itself now runs its Lua config provider, so the
-//! Input page edits `input.lua` through
-//! [`crate::parsers::lua_literal`] instead (analysis §7.1, task 11.4).
+//! `hypridle.conf`, `hyprlock.conf` and `hyprpaper.conf`. Hyprland itself now
+//! runs its Lua config provider, so the Input page edits `input.lua` and the
+//! cursor write edits the two `hl.env` lines of `hyprland.lua` through
+//! [`crate::parsers::lua_literal`] instead (analysis §7.1, §8.6; tasks 11.4,
+//! 11.5).
 //!
 //! # Why a surgical, lossless parser (not a serializer)
 //!
@@ -600,9 +600,15 @@ impl HyprlangFile {
     /// changing only those bytes and leaving the field name and the rest of the
     /// line byte-identical.
     ///
-    /// This is how the cursor-env writer edits `hyprland.conf`'s
-    /// `env = XCURSOR_THEME,…` / `env = XCURSOR_SIZE,…` lines (task 6.4) without
-    /// disturbing sibling `env` lines, `source` lines, or comments.
+    /// For example, `set_repeatable_field_value("env", "XCURSOR_THEME", "Bibata")`
+    /// rewrites `env = XCURSOR_THEME,Nordic-cursors` to `env = XCURSOR_THEME,Bibata`
+    /// without disturbing sibling `env` lines, `source` lines, or comments. (The
+    /// cursor write used exactly that on Hyprland's former hyprlang main config until
+    /// task 11.5 moved it to `hyprland.lua`; none of the three hyprlang files the app
+    /// still edits has repeatable keys as the dotfiles currently write them
+    /// (hyprpaper's grammar does allow repeated `preload =`/`wallpaper =`), so this
+    /// is general parser capability per architecture §3 rather than a path the app
+    /// currently takes.)
     ///
     /// If several entries share the key *and* the first field, the **first** of
     /// them is rewritten (matching what
@@ -1246,10 +1252,11 @@ wallpaper {
 splash = false
 ";
 
-    /// An excerpt of `hyprland.conf`: `source =` directives, the two cursor
-    /// `env =` lines (repeatable top-level keys), a commented-out decoy `env`
-    /// line, a commented-out `exec-once`, and a real `exec-once`.
-    const HYPRLAND_ENV: &str = "\
+    /// A hyprlang file with repeatable top-level keys, shaped like Hyprland's former
+    /// hyprlang main config: `source =` directives, two `env =` lines, a
+    /// commented-out decoy `env` line, a commented-out `exec-once`, and a real
+    /// `exec-once`.
+    const REPEATABLE_KEYS: &str = "\
 # Hyprland main config (excerpt)
 source = ~/.config/hypr/colors.conf
 source = ~/.config/hypr/monitors.conf
@@ -1296,12 +1303,12 @@ outer {
 }
 ";
 
-    /// A live-shaped `hyprland.conf` excerpt exercising the broadened key rule:
+    /// A Hyprland-shaped hyprlang excerpt exercising the broadened key rule:
     /// `$variable` declarations, a `general { }` block with dotted keys
     /// (`col.active_border`), a nested `decoration { blur { } }` block with an
     /// inline comment, the cursor `env =` lines, and a `bind =` line. None of
     /// these may be misclassified as malformed.
-    const HYPRLAND_CONF: &str = "\
+    const DOTTED_AND_VARIABLE_KEYS: &str = "\
 # Hyprland config (excerpt)
 source = ~/.config/hypr/colors.conf
 
@@ -1339,8 +1346,8 @@ bind = $mainMod, Return, exec, $terminal
             ("nested block", NESTED_BLOCK),
             ("hypridle.conf", HYPRIDLE_CONF),
             ("hyprpaper.conf", HYPRPAPER_CONF),
-            ("hyprland.conf env", HYPRLAND_ENV),
-            ("hyprland.conf", HYPRLAND_CONF),
+            ("repeatable keys", REPEATABLE_KEYS),
+            ("dotted and variable keys", DOTTED_AND_VARIABLE_KEYS),
             ("hyprlock.conf", HYPRLOCK_CONF),
             ("nested duplicate", NESTED_DUPLICATE),
         ]
@@ -1463,7 +1470,7 @@ bind = $mainMod, Return, exec, $terminal
         // Repeatable-key fixture: editing `env:XCURSOR_THEME` changes only that
         // line's value portion, leaving the other `env` line, the `source` lines,
         // and the commented-out decoy byte-identical.
-        let (mut file, _) = HyprlangFile::parse(HYPRLAND_ENV);
+        let (mut file, _) = HyprlangFile::parse(REPEATABLE_KEYS);
         assert_eq!(
             file.repeatable_field_value("env", "XCURSOR_THEME"),
             Some("Nordic-cursors")
@@ -1477,8 +1484,8 @@ bind = $mainMod, Return, exec, $terminal
             .expect("matched env line");
         let edited = file.emit();
 
-        let changed = differing_lines(HYPRLAND_ENV, &edited);
-        let target = HYPRLAND_ENV
+        let changed = differing_lines(REPEATABLE_KEYS, &edited);
+        let target = REPEATABLE_KEYS
             .lines()
             .position(|l| l == "env = XCURSOR_THEME,Nordic-cursors")
             .expect("fixture contains the cursor-theme env line");
@@ -1502,7 +1509,7 @@ bind = $mainMod, Return, exec, $terminal
         // A commented-out `#exec-once=...` must not be read as the value of the
         // real `exec-once`, and a commented-out `#env = ...` must not be matched
         // by the repeatable-field selector.
-        let (file, _) = HyprlangFile::parse(HYPRLAND_ENV);
+        let (file, _) = HyprlangFile::parse(REPEATABLE_KEYS);
         assert_eq!(
             file.value(&KeyPath::top_level("exec-once")),
             Some("hyprpaper"),
@@ -1659,17 +1666,17 @@ bind = $mainMod, Return, exec, $terminal
             "no rejected edit changed the file"
         );
 
-        let (mut env, _) = HyprlangFile::parse(HYPRLAND_ENV);
+        let (mut env, _) = HyprlangFile::parse(REPEATABLE_KEYS);
         assert_eq!(
             env.set_repeatable_field_value("env", "XCURSOR_THEME", "a#b"),
             Err(EditError::InvalidValue("a#b".to_string()))
         );
-        assert_eq!(env.emit(), HYPRLAND_ENV);
+        assert_eq!(env.emit(), REPEATABLE_KEYS);
     }
 
     #[test]
     fn repeatable_edit_reports_a_missing_target() {
-        let (mut file, _) = HyprlangFile::parse(HYPRLAND_ENV);
+        let (mut file, _) = HyprlangFile::parse(REPEATABLE_KEYS);
         assert_eq!(
             file.set_repeatable_field_value("env", "GDK_BACKEND", "wayland"),
             Err(EditError::RepeatableKeyNotFound {
@@ -1677,7 +1684,7 @@ bind = $mainMod, Return, exec, $terminal
                 field: "GDK_BACKEND".to_string(),
             })
         );
-        assert_eq!(file.emit(), HYPRLAND_ENV);
+        assert_eq!(file.emit(), REPEATABLE_KEYS);
     }
 
     #[test]
@@ -1975,15 +1982,15 @@ bind = $mainMod, Return, exec, $terminal
     }
 
     #[test]
-    fn live_hyprland_conf_classifies_dotted_and_variable_keys_as_entries() {
+    fn dotted_and_variable_keys_classify_as_entries() {
         // Real hyprland lines must not misfire as malformed. Round-trip is
         // byte-identical, there are zero parse warnings, and dotted keys and
         // `$variable` declarations are addressable ordinary entries.
-        let (file, warnings) = HyprlangFile::parse(HYPRLAND_CONF);
-        assert_eq!(file.emit(), HYPRLAND_CONF);
+        let (file, warnings) = HyprlangFile::parse(DOTTED_AND_VARIABLE_KEYS);
+        assert_eq!(file.emit(), DOTTED_AND_VARIABLE_KEYS);
         assert!(
             warnings.is_empty(),
-            "a live hyprland.conf must yield no warnings, got {warnings:?}"
+            "a Hyprland-shaped hyprlang file must yield no warnings, got {warnings:?}"
         );
         assert_eq!(
             file.value(&KeyPath::top_level("$mainMod")),

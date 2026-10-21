@@ -2,22 +2,24 @@
 //! R3.4, R4.2, R4.4) — see [`super`] for how the page's three models fit together.
 //!
 //! Unlike the palette, these controls *do* edit files: a change is written identically to
-//! every place the value is duplicated (both GTK `settings.ini` files, and — for the
-//! cursor — `hyprland.conf`'s `env` lines and `uwsm/env`) and applied live with
-//! `gsettings set` + `hyprctl setcursor` (R3.3/R3.4, analysis §6.2). The model handles
-//! the `GTK_THEME` override (never fight it, R3.3) and gates the live-restyle claim on
-//! the settings portal (R2.2). [`ThemesModel`]'s own docs carry the rest.
+//! every place the value is duplicated and applied live with `gsettings set` +
+//! `hyprctl setcursor` (R3.3/R3.4). The GTK and icon themes live in both GTK
+//! `settings.ini` files; the cursor theme and size additionally in `uwsm/env`, in the two
+//! `hl.env("XCURSOR_THEME", …)` / `hl.env("XCURSOR_SIZE", …)` lines of Hyprland's Lua
+//! config `hyprland.lua`, and (the theme only) in the XCursor fallback theme
+//! `~/.icons/default/index.theme` (analysis §7.7, §8.4). The model handles the
+//! `GTK_THEME` override (never fight it, R3.3), gates the live-restyle claim on the
+//! settings portal (R2.2), and reports cursor copies that disagree with each other.
+//! [`ThemesModel`]'s own docs carry the rest.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use crate::core::apply::{FileWrite, WriteValidation};
+use crate::core::apply::{FileWrite, WriteMode, WriteValidation};
 use crate::core::reload::{BackingFile, CursorValue, ReloadParams};
 use crate::parsers::env::{EnvFile, GtkThemeOverride};
-// Aliased because each parser module has its own `EditError`; only hyprlang's variants are
-// matched here (to tell an *absent* config line from one that refused the value).
-use crate::parsers::hyprlang::{EditError as HyprlangEditError, HyprlangFile};
 use crate::parsers::ini::IniFile;
+use crate::parsers::lua_literal::{LuaConfigFile, LuaEditError};
 
 use super::{BackingSet, BackingText, Selection};
 
@@ -31,13 +33,26 @@ const KEY_ICON_THEME: &str = "gtk-icon-theme-name";
 const KEY_CURSOR_THEME: &str = "gtk-cursor-theme-name";
 /// `settings.ini` key naming the cursor size (R3.4).
 const KEY_CURSOR_SIZE: &str = "gtk-cursor-theme-size";
-/// `uwsm/env` and `hyprland.conf` variable naming the cursor theme (analysis §6.2).
+/// Environment variable naming the cursor theme, exported by `uwsm/env` and declared by
+/// `hyprland.lua`'s `hl.env` call of the same name (analysis §7.7).
 const ENV_CURSOR_THEME: &str = "XCURSOR_THEME";
-/// `uwsm/env` and `hyprland.conf` variable naming the cursor size (analysis §6.2).
+/// Environment variable naming the cursor size, exported by `uwsm/env` and declared by
+/// `hyprland.lua`'s `hl.env` call of the same name (analysis §7.7). In Lua the size is a
+/// string argument like every `hl.env` value (`hl.env("XCURSOR_SIZE", "24")`).
 const ENV_CURSOR_SIZE: &str = "XCURSOR_SIZE";
-/// The repeatable top-level key in `hyprland.conf` that carries the cursor env lines
-/// (`env = XCURSOR_THEME,…`), addressed by the hyprlang repeatable-field writer.
-const HYPR_ENV_KEY: &str = "env";
+/// The key-file group of an icon theme's `index.theme`, which holds the XCursor
+/// fallback's `Inherits=` (analysis §8.4).
+const ICON_THEME_GROUP: &str = "Icon Theme";
+/// The `index.theme` key that names the theme the `default` cursor theme inherits its
+/// cursors from — i.e. the cursor theme programs ignoring `XCURSOR_THEME` fall back to.
+/// The XCursor format allows a comma-separated list here; the app writes the single
+/// chosen theme, which is what the dotfiles ship.
+const KEY_INHERITS: &str = "Inherits";
+/// The `index.theme` the app creates when `~/.icons/default/index.theme` is absent,
+/// before the chosen theme is set as its `Inherits=`: the `[Icon Theme]` group with the
+/// two descriptive keys the dotfiles' tracked copy carries (analysis §8.4), so a created
+/// file is byte-identical to the one `setup.sh` would deploy for the same theme.
+const CURSOR_FALLBACK_TEMPLATE: &str = "[Icon Theme]\nName=Default\nComment=Default Cursor Theme\n";
 
 /// Cursor pixel sizes offered in the cursor-size drop-down, in ascending order. The
 /// currently-configured size is added too (see [`ThemesModel::load`]) so an unusual
@@ -103,28 +118,74 @@ pub struct ThemeRoots {
     pub icon_dirs: Vec<PathBuf>,
 }
 
-/// The live XDG paths of the four config files a theme/cursor change writes (R8.5).
+/// The live paths of the files a theme/cursor change writes (R8.5).
 ///
 /// Injected for the same reason as [`ThemeRoots`]: tests point them at a fixture tree,
 /// and the writer follows symlinks so a dotfiles-deployed file is handled identically
-/// to a plain one. The cursor is duplicated across all four; a GTK/icon theme change
-/// touches only the two `settings.ini` files (analysis §6.2, R3.4). The Hyprland-side
-/// copy is optional because it is guarded by the Hyprland config provider (task 11.2,
-/// analysis §8.6): the startup loader leaves it `None` unless the compositor runs its
-/// Lua provider, and then no Hyprland-side cursor write exists at all.
+/// to a plain one. The cursor is duplicated across all five; a GTK/icon theme change
+/// touches only the two `settings.ini` files (R3.4, analysis §7.7, §8.4). Two copies are
+/// optional:
+///
+/// - the Hyprland-side copy is guarded by the Hyprland config provider (task 11.2,
+///   analysis §8.6): the startup loader leaves it `None` unless the compositor runs its
+///   Lua provider, and then no Hyprland-side cursor write exists at all — the app keeps
+///   no hyprlang cursor path;
+/// - the XCursor fallback theme lives under `$HOME`, not the XDG config directory, so it
+///   is `None` only when the home directory is unknown (the app then never guesses a
+///   relative path to create a file at).
 #[derive(Clone, Debug)]
 pub struct ThemesPaths {
     /// `~/.config/gtk-3.0/settings.ini`.
     pub gtk3_settings: PathBuf,
     /// `~/.config/gtk-4.0/settings.ini`.
     pub gtk4_settings: PathBuf,
-    /// `~/.config/hypr/hyprland.conf` (only its cursor `env =` lines are edited), or
-    /// `None` when the Hyprland-side cursor write is hidden because the compositor does
-    /// not run its Lua config provider (task 11.2). Task 11.5 retargets this copy to
-    /// the two `hl.env` lines of `hyprland.lua` behind the same guard.
-    pub hyprland_conf: Option<PathBuf>,
+    /// `~/.config/hypr/hyprland.lua`, of which only the two cursor `hl.env` lines are
+    /// ever edited, or `None` when the Hyprland-side cursor write is hidden because the
+    /// compositor does not run its Lua config provider (task 11.2).
+    pub hyprland_lua: Option<PathBuf>,
     /// `~/.config/uwsm/env` (the canonical cursor env copy).
     pub uwsm_env: PathBuf,
+    /// `~/.icons/default/index.theme`, the XCursor fallback theme (`Inherits=` under
+    /// `[Icon Theme]`, analysis §8.4) — created by the cursor write when absent — or
+    /// `None` when the home directory is unknown.
+    pub cursor_fallback_theme: Option<PathBuf>,
+}
+
+/// One of the places the cursor theme and size are duplicated (R3.4), named so the
+/// Theme page can say *which* copies disagree with the value it shows (see
+/// [`ThemesModel::disagreeing_cursor_copies`]).
+///
+/// The copies are expected to hold the identical value — the app writes every one of
+/// them on each cursor change — but other tools (an old `nwg-look` run, a hand edit, a
+/// fresh checkout of the dotfiles) can leave them out of step, and since different
+/// programs read different copies the result is a cursor that changes depending on
+/// which program it hovers over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorCopy {
+    /// `gtk-cursor-theme-name`/`-size` in `~/.config/gtk-3.0/settings.ini`.
+    Gtk3Settings,
+    /// `gtk-cursor-theme-name`/`-size` in `~/.config/gtk-4.0/settings.ini`.
+    Gtk4Settings,
+    /// `XCURSOR_THEME`/`XCURSOR_SIZE` in `~/.config/uwsm/env`.
+    UwsmEnv,
+    /// The two `hl.env` cursor lines in `~/.config/hypr/hyprland.lua`.
+    HyprlandLua,
+    /// `Inherits=` in `~/.icons/default/index.theme` (the theme only; the file has no
+    /// size).
+    CursorFallbackTheme,
+}
+
+impl CursorCopy {
+    /// The short, user-facing name of the copy, as the Theme page lists it.
+    pub fn label(self) -> &'static str {
+        match self {
+            CursorCopy::Gtk3Settings => "gtk-3.0/settings.ini",
+            CursorCopy::Gtk4Settings => "gtk-4.0/settings.ini",
+            CursorCopy::UwsmEnv => "uwsm/env",
+            CursorCopy::HyprlandLua => "hyprland.lua",
+            CursorCopy::CursorFallbackTheme => "~/.icons/default/index.theme",
+        }
+    }
 }
 
 /// Where an active `GTK_THEME` override was found, so the UI can name it in the banner
@@ -178,9 +239,10 @@ enum ThemeValue {
     GtkTheme,
     /// The icon theme name (`settings.ini` only).
     IconTheme,
-    /// The cursor theme name (duplicated across four files, R3.4).
+    /// The cursor theme name (duplicated across five files, R3.4).
     CursorTheme,
-    /// The cursor size in pixels (duplicated across four files, R3.4).
+    /// The cursor size in pixels (duplicated across four files, R3.4 — the XCursor
+    /// fallback theme carries no size).
     CursorSize,
 }
 
@@ -241,18 +303,20 @@ impl ThemeValueFlags {
 /// The two flag sets distinguish the two ways a copy can be skipped, which need opposite
 /// treatment:
 ///
-/// - **absent copy** — the file simply does not carry this value (the only real case is a
-///   `hyprland.conf` without an `env = XCURSOR_*` line: the hyprlang repeatable-key
-///   writer edits such lines but never *appends* one, see
-///   [`ThemesModel::render_hyprland_env`]). Nothing on disk then disagrees with the value,
-///   so this must not block promotion — otherwise the cursor would stay dirty forever on
-///   such a host, with every later Apply pointlessly rewriting the other three copies.
-/// - **refused copy** — the file carries the value but the writer would not put the new
-///   one there (e.g. hyprlang rejects a `#`, which it would otherwise read as the start of
-///   an inline comment, while the `settings.ini` and `uwsm/env` writers accept it). This
-///   *does* block promotion: the copies on disk now genuinely differ, and R3.4 requires
-///   every copy to hold the identical value, so the page must stay dirty rather than look
-///   applied while one copy lags behind.
+/// - **absent copy** — the file simply does not carry this value (the real case is a
+///   `hyprland.lua` without an `hl.env("XCURSOR_*", …)` line: the Lua editor rewrites
+///   such calls but never *adds* one, since that file is code the app does not author,
+///   see [`ThemesModel::render_hyprland_lua`]). Nothing on disk then disagrees with the
+///   value, so this must not block promotion — otherwise the cursor would stay dirty
+///   forever on such a host, with every later Apply pointlessly rewriting the other
+///   copies.
+/// - **refused copy** — the file carries (or may carry) the value but the writer would
+///   not put the new one there (e.g. the Lua writer rejects a `"` or `\`, which would
+///   end or escape the string literal, while the `settings.ini` and `uwsm/env` writers
+///   accept them; or `hyprland.lua`'s structure cannot be followed, so its lines cannot
+///   be located safely). This *does* block promotion: the copies on disk now differ, or
+///   may, and R3.4 requires every copy to hold the identical value, so the page must stay
+///   dirty rather than look applied while one copy lags behind.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ThemeRenderRecord {
     /// Values that reached at least one of the files carrying them.
@@ -295,10 +359,19 @@ pub struct ThemesModel {
     cursor_theme: Selection,
     /// The cursor size drop-down (values held as strings; parsed when written).
     cursor_size: Selection,
-    /// The four backing config files this model edits, with their freshness baseline
+    /// The backing config files this model edits, with their freshness baseline
     /// (R5.6). Reached through the per-file accessors [`Self::gtk3`], [`Self::gtk4`],
-    /// [`Self::hyprland`], and [`Self::uwsm`], which document what each one is for.
+    /// [`Self::hyprland_lua`], [`Self::uwsm`] and [`Self::cursor_fallback`], which
+    /// document what each one is for.
     backing: BackingSet,
+    /// Whether `~/.icons/default/index.theme` did not exist at load (not merely
+    /// unreadable), so a cursor theme change *creates* it instead of skipping that copy
+    /// (analysis §8.4). Kept separately from [`Self::backing`], which only holds files
+    /// that could be read, so the freshness check can also notice the file appearing
+    /// before the Apply (see [`Self::check_conflict`]). It stays `true` after a
+    /// committed creation; that is harmless, because the commit adds the created file
+    /// to [`Self::backing`], and every use checks that entry first.
+    cursor_fallback_absent: bool,
     /// The active `GTK_THEME` override (app environment preferred over `uwsm/env`), or
     /// `None`. When `Some`, the GTK-theme drop-down is disabled and a banner shown
     /// (R3.3).
@@ -320,10 +393,10 @@ pub struct ThemesModel {
 /// [`ApplyPlan`](crate::core::apply::ApplyPlan): the file writes plus the reload
 /// parameters (task 6.4).
 ///
-/// A cursor change contributes writes for *all four* files carrying the value (both
-/// `settings.ini`, `hyprland.conf`, `uwsm/env`) with the identical value, so they
-/// never desync (R3.4); a GTK/icon theme change contributes only the two `settings.ini`
-/// writes. The reload parameters carry only the values that changed, so the reload
+/// A cursor change contributes writes for *every* file carrying the value (both
+/// `settings.ini`, `uwsm/env`, the `hl.env` lines of `hyprland.lua`, and — for the theme
+/// — `~/.icons/default/index.theme`) with the identical value, so they never desync
+/// (R3.4); a GTK/icon theme change contributes only the two `settings.ini` writes. The reload parameters carry only the values that changed, so the reload
 /// table (task 4.4) emits `gsettings set` / `hyprctl setcursor` only for those.
 pub struct ThemesApply {
     /// The atomic writes, one per changed backing file.
@@ -343,8 +416,16 @@ impl ThemesModel {
     /// (`std::env::var("GTK_THEME").ok()`), the copy that overrides *this* app's theme.
     /// Nothing here fails: an unreadable config simply yields no backing text for that
     /// file (its controls degrade — a settings.ini that cannot be read hides the theme
-    /// rows via [`Self::themes_editable`], R4.4), and the current values are read from
-    /// whichever `settings.ini` is present (with the cursor falling back to `uwsm/env`).
+    /// rows via [`Self::themes_editable`], R4.4). The current values are read from
+    /// whichever `settings.ini` is present; the cursor theme and size fall back, in
+    /// order, to `uwsm/env`, to `hyprland.lua`'s `hl.env` lines, and (the theme only) to
+    /// the XCursor fallback theme's `Inherits=`. A `hyprland.lua` without those lines, or
+    /// one whose structure the Lua editor cannot follow, simply contributes no value.
+    /// The order deliberately starts at `settings.ini`, not at the canonical `uwsm/env`:
+    /// `settings.ini` is what GTK (and so this app) actually reads, it is the file whose
+    /// absence hides the theme rows ([`Self::themes_editable`]), and any difference
+    /// from the canonical copy is surfaced by [`Self::disagreeing_cursor_copies`] — so
+    /// do not reorder this to read `uwsm/env` first.
     pub fn load(
         roots: &ThemeRoots,
         paths: ThemesPaths,
@@ -354,38 +435,41 @@ impl ThemesModel {
         let backing_paths: Vec<&Path> = [
             Some(paths.gtk3_settings.as_path()),
             Some(paths.gtk4_settings.as_path()),
-            paths.hyprland_conf.as_deref(),
+            paths.hyprland_lua.as_deref(),
             Some(paths.uwsm_env.as_path()),
+            paths.cursor_fallback_theme.as_deref(),
         ]
         .into_iter()
         .flatten()
         .collect();
         let backing = BackingSet::load(&backing_paths);
+        let cursor_fallback_absent = paths
+            .cursor_fallback_theme
+            .as_deref()
+            .is_some_and(|path| backing.get(path).is_none() && is_absent(path));
 
         // Read current values from whichever settings.ini is present (prefer gtk-3.0),
-        // since both carry the same keys. The cursor theme/size fall back to uwsm/env's
-        // XCURSOR_* when settings.ini did not set them.
-        let settings_ini = backing
-            .get(&paths.gtk3_settings)
-            .or_else(|| backing.get(&paths.gtk4_settings))
-            .map(|backing| IniFile::parse(&backing.text).0);
-        let uwsm_file = backing
-            .get(&paths.uwsm_env)
-            .map(|backing| EnvFile::parse(&backing.text).0);
+        // since both carry the same keys. The cursor theme/size fall back to the other
+        // copies when settings.ini did not set them (see the method docs).
+        let copies = CursorCopies::read(&backing, &paths);
+        let settings_ini = copies.gtk3.as_ref().or(copies.gtk4.as_ref());
 
-        let current_gtk = settings_value(&settings_ini, KEY_GTK_THEME);
-        let current_icon = settings_value(&settings_ini, KEY_ICON_THEME);
-        let current_cursor = settings_value(&settings_ini, KEY_CURSOR_THEME)
-            .or_else(|| env_value(&uwsm_file, ENV_CURSOR_THEME));
-        let current_size = settings_value(&settings_ini, KEY_CURSOR_SIZE)
-            .or_else(|| env_value(&uwsm_file, ENV_CURSOR_SIZE));
+        let current_gtk = settings_value(settings_ini, KEY_GTK_THEME);
+        let current_icon = settings_value(settings_ini, KEY_ICON_THEME);
+        let current_cursor = settings_value(settings_ini, KEY_CURSOR_THEME)
+            .or_else(|| env_value(copies.uwsm.as_ref(), ENV_CURSOR_THEME))
+            .or_else(|| lua_env_value(copies.hyprland_lua.as_ref(), ENV_CURSOR_THEME))
+            .or_else(|| fallback_inherits(copies.cursor_fallback.as_ref()));
+        let current_size = settings_value(settings_ini, KEY_CURSOR_SIZE)
+            .or_else(|| env_value(copies.uwsm.as_ref(), ENV_CURSOR_SIZE))
+            .or_else(|| lua_env_value(copies.hyprland_lua.as_ref(), ENV_CURSOR_SIZE));
 
         let gtk_themes = discover_gtk_themes(&roots.gtk_theme_dirs);
         let (icon_themes, cursor_themes) = discover_icon_and_cursor_themes(&roots.icon_dirs);
 
         // The app's own environment takes precedence: a GTK_THEME in it overrides this
         // very app, regardless of what uwsm/env says (R3.3).
-        let uwsm_override = uwsm_file.as_ref().map(EnvFile::gtk_theme_override);
+        let uwsm_override = copies.uwsm.as_ref().map(EnvFile::gtk_theme_override);
         let gtk_override = resolve_gtk_override(app_env_gtk_theme.clone(), uwsm_override.as_ref());
 
         let curated_sizes: Vec<String> = CURATED_CURSOR_SIZES
@@ -408,6 +492,7 @@ impl ThemesModel {
             cursor_theme: Selection::new(cursor_themes, current_cursor),
             cursor_size: Selection::new(curated_sizes, current_size),
             backing,
+            cursor_fallback_absent,
             gtk_override,
             live_restyle: settings_portal_available,
             roots: roots.clone(),
@@ -426,12 +511,22 @@ impl ThemesModel {
         self.backing.get(&self.paths.gtk4_settings)
     }
 
-    /// `hyprland.conf`'s current text, or `None` when it was unreadable or the
-    /// Hyprland-side cursor write is guarded off (task 11.2) — only its cursor `env =`
-    /// lines are edited.
-    fn hyprland(&self) -> Option<&BackingText> {
+    /// `hyprland.lua`'s current text, or `None` when it was unreadable or the
+    /// Hyprland-side cursor write is guarded off (task 11.2) — only its two cursor
+    /// `hl.env` lines are ever edited.
+    fn hyprland_lua(&self) -> Option<&BackingText> {
         self.paths
-            .hyprland_conf
+            .hyprland_lua
+            .as_deref()
+            .and_then(|path| self.backing.get(path))
+    }
+
+    /// `~/.icons/default/index.theme`'s current text, or `None` when it was absent,
+    /// unreadable, or the home directory is unknown — see
+    /// [`Self::cursor_fallback_absent`] for the case in which the file is created.
+    fn cursor_fallback(&self) -> Option<&BackingText> {
+        self.paths
+            .cursor_fallback_theme
             .as_deref()
             .and_then(|path| self.backing.get(path))
     }
@@ -558,11 +653,139 @@ impl ThemesModel {
         self.cursor_size.reset();
     }
 
-    /// Whether any of the four backing files changed on disk since it was loaded, so a
+    /// Whether any of the backing files changed on disk since it was loaded, so a
     /// dirty theme change must be reloaded instead of written (R5.6) — see
     /// [`BackingSet::check_conflict`] for the discipline this is part of.
+    ///
+    /// The one file the model may *create*, `~/.icons/default/index.theme`, is checked
+    /// too: if it was absent at load and something now exists at its path, another
+    /// program created it, and the staged creation was rendered from a state that no
+    /// longer holds. (The writer's exclusive create would refuse it anyway; reporting it
+    /// here turns that into the ordinary "reload and retry" conflict instead of a failed
+    /// Apply.)
     pub fn check_conflict(&self) -> bool {
-        self.backing.check_conflict()
+        self.backing.check_conflict() || self.cursor_fallback_appeared()
+    }
+
+    /// Whether `~/.icons/default/index.theme` was absent at load but not any more, and
+    /// the model has not created it itself (a committed creation puts it in
+    /// [`Self::backing`]). Logged at `warn` like every other conflict.
+    fn cursor_fallback_appeared(&self) -> bool {
+        if !self.cursor_fallback_absent || self.cursor_fallback().is_some() {
+            return false;
+        }
+        let Some(path) = self.paths.cursor_fallback_theme.as_deref() else {
+            return false;
+        };
+        let appeared = !is_absent(path);
+        if appeared {
+            tracing::warn!(
+                path = %path.display(),
+                "the XCursor fallback theme was created by another program since it was \
+                 found absent; the staged creation is not written over it (R5.6)"
+            );
+        }
+        appeared
+    }
+
+    /// The cursor copies whose on-disk value differs from the one the Theme page shows,
+    /// in a fixed order (R3.4).
+    ///
+    /// The value shown is the one [`Self::load`] reads first (`settings.ini`, then the
+    /// fallbacks listed there), so a copy is listed when it sets the cursor theme or
+    /// size to something else. A copy that does not carry the value at all (an
+    /// unreadable file, a missing key, a `hyprland.lua` without the `hl.env` lines or
+    /// whose structure the Lua editor cannot follow, an absent `index.theme`) is not a
+    /// disagreement: the next cursor Apply writes or creates every copy that can carry
+    /// the value. The comparison uses the on-disk state, not staged edits, and is
+    /// re-derived on each call, so after a committed Apply it reflects what was written.
+    pub fn disagreeing_cursor_copies(&self) -> Vec<CursorCopy> {
+        let copies = CursorCopies::read(&self.backing, &self.paths);
+        let shown_theme = self.cursor_theme.value.original.as_deref();
+        let shown_size = self.cursor_size.value.original.as_deref();
+        let differs = |copy: Option<String>, shown: Option<&str>| match (copy, shown) {
+            (Some(copy), Some(shown)) => copy != shown,
+            _ => false,
+        };
+        let candidates = [
+            (
+                CursorCopy::Gtk3Settings,
+                settings_value(copies.gtk3.as_ref(), KEY_CURSOR_THEME),
+                settings_value(copies.gtk3.as_ref(), KEY_CURSOR_SIZE),
+            ),
+            (
+                CursorCopy::Gtk4Settings,
+                settings_value(copies.gtk4.as_ref(), KEY_CURSOR_THEME),
+                settings_value(copies.gtk4.as_ref(), KEY_CURSOR_SIZE),
+            ),
+            (
+                CursorCopy::UwsmEnv,
+                env_value(copies.uwsm.as_ref(), ENV_CURSOR_THEME),
+                env_value(copies.uwsm.as_ref(), ENV_CURSOR_SIZE),
+            ),
+            (
+                CursorCopy::HyprlandLua,
+                lua_env_value(copies.hyprland_lua.as_ref(), ENV_CURSOR_THEME),
+                lua_env_value(copies.hyprland_lua.as_ref(), ENV_CURSOR_SIZE),
+            ),
+            (
+                CursorCopy::CursorFallbackTheme,
+                fallback_inherits(copies.cursor_fallback.as_ref()),
+                None,
+            ),
+        ];
+        candidates
+            .into_iter()
+            .filter(|(_, theme, size)| {
+                differs(theme.clone(), shown_theme) || differs(size.clone(), shown_size)
+            })
+            .map(|(copy, _, _)| copy)
+            .collect()
+    }
+
+    /// The note the Theme page shows when cursor copies disagree (see
+    /// [`Self::disagreeing_cursor_copies`]), or `None` when they all agree.
+    pub fn cursor_mismatch_note(&self) -> Option<String> {
+        let copies = self.disagreeing_cursor_copies();
+        if copies.is_empty() {
+            return None;
+        }
+        let names: Vec<&str> = copies.into_iter().map(CursorCopy::label).collect();
+        Some(format!(
+            "The cursor is set differently in {}. Applying a cursor change writes the same \
+             theme and size to every copy.",
+            names.join(", ")
+        ))
+    }
+
+    /// The note the Theme page shows under the cursor controls about the session
+    /// environment copies, or `None` when the model writes none of them.
+    ///
+    /// `uwsm/env` and `hyprland.lua`'s `hl.env` lines set `XCURSOR_THEME`/`XCURSOR_SIZE`
+    /// for the session, and both are read when the session starts (uwsm exports the
+    /// first, Hyprland runs the second at startup), so programs already running — and the
+    /// session environment new programs inherit — keep the old values until the next
+    /// login (architecture §6, analysis §7.7). The cursor itself changes immediately:
+    /// `hyprctl setcursor` and `gsettings` apply it live. The note names only the copies
+    /// this model actually writes (on a hyprlang host there is no `hyprland.lua` copy).
+    pub fn cursor_login_note(&self) -> Option<String> {
+        let env_copies: Vec<&str> = [
+            self.uwsm().map(|_| "uwsm/env"),
+            self.hyprland_lua()
+                .map(|_| "the hl.env lines of hyprland.lua"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let copies = match env_copies.as_slice() {
+            [] => return None,
+            [one] => format!("copy ({one}) takes"),
+            many => format!("copies ({}) take", many.join(" and ")),
+        };
+        Some(format!(
+            "A cursor change shows immediately; its session environment {copies} effect \
+             at the next login."
+        ))
     }
 
     /// Re-reads the backing files and re-discovers themes, returning a fresh model with
@@ -585,8 +808,9 @@ impl ThemesModel {
     ///
     /// Renders each changed value into the files that carry it through the surgical
     /// parsers (§3) and collects the reload parameters. A cursor change produces writes
-    /// for both `settings.ini` files, `hyprland.conf`, and `uwsm/env` with the
-    /// **identical** value (R3.4); a GTK/icon theme change produces only the two
+    /// for both `settings.ini` files, `uwsm/env`, `hyprland.lua` (its two `hl.env`
+    /// lines) and — when the theme changed — `~/.icons/default/index.theme`, all with
+    /// the **identical** value (R3.4); a GTK/icon theme change produces only the two
     /// `settings.ini` writes.
     pub fn apply_contribution(&self) -> Option<ThemesApply> {
         if !self.is_dirty() {
@@ -663,11 +887,12 @@ impl ThemesModel {
             }
         }
 
-        // The cursor is additionally duplicated in hyprland.conf's env lines and
-        // uwsm/env; write the identical value there whenever the cursor changed (R3.4).
+        // The cursor is additionally duplicated in hyprland.lua's hl.env lines,
+        // uwsm/env and the XCursor fallback theme; write the identical value there
+        // whenever the cursor changed (R3.4).
         if cursor_changed {
-            if let Some(backing) = self.hyprland() {
-                let (write, file_record) = self.render_hyprland_env(backing);
+            if let Some(backing) = self.hyprland_lua() {
+                let (write, file_record) = self.render_hyprland_lua(backing);
                 record.merge(file_record);
                 writes.extend(write);
             }
@@ -676,6 +901,9 @@ impl ThemesModel {
                 record.merge(file_record);
                 writes.extend(write);
             }
+            let (write, file_record) = self.render_cursor_fallback();
+            record.merge(file_record);
+            writes.extend(write);
         }
 
         (writes, record)
@@ -690,8 +918,8 @@ impl ThemesModel {
     /// carries the key, never an absent copy — the INI writer appends the key, and even
     /// the `[Settings]` group, when it is missing — so it blocks promotion. (In practice a
     /// value the INI writer rejects, i.e. one containing a newline, is rejected by the env
-    /// and hyprlang writers too, so nothing is written anywhere; the flag is what keeps
-    /// that conclusion from depending on the three writers agreeing.)
+    /// and Lua writers too, so nothing is written anywhere; the flag is what keeps
+    /// that conclusion from depending on the writers agreeing.)
     fn render_settings_ini(&self, backing: &BackingText) -> (Option<FileWrite>, ThemeRenderRecord) {
         let (mut ini, _) = IniFile::parse(&backing.text);
         let mut changed_keys = Vec::new();
@@ -762,67 +990,67 @@ impl ThemesModel {
                 // validation-free by design. Task 9.27 will give these values their own
                 // validations; this declaration becomes `InPlan` when it does.
                 validation: WriteValidation::NotNeeded,
+                mode: WriteMode::Replace,
             }),
             record,
         )
     }
 
-    /// Renders the `hyprland.conf` cursor-env write, editing only the repeatable
-    /// `env = XCURSOR_*` lines' value portions.
+    /// Renders the `hyprland.lua` cursor write: the second argument of the two
+    /// `hl.env("XCURSOR_THEME", "…")` / `hl.env("XCURSOR_SIZE", "…")` calls, and nothing
+    /// else (R3.4, architecture §3 "Lua literal" row).
     ///
-    /// Each field is applied independently: a `env = XCURSOR_*` line that is absent
-    /// (the hyprlang repeatable writer never appends one) is skipped and logged at
-    /// `debug`, but a field whose line *does* exist is still written — so if only one
-    /// of the two lines is present, hyprland.conf receives that field rather than being
-    /// abandoned wholesale, keeping it from drifting out of step with the other copies.
-    /// Returns `None` only when neither field could be written (the app-owned invariant
-    /// is that both lines are present, so this partial path is a robustness measure).
+    /// [`LuaConfigFile::set_env`] is the **only** editing method ever called on this
+    /// file. `hyprland.lua` is real code — keybinds, window rules, the monitor loader —
+    /// and the Lua editor can address its top-level `hl.config({ … })` literals too, but
+    /// the app owns none of them; architecture §3 restricts it to the two env lines, and
+    /// task 11.3 documented that restriction as a contract the caller (this function)
+    /// keeps, because a parsed file does not know which file it came from. The size is
+    /// written as a Lua string (`"24"`) like every `hl.env` value.
     ///
-    /// The two skip reasons are recorded differently in the returned
-    /// [`ThemeRenderRecord`], because hyprlang's value rule is stricter than the
-    /// `settings.ini` and `uwsm/env` ones (it also rejects `#`, which it would otherwise
-    /// read as the start of an inline comment):
+    /// Each field is applied independently, and the three ways a field can fail are
+    /// recorded differently in the returned [`ThemeRenderRecord`]:
     ///
-    /// - a missing line ([`HyprlangEditError::RepeatableKeyNotFound`]) means this file
-    ///   carries no such copy, so there is nothing to diverge from and the value may still
-    ///   be promoted on the strength of the other copies;
-    /// - the other two variants this call can return mean the copy must **not** be
-    ///   promoted (R3.4), so the page stays dirty instead of looking applied while
-    ///   `hyprland.conf` lags behind: [`HyprlangEditError::InvalidValue`] leaves the
-    ///   existing line holding its old value, and [`HyprlangEditError::NoValuePortion`]
-    ///   means the line is malformed (an `env = XCURSOR_THEME` with no comma). The
-    ///   malformed case is deliberately treated as a refusal even though there is no old
-    ///   value to lag behind: hyprland still reads the line, so writing the other copies
-    ///   while leaving it alone is a divergence the user should see.
+    /// - no such call ([`LuaEditError::EnvNotFound`]): this file carries no copy of the
+    ///   field, so there is nothing to diverge from; it is skipped (logged at `debug`)
+    ///   and the value may still be promoted on the strength of the other copies. The
+    ///   editor never *adds* an `hl.env` line — inserting code into a file the app does
+    ///   not author would be guessing where it belongs. If only one of the two lines is
+    ///   present, that field is still written rather than the file being abandoned.
+    /// - a structure the editor cannot follow ([`LuaEditError::UnsafeFile`]): no line can
+    ///   be located safely, so nothing is written, but the file may well hold an env line
+    ///   with the old value, so it counts as a **refusal** that blocks promotion (logged
+    ///   at `warn` with the reason) — the app refuses rather than guesses.
+    /// - a value the Lua string rule rejects ([`LuaEditError::Literal`] — a `"`, `\` or
+    ///   control character): the existing line keeps its old value, a refusal too.
     ///
-    /// [`HyprlangEditError::SectionNotFound`] cannot arise here — `set_repeatable_field_value`
-    /// addresses top-level repeatable keys, not sections.
-    fn render_hyprland_env(&self, backing: &BackingText) -> (Option<FileWrite>, ThemeRenderRecord) {
-        let (mut file, _) = HyprlangFile::parse(&backing.text);
+    /// Returns `None` for the write when neither field could be written.
+    fn render_hyprland_lua(&self, backing: &BackingText) -> (Option<FileWrite>, ThemeRenderRecord) {
+        let mut file = LuaConfigFile::parse(&backing.text);
         let mut changed_keys = Vec::new();
         let mut record = ThemeRenderRecord::default();
 
-        let mut set = |value_id: ThemeValue, field: &str, value: Option<&str>, label: &str| {
+        let mut set = |value_id: ThemeValue, name: &str, value: Option<&str>, label: &str| {
             let Some(value) = value else {
                 return;
             };
-            match file.set_repeatable_field_value(HYPR_ENV_KEY, field, value) {
+            match file.set_env(name, value) {
                 Ok(()) => {
                     changed_keys.push(label.to_string());
                     *record.written.flag(value_id) = true;
                 }
-                Err(HyprlangEditError::RepeatableKeyNotFound { .. }) => {
+                Err(LuaEditError::EnvNotFound(_)) => {
                     tracing::debug!(
-                        field,
-                        "no such env line in hyprland.conf; skipping that field"
+                        name,
+                        "no hl.env line for this variable in hyprland.lua; skipping that field"
                     );
                 }
                 Err(error) => {
                     tracing::warn!(
-                        field,
+                        name,
                         %error,
-                        "hyprland.conf's env line refused the value, so its copy now differs \
-                         from the others (R3.4); not promoting the change"
+                        "hyprland.lua's cursor line was not written, so its copy may now \
+                         differ from the others (R3.4); not promoting the change"
                     );
                     *record.diverged.flag(value_id) = true;
                 }
@@ -833,7 +1061,7 @@ impl ThemesModel {
                 ThemeValue::CursorTheme,
                 ENV_CURSOR_THEME,
                 self.cursor_theme.effective(),
-                "cursor theme (hyprland.conf env)",
+                "cursor theme (hyprland.lua hl.env)",
             );
         }
         if self.cursor_size.is_changed() {
@@ -841,7 +1069,7 @@ impl ThemesModel {
                 ThemeValue::CursorSize,
                 ENV_CURSOR_SIZE,
                 self.cursor_size.effective(),
-                "cursor size (hyprland.conf env)",
+                "cursor size (hyprland.lua hl.env)",
             );
         }
 
@@ -853,10 +1081,74 @@ impl ThemesModel {
                 path: backing.path.clone(),
                 contents: file.emit().into_bytes(),
                 changed_keys,
-                backing: BackingFile::HyprlandConf,
+                backing: BackingFile::HyprlandLua,
                 // The cursor copy of the same discovered values as the `settings.ini`
                 // write above, so validation-free by design for the same reason.
                 validation: WriteValidation::NotNeeded,
+                mode: WriteMode::Replace,
+            }),
+            record,
+        )
+    }
+
+    /// Renders the XCursor fallback write: `Inherits=<cursor theme>` in the
+    /// `[Icon Theme]` group of `~/.icons/default/index.theme`, through the INI writer
+    /// (R3.4, analysis §8.4). Programs that ignore `XCURSOR_THEME` load the theme named
+    /// `default`, which this file points at the chosen cursor theme.
+    ///
+    /// Only the cursor *theme* lives here (the file has no size), so a size-only change
+    /// writes nothing. When the file exists, only the `Inherits=` value span changes
+    /// (the key is appended to the group, or the group created, when missing — the INI
+    /// writer's normal behaviour). When it was **absent** at load, the write creates it
+    /// ([`WriteMode::CreateNew`]) from [`CURSOR_FALLBACK_TEMPLATE`] plus the `Inherits=`
+    /// line — the same three keys the dotfiles ship. A file that exists but could not be
+    /// read is left alone, like any other unreadable copy.
+    ///
+    /// A value the INI writer rejects (a newline) is a refusal that blocks promotion
+    /// when the file exists; for a file that would have been created nothing on disk
+    /// disagrees, so it is merely skipped.
+    fn render_cursor_fallback(&self) -> (Option<FileWrite>, ThemeRenderRecord) {
+        let mut record = ThemeRenderRecord::default();
+        if !self.cursor_theme.is_changed() {
+            return (None, record);
+        }
+        let Some(theme) = self.cursor_theme.effective() else {
+            return (None, record);
+        };
+        let (path, text, mode) = match (self.cursor_fallback(), &self.paths.cursor_fallback_theme) {
+            (Some(backing), _) => (
+                backing.path.clone(),
+                backing.text.as_str(),
+                WriteMode::Replace,
+            ),
+            (None, Some(path)) if self.cursor_fallback_absent => {
+                (path.clone(), CURSOR_FALLBACK_TEMPLATE, WriteMode::CreateNew)
+            }
+            _ => return (None, record),
+        };
+
+        let (mut ini, _) = IniFile::parse(text);
+        if let Err(error) = ini.set_value(ICON_THEME_GROUP, KEY_INHERITS, theme) {
+            tracing::warn!(
+                %error,
+                "could not set Inherits= in the XCursor fallback theme; that copy is skipped"
+            );
+            if mode == WriteMode::Replace {
+                record.diverged.cursor_theme = true;
+            }
+            return (None, record);
+        }
+        record.written.cursor_theme = true;
+        (
+            Some(FileWrite {
+                path,
+                contents: ini.emit().into_bytes(),
+                changed_keys: vec!["cursor theme (index.theme Inherits)".to_string()],
+                backing: BackingFile::CursorFallbackTheme,
+                // The same discovered cursor theme as every other copy, so
+                // validation-free by design for the same reason.
+                validation: WriteValidation::NotNeeded,
+                mode,
             }),
             record,
         )
@@ -916,6 +1208,7 @@ impl ThemesModel {
                 // The `uwsm/env` copy of the same discovered cursor values, so
                 // validation-free by design for the same reason.
                 validation: WriteValidation::NotNeeded,
+                mode: WriteMode::Replace,
             }),
             record,
         )
@@ -966,18 +1259,76 @@ impl ThemesModel {
     }
 }
 
+/// The parsed cursor copies of one [`BackingSet`], each `None` when its file is
+/// unreadable or not part of the write set — the read side shared by
+/// [`ThemesModel::load`] (the values the page shows) and
+/// [`ThemesModel::disagreeing_cursor_copies`] (which copies differ from them).
+struct CursorCopies {
+    /// `gtk-3.0/settings.ini`.
+    gtk3: Option<IniFile>,
+    /// `gtk-4.0/settings.ini`.
+    gtk4: Option<IniFile>,
+    /// `uwsm/env`.
+    uwsm: Option<EnvFile>,
+    /// `hyprland.lua` (read only through [`LuaConfigFile::env_value`]).
+    hyprland_lua: Option<LuaConfigFile>,
+    /// `~/.icons/default/index.theme`.
+    cursor_fallback: Option<IniFile>,
+}
+
+impl CursorCopies {
+    /// Parses every readable backing file named in `paths`.
+    fn read(backing: &BackingSet, paths: &ThemesPaths) -> CursorCopies {
+        let text = |path: Option<&Path>| {
+            path.and_then(|path| backing.get(path))
+                .map(|backing| backing.text.as_str())
+        };
+        let ini = |path: Option<&Path>| text(path).map(|text| IniFile::parse(text).0);
+        CursorCopies {
+            gtk3: ini(Some(&paths.gtk3_settings)),
+            gtk4: ini(Some(&paths.gtk4_settings)),
+            uwsm: text(Some(&paths.uwsm_env)).map(|text| EnvFile::parse(text).0),
+            hyprland_lua: text(paths.hyprland_lua.as_deref()).map(LuaConfigFile::parse),
+            cursor_fallback: ini(paths.cursor_fallback_theme.as_deref()),
+        }
+    }
+}
+
 /// Reads a `[Settings]` key from a parsed `settings.ini`, if present.
-fn settings_value(ini: &Option<IniFile>, key: &str) -> Option<String> {
-    ini.as_ref()
-        .and_then(|file| file.value(SETTINGS_GROUP, key))
+fn settings_value(ini: Option<&IniFile>, key: &str) -> Option<String> {
+    ini.and_then(|file| file.value(SETTINGS_GROUP, key))
         .map(str::to_string)
 }
 
 /// Reads a variable from a parsed `uwsm/env`, if present.
-fn env_value(env: &Option<EnvFile>, key: &str) -> Option<String> {
-    env.as_ref()
-        .and_then(|file| file.value(key))
+fn env_value(env: Option<&EnvFile>, key: &str) -> Option<String> {
+    env.and_then(|file| file.value(key)).map(str::to_string)
+}
+
+/// Reads the value of `hyprland.lua`'s top-level `hl.env("name", "…")` call, if present.
+///
+/// A file whose structure the Lua editor cannot follow yields nothing here (every line
+/// is opaque to it), the same as a file without the line: the field is reported absent
+/// rather than guessed (architecture §10).
+fn lua_env_value(lua: Option<&LuaConfigFile>, name: &str) -> Option<String> {
+    lua.and_then(|file| file.env_value(name))
         .map(str::to_string)
+}
+
+/// Reads the XCursor fallback theme's `[Icon Theme]` `Inherits=`, if present.
+fn fallback_inherits(ini: Option<&IniFile>) -> Option<String> {
+    ini.and_then(|file| file.value(ICON_THEME_GROUP, KEY_INHERITS))
+        .map(str::to_string)
+}
+
+/// Whether nothing at all exists at `path` — not a file, a directory, or a symlink
+/// (dangling or not). Only such a path may be *created*; anything else present is
+/// either someone's file or a link that must never be replaced.
+fn is_absent(path: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
 }
 
 /// Parses a cursor size string into a positive pixel size, or `None` when it is not a
@@ -1154,11 +1505,28 @@ gtk-cursor-theme-name=Nordic-cursors
 gtk-cursor-theme-size=16
 ";
 
-    /// The two cursor `env =` lines the app owns in `hyprland.conf`.
-    const HYPRLAND_ENV: &str = "\
-# Cursor env, kept identical to uwsm/env.
-env = XCURSOR_THEME,Nordic-cursors
-env = XCURSOR_SIZE,16
+    /// A `hyprland.lua` excerpt: the two cursor `hl.env` lines the app owns, plus a
+    /// top-level `hl.config` table the Lua editor could address but the app must never
+    /// touch (the `set_env`-only caller contract, task 11.3).
+    const HYPRLAND_LUA: &str = "\
+-- Cursor env, kept identical to uwsm/env.
+hl.env(\"XCURSOR_THEME\", \"Nordic-cursors\")
+hl.env(\"XCURSOR_SIZE\", \"16\")
+
+hl.config({
+    general = {
+        border_size = 2,
+    },
+})
+";
+
+    /// The XCursor fallback theme as the dotfiles ship it, pointing at the same cursor
+    /// theme as the other fixture copies.
+    const CURSOR_FALLBACK: &str = "\
+[Icon Theme]
+Name=Default
+Comment=Default Cursor Theme
+Inherits=Nordic-cursors
 ";
 
     /// A `uwsm/env` with the canonical cursor exports and a commented-out `GTK_THEME`.
@@ -1170,27 +1538,51 @@ export XCURSOR_SIZE=16
 
     /// The Hyprland-side cursor copy of a test's [`ThemesPaths`], which every fixture
     /// below sets (only the provider-guard test leaves it `None`).
-    fn hypr_conf(paths: &ThemesPaths) -> &Path {
+    fn hypr_lua(paths: &ThemesPaths) -> &Path {
         paths
-            .hyprland_conf
+            .hyprland_lua
             .as_deref()
-            .expect("the fixture sets the hyprland.conf path")
+            .expect("the fixture sets the hyprland.lua path")
     }
 
-    /// Writes the four backing files into `dir` and returns their [`ThemesPaths`]. The
-    /// `uwsm` text is supplied so a test can flip the `GTK_THEME` override on.
+    /// The XCursor fallback theme path of a test's [`ThemesPaths`], which every fixture
+    /// below sets.
+    fn fallback(paths: &ThemesPaths) -> &Path {
+        paths
+            .cursor_fallback_theme
+            .as_deref()
+            .expect("the fixture sets the index.theme path")
+    }
+
+    /// Backing paths under `config` (plus the fallback theme under `home/.icons`) that
+    /// a test fills in itself.
+    fn paths_under(config: &Path, home: &Path) -> ThemesPaths {
+        ThemesPaths {
+            gtk3_settings: config.join("gtk-3.0/settings.ini"),
+            gtk4_settings: config.join("gtk-4.0/settings.ini"),
+            hyprland_lua: Some(config.join("hypr/hyprland.lua")),
+            uwsm_env: config.join("uwsm/env"),
+            cursor_fallback_theme: Some(home.join(".icons/default/index.theme")),
+        }
+    }
+
+    /// Writes the five backing files into `dir` (the fallback theme under
+    /// `dir/home/.icons/default`) and returns their [`ThemesPaths`]. The `uwsm` text is
+    /// supplied so a test can flip the `GTK_THEME` override on.
     fn write_backing_fixture(dir: &Path, uwsm: &str) -> ThemesPaths {
         let gtk3 = dir.join("gtk-3.0");
         let gtk4 = dir.join("gtk-4.0");
         let hypr = dir.join("hypr");
         let uwsm_dir = dir.join("uwsm");
-        for sub in [&gtk3, &gtk4, &hypr, &uwsm_dir] {
+        let icons_default = dir.join("home/.icons/default");
+        for sub in [&gtk3, &gtk4, &hypr, &uwsm_dir, &icons_default] {
             fs::create_dir_all(sub).expect("create a config subdir");
         }
         let gtk3_settings = gtk3.join("settings.ini");
         let gtk4_settings = gtk4.join("settings.ini");
-        let hyprland_conf = hypr.join("hyprland.conf");
+        let hyprland_lua = hypr.join("hyprland.lua");
         let uwsm_env = uwsm_dir.join("env");
+        let cursor_fallback_theme = icons_default.join("index.theme");
         fs::write(&gtk3_settings, SETTINGS_INI).expect("write gtk-3.0 settings.ini");
         // gtk-4.0 carries a different layout but the same keys, to prove identical
         // writes regardless of surrounding formatting.
@@ -1199,14 +1591,34 @@ export XCURSOR_SIZE=16
             "# gtk4\n[Settings]\ngtk-theme-name = Everforest-Green-Dark\ngtk-cursor-theme-name = Nordic-cursors\ngtk-cursor-theme-size = 16\n",
         )
         .expect("write gtk-4.0 settings.ini");
-        fs::write(&hyprland_conf, HYPRLAND_ENV).expect("write hyprland.conf");
+        fs::write(&hyprland_lua, HYPRLAND_LUA).expect("write hyprland.lua");
         fs::write(&uwsm_env, uwsm).expect("write uwsm/env");
+        fs::write(&cursor_fallback_theme, CURSOR_FALLBACK).expect("write index.theme");
         ThemesPaths {
             gtk3_settings,
             gtk4_settings,
-            hyprland_conf: Some(hyprland_conf),
+            hyprland_lua: Some(hyprland_lua),
             uwsm_env,
+            cursor_fallback_theme: Some(cursor_fallback_theme),
         }
+    }
+
+    /// The paths of a contribution's writes, in order.
+    fn written_paths(contribution: &ThemesApply) -> Vec<&Path> {
+        contribution
+            .writes
+            .iter()
+            .map(|write| write.path.as_path())
+            .collect()
+    }
+
+    /// A loaded model over `paths` with the icon fixture's cursor themes discoverable.
+    fn load_with_cursors(tmp: &Path, paths: &ThemesPaths) -> ThemesModel {
+        let roots = ThemeRoots {
+            gtk_theme_dirs: Vec::new(),
+            icon_dirs: vec![write_icon_root(tmp)],
+        };
+        ThemesModel::load(&roots, paths.clone(), false, None)
     }
 
     /// Writes an icon-dir fixture exercising the independent icon/cursor classification,
@@ -1349,44 +1761,36 @@ export XCURSOR_SIZE=16
 
     #[test]
     fn a_guarded_off_hyprland_copy_gets_no_cursor_write() {
-        // Task 11.2: on a host whose compositor does not run the Lua config provider,
-        // the startup loader passes no Hyprland-side path. A cursor change then writes
-        // the other three copies only, and the Hyprland file on disk is untouched.
+        // Task 11.2 (analysis §8.6): on a host whose compositor does not run the Lua
+        // config provider, the startup loader passes no Hyprland-side path. A cursor
+        // change then writes the other copies only, and hyprland.lua is untouched.
         let tmp = tempfile::tempdir().expect("temp dir");
         let config = tmp.path().join("config");
         fs::create_dir_all(&config).unwrap();
         let mut paths = write_backing_fixture(&config, UWSM_ENV);
-        let hyprland_conf = hypr_conf(&paths).to_path_buf();
-        paths.hyprland_conf = None;
-        let roots = ThemeRoots {
-            gtk_theme_dirs: Vec::new(),
-            icon_dirs: vec![write_icon_root(tmp.path())],
-        };
+        let hyprland_lua = hypr_lua(&paths).to_path_buf();
+        paths.hyprland_lua = None;
 
-        let mut model = ThemesModel::load(&roots, paths.clone(), false, None);
+        let mut model = load_with_cursors(tmp.path(), &paths);
         model.stage_cursor_theme("Bibata");
         let contribution = model
             .apply_contribution()
             .expect("a cursor change still contributes the other writes");
-        let written: Vec<&Path> = contribution
-            .writes
-            .iter()
-            .map(|write| write.path.as_path())
-            .collect();
         assert_eq!(
-            written,
+            written_paths(&contribution),
             vec![
                 paths.gtk3_settings.as_path(),
                 paths.gtk4_settings.as_path(),
                 paths.uwsm_env.as_path(),
+                fallback(&paths),
             ],
-            "both settings.ini and uwsm/env are written, the Hyprland copy is not"
+            "both settings.ini, uwsm/env and index.theme are written, the Hyprland copy is not"
         );
         assert!(
             contribution
                 .writes
                 .iter()
-                .all(|write| write.backing != BackingFile::HyprlandConf),
+                .all(|write| write.backing != BackingFile::HyprlandLua),
             "no write is attributed to the Hyprland config"
         );
 
@@ -1396,17 +1800,26 @@ export XCURSOR_SIZE=16
             "the change is promoted from the remaining copies"
         );
         assert_eq!(
-            fs::read_to_string(&hyprland_conf).unwrap(),
-            HYPRLAND_ENV,
+            fs::read_to_string(&hyprland_lua).unwrap(),
+            HYPRLAND_LUA,
             "the guarded-off Hyprland file is never touched"
+        );
+        assert_eq!(
+            model.cursor_login_note().as_deref(),
+            Some(
+                "A cursor change shows immediately; its session environment copy \
+                 (uwsm/env) takes effect at the next login."
+            ),
+            "the login note names only the env copy this host writes"
         );
     }
 
     #[test]
-    fn a_cursor_change_writes_all_four_files_to_the_same_value_and_reloads() {
-        // Accept criterion: a cursor apply writes BOTH settings.ini files AND both env
-        // files to the SAME value, and drives the exact gsettings/hyprctl setcursor
-        // command sequence through the apply pipeline (R3.4).
+    fn a_cursor_change_writes_all_five_copies_to_the_same_value_and_reloads() {
+        // Accept criterion: a cursor apply writes BOTH settings.ini files, both env
+        // copies (uwsm/env and hyprland.lua's hl.env lines) AND the XCursor fallback
+        // theme to the SAME value, and drives the exact gsettings/hyprctl setcursor
+        // command sequence through the apply pipeline (R3.4, task 11.5).
         let tmp = tempfile::tempdir().expect("temp dir");
         let config = tmp.path().join("config");
         fs::create_dir_all(&config).unwrap();
@@ -1424,11 +1837,17 @@ export XCURSOR_SIZE=16
         let contribution = model
             .apply_contribution()
             .expect("a cursor change contributes writes");
-        // All four copies are written: both settings.ini, hyprland.conf, uwsm/env.
+        // All five copies are written, in the model's fixed order.
         assert_eq!(
-            contribution.writes.len(),
-            4,
-            "a cursor change writes both settings.ini plus hyprland.conf and uwsm/env"
+            written_paths(&contribution),
+            vec![
+                paths.gtk3_settings.as_path(),
+                paths.gtk4_settings.as_path(),
+                hypr_lua(&paths),
+                paths.uwsm_env.as_path(),
+                fallback(&paths),
+            ],
+            "a cursor change writes both settings.ini, hyprland.lua, uwsm/env and index.theme"
         );
         assert_eq!(
             contribution.reload_params.cursor,
@@ -1441,11 +1860,11 @@ export XCURSOR_SIZE=16
         assert!(contribution.reload_params.gtk_theme.is_none());
         assert!(contribution.reload_params.icon_theme.is_none());
 
-        // Task 9.10: `ThemesApply` carries no validations, so all four cursor copies must
-        // declare themselves validation-free. Asserted here as well as on the GTK-theme
-        // path because this is the only test that renders the hyprland.conf and uwsm/env
-        // copies: without it, either of those two sites could drift to `InPlan` on its own
-        // and silently make the plan-drift guard warn on every cursor change.
+        // Task 9.10: `ThemesApply` carries no validations, so every cursor copy must
+        // declare itself validation-free. Asserted here as well as on the GTK-theme path
+        // because this is the test that renders the hyprland.lua, uwsm/env and index.theme
+        // copies: without it, one of those sites could drift to `InPlan` on its own and
+        // silently make the plan-drift guard warn on every cursor change.
         assert!(
             contribution
                 .writes
@@ -1474,8 +1893,9 @@ export XCURSOR_SIZE=16
             "the cursor apply must succeed, got {outcome:?}"
         );
 
-        // The exact reload sequence: hyprctl reload (from hyprland.conf) then the
-        // cursor gsettings keys then setcursor, deduped across the four files.
+        // The exact reload sequence: hyprctl reload (from hyprland.lua; task 11.11
+        // makes it `config-only`) then the cursor gsettings keys then setcursor,
+        // deduped across the five files.
         assert_eq!(
             runner.recorded(),
             vec![
@@ -1499,16 +1919,38 @@ export XCURSOR_SIZE=16
         // Every copy on disk now holds the identical new value.
         let gtk3 = fs::read_to_string(&paths.gtk3_settings).unwrap();
         let gtk4 = fs::read_to_string(&paths.gtk4_settings).unwrap();
-        let hypr = fs::read_to_string(hypr_conf(&paths)).unwrap();
         let uwsm = fs::read_to_string(&paths.uwsm_env).unwrap();
         assert!(gtk3.contains("gtk-cursor-theme-name=Bibata"));
         assert!(gtk3.contains("gtk-cursor-theme-size=24"));
         assert!(gtk4.contains("gtk-cursor-theme-name = Bibata"));
         assert!(gtk4.contains("gtk-cursor-theme-size = 24"));
-        assert!(hypr.contains("env = XCURSOR_THEME,Bibata"));
-        assert!(hypr.contains("env = XCURSOR_SIZE,24"));
         assert!(uwsm.contains("export XCURSOR_THEME=Bibata"));
         assert!(uwsm.contains("export XCURSOR_SIZE=24"));
+        // hyprland.lua: exactly the two hl.env lines change, the size as a Lua string,
+        // and the addressable hl.config table stays byte-identical.
+        let expected_lua = replace_once(
+            &replace_once(
+                HYPRLAND_LUA,
+                "hl.env(\"XCURSOR_THEME\", \"Nordic-cursors\")",
+                "hl.env(\"XCURSOR_THEME\", \"Bibata\")",
+            ),
+            "hl.env(\"XCURSOR_SIZE\", \"16\")",
+            "hl.env(\"XCURSOR_SIZE\", \"24\")",
+        );
+        assert_eq!(fs::read_to_string(hypr_lua(&paths)).unwrap(), expected_lua);
+        // index.theme: only the Inherits= value (it carries no size).
+        assert_eq!(
+            fs::read_to_string(fallback(&paths)).unwrap(),
+            replace_once(
+                CURSOR_FALLBACK,
+                "Inherits=Nordic-cursors",
+                "Inherits=Bibata"
+            )
+        );
+        // The model promotes the change, and every copy now agrees.
+        model.commit();
+        assert!(!model.is_dirty());
+        assert_eq!(model.disagreeing_cursor_copies(), Vec::new());
     }
 
     #[test]
@@ -1968,12 +2410,7 @@ export XCURSOR_SIZE=16
         // R4.4: with no settings.ini readable there is nothing to preselect or write,
         // so the rows are hidden and nothing can be applied.
         let tmp = tempfile::tempdir().expect("temp dir");
-        let paths = ThemesPaths {
-            gtk3_settings: tmp.path().join("gtk-3.0/settings.ini"),
-            gtk4_settings: tmp.path().join("gtk-4.0/settings.ini"),
-            hyprland_conf: Some(tmp.path().join("hypr/hyprland.conf")),
-            uwsm_env: tmp.path().join("uwsm/env"),
-        };
+        let paths = paths_under(tmp.path(), tmp.path());
         let roots = ThemeRoots {
             gtk_theme_dirs: Vec::new(),
             icon_dirs: Vec::new(),
@@ -2067,12 +2504,7 @@ export XCURSOR_SIZE=16
         for sub in ["gtk-3.0", "gtk-4.0", "hypr", "uwsm"] {
             fs::create_dir_all(config.join(sub)).unwrap();
         }
-        let paths = ThemesPaths {
-            gtk3_settings: config.join("gtk-3.0/settings.ini"),
-            gtk4_settings: config.join("gtk-4.0/settings.ini"),
-            hyprland_conf: Some(config.join("hypr/hyprland.conf")),
-            uwsm_env: config.join("uwsm/env"),
-        };
+        let paths = paths_under(&config, tmp.path());
         // settings.ini has a GTK theme but no cursor keys.
         fs::write(
             &paths.gtk3_settings,
@@ -2084,7 +2516,7 @@ export XCURSOR_SIZE=16
             "[Settings]\ngtk-theme-name=Everforest-Green-Dark\n",
         )
         .unwrap();
-        fs::write(hypr_conf(&paths), HYPRLAND_ENV).unwrap();
+        fs::write(hypr_lua(&paths), HYPRLAND_LUA).unwrap();
         fs::write(&paths.uwsm_env, UWSM_ENV).unwrap(); // XCURSOR_THEME=Nordic-cursors, SIZE=16
         let roots = ThemeRoots {
             gtk_theme_dirs: Vec::new(),
@@ -2172,16 +2604,11 @@ export XCURSOR_SIZE=16
         for sub in ["gtk-3.0", "gtk-4.0", "hypr", "uwsm"] {
             fs::create_dir_all(config.join(sub)).unwrap();
         }
-        let paths = ThemesPaths {
-            gtk3_settings: config.join("gtk-3.0/settings.ini"),
-            gtk4_settings: config.join("gtk-4.0/settings.ini"),
-            hyprland_conf: Some(config.join("hypr/hyprland.conf")),
-            uwsm_env: config.join("uwsm/env"),
-        };
+        let paths = paths_under(&config, tmp.path());
         let ini = "[Settings]\ngtk-cursor-theme-name=Nordic-cursors\ngtk-cursor-theme-size=big\n";
         fs::write(&paths.gtk3_settings, ini).unwrap();
         fs::write(&paths.gtk4_settings, ini).unwrap();
-        fs::write(hypr_conf(&paths), HYPRLAND_ENV).unwrap();
+        fs::write(hypr_lua(&paths), HYPRLAND_LUA).unwrap();
         fs::write(&paths.uwsm_env, UWSM_ENV).unwrap();
         let roots = ThemeRoots {
             gtk_theme_dirs: Vec::new(),
@@ -2206,20 +2633,19 @@ export XCURSOR_SIZE=16
 
     #[test]
     fn a_missing_hyprland_env_field_still_writes_the_present_one() {
-        // N1: with only one XCURSOR_* env line present, the present field is still
-        // written to hyprland.conf rather than the whole file being abandoned — so the
-        // copies do not drift out of step.
+        // N1: with only one cursor hl.env line present, the present field is still
+        // written to hyprland.lua rather than the whole file being abandoned — so the
+        // copies do not drift out of step. The missing line is never invented.
         let tmp = tempfile::tempdir().expect("temp dir");
         let config = tmp.path().join("config");
         let paths = write_backing_fixture(&config, UWSM_ENV);
-        // Leave only the XCURSOR_THEME env line; drop XCURSOR_SIZE.
-        fs::write(hypr_conf(&paths), "env = XCURSOR_THEME,Nordic-cursors\n").unwrap();
-        let roots = ThemeRoots {
-            gtk_theme_dirs: Vec::new(),
-            icon_dirs: vec![write_icon_root(tmp.path())],
-        };
+        fs::write(
+            hypr_lua(&paths),
+            "hl.env(\"XCURSOR_THEME\", \"Nordic-cursors\")\n",
+        )
+        .unwrap();
 
-        let mut model = ThemesModel::load(&roots, paths.clone(), false, None);
+        let mut model = load_with_cursors(tmp.path(), &paths);
         model.stage_cursor_theme("Bibata");
         model.stage_cursor_size("24");
         let contribution = model
@@ -2229,21 +2655,17 @@ export XCURSOR_SIZE=16
         let hypr_write = contribution
             .writes
             .iter()
-            .find(|write| write.path == hypr_conf(&paths))
-            .expect("hyprland.conf is still written despite the missing XCURSOR_SIZE line");
-        let text = String::from_utf8(hypr_write.contents.clone()).unwrap();
-        assert!(
-            text.contains("env = XCURSOR_THEME,Bibata"),
-            "the present theme field is written"
-        );
-        assert!(
-            !text.contains("XCURSOR_SIZE"),
-            "the absent size line is not fabricated (the repeatable writer never appends)"
+            .find(|write| write.path == hypr_lua(&paths))
+            .expect("hyprland.lua is still written despite the missing XCURSOR_SIZE line");
+        assert_eq!(
+            String::from_utf8(hypr_write.contents.clone()).unwrap(),
+            "hl.env(\"XCURSOR_THEME\", \"Bibata\")\n",
+            "the present theme field is written and no size line is fabricated"
         );
         assert_eq!(
             hypr_write.changed_keys,
-            vec!["cursor theme (hyprland.conf env)".to_string()],
-            "only the present field is recorded for the hyprland.conf write"
+            vec!["cursor theme (hyprland.lua hl.env)".to_string()],
+            "only the present field is recorded for the hyprland.lua write"
         );
     }
 
@@ -2334,19 +2756,19 @@ export XCURSOR_SIZE=16
     #[test]
     fn a_value_one_existing_copy_refuses_is_not_promoted() {
         // Task 9.6, the divergence rule (R3.4): the writers do not share a value rule —
-        // hyprlang additionally rejects `#`, which it would otherwise read as the start of
-        // an inline comment and silently truncate the value at, while the settings.ini and
-        // uwsm/env writers accept it. A cursor theme directory named `Nord#ic` is legal on
-        // Linux and discovery offers it, so the cursor theme can reach three of its four
-        // copies while `hyprland.conf`'s env line keeps the old one. The copies on disk
-        // then genuinely differ, so the change must NOT be promoted: the page stays dirty
+        // the Lua writer additionally rejects `"` (it would end the string literal and
+        // break hyprland.lua), while the settings.ini, uwsm/env and index.theme writers
+        // accept it. A cursor theme directory named `Nord"ic` is legal on Linux and
+        // discovery offers it, so the cursor theme can reach four of its five copies
+        // while hyprland.lua's hl.env line keeps the old one. The copies on disk then
+        // genuinely differ, so the change must NOT be promoted: the page stays dirty
         // rather than looking applied while one copy lags behind.
         let tmp = tempfile::tempdir().expect("temp dir");
         let config = tmp.path().join("config");
         let paths = write_backing_fixture(&config, UWSM_ENV);
         let icons = write_icon_root(tmp.path());
-        fs::create_dir_all(icons.join("Nord#ic").join("cursors"))
-            .expect("create a cursor theme dir whose name contains a #");
+        fs::create_dir_all(icons.join("Nord\"ic").join("cursors"))
+            .expect("create a cursor theme dir whose name contains a quote");
         let roots = ThemeRoots {
             gtk_theme_dirs: Vec::new(),
             icon_dirs: vec![icons],
@@ -2354,25 +2776,23 @@ export XCURSOR_SIZE=16
 
         let mut model = ThemesModel::load(&roots, paths.clone(), false, None);
         assert!(
-            model.cursor_themes().contains(&"Nord#ic".to_string()),
-            "discovery surfaces the `#`-named cursor theme, so the drop-down offers it"
+            model.cursor_themes().contains(&"Nord\"ic".to_string()),
+            "discovery surfaces the quote-named cursor theme, so the drop-down offers it"
         );
-        model.stage_cursor_theme("Nord#ic");
+        model.stage_cursor_theme("Nord\"ic");
 
         let contribution = model
             .apply_contribution()
             .expect("the copies that accept the value are still written");
         assert_eq!(
-            contribution.writes.len(),
-            3,
-            "both settings.ini copies and uwsm/env accept the value"
-        );
-        assert!(
-            !contribution
-                .writes
-                .iter()
-                .any(|write| write.path == hypr_conf(&paths)),
-            "hyprland.conf refuses the `#` value, so it contributes no write"
+            written_paths(&contribution),
+            vec![
+                paths.gtk3_settings.as_path(),
+                paths.gtk4_settings.as_path(),
+                paths.uwsm_env.as_path(),
+                fallback(&paths),
+            ],
+            "hyprland.lua refuses the quote, so it contributes no write"
         );
 
         model.commit();
@@ -2388,37 +2808,39 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn a_cursor_change_is_still_promoted_when_hyprland_conf_has_no_env_line() {
+    fn a_cursor_change_is_still_promoted_when_hyprland_lua_has_no_env_line() {
         // Task 9.6, the other side of the divergence rule: an ABSENT copy must not block
-        // promotion. Here hyprland.conf carries only the XCURSOR_THEME line, and the
-        // hyprlang repeatable-key writer edits such lines but never appends a missing one,
-        // so a cursor *size* change can only reach the two settings.ini files and uwsm/env.
+        // promotion. Here hyprland.lua carries only the XCURSOR_THEME line, and the Lua
+        // editor rewrites hl.env calls but never adds one, so a cursor *size* change can
+        // only reach the two settings.ini files and uwsm/env (index.theme has no size).
         // Nothing on disk then disagrees with the new size, so the commit promotes it and
-        // the page goes clean. Were promotion to require all four copies instead, the page
+        // the page goes clean. Were promotion to require every copy instead, the page
         // would stay dirty forever on such a host and every later Apply would rewrite the
-        // other three copies for nothing.
+        // other copies for nothing.
         let tmp = tempfile::tempdir().expect("temp dir");
         let config = tmp.path().join("config");
         let paths = write_backing_fixture(&config, UWSM_ENV);
-        fs::write(hypr_conf(&paths), "env = XCURSOR_THEME,Nordic-cursors\n")
-            .expect("write a hyprland.conf with no XCURSOR_SIZE line");
-        let roots = ThemeRoots {
-            gtk_theme_dirs: Vec::new(),
-            icon_dirs: vec![write_icon_root(tmp.path())],
-        };
+        fs::write(
+            hypr_lua(&paths),
+            "hl.env(\"XCURSOR_THEME\", \"Nordic-cursors\")\n",
+        )
+        .expect("write a hyprland.lua with no XCURSOR_SIZE line");
 
-        let mut model = ThemesModel::load(&roots, paths.clone(), false, None);
+        let mut model = load_with_cursors(tmp.path(), &paths);
         model.stage_cursor_size("24");
 
         let contribution = model
             .apply_contribution()
             .expect("the three copies carrying the size are written");
-        assert!(
-            !contribution
-                .writes
-                .iter()
-                .any(|write| write.path == hypr_conf(&paths)),
-            "with no XCURSOR_SIZE line to edit, hyprland.conf contributes no write"
+        assert_eq!(
+            written_paths(&contribution),
+            vec![
+                paths.gtk3_settings.as_path(),
+                paths.gtk4_settings.as_path(),
+                paths.uwsm_env.as_path(),
+            ],
+            "with no XCURSOR_SIZE line to edit, hyprland.lua contributes no write, and a \
+             size-only change never touches index.theme"
         );
 
         model.commit();
@@ -2434,6 +2856,307 @@ export XCURSOR_SIZE=16
         assert!(
             !model.is_dirty(),
             "an absent copy does not keep the page dirty"
+        );
+    }
+
+    #[test]
+    fn an_unsafe_hyprland_lua_is_read_as_absent_and_refuses_the_write() {
+        // A hyprland.lua whose bracket structure the Lua editor cannot follow (here an
+        // unclosed table) has no locatable lines: its cursor values read as absent — the
+        // page still loads and shows the other copies' value, and no disagreement is
+        // claimed — but the write is refused with a logged reason rather than guessed,
+        // and the refusal keeps the change from being promoted (the file may well hold
+        // the old value). The file is left byte-identical.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_backing_fixture(&config, UWSM_ENV);
+        let unsafe_lua = "hl.env(\"XCURSOR_THEME\", \"Other\")\nhl.config({\n    general = {\n";
+        fs::write(hypr_lua(&paths), unsafe_lua).unwrap();
+
+        let mut model = load_with_cursors(tmp.path(), &paths);
+        let shown = model
+            .selected_cursor_index()
+            .and_then(|index| model.cursor_themes().get(index))
+            .map(String::as_str);
+        assert_eq!(shown, Some("Nordic-cursors"), "the page still loads");
+        assert_eq!(
+            model.disagreeing_cursor_copies(),
+            Vec::new(),
+            "an unreadable Lua copy is absent, not a disagreement"
+        );
+
+        model.stage_cursor_theme("Bibata");
+        let contribution = model
+            .apply_contribution()
+            .expect("the other copies are still written");
+        assert!(
+            contribution
+                .writes
+                .iter()
+                .all(|write| write.backing != BackingFile::HyprlandLua),
+            "nothing is written to a hyprland.lua whose structure cannot be followed"
+        );
+        model.commit();
+        assert!(model.is_dirty(), "the refused copy blocks promotion");
+        assert_eq!(fs::read_to_string(hypr_lua(&paths)).unwrap(), unsafe_lua);
+    }
+
+    #[test]
+    fn the_consistency_check_names_only_the_lua_copy_when_it_alone_disagrees() {
+        // R3.4: the Theme page reports which cursor copies differ from the value it
+        // shows. With every copy at Nordic-cursors/16 except hyprland.lua's size line,
+        // exactly the Lua copy is named.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_backing_fixture(&config, UWSM_ENV);
+        let model = load_with_cursors(tmp.path(), &paths);
+        assert_eq!(model.disagreeing_cursor_copies(), Vec::new());
+        assert_eq!(model.cursor_mismatch_note(), None, "all copies agree");
+
+        fs::write(
+            hypr_lua(&paths),
+            replace_once(
+                HYPRLAND_LUA,
+                "hl.env(\"XCURSOR_SIZE\", \"16\")",
+                "hl.env(\"XCURSOR_SIZE\", \"24\")",
+            ),
+        )
+        .unwrap();
+        let model = load_with_cursors(tmp.path(), &paths);
+        assert_eq!(
+            model.disagreeing_cursor_copies(),
+            vec![CursorCopy::HyprlandLua]
+        );
+        assert_eq!(
+            model.cursor_mismatch_note().as_deref(),
+            Some(
+                "The cursor is set differently in hyprland.lua. Applying a cursor change \
+                 writes the same theme and size to every copy."
+            )
+        );
+    }
+
+    #[test]
+    fn the_consistency_check_names_only_index_theme_when_it_alone_disagrees() {
+        // The XCursor fallback theme's Inherits= is a cursor copy too (analysis §8.4).
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_backing_fixture(&config, UWSM_ENV);
+        fs::write(
+            fallback(&paths),
+            replace_once(
+                CURSOR_FALLBACK,
+                "Inherits=Nordic-cursors",
+                "Inherits=Adwaita",
+            ),
+        )
+        .unwrap();
+
+        let model = load_with_cursors(tmp.path(), &paths);
+        assert_eq!(
+            model.disagreeing_cursor_copies(),
+            vec![CursorCopy::CursorFallbackTheme]
+        );
+        assert!(
+            model
+                .cursor_mismatch_note()
+                .is_some_and(|note| note.contains("~/.icons/default/index.theme")),
+            "the note names the fallback theme"
+        );
+    }
+
+    #[test]
+    fn the_cursor_falls_back_to_the_lua_and_index_theme_copies_when_the_others_lack_it() {
+        // The value the page shows comes from settings.ini, then uwsm/env, then
+        // hyprland.lua, then (the theme only) index.theme — so a host whose only cursor
+        // copies are the Lua lines and the fallback theme still preselects them.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_backing_fixture(&config, UWSM_ENV);
+        let no_cursor = "[Settings]\ngtk-theme-name=Everforest-Green-Dark\n";
+        fs::write(&paths.gtk3_settings, no_cursor).unwrap();
+        fs::write(&paths.gtk4_settings, no_cursor).unwrap();
+        fs::write(&paths.uwsm_env, "export GDK_BACKEND=wayland\n").unwrap();
+
+        let model = load_with_cursors(tmp.path(), &paths);
+        let selected = |options: &[String], index: Option<usize>| {
+            index.and_then(|index| options.get(index)).cloned()
+        };
+        assert_eq!(
+            selected(model.cursor_themes(), model.selected_cursor_index()).as_deref(),
+            Some("Nordic-cursors"),
+            "the theme comes from hyprland.lua"
+        );
+        assert_eq!(
+            selected(model.cursor_sizes(), model.selected_cursor_size_index()).as_deref(),
+            Some("16"),
+            "the size comes from hyprland.lua"
+        );
+
+        fs::write(hypr_lua(&paths), "-- no cursor lines\n").unwrap();
+        let model = load_with_cursors(tmp.path(), &paths);
+        assert_eq!(
+            selected(model.cursor_themes(), model.selected_cursor_index()).as_deref(),
+            Some("Nordic-cursors"),
+            "the theme comes from index.theme's Inherits= as the last resort"
+        );
+    }
+
+    #[test]
+    fn a_missing_index_theme_is_created_with_the_standard_keys() {
+        // Analysis §8.4: when ~/.icons/default/index.theme is absent (and so is its
+        // directory), a cursor theme change creates it — the three keys the dotfiles
+        // ship, the chosen theme as Inherits= — through the exclusive-create write
+        // mode. After the commit the created file is an ordinary backing file: the next
+        // change rewrites it in place and no self-conflict is reported.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_backing_fixture(&config, UWSM_ENV);
+        let icons_default = fallback(&paths).parent().unwrap().to_path_buf();
+        fs::remove_dir_all(&icons_default).unwrap();
+
+        let mut model = load_with_cursors(tmp.path(), &paths);
+        assert!(!model.check_conflict(), "an absent file is not a conflict");
+        model.stage_cursor_theme("Bibata");
+        let contribution = model.apply_contribution().expect("a cursor change");
+        let create = contribution
+            .writes
+            .iter()
+            .find(|write| write.backing == BackingFile::CursorFallbackTheme)
+            .expect("the fallback theme is part of the write set");
+        assert_eq!(create.mode, WriteMode::CreateNew);
+        assert_eq!(create.path, fallback(&paths));
+        assert_eq!(
+            String::from_utf8(create.contents.clone()).unwrap(),
+            "[Icon Theme]\nName=Default\nComment=Default Cursor Theme\nInherits=Bibata\n"
+        );
+        assert!(
+            contribution
+                .writes
+                .iter()
+                .filter(|write| write.backing != BackingFile::CursorFallbackTheme)
+                .all(|write| write.mode == WriteMode::Replace),
+            "every other copy is rewritten, never created"
+        );
+
+        let plan = ApplyPlan {
+            validations: Vec::new(),
+            writes: contribution.writes,
+            palette: None,
+            reload_params: contribution.reload_params,
+        };
+        let caps = Capabilities::for_tests(&[Binary::Gsettings], &[], false);
+        let outcome = apply::run(
+            &plan,
+            &FreshnessTracker::new(),
+            &caps,
+            &MockCommandRunner::new(),
+            &MockProcessSignaller::new(),
+        );
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(fallback(&paths)).unwrap(),
+            "[Icon Theme]\nName=Default\nComment=Default Cursor Theme\nInherits=Bibata\n"
+        );
+        assert!(icons_default.is_dir(), "the directory is created as well");
+
+        model.commit();
+        assert!(!model.is_dirty());
+        assert!(
+            !model.check_conflict(),
+            "the app's own creation is not a conflict"
+        );
+        model.stage_cursor_theme("Nordic-cursors");
+        let second = model.apply_contribution().expect("a second cursor change");
+        let rewrite = second
+            .writes
+            .iter()
+            .find(|write| write.backing == BackingFile::CursorFallbackTheme)
+            .expect("the created file is written again");
+        assert_eq!(
+            rewrite.mode,
+            WriteMode::Replace,
+            "once created, the file is rewritten in place"
+        );
+    }
+
+    #[test]
+    fn an_index_theme_created_by_another_program_is_a_conflict() {
+        // R5.6: the staged creation was rendered from "absent". A file appearing at the
+        // path before the Apply is an external change, reported like any other conflict
+        // so the page reloads instead of writing over it.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_backing_fixture(&config, UWSM_ENV);
+        fs::remove_file(fallback(&paths)).unwrap();
+
+        let model = load_with_cursors(tmp.path(), &paths);
+        assert!(!model.check_conflict());
+        fs::write(fallback(&paths), CURSOR_FALLBACK).unwrap();
+        assert!(
+            model.check_conflict(),
+            "the newly appeared file is a conflict"
+        );
+        assert!(
+            !model.reload().check_conflict(),
+            "a reload adopts the new file as an ordinary backing file"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_or_dangling_index_theme_is_never_created_over() {
+        // Only a path with nothing at it is created. A dangling symlink (a deployment
+        // link whose repo file is missing) is a link the user made; it is skipped like
+        // any unreadable copy, never replaced by a plain file. And with the home
+        // directory unknown there is no path at all, so nothing is created anywhere.
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let mut paths = write_backing_fixture(&config, UWSM_ENV);
+        fs::remove_file(fallback(&paths)).unwrap();
+        symlink(tmp.path().join("missing-repo-file"), fallback(&paths)).unwrap();
+
+        let mut model = load_with_cursors(tmp.path(), &paths);
+        model.stage_cursor_theme("Bibata");
+        let contribution = model.apply_contribution().expect("the other copies");
+        assert!(
+            contribution
+                .writes
+                .iter()
+                .all(|write| write.backing != BackingFile::CursorFallbackTheme),
+            "a dangling link is not written through or replaced"
+        );
+
+        paths.cursor_fallback_theme = None;
+        let mut model = load_with_cursors(tmp.path(), &paths);
+        model.stage_cursor_theme("Bibata");
+        let contribution = model.apply_contribution().expect("the other copies");
+        assert_eq!(
+            contribution.writes.len(),
+            4,
+            "no index.theme write without a home"
+        );
+    }
+
+    #[test]
+    fn the_login_note_names_both_session_env_copies_on_a_lua_host() {
+        // Architecture §6: env-file copies take effect at the next login, which the page
+        // says. On a Lua host the hl.env lines are such a copy too.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_backing_fixture(&config, UWSM_ENV);
+        let model = load_with_cursors(tmp.path(), &paths);
+        assert_eq!(
+            model.cursor_login_note().as_deref(),
+            Some(
+                "A cursor change shows immediately; its session environment copies \
+                 (uwsm/env and the hl.env lines of hyprland.lua) take effect at the next \
+                 login."
+            )
         );
     }
 }

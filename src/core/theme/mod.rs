@@ -32,7 +32,7 @@
 //! [`SettingId`](crate::core::model::SettingId) values. The store's shape — an
 //! `original`/`staged` [`Value`](crate::core::model::Value) per `SettingId`, applied as
 //! one [`FileWrite`](crate::core::apply::FileWrite) per file — does not fit a control
-//! whose value is duplicated across four files, one whose Apply runs a generator instead
+//! whose value is duplicated across five files, one whose Apply runs a generator instead
 //! of writing a file (see the `palette` submodule for that argument in full), or one
 //! whose two files hold a derived rather than an edited value.
 //!
@@ -52,7 +52,9 @@ mod themes;
 mod wallpaper;
 
 pub use palette::{PaletteModel, Scheme};
-pub use themes::{GtkThemeOverrideSource, ThemeRoots, ThemesApply, ThemesModel, ThemesPaths};
+pub use themes::{
+    CursorCopy, GtkThemeOverrideSource, ThemeRoots, ThemesApply, ThemesModel, ThemesPaths,
+};
 pub use wallpaper::{WallpaperApply, WallpaperModel, WallpaperPaths};
 
 /// One staged value: what the backing config currently holds, plus any pending edit.
@@ -208,7 +210,9 @@ struct BackingText {
 /// A read failure is not surfaced at `warn` here: the section-level gating
 /// ([`ThemesModel::themes_editable`]) reports a missing `settings.ini`, and detection
 /// already logs the primary gates (R4.4). A missing secondary cursor copy
-/// (`hyprland.conf`/`uwsm/env`) just means that copy is skipped, so `debug` is right.
+/// (`hyprland.lua`, `uwsm/env`, `~/.icons/default/index.theme`) just means that copy is
+/// skipped — or, for `index.theme`, created by the next cursor Apply — so `debug` is
+/// right.
 fn read_backing(path: &Path) -> Option<BackingText> {
     match std::fs::read_to_string(path) {
         Ok(text) => Some(BackingText {
@@ -225,7 +229,7 @@ fn read_backing(path: &Path) -> Option<BackingText> {
 /// The set of backing config files one Theme model edits: each readable file's current
 /// text, plus the freshness baseline its conflict check and post-Apply re-baselining need.
 ///
-/// The GTK/icon/cursor model owns four files and the wallpaper model two, but they own
+/// The GTK/icon/cursor model owns five files and the wallpaper model two, but they own
 /// them the same way, and duplicating this bookkeeping is how the promotion bug that task
 /// 9.6 fixed came to be written twice. One copy means one place to get it right.
 ///
@@ -287,12 +291,13 @@ impl BackingSet {
     /// text alone: no parser here emits such bytes, so this only avoids a lossy
     /// conversion.
     ///
-    /// A write to a path this set does not hold is re-baselined too — only the *text*
-    /// update skips it, since there is no in-memory copy to refresh. That cannot happen
-    /// today, because every write is rendered from one of these files; were it ever to,
-    /// the stray path would join the freshness baseline and be conflict-checked from then
-    /// on, which would widen the write-target scoping task 9.11 deliberately narrowed. Any
-    /// future caller passing foreign writes should guard the `record_bytes` call above.
+    /// A write to a path this set does not hold yet is a file the Apply **created** —
+    /// the GTK/icon/cursor model creates `~/.icons/default/index.theme` when it is absent
+    /// (task 11.5, [`WriteMode::CreateNew`](crate::core::apply::WriteMode::CreateNew)) —
+    /// so it joins the set: it is baselined and its text kept, and from then on it is
+    /// edited and conflict-checked like a file that was there at load. Every write is
+    /// rendered from one of the model's own declared paths, so no foreign path can join
+    /// this way and widen the write-target scoping task 9.11 deliberately narrowed.
     fn absorb_writes(&mut self, writes: &[FileWrite]) {
         for write in writes {
             self.freshness
@@ -300,12 +305,16 @@ impl BackingSet {
             let Ok(text) = std::str::from_utf8(&write.contents) else {
                 continue;
             };
-            if let Some(backing) = self
+            match self
                 .files
                 .iter_mut()
                 .find(|backing| backing.path == write.path)
             {
-                backing.text = text.to_string();
+                Some(backing) => backing.text = text.to_string(),
+                None => self.files.push(BackingText {
+                    path: write.path.clone(),
+                    text: text.to_string(),
+                }),
             }
         }
     }

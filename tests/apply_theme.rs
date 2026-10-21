@@ -11,8 +11,10 @@
 //!   chain — including the rollback proof that a failed palette apply never
 //!   leaves the generated files regenerated (the palette gotcha);
 //! - the **GTK/icon/cursor** themes, whose duplicated on-disk copies (both
-//!   `settings.ini` files; for the cursor also `hyprland.conf` + `uwsm/env`)
-//!   must all receive the identical value (analysis §6.2, R3.4);
+//!   `settings.ini` files; for the cursor also `uwsm/env`, the two `hl.env`
+//!   lines of `hyprland.lua` and the XCursor fallback
+//!   `~/.icons/default/index.theme`) must all receive the identical value
+//!   (R3.4, analysis §7.7, §8.4);
 //! - the **wallpaper / lock background** dual write (`hyprpaper.conf` +
 //!   `hyprlock.conf`, same image), including the real machine's tilde-shaped
 //!   original path (`~/Pictures/…`), which the fixture's anonymized absolute
@@ -26,17 +28,21 @@ use std::fs;
 
 use nix::sys::signal::Signal;
 
+use settings4000::core::apply::WriteMode;
 use settings4000::core::apply::{self, ApplyOutcome, ApplyPlan, WriteFailureCause};
 use settings4000::core::detect::{Binary, Capabilities, Daemon, DetectionInputs};
 use settings4000::core::freshness::FreshnessTracker;
+use settings4000::core::reload::BackingFile;
 use settings4000::core::reload::ReloadParams;
 use settings4000::core::theme::{
     PaletteModel, ThemeRoots, ThemesModel, ThemesPaths, WallpaperModel, WallpaperPaths,
 };
+use settings4000::parsers::lua_literal::{LuaConfigFile, LuaValue};
 use settings4000::system::command::{Command, CommandOutput, MockCommandRunner};
 use settings4000::system::signal::{MockProcessSignaller, SignalCall};
 use settings4000::testing::{
-    FixtureDotfiles, assert_repo_untouched_except, expect_applied, replace_once, repo_snapshot,
+    FixtureDotfiles, assert_repo_untouched_except, differing_lines, expect_applied, replace_once,
+    repo_snapshot,
 };
 
 /// Builds the palette model exactly as the startup worker does (task 6.3): the
@@ -78,13 +84,20 @@ fn load_themes(fx: &FixtureDotfiles) -> ThemesModel {
         gtk_theme_dirs: vec![fx.home().join(".themes")],
         icon_dirs: vec![fx.home().join(".icons")],
     };
-    let paths = ThemesPaths {
+    ThemesModel::load(&roots, themes_paths(fx), false, None)
+}
+
+/// The deployed backing paths of the GTK/icon/cursor model on a Lua-provider host,
+/// as the startup loader builds them: the XDG config files plus the home-level
+/// XCursor fallback theme.
+fn themes_paths(fx: &FixtureDotfiles) -> ThemesPaths {
+    ThemesPaths {
         gtk3_settings: fx.config_path("gtk-3.0/settings.ini"),
         gtk4_settings: fx.config_path("gtk-4.0/settings.ini"),
-        hyprland_conf: Some(fx.config_path("hypr/hyprland.conf")),
+        hyprland_lua: Some(fx.config_path("hypr/hyprland.lua")),
         uwsm_env: fx.config_path("uwsm/env"),
-    };
-    ThemesModel::load(&roots, paths, false, None)
+        cursor_fallback_theme: Some(fx.home().join(".icons/default/index.theme")),
+    }
 }
 
 /// Builds the wallpaper model exactly as the startup worker does (task 6.5), with
@@ -177,8 +190,8 @@ fn a_palette_switch_runs_generate_colors_then_the_reload_chain() {
 #[test]
 fn a_gtk_theme_change_writes_both_settings_ini_identically() {
     // Task 6.4 (R3.3): a GTK theme switch writes the identical value to BOTH
-    // settings.ini duplicates — and nothing else (uwsm/env and hyprland.conf are
-    // cursor copies only) — then applies it live with one `gsettings set`.
+    // settings.ini duplicates — and nothing else (uwsm/env, hyprland.lua and
+    // index.theme are cursor copies only) — then applies it live with one `gsettings set`.
     let fx = FixtureDotfiles::install();
     // Install a discoverable GTK theme so the drop-down offers it, as on a real
     // machine (a directory with a gtk-3.0/ subdirectory under ~/.themes).
@@ -237,7 +250,7 @@ fn a_gtk_theme_change_writes_both_settings_ini_identically() {
         ])]
     );
 
-    // (c) Everything else untouched — in particular uwsm/env and hyprland.conf.
+    // (c) Everything else untouched — in particular the cursor-only copies.
     assert_repo_untouched_except(
         &fx,
         &before,
@@ -245,25 +258,45 @@ fn a_gtk_theme_change_writes_both_settings_ini_identically() {
     );
 }
 
+/// Task 11.5 (R3.4, the duplicated-values gotcha): a cursor change writes the
+/// identical value to every copy — both `settings.ini`, `uwsm/env`, the two
+/// `hl.env` lines of `hyprland.lua` and `~/.icons/default/index.theme` — through
+/// the deployed symlinks into the repo, then reloads with `hyprctl reload` (the
+/// changed Lua config), the two `gsettings set` cursor keys and
+/// `hyprctl setcursor`.
+///
+/// The `hyprland.lua` byte diff is also the proof of the caller contract from task
+/// 11.3: the Lua editor can address that file's top-level `hl.config` literals
+/// (the real file has e.g. `cursor.inactive_timeout`), but the cursor write may only
+/// ever call `LuaConfigFile::set_env`, so exactly the two env line indices may
+/// differ and the other 480+ lines must stay byte-identical.
 #[test]
-fn a_cursor_change_writes_all_four_duplicated_copies_identically() {
-    // Task 6.4 (R3.4, the duplicated-values gotcha): the cursor theme is declared
-    // in both settings.ini files, hyprland.conf's env lines, AND uwsm/env — a
-    // change must write every copy identically so a writer can never desync them,
-    // then reload via gsettings + `hyprctl setcursor` (plus `hyprctl reload` for
-    // the changed hyprland.conf).
+fn a_cursor_change_writes_every_duplicated_copy_identically() {
     let fx = FixtureDotfiles::install();
     fs::create_dir_all(fx.home().join(".icons/Fixture-Cursors/cursors"))
         .expect("create the fixture cursor theme");
     let before = repo_snapshot(&fx);
 
     let mut themes = load_themes(&fx);
+    assert_eq!(
+        themes.disagreeing_cursor_copies(),
+        Vec::new(),
+        "the refreshed fixture's five cursor copies all agree on breeze_cursors/24"
+    );
     themes.stage_cursor_theme("Fixture-Cursors");
+    themes.stage_cursor_size("32");
 
     let mut plan = empty_plan();
     let contribution = themes
         .apply_contribution()
         .expect("a dirty cursor contributes");
+    assert!(
+        contribution
+            .writes
+            .iter()
+            .all(|write| write.mode == WriteMode::Replace),
+        "every copy exists in the fixture, so every write is a rewrite"
+    );
     plan.writes.extend(contribution.writes);
     plan.reload_params = contribution.reload_params;
 
@@ -274,44 +307,103 @@ fn a_cursor_change_writes_all_four_duplicated_copies_identically() {
     let outcome = apply::run(&plan, &freshness, &caps, &runner, &signaller);
     let (reload_failures, written) = expect_applied(outcome);
     assert!(reload_failures.is_empty());
-    assert_eq!(written.len(), 4, "all four cursor copies are written");
+    assert_eq!(written.len(), 5, "all five cursor copies are written");
 
-    // (a) Exact bytes per copy: each file's own key/format, the identical value.
-    let expect_patched = |relative: &str, from: &str, to: &str| {
-        let repo_relative = format!("config/{relative}");
-        let original = String::from_utf8(before[repo_relative.as_str()].clone())
+    // (a) hyprland.lua: exactly the two hl.env lines differ, the size as a Lua
+    // string. The repo copy behind the deployed symlink carries the change and the
+    // link itself is preserved.
+    let lua_live = fx.config_path("hypr/hyprland.lua");
+    assert!(
+        fs::symlink_metadata(&lua_live)
+            .expect("hyprland.lua is deployed")
+            .file_type()
+            .is_symlink(),
+        "the deployment link is preserved"
+    );
+    let lua_before = String::from_utf8(before["config/hypr/hyprland.lua"].clone())
+        .expect("hyprland.lua is UTF-8");
+    let lua_after =
+        fs::read_to_string(fx.repo_path("config/hypr/hyprland.lua")).expect("read the repo copy");
+    let env_line = |name: &str| {
+        lua_before
+            .lines()
+            .position(|line| line.starts_with(&format!("hl.env(\"{name}\"")))
+            .unwrap_or_else(|| panic!("the fixture has an hl.env line for {name}"))
+    };
+    assert!(lua_before.lines().count() > 480, "the real, whole file");
+    assert_eq!(
+        differing_lines(&lua_before, &lua_after),
+        vec![env_line("XCURSOR_THEME"), env_line("XCURSOR_SIZE")],
+        "only the two hl.env lines may change"
+    );
+    assert_eq!(
+        lua_after,
+        replace_once(
+            &replace_once(
+                &lua_before,
+                "hl.env(\"XCURSOR_THEME\", \"breeze_cursors\")",
+                "hl.env(\"XCURSOR_THEME\", \"Fixture-Cursors\")",
+            ),
+            "hl.env(\"XCURSOR_SIZE\", \"24\")",
+            "hl.env(\"XCURSOR_SIZE\", \"32\")",
+        )
+    );
+    // The addressable-but-not-owned literal the contract protects is untouched.
+    assert_eq!(
+        LuaConfigFile::parse(&lua_after).value("cursor.inactive_timeout"),
+        Some(&LuaValue::Integer(0))
+    );
+
+    // (b) The other copies: each file's own key/format, the identical value.
+    let expect_patched = |repo_relative: &str, edits: &[(&str, &str)]| {
+        let original = String::from_utf8(before[repo_relative].clone())
             .expect("theme backing files are UTF-8");
+        let expected = edits
+            .iter()
+            .fold(original, |text, (from, to)| replace_once(&text, from, to));
         assert_eq!(
-            fs::read_to_string(fx.config_path(relative)).expect("read the applied file"),
-            replace_once(&original, from, to),
-            "{relative}: only the cursor theme value may change"
+            fs::read_to_string(fx.repo_path(repo_relative)).expect("read the applied file"),
+            expected,
+            "{repo_relative}: only the cursor values may change"
         );
     };
+    for settings in ["config/gtk-3.0/settings.ini", "config/gtk-4.0/settings.ini"] {
+        expect_patched(
+            settings,
+            &[
+                (
+                    "gtk-cursor-theme-name=breeze_cursors",
+                    "gtk-cursor-theme-name=Fixture-Cursors",
+                ),
+                ("gtk-cursor-theme-size=24", "gtk-cursor-theme-size=32"),
+            ],
+        );
+    }
     expect_patched(
-        "gtk-3.0/settings.ini",
-        "gtk-cursor-theme-name=Nordic-cursors",
-        "gtk-cursor-theme-name=Fixture-Cursors",
+        "config/uwsm/env",
+        &[
+            (
+                "export XCURSOR_THEME=breeze_cursors",
+                "export XCURSOR_THEME=Fixture-Cursors",
+            ),
+            ("export XCURSOR_SIZE=24", "export XCURSOR_SIZE=32"),
+        ],
     );
     expect_patched(
-        "gtk-4.0/settings.ini",
-        "gtk-cursor-theme-name=Nordic-cursors",
-        "gtk-cursor-theme-name=Fixture-Cursors",
+        "icons/default/index.theme",
+        &[("Inherits=breeze_cursors", "Inherits=Fixture-Cursors")],
     );
-    expect_patched(
-        "hypr/hyprland.conf",
-        "env = XCURSOR_THEME,Nordic-cursors",
-        "env = XCURSOR_THEME,Fixture-Cursors",
-    );
-    expect_patched(
-        "uwsm/env",
-        "export XCURSOR_THEME=Nordic-cursors",
-        "export XCURSOR_THEME=Fixture-Cursors",
+    assert!(
+        fs::symlink_metadata(fx.home().join(".icons/default/index.theme"))
+            .expect("index.theme is deployed")
+            .file_type()
+            .is_symlink(),
+        "the home-level deployment link is preserved"
     );
 
-    // (b) The exact reload sequence in the canonical order: hyprctl reload (the
-    // changed hyprland.conf), the two gsettings cursor keys (the size rides along
-    // with the unchanged 16 — setcursor needs both), then hyprctl setcursor. The
-    // gsettings/setcursor pair appears ONCE despite three files sharing it.
+    // (c) The exact command sequence in the canonical order: hyprctl reload (the
+    // changed hyprland.lua; task 11.11 makes it `config-only`), the two gsettings
+    // cursor keys, then hyprctl setcursor — ONCE despite five files sharing it.
     assert_eq!(
         runner.recorded(),
         vec![
@@ -326,22 +418,98 @@ fn a_cursor_change_writes_all_four_duplicated_copies_identically() {
                 "set",
                 "org.gnome.desktop.interface",
                 "cursor-size",
-                "16",
+                "32",
             ]),
-            Command::new("hyprctl").args(["setcursor", "Fixture-Cursors", "16"]),
+            Command::new("hyprctl").args(["setcursor", "Fixture-Cursors", "32"]),
         ]
     );
 
-    // (c) Everything else untouched.
+    // (d) Everything else untouched, and the copies agree again after the commit.
     assert_repo_untouched_except(
         &fx,
         &before,
         &[
             "config/gtk-3.0/settings.ini",
             "config/gtk-4.0/settings.ini",
-            "config/hypr/hyprland.conf",
+            "config/hypr/hyprland.lua",
+            "config/uwsm/env",
+            "icons/default/index.theme",
+        ],
+    );
+    themes.commit();
+    assert!(!themes.is_dirty());
+    assert_eq!(themes.disagreeing_cursor_copies(), Vec::new());
+}
+
+#[test]
+fn a_cursor_change_creates_a_missing_xcursor_fallback_theme() {
+    // Analysis §8.4: on a host without the dotfiles' `~/.icons/default/index.theme`
+    // (here: the deployment link and its directory removed), a cursor theme change
+    // creates the file — a plain file with the three standard keys — in a freshly
+    // created plain `~/.icons/default`, alongside the rewrites of the other copies.
+    let fx = FixtureDotfiles::install();
+    fs::create_dir_all(fx.home().join(".icons/Fixture-Cursors/cursors"))
+        .expect("create the fixture cursor theme");
+    let icons_default = fx.home().join(".icons/default");
+    fs::remove_dir_all(&icons_default).expect("remove the deployed fallback theme");
+    let before = repo_snapshot(&fx);
+
+    let mut themes = load_themes(&fx);
+    themes.stage_cursor_theme("Fixture-Cursors");
+    let contribution = themes
+        .apply_contribution()
+        .expect("a dirty cursor contributes");
+    let create = contribution
+        .writes
+        .iter()
+        .find(|write| write.backing == BackingFile::CursorFallbackTheme)
+        .expect("the missing fallback theme is part of the write set");
+    assert_eq!(create.mode, WriteMode::CreateNew);
+
+    let mut plan = empty_plan();
+    plan.writes.extend(contribution.writes);
+    plan.reload_params = contribution.reload_params;
+    let caps = Capabilities::for_tests(&[Binary::Gsettings, Binary::Hyprctl], &[], true);
+    let outcome = apply::run(
+        &plan,
+        &FreshnessTracker::new(),
+        &caps,
+        &MockCommandRunner::new(),
+        &MockProcessSignaller::new(),
+    );
+    let (reload_failures, written) = expect_applied(outcome);
+    assert!(reload_failures.is_empty());
+    assert_eq!(written.len(), 5, "four rewrites and one creation");
+
+    let created = icons_default.join("index.theme");
+    assert_eq!(
+        fs::read_to_string(&created).expect("the fallback theme exists"),
+        "[Icon Theme]\nName=Default\nComment=Default Cursor Theme\nInherits=Fixture-Cursors\n"
+    );
+    for path in [&icons_default, &created] {
+        let meta = fs::symlink_metadata(path).expect("created");
+        assert!(
+            !meta.file_type().is_symlink(),
+            "{} is plain",
+            path.display()
+        );
+    }
+    // The repo's tracked copy is no longer deployed, so it is not touched.
+    assert_repo_untouched_except(
+        &fx,
+        &before,
+        &[
+            "config/gtk-3.0/settings.ini",
+            "config/gtk-4.0/settings.ini",
+            "config/hypr/hyprland.lua",
             "config/uwsm/env",
         ],
+    );
+    themes.commit();
+    assert!(!themes.is_dirty());
+    assert!(
+        !themes.check_conflict(),
+        "the file the app created is not a self-conflict"
     );
 }
 

@@ -407,13 +407,17 @@ mod tests {
         // Accept criterion (primary): an external edit made after recording is
         // reported as a ContentChanged conflict on the exact tracked path.
         let dir = tempfile::tempdir().expect("temp dir should be creatable");
-        let path = write_file(dir.path(), "hyprland.conf", b"env = XCURSOR_SIZE,16\n");
+        let path = write_file(
+            dir.path(),
+            "hypridle.conf",
+            b"listener {\n    timeout = 150\n}\n",
+        );
 
         let mut tracker = FreshnessTracker::new();
         tracker.record(&path).expect("record baseline");
 
         // Someone edits the file by hand between the read and the check.
-        fs::write(&path, b"env = XCURSOR_SIZE,24\n").expect("external edit");
+        fs::write(&path, b"listener {\n    timeout = 300\n}\n").expect("external edit");
 
         let conflicts = tracker.check_conflicts();
         assert_eq!(conflicts.len(), 1, "the edited file must be reported");
@@ -643,8 +647,8 @@ mod tests {
         // (ii) bytes still matching on disk are not flagged, and (i) a later
         // external edit is caught as ContentChanged.
         let dir = tempfile::tempdir().expect("temp dir should be creatable");
-        let contents = b"env = XCURSOR_SIZE,16\n";
-        let path = write_file(dir.path(), "hyprland.conf", contents);
+        let contents = b"listener {\n    timeout = 150\n}\n";
+        let path = write_file(dir.path(), "hypridle.conf", contents);
 
         let mut tracker = FreshnessTracker::new();
         tracker.record_bytes(&path, contents);
@@ -657,7 +661,7 @@ mod tests {
         );
 
         // (i) An external edit after recording is detected.
-        fs::write(&path, b"env = XCURSOR_SIZE,24\n").expect("external edit");
+        fs::write(&path, b"listener {\n    timeout = 300\n}\n").expect("external edit");
         let conflicts = tracker.check_conflicts();
         assert_eq!(conflicts.len(), 1, "the edited file must be reported");
         assert_eq!(conflicts[0].path(), path.as_path());

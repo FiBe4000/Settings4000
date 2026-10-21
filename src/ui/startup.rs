@@ -474,7 +474,8 @@ fn load_palette(capabilities: &Capabilities) -> Option<PaletteModel> {
 /// its changes with `gsettings set`, so without it the controls are hidden and logged
 /// at `info` (R4.2). When present, it discovers installed themes under the XDG theme
 /// roots (`~/.themes`, the data dirs, `/usr/share/...`), reads the backing config
-/// (both `settings.ini`, `hyprland.conf`, `uwsm/env`), gates the live-restyle claim on
+/// (both `settings.ini`, `hyprland.lua`, `uwsm/env`, `~/.icons/default/index.theme`),
+/// gates the live-restyle claim on
 /// the settings portal (R2.2), and passes the app's own `GTK_THEME` environment value
 /// so an override disables the GTK-theme drop-down (R3.3). Running the discovery here,
 /// on the startup worker, keeps its filesystem scans off the main thread and inside the
@@ -518,16 +519,23 @@ fn theme_roots() -> ThemeRoots {
     }
 }
 
-/// The live XDG paths of the config files a theme/cursor change writes (R8.5).
+/// The live paths of the files a theme/cursor change writes (R8.5).
 ///
-/// The Hyprland-side cursor copy is included only when the compositor runs its Lua
-/// config provider (task 11.2, analysis §8.6): the app keeps no hyprlang cursor path,
-/// so on any other host that write is hidden (logged at `info`) while the
-/// `settings.ini`, `uwsm/env`, `gsettings` and `hyprctl setcursor` legs stay.
+/// The Hyprland-side cursor copy — the two `hl.env` lines of `hyprland.lua` — is
+/// included only when the compositor runs its Lua config provider (task 11.2,
+/// analysis §8.6): the app keeps no hyprlang cursor path, so on any other host that
+/// write is hidden (logged at `info`) while the `settings.ini`, `uwsm/env`,
+/// `index.theme`, `gsettings` and `hyprctl setcursor` legs stay.
+///
+/// The XCursor fallback theme is the one cursor copy outside the XDG config directory:
+/// `$HOME/.icons/default/index.theme`, the path libXcursor and `setup.sh` use (analysis
+/// §8.4; R8.2's "equivalent per-app paths"). It is left out when `$HOME` is unset,
+/// because the cursor write may *create* that file and must never do so at a path
+/// relative to the working directory.
 fn themes_paths(capabilities: &Capabilities) -> ThemesPaths {
     let config = config_home();
-    let hyprland_conf = if capabilities.hypr_config_provider() == HyprConfigProvider::Lua {
-        Some(config.join("hypr").join("hyprland.conf"))
+    let hyprland_lua = if capabilities.hypr_config_provider() == HyprConfigProvider::Lua {
+        Some(config.join("hypr").join("hyprland.lua"))
     } else {
         tracing::info!(
             provider = %capabilities.hypr_config_provider(),
@@ -536,11 +544,20 @@ fn themes_paths(capabilities: &Capabilities) -> ThemesPaths {
         );
         None
     };
+    let cursor_fallback_theme =
+        home_dir().map(|home| home.join(".icons").join("default").join("index.theme"));
+    if cursor_fallback_theme.is_none() {
+        tracing::info!(
+            "the home directory is unknown; the XCursor fallback theme copy of the cursor \
+             is not written (R3.4)"
+        );
+    }
     ThemesPaths {
         gtk3_settings: config.join("gtk-3.0").join("settings.ini"),
         gtk4_settings: config.join("gtk-4.0").join("settings.ini"),
-        hyprland_conf,
+        hyprland_lua,
         uwsm_env: config.join("uwsm").join("env"),
+        cursor_fallback_theme,
     }
 }
 
@@ -1240,7 +1257,9 @@ mod tests {
             "the Input helper is built"
         );
         assert!(
-            themes_paths(&lua).hyprland_conf.is_some(),
+            themes_paths(&lua)
+                .hyprland_lua
+                .is_some_and(|path| path.ends_with("hypr/hyprland.lua")),
             "the Hyprland-side cursor copy is written on a Lua host"
         );
 
@@ -1255,7 +1274,7 @@ mod tests {
             "no Input helper is built"
         );
         assert!(
-            themes_paths(&hyprlang).hyprland_conf.is_none(),
+            themes_paths(&hyprlang).hyprland_lua.is_none(),
             "the Hyprland-side cursor write is hidden on a hyprlang host"
         );
         // The rest of the Theme page is unaffected: gsettings still gates it.

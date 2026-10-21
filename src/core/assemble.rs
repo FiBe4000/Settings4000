@@ -142,7 +142,8 @@ pub enum ConflictedSource {
     /// The Display model's `monitors.conf` (task 6.1).
     Display,
     /// The GTK/icon/cursor model's backing files — both `settings.ini` files,
-    /// `hyprland.conf`, and `uwsm/env` (task 6.4).
+    /// `hyprland.lua`, `uwsm/env`, and `~/.icons/default/index.theme` (tasks 6.4,
+    /// 11.5).
     Themes,
     /// The wallpaper model's `hyprpaper.conf`/`hyprlock.conf` (task 6.5).
     Wallpaper,
@@ -327,9 +328,9 @@ pub fn assemble_apply_plan(sources: ApplySources<'_>) -> Result<AssembledPlan, P
     }
 
     // The GTK/icon/cursor theme writes (task 6.4): the value goes identically to every
-    // copy the app owns (both `settings.ini` files and, for the cursor, `hyprland.conf`'s
-    // env lines and `uwsm/env` — R3.4), and the reload parameters drive `gsettings set`
-    // plus `hyprctl setcursor`.
+    // copy the app owns (both `settings.ini` files and, for the cursor, `hyprland.lua`'s
+    // hl.env lines, `uwsm/env` and `~/.icons/default/index.theme` — R3.4), and the
+    // reload parameters drive `gsettings set` plus `hyprctl setcursor`.
     if let Some(contribution) = sources.themes.and_then(ThemesModel::apply_contribution) {
         plan.writes.extend(contribution.writes);
         merge_reload_params(&mut plan.reload_params, contribution.reload_params);

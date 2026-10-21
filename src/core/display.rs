@@ -81,7 +81,7 @@ use std::path::PathBuf;
 
 use serde_json::Value as JsonValue;
 
-use crate::core::apply::{FileWrite, WriteValidation};
+use crate::core::apply::{FileWrite, WriteMode, WriteValidation};
 use crate::core::freshness::FreshnessTracker;
 use crate::core::model::{
     SCALE_RANGE, SettingId, Value, validate_float_range, validate_monitor_mode,
@@ -711,6 +711,7 @@ impl DisplayModel {
                 // The mode/scale/position values in this write are exactly what the
                 // `validations` below hand the pipeline to re-check (R8.3).
                 validation: WriteValidation::InPlan,
+                mode: WriteMode::Replace,
             },
             validations: self.staged_validations(),
         }))

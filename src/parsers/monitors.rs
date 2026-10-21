@@ -4,7 +4,7 @@
 //! # What this file is
 //!
 //! `config/hypr/monitors.conf` is a line-oriented list of `monitor=` records,
-//! `source=`d from `hyprland.conf`, that configures every output. Each record is
+//! read by the monitor loader in `hyprland.lua`, that configures every output. Each record is
 //! the key `monitor` followed by comma-separated positional fields:
 //!
 //! ```text

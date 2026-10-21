@@ -90,7 +90,6 @@ fn deployed_config_paths_are_symlinks_into_the_repo() {
     let deployed = [
         "hypr/colors.conf",
         "hypr/hypridle.conf",
-        "hypr/hyprland.conf",
         "hypr/hyprlock.conf",
         "hypr/hyprpaper.conf",
         "hypr/monitors.conf",
@@ -211,7 +210,6 @@ fn hyprlang_configs_parse_losslessly_at_their_deployed_paths() {
 
     // Round-trip identity + warning-free parse for the whole hyprlang family.
     for relative in [
-        "hypr/hyprland.conf",
         "hypr/hypridle.conf",
         "hypr/hyprlock.conf",
         "hypr/hyprpaper.conf",
@@ -331,7 +329,9 @@ fn swaync_config_parses_with_stable_shape() {
 }
 
 /// Both GTK `settings.ini` files parse with the `[Settings]` section holding
-/// the unified cursor values (analysis §6.5) and round-trip byte-identically.
+/// the unified cursor values (`breeze_cursors`/24, analysis §7.7) and round-trip
+/// byte-identically. Neither carries `gtk-xft-dpi`, which the app never writes
+/// (analysis §7.7: X11 DPI comes from `xrdb`).
 #[test]
 fn gtk_settings_ini_parse_with_the_unified_cursor_values() {
     let fx = FixtureDotfiles::install();
@@ -343,14 +343,15 @@ fn gtk_settings_ini_parse_with_the_unified_cursor_values() {
         assert_eq!(ini.emit(), input, "{relative} should round-trip");
         assert_eq!(
             ini.value("Settings", "gtk-cursor-theme-name"),
-            Some("Nordic-cursors"),
+            Some("breeze_cursors"),
             "{relative}"
         );
         assert_eq!(
             ini.value("Settings", "gtk-cursor-theme-size"),
-            Some("16"),
+            Some("24"),
             "{relative}"
         );
+        assert_eq!(ini.value("Settings", "gtk-xft-dpi"), None, "{relative}");
         assert_eq!(
             ini.value("Settings", "gtk-theme-name"),
             Some("Everforest-Green-Dark"),
@@ -359,8 +360,9 @@ fn gtk_settings_ini_parse_with_the_unified_cursor_values() {
     }
 }
 
-/// `uwsm/env` parses with the canonical cursor values and the deliberately
-/// commented-out `GTK_THEME` line the override check reads (R3.3).
+/// `uwsm/env` parses with the canonical cursor values (`breeze_cursors`/24) and
+/// the deliberately commented-out `GTK_THEME` line the override check reads
+/// (R3.3).
 #[test]
 fn uwsm_env_parses_with_the_commented_gtk_theme_override() {
     let fx = FixtureDotfiles::install();
@@ -370,8 +372,8 @@ fn uwsm_env_parses_with_the_commented_gtk_theme_override() {
     assert!(warnings.is_empty(), "unexpected {warnings:?}");
     assert_eq!(env.emit(), input, "uwsm/env should round-trip");
 
-    assert_eq!(env.value("XCURSOR_THEME"), Some("Nordic-cursors"));
-    assert_eq!(env.value("XCURSOR_SIZE"), Some("16"));
+    assert_eq!(env.value("XCURSOR_THEME"), Some("breeze_cursors"));
+    assert_eq!(env.value("XCURSOR_SIZE"), Some("24"));
     assert_eq!(
         env.gtk_theme_override(),
         GtkThemeOverride::Commented {

@@ -54,10 +54,11 @@
 //!    user is told and recovers with Refresh, which reloads and re-baselines what it
 //!    can (R4.3).
 //! 3. **Atomic writes with per-file rollback** (R5.4): write each planned file
-//!    through [`write_atomic`], collecting a [`FileSnapshot`] per success. If any
-//!    write fails, every already-written file is rolled back from its in-memory
-//!    pre-apply snapshot and the failure is returned, leaving the desktop as it
-//!    was.
+//!    through [`write_atomic`] (or, for the one file a page may create, through
+//!    [`create_atomic`] — see [`WriteMode`]), collecting a [`FileSnapshot`] per
+//!    success. If any write fails, every already-written file is rolled back from
+//!    its in-memory pre-apply snapshot (a created file is deleted again) and the
+//!    failure is returned, leaving the desktop as it was.
 //! 4. **Palette generator, last** (the palette gotcha): if the change is a
 //!    color-scheme switch, run the discovered `scripts/generate-colors <scheme>`
 //!    as the **last** write step. A non-zero exit — which also covers a
@@ -147,7 +148,7 @@ use crate::core::model::{SettingId, ValidationError, Value};
 use crate::core::reload::{BackingFile, ReloadError, ReloadParams, plan_reloads};
 use crate::system::command::{Command, CommandError, CommandRunner, STDERR_EXCERPT_LIMIT};
 use crate::system::signal::ProcessSignaller;
-use crate::system::writer::{FileSnapshot, WriteError, write_atomic};
+use crate::system::writer::{FileSnapshot, WriteError, create_atomic, write_atomic};
 
 /// One planned atomic write of a backing config file — the pipeline's file-write
 /// seam (see the module docs).
@@ -174,6 +175,33 @@ pub struct FileWrite {
     /// built the write, and read only by the plan-drift guard
     /// ([`warn_on_missing_validations`]). See [`WriteValidation`].
     pub validation: WriteValidation,
+    /// Whether the write rewrites an existing file (every backing file but one) or
+    /// creates a file that does not exist yet. See [`WriteMode`].
+    pub mode: WriteMode,
+}
+
+/// Whether a [`FileWrite`] rewrites an existing file or creates a new one.
+///
+/// The distinction is explicit rather than inferred from whether the path exists
+/// at write time, because the two cases need opposite safety rules: a rewrite must
+/// find the file it rendered its edit from (a missing target means it was deleted
+/// since it was read — an error, never a reason to create it), while a creation
+/// must find *nothing* there (anything present appeared after the page looked and
+/// must not be clobbered). The page that renders the write knows which it read, so
+/// it declares it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteMode {
+    /// Rewrite an existing file through [`write_atomic`] (symlinks followed, a
+    /// missing target is a write failure). The mode of every backing file the app
+    /// expects to exist.
+    Replace,
+    /// Create a file that was absent when the page loaded, through
+    /// [`create_atomic`]: exclusive (a file that has appeared since is a write
+    /// failure, not overwritten), missing parent directories are created, and a
+    /// rollback deletes the file again. Used only for the XCursor fallback theme
+    /// `~/.icons/default/index.theme`, which the cursor write set creates when it is
+    /// absent (task 11.5, analysis §8.4).
+    CreateNew,
 }
 
 /// Whether a [`FileWrite`]'s values are covered by its plan's
@@ -638,9 +666,14 @@ struct WritePhaseFailure {
 fn write_phase(plan: &ApplyPlan, runner: &dyn CommandRunner) -> Result<(), WritePhaseFailure> {
     let mut snapshots: Vec<FileSnapshot> = Vec::new();
 
-    // Step 3: write each backing file atomically, snapshotting for rollback.
+    // Step 3: write each backing file atomically, snapshotting for rollback. A
+    // created file's snapshot records it as absent, so the same rollback removes it.
     for write in &plan.writes {
-        match write_atomic(&write.path, &write.contents) {
+        let result = match write.mode {
+            WriteMode::Replace => write_atomic(&write.path, &write.contents),
+            WriteMode::CreateNew => create_atomic(&write.path, &write.contents),
+        };
+        match result {
             Ok(snapshot) => {
                 // R7.3: the apply-level write record — path + changed keys, never
                 // the contents (the writer logs the resolved path + byte count).
@@ -781,7 +814,7 @@ fn reload_phase(
     signaller: &dyn ProcessSignaller,
 ) -> Vec<ReloadError> {
     // Derive the changed backing files (a set dedups the several files that share a
-    // reload, e.g. the cursor's settings.ini/uwsm/hyprland.conf copies).
+    // reload, e.g. the cursor's settings.ini/uwsm/env/hyprland.lua copies).
     let mut changed: BTreeSet<BackingFile> =
         plan.writes.iter().map(|write| write.backing).collect();
     if plan.palette.is_some() {
@@ -868,6 +901,7 @@ mod tests {
                 changed_keys: vec!["monitor:eDP-1 scale".to_string()],
                 backing: BackingFile::MonitorsConf,
                 validation: WriteValidation::InPlan,
+                mode: WriteMode::Replace,
             }],
             palette: None,
             reload_params: ReloadParams::default(),
@@ -998,6 +1032,7 @@ mod tests {
                 changed_keys: vec!["preload".to_string()],
                 backing: BackingFile::HyprpaperConf,
                 validation: WriteValidation::InPlan,
+                mode: WriteMode::Replace,
             }],
             palette: None,
             reload_params: ReloadParams::default(),
@@ -1054,6 +1089,7 @@ mod tests {
                 changed_keys: vec!["kb_layout".to_string()],
                 backing: BackingFile::InputLua,
                 validation: WriteValidation::InPlan,
+                mode: WriteMode::Replace,
             }],
             palette: None,
             reload_params: ReloadParams::default(),
@@ -1105,6 +1141,7 @@ mod tests {
             changed_keys: vec!["kb_layout".to_string()],
             backing: BackingFile::InputLua,
             validation: WriteValidation::InPlan,
+            mode: WriteMode::Replace,
         }
     }
 
@@ -1228,6 +1265,7 @@ mod tests {
                 changed_keys: vec!["listener[1].timeout".to_string()],
                 backing: BackingFile::HypridleConf,
                 validation: WriteValidation::InPlan,
+                mode: WriteMode::Replace,
             }],
             palette: None,
             reload_params: ReloadParams::default(),
@@ -1287,6 +1325,7 @@ mod tests {
                 changed_keys: vec!["listener[1].timeout".to_string()],
                 backing: BackingFile::HypridleConf,
                 validation: WriteValidation::InPlan,
+                mode: WriteMode::Replace,
             }],
             palette: None,
             reload_params: ReloadParams::default(),
@@ -1336,6 +1375,7 @@ mod tests {
                     changed_keys: vec!["kb_layout".to_string()],
                     backing: BackingFile::InputLua,
                     validation: WriteValidation::InPlan,
+                    mode: WriteMode::Replace,
                 },
                 FileWrite {
                     path: missing.clone(),
@@ -1343,6 +1383,7 @@ mod tests {
                     changed_keys: vec!["monitor".to_string()],
                     backing: BackingFile::MonitorsConf,
                     validation: WriteValidation::InPlan,
+                    mode: WriteMode::Replace,
                 },
             ],
             palette: None,
@@ -1380,6 +1421,110 @@ mod tests {
         assert!(signaller.calls().is_empty());
     }
 
+    #[test]
+    fn a_created_file_is_deleted_again_when_a_later_write_fails() {
+        // Task 11.5: the XCursor fallback theme is *created* when absent
+        // (`WriteMode::CreateNew`). Rollback must restore the pre-apply state, which for
+        // that file is "no file": a later failing write leaves neither the created file
+        // nor the directory created for it.
+        let dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let created = dir.path().join("icons/default/index.theme");
+        let missing = dir.path().join("monitors.conf");
+
+        let plan = ApplyPlan {
+            validations: Vec::new(),
+            writes: vec![
+                FileWrite {
+                    path: created.clone(),
+                    contents: b"[Icon Theme]\nInherits=Bibata\n".to_vec(),
+                    changed_keys: vec!["cursor theme".to_string()],
+                    backing: BackingFile::CursorFallbackTheme,
+                    validation: WriteValidation::NotNeeded,
+                    mode: WriteMode::CreateNew,
+                },
+                FileWrite {
+                    path: missing,
+                    contents: b"new monitors\n".to_vec(),
+                    changed_keys: vec!["monitor".to_string()],
+                    backing: BackingFile::MonitorsConf,
+                    validation: WriteValidation::NotNeeded,
+                    mode: WriteMode::Replace,
+                },
+            ],
+            palette: None,
+            reload_params: ReloadParams::default(),
+        };
+        let runner = MockCommandRunner::new();
+        let signaller = MockProcessSignaller::new();
+
+        let outcome = run(
+            &plan,
+            &FreshnessTracker::new(),
+            &hyprland_only(),
+            &runner,
+            &signaller,
+        );
+        let ApplyOutcome::WriteFailed(failure) = outcome else {
+            panic!("expected WriteFailed, got {outcome:?}");
+        };
+        assert_eq!(
+            failure.rolled_back.len(),
+            1,
+            "the created file is rolled back"
+        );
+        assert!(failure.rollback_failures.is_empty());
+        assert!(!created.exists(), "the created file is deleted again");
+        assert!(
+            !dir.path().join("icons").exists(),
+            "the directories created for it are removed too"
+        );
+        assert!(runner.recorded().is_empty());
+    }
+
+    #[test]
+    fn a_create_write_never_clobbers_a_file_that_appeared_meanwhile() {
+        // A `CreateNew` write was rendered from "the file is absent". If a file is
+        // there by the time the pipeline writes, another program created it, and the
+        // write fails rather than overwriting it (R5.6).
+        let dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let target = write_file(&dir, "index.theme", b"[Icon Theme]\nInherits=theirs\n");
+
+        let plan = ApplyPlan {
+            validations: Vec::new(),
+            writes: vec![FileWrite {
+                path: target.clone(),
+                contents: b"[Icon Theme]\nInherits=ours\n".to_vec(),
+                changed_keys: vec!["cursor theme".to_string()],
+                backing: BackingFile::CursorFallbackTheme,
+                validation: WriteValidation::NotNeeded,
+                mode: WriteMode::CreateNew,
+            }],
+            palette: None,
+            reload_params: ReloadParams::default(),
+        };
+        let outcome = run(
+            &plan,
+            &FreshnessTracker::new(),
+            &hyprland_only(),
+            &MockCommandRunner::new(),
+            &MockProcessSignaller::new(),
+        );
+        let ApplyOutcome::WriteFailed(failure) = outcome else {
+            panic!("expected WriteFailed, got {outcome:?}");
+        };
+        assert!(matches!(
+            failure.cause,
+            WriteFailureCause::File {
+                error: WriteError::AlreadyExists { .. },
+                ..
+            }
+        ));
+        assert_eq!(
+            fs::read(&target).expect("read"),
+            b"[Icon Theme]\nInherits=theirs\n"
+        );
+    }
+
     // --- (f) a generate-colors failure: earlier files rolled back ----------------
 
     #[test]
@@ -1400,6 +1545,7 @@ mod tests {
                 changed_keys: vec!["monitor:eDP-1 scale".to_string()],
                 backing: BackingFile::MonitorsConf,
                 validation: WriteValidation::InPlan,
+                mode: WriteMode::Replace,
             }],
             palette: Some(PaletteSwitch {
                 scheme: "nord".to_string(),
@@ -1590,6 +1736,7 @@ mod tests {
                 changed_keys: vec!["monitor:eDP-1 scale".to_string()],
                 backing: BackingFile::MonitorsConf,
                 validation: WriteValidation::InPlan,
+                mode: WriteMode::Replace,
             }],
             palette: Some(PaletteSwitch {
                 scheme: "nord".to_string(),
@@ -1647,6 +1794,7 @@ mod tests {
                 changed_keys: vec!["monitor:eDP-1 scale".to_string()],
                 backing: BackingFile::MonitorsConf,
                 validation: WriteValidation::InPlan,
+                mode: WriteMode::Replace,
             }],
             palette: None,
             reload_params: ReloadParams::default(),
@@ -1772,6 +1920,7 @@ mod tests {
                 changed_keys: vec!["monitor:eDP-1 scale".to_string()],
                 backing: BackingFile::MonitorsConf,
                 validation: WriteValidation::InPlan,
+                mode: WriteMode::Replace,
             }],
             palette: Some(PaletteSwitch {
                 scheme: "nord".to_string(),
@@ -1848,6 +1997,7 @@ mod tests {
                 changed_keys: vec!["positionX".to_string()],
                 backing: BackingFile::SwayncConfig,
                 validation: WriteValidation::InPlan,
+                mode: WriteMode::Replace,
             }],
             palette: Some(PaletteSwitch {
                 scheme: "nord".to_string(),
@@ -2001,6 +2151,7 @@ mod tests {
                     changed_keys: vec![format!("{backing:?} key")],
                     backing: *backing,
                     validation: *validation,
+                    mode: WriteMode::Replace,
                 })
                 .collect(),
             palette: None,
@@ -2115,7 +2266,8 @@ mod tests {
         let by_design = plan_with_writes(&[
             (BackingFile::GtkSettings, WriteValidation::NotNeeded),
             (BackingFile::UwsmEnv, WriteValidation::NotNeeded),
-            (BackingFile::HyprlandConf, WriteValidation::NotNeeded),
+            (BackingFile::HyprlandLua, WriteValidation::NotNeeded),
+            (BackingFile::CursorFallbackTheme, WriteValidation::NotNeeded),
             (BackingFile::HyprpaperConf, WriteValidation::NotNeeded),
         ]);
         assert!(
@@ -2199,6 +2351,7 @@ mod tests {
                 changed_keys: vec!["general:lock_cmd".to_string()],
                 backing: BackingFile::HypridleConf,
                 validation: WriteValidation::InPlan,
+                mode: WriteMode::Replace,
             }],
             palette: None,
             reload_params: ReloadParams::default(),
@@ -2302,6 +2455,7 @@ mod tests {
                 changed_keys: vec!["input.sensitivity".to_string()],
                 backing: BackingFile::InputLua,
                 validation: WriteValidation::InPlan,
+                mode: WriteMode::Replace,
             }],
             palette: None,
             reload_params: ReloadParams::default(),

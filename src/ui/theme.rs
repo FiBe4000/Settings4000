@@ -30,7 +30,9 @@
 //! claims a live GTK-theme restyle or "takes effect at next launch" is gated on the
 //! model's [`live_restyle`](crate::core::theme::ThemesModel::live_restyle) flag
 //! (R2.2). The whole appearance section is only built when `gsettings` is present
-//! (the window gates it, R4.2).
+//! (the window gates it, R4.2). Below the cursor drop-downs the section shows the
+//! model's two cursor notes: which of the duplicated cursor copies disagree (R3.4),
+//! and that the session environment copies take effect at the next login.
 //!
 //! # Why this page is bespoke, not declarative
 //!
@@ -276,7 +278,8 @@ impl Inner {
 
     /// Builds the GTK/icon/cursor appearance section: the GTK-theme, icon-theme,
     /// cursor-theme, and cursor-size drop-downs, preselected from the backing config,
-    /// with the `GTK_THEME` override banner and the live-restyle note (task 6.4).
+    /// with the `GTK_THEME` override banner, the live-restyle note (task 6.4), and the
+    /// cursor-copy and next-login notes (task 11.5).
     ///
     /// When `settings.ini` is unreadable the rows are hidden behind a note (R4.4); when
     /// a `GTK_THEME` override is active the GTK-theme drop-down is disabled and the
@@ -352,6 +355,18 @@ impl Inner {
             ThemeKind::CursorSize,
         );
         section.append(&labelled_row("Cursor size", &size_dropdown));
+
+        // R3.4: name the cursor copies that disagree with the value shown, so a cursor
+        // that looks different from program to program is explained; the next cursor
+        // Apply rewrites every copy.
+        if let Some(mismatch) = model.cursor_mismatch_note() {
+            section.append(&note(&mismatch));
+        }
+        // Architecture §6: the session environment copies of the cursor (uwsm/env and
+        // hyprland.lua's hl.env lines) take effect at the next login.
+        if let Some(login) = model.cursor_login_note() {
+            section.append(&note(&login));
+        }
 
         frame.set_child(Some(&section));
         frame

@@ -147,8 +147,9 @@ fn themes_model(fx: &FixtureDotfiles) -> ThemesModel {
     let paths = ThemesPaths {
         gtk3_settings: fx.config_path("gtk-3.0/settings.ini"),
         gtk4_settings: fx.config_path("gtk-4.0/settings.ini"),
-        hyprland_conf: Some(fx.config_path("hypr/hyprland.conf")),
+        hyprland_lua: Some(fx.config_path("hypr/hyprland.lua")),
         uwsm_env: fx.config_path("uwsm/env"),
+        cursor_fallback_theme: Some(fx.home().join(".icons/default/index.theme")),
     };
     ThemesModel::load(&roots, paths, false, None)
 }

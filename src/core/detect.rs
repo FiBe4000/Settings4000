@@ -37,7 +37,7 @@
 //! # The config provider is a guard, not a router (analysis §8.6)
 //!
 //! Hyprland ≥ 0.55 runs `hyprland.lua` through its Lua config provider, and the
-//! target dotfiles deleted their hyprlang `hyprland.conf` and input file. The app's
+//! target dotfiles deleted their hyprlang main config and input file. The app's
 //! Hyprland-side input and cursor writes therefore exist only for the Lua files;
 //! there is deliberately no hyprlang code path for them (Hyprland deprecated
 //! hyprlang in 0.55). [`HyprConfigProvider`] records which provider is in use so a
@@ -264,7 +264,7 @@ const CONFIG_PROVIDER_PREFIX: &str = "configProvider:";
 /// §7.1, §8.6; R4.1).
 ///
 /// Hyprland ≥ 0.55 loads `~/.config/hypr/hyprland.lua` through its Lua provider
-/// when that file exists and falls back to the legacy hyprlang `hyprland.conf`
+/// when that file exists and falls back to the legacy hyprlang main config
 /// otherwise. The app's Hyprland-side input and cursor writes target only the Lua
 /// files (`input.lua`, the two `hl.env` lines of `hyprland.lua`), so this value is
 /// a **guard**: anything other than [`Lua`](Self::Lua) hides those controls (see
@@ -276,7 +276,7 @@ pub enum HyprConfigProvider {
     /// run, and the only one the Input page and the Hyprland-side cursor write
     /// support.
     Lua,
-    /// The legacy hyprlang provider (`hyprland.conf`). Also the conservative answer
+    /// The legacy hyprlang provider (a `.conf` main config). Also the conservative answer
     /// when nothing indicates Lua (no session reports it and no `hyprland.lua`
     /// exists), since then the Lua files the app would write are not in use.
     Hyprlang,

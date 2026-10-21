@@ -15,7 +15,7 @@
 //! ```text
 //! export GDK_BACKEND=wayland,x11
 //! #export GTK_THEME=Nordic-bluish-accent
-//! # Cursor theme/size: canonical value; keep in sync with hyprland.conf
+//! # Cursor theme/size: canonical value; keep in sync with the two hl.env lines in config/hypr/hyprland.lua
 //! export XCURSOR_THEME=Nordic-cursors
 //! export XCURSOR_SIZE=16
 //! export QT_QPA_PLATFORM="wayland;xcb"
@@ -24,11 +24,12 @@
 //! # What the app edits here, and what it only reads
 //!
 //! - **Edits `XCURSOR_THEME` / `XCURSOR_SIZE`.** These are duplicated across
-//!   `uwsm/env` (canonical), `hyprland.conf`'s env lines, and both
-//!   `gtk-{3,4}.0/settings.ini`; the Theme page (task 6.4) writes the *same*
-//!   value into every copy so they never desync (R3.4, analysis §6.2). This
-//!   module owns only the `uwsm/env` copy — the hyprlang writer (task 3.2) and
-//!   the INI editor (task 3.5) own the others. Keeping the edit API value-only
+//!   `uwsm/env` (canonical), the two `hl.env` lines of `hyprland.lua`, both
+//!   `gtk-{3,4}.0/settings.ini` and (the theme) `~/.icons/default/index.theme`;
+//!   the Theme page (tasks 6.4, 11.5) writes the *same* value into every copy so
+//!   they never desync (R3.4, analysis §7.7, §8.4). This module owns only the
+//!   `uwsm/env` copy — the Lua-literal editor (task 11.3) and the INI editor
+//!   (task 3.5) own the others. Keeping the edit API value-only
 //!   lets the page drive all copies from one value.
 //! - **Only reads `GTK_THEME`.** A set `GTK_THEME` overrides GTK's theme choice
 //!   entirely, so the app must never fight it (R3.3): if it finds an active
@@ -734,7 +735,7 @@ mod tests {
 # uwsm session environment (app-owned; analysis §6.3)
 export GDK_BACKEND=wayland,x11
 #export GTK_THEME=Nordic-bluish-accent
-# Cursor theme/size: canonical value; keep in sync with config/hypr/hyprland.conf
+# Cursor theme/size: canonical value; keep in sync with the two hl.env lines in config/hypr/hyprland.lua
 export XCURSOR_THEME=Nordic-cursors
 export XCURSOR_SIZE=16
 export QT_QPA_PLATFORM=\"wayland;xcb\"
@@ -747,7 +748,7 @@ export QT_QPA_PLATFORMTHEME=gtk3
 # uwsm session environment (app-owned; analysis §6.3)
 export GDK_BACKEND=wayland,x11
 export GTK_THEME=Nordic-bluish-accent
-# Cursor theme/size: canonical value; keep in sync with config/hypr/hyprland.conf
+# Cursor theme/size: canonical value; keep in sync with the two hl.env lines in config/hypr/hyprland.lua
 export XCURSOR_THEME=Nordic-cursors
 export XCURSOR_SIZE=16
 export QT_QPA_PLATFORM=\"wayland;xcb\"

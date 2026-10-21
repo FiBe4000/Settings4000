@@ -128,10 +128,11 @@ pub enum BackingFile {
     /// that `hyprland.lua` loads with `dofile` (analysis §7.1, §8.6); re-read with
     /// `hyprctl reload config-only` (tasks 6.6, 11.4).
     InputLua,
-    /// `config/hypr/hyprland.conf` — the cursor `env =` lines the app still owns
-    /// here; `hyprctl reload` re-reads the file (task 6.4). The live cursor change
-    /// itself is applied by the cursor reload emitted for the GTK/env files.
-    HyprlandConf,
+    /// `config/hypr/hyprland.lua` — the Lua Hyprland config, of which the app edits
+    /// only the two cursor `hl.env("XCURSOR_THEME", …)` / `hl.env("XCURSOR_SIZE", …)`
+    /// lines (task 11.5, R3.4); `hyprctl reload` re-runs the file. The live cursor
+    /// change itself is applied by the cursor reload emitted for the GTK/env files.
+    HyprlandLua,
     /// `config/hypr/hypridle.conf` — idle timeouts / lock command; hypridle is
     /// restarted to pick them up (task 6.8).
     HypridleConf,
@@ -153,6 +154,12 @@ pub enum BackingFile {
     /// `config/uwsm/env` — the cursor `XCURSOR_*` env copy; the cursor is applied
     /// live with `gsettings set cursor-*` + `hyprctl setcursor` (task 6.4).
     UwsmEnv,
+    /// `~/.icons/default/index.theme` — the XCursor fallback theme, whose
+    /// `[Icon Theme]` `Inherits=` names the cursor theme for programs that ignore
+    /// `XCURSOR_THEME` (task 11.5, analysis §8.4). Nothing re-reads it on demand
+    /// (libXcursor reads it when a program loads its cursors), so like `uwsm/env` it
+    /// carries only the shared live cursor reload.
+    CursorFallbackTheme,
     /// A palette (color-scheme) switch: `colors/<scheme>` is edited and
     /// `generate-colors` rewrites the color partials. Triggers the broad
     /// apply-theme reload chain (analysis §6.1).
@@ -178,11 +185,11 @@ impl BackingFile {
                 vec![ReloadAction::HyprctlReload(HyprlandReloadScope::ConfigOnly)]
             }
             // A full Hyprland re-read. `monitors.conf` needs it so the monitor rules
-            // are re-applied. hyprland.conf is here (not with the cursor reload)
-            // because architecture §6 maps the file to `hyprctl reload`; the live
-            // cursor apply rides on the GTK/env files' actions. Task 11.11 decides
-            // which of these keep the full form.
-            BackingFile::MonitorsConf | BackingFile::HyprlandConf => {
+            // are re-applied. hyprland.lua is here (not with the cursor reload)
+            // because a changed Hyprland config is re-run with `hyprctl reload`; the
+            // live cursor apply rides on the GTK/env files' actions. Task 11.11
+            // switches hyprland.lua to the `config-only` form.
+            BackingFile::MonitorsConf | BackingFile::HyprlandLua => {
                 vec![ReloadAction::HyprctlReload(HyprlandReloadScope::Full)]
             }
             BackingFile::HypridleConf => vec![ReloadAction::HypridleRestart],
@@ -206,9 +213,11 @@ impl BackingFile {
                 }
             },
             // The GTK settings.ini files carry the GTK theme, icon theme, and cursor;
-            // uwsm/env carries only the cursor copy.
+            // uwsm/env and the XCursor fallback theme carry only the cursor copy.
             BackingFile::GtkSettings => theme_and_cursor_actions(params, true),
-            BackingFile::UwsmEnv => theme_and_cursor_actions(params, false),
+            BackingFile::UwsmEnv | BackingFile::CursorFallbackTheme => {
+                theme_and_cursor_actions(params, false)
+            }
             // A palette switch reloads every component whose colors were regenerated,
             // in the apply-theme order (analysis §6.1). swaync gets the *CSS* reload
             // (`-rs`) only: `generate-colors` rewrites `swaync/colors.css`, which
@@ -540,7 +549,7 @@ fn gsettings_key_rank(key: &str) -> u8 {
 /// is absent or not running ([`ReloadAction::is_available`]), then sorts by
 /// [`ReloadAction::order_key`] and removes duplicates so a change touching several
 /// files that share a reload (e.g. a cursor written to `settings.ini`, `uwsm/env`,
-/// and `hyprland.conf`) issues each reload once, in a deterministic order. When both
+/// `hyprland.lua` and `index.theme`) issues each reload once, in a deterministic order. When both
 /// Hyprland reload forms are planned, only the full one is kept (see
 /// [`HyprlandReloadScope`]). This is the list the Apply pipeline (task 4.5) executes
 /// after writing the files.
@@ -943,10 +952,11 @@ mod tests {
 
     #[test]
     fn hypr_config_files_map_to_hyprctl_reload() {
-        // monitors.conf / hyprland.conf re-read via the full `hyprctl reload`
-        // (architecture §6). No params are needed.
+        // monitors.conf / hyprland.lua re-read via the full `hyprctl reload`
+        // (architecture §6; task 11.11 moves hyprland.lua to `config-only`). No
+        // params are needed.
         let params = ReloadParams::default();
-        for file in [BackingFile::MonitorsConf, BackingFile::HyprlandConf] {
+        for file in [BackingFile::MonitorsConf, BackingFile::HyprlandLua] {
             assert_eq!(
                 file.reload_actions(&params),
                 vec![ReloadAction::HyprctlReload(HyprlandReloadScope::Full)],
@@ -1110,26 +1120,34 @@ mod tests {
     }
 
     #[test]
-    fn uwsm_env_maps_to_the_cursor_reload_only() {
-        // uwsm/env holds only the cursor copy, so it never emits the GTK/icon theme
-        // gsettings — only the cursor keys and setcursor.
-        assert_eq!(
-            BackingFile::UwsmEnv.reload_actions(&full_params()),
-            vec![
-                ReloadAction::GsettingsSet {
-                    key: GSETTINGS_CURSOR_THEME,
-                    value: "Nordic-cursors".to_string()
-                },
-                ReloadAction::GsettingsSet {
-                    key: GSETTINGS_CURSOR_SIZE,
-                    value: "16".to_string()
-                },
-                ReloadAction::HyprctlSetCursor {
-                    theme: "Nordic-cursors".to_string(),
-                    size: 16
-                },
-            ]
-        );
+    fn uwsm_env_and_the_cursor_fallback_theme_map_to_the_cursor_reload_only() {
+        // uwsm/env and ~/.icons/default/index.theme hold only the cursor copy, so they
+        // never emit the GTK/icon theme gsettings — only the cursor keys and setcursor.
+        for file in [BackingFile::UwsmEnv, BackingFile::CursorFallbackTheme] {
+            assert_eq!(
+                file.reload_actions(&full_params()),
+                cursor_reload_actions(),
+                "{file:?}"
+            );
+        }
+    }
+
+    /// The cursor reload every cursor copy maps to, for [`full_params`]'s cursor.
+    fn cursor_reload_actions() -> Vec<ReloadAction> {
+        vec![
+            ReloadAction::GsettingsSet {
+                key: GSETTINGS_CURSOR_THEME,
+                value: "Nordic-cursors".to_string(),
+            },
+            ReloadAction::GsettingsSet {
+                key: GSETTINGS_CURSOR_SIZE,
+                value: "16".to_string(),
+            },
+            ReloadAction::HyprctlSetCursor {
+                theme: "Nordic-cursors".to_string(),
+                size: 16,
+            },
+        ]
     }
 
     #[test]
@@ -1165,10 +1183,10 @@ mod tests {
 
     #[test]
     fn plan_dedups_and_orders_a_multi_file_cursor_change() {
-        // A cursor change writes settings.ini, uwsm/env, and hyprland.conf. The
-        // three files' actions overlap on the cursor reload and must collapse to one
-        // of each, in canonical order: hyprctl reload (from hyprland.conf), then the
-        // cursor gsettings keys, then setcursor.
+        // A cursor change writes settings.ini, uwsm/env, hyprland.lua and the
+        // XCursor fallback index.theme. The files' actions overlap on the cursor
+        // reload and must collapse to one of each, in canonical order: hyprctl
+        // reload (from hyprland.lua), then the cursor gsettings keys, then setcursor.
         let params = ReloadParams {
             cursor: Some(CursorValue {
                 theme: "Nordic-cursors".to_string(),
@@ -1180,7 +1198,8 @@ mod tests {
             &[
                 BackingFile::GtkSettings,
                 BackingFile::UwsmEnv,
-                BackingFile::HyprlandConf,
+                BackingFile::HyprlandLua,
+                BackingFile::CursorFallbackTheme,
             ],
             &params,
             &all_capabilities(),

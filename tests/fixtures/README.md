@@ -43,7 +43,7 @@ files are deliberately still in their §6 shape; see "Known divergences from
 - `state/active-scheme`, `theme/fonts` — the repo-level palette/font sources.
 - `icons/default/index.theme` — the XCursor fallback theme (`[Icon Theme]`,
   `Inherits=breeze_cursors`), deployed as `~/.icons/default/index.theme`
-  (analysis §8.4; a write target of the cursor setting from task 11.5).
+  (analysis §8.4; a write target of the cursor setting since task 11.5).
 - `config/` — every file the app parses or writes plus the generated
   color/font partials with their `# Generated from …` headers, and the
   non-target files deployment also symlinks (`kitty.conf`, swaync's
@@ -51,7 +51,8 @@ files are deliberately still in their §6 shape; see "Known divergences from
   - `hypr/hyprland.lua` — the real Lua Hyprland config (485 lines), anonymized
     only in its laptop-panel `desc:` key. It is the realistic fixture for the
     Lua-literal editor (task 11.3): nested tables, the two cursor `hl.env`
-    lines, and plenty of code the editor must treat as opaque.
+    lines the cursor write edits (task 11.5), and plenty of code the editor
+    must treat as opaque.
   - `hypr/input.lua` — the app-owned, schema-flat input table (verbatim);
     the Input page's backing file since task 11.4, which also removed the
     hyprlang input file it replaced.
@@ -79,6 +80,20 @@ parent directories are plain, as `setup.sh` creates them.
   everything but the same `path` value.
 - `scripts/generate-colors` — see above.
 
+### Refreshed to `8a5b20b` in task 11.5
+
+- `config/gtk-3.0/settings.ini`, `config/gtk-4.0/settings.ini` — verbatim:
+  `breeze_cursors`/`24`, no cursor comment lines, no `gtk-xft-dpi`, and no
+  `gtk-modules` in the GTK 3 file.
+- `config/uwsm/env` — `breeze_cursors`/`24` and the cursor comment that names
+  the two `hl.env` lines in `hyprland.lua`; the Electron comment block keeps
+  the shortened wording introduced in task 7.1 (it omits the real comment's
+  application name and display scale factor, see "Anonymization rules").
+
+Since this refresh every cursor copy in the fixture agrees on
+`breeze_cursors`/`24`: both `settings.ini`, `uwsm/env`, the two `hl.env`
+lines of `hyprland.lua`, and `icons/default/index.theme`.
+
 ### Known divergences from `8a5b20b`
 
 Each of these files is kept in its §6 shape because the `8a5b20b` version
@@ -89,20 +104,13 @@ was verified by refreshing each file in turn and running the suite.
 | Fixture file | `8a5b20b` has | Existing tests it breaks | Refresh with |
 |---|---|---|---|
 | `colors/everforest`, `colors/nord` | an 18th key `shadow` | `fixture_tree::palette_schemes_parse_and_satisfy_the_schema` (unknown key on the 17-key schema); `apply_theme::a_palette_switch_runs_generate_colors_then_the_reload_chain`, `apply_theme::a_generate_colors_failure_rolls_back_the_theme_writes_and_reloads_nothing`, `apply_assembly::the_bespoke_models_compose_into_one_plan` (nord) | 11.6 |
-| `config/gtk-3.0/settings.ini`, `config/gtk-4.0/settings.ini` | `breeze_cursors`/`24`, no cursor comment lines, no `gtk-xft-dpi`, no `gtk-modules` (gtk-3.0) | `fixture_tree::gtk_settings_ini_parse_with_the_unified_cursor_values`, `apply_theme::a_cursor_change_writes_all_four_duplicated_copies_identically` | 11.5 |
-| `config/uwsm/env` | `breeze_cursors`/`24`, cursor comment naming the `hl.env` lines in `hyprland.lua` | `fixture_tree::uwsm_env_parses_with_the_commented_gtk_theme_override`, `apply_theme::a_cursor_change_writes_all_four_duplicated_copies_identically` | 11.5 |
 | `config/hypr/hypridle.conf` | `--grace 10` in `lock_cmd`, dual-form dpms commands, `idle-dim` dim/restore, explanatory comments | `apply_power::a_lock_command_edit_restarts_via_the_kill_and_respawn_fallback` (expects the old `lock_cmd` text) | 11.13 |
 | `config/hypr/hyprlock.conf`, `config/hypr/hyprpaper.conf` | `path = ~/Pictures/wallpaper/18.jpg` | `fixture_tree::hyprlang_configs_parse_losslessly_at_their_deployed_paths`, `apply_theme::a_wallpaper_change_dual_writes_hyprpaper_and_hyprlock_and_reloads`, `apply_theme::a_tilde_shaped_wallpaper_original_is_replaced_surgically` (all expect the substituted absolute path of an existing file) | 11.10 |
 
-Consequences to keep in mind until those tasks land:
-
-- The cursor copies disagree inside the fixture: `hyprland.lua` and
-  `icons/default/index.theme` say `breeze_cursors`/`24` (current), while
-  `uwsm/env`, both `settings.ini` and the retiring `hyprland.conf` still say
-  `Nordic-cursors`/`16`.
-- The generated partials other than `colors.lua` (`hypr/colors.conf`,
-  `eww/_colors.scss`, `rofi/colors.rasi`, kitty `colors.conf`) are still the
-  pre-`shadow` output, while `colors.lua` carries `shadow`.
+Consequence to keep in mind until 11.6 lands: the generated partials other
+than `colors.lua` (`hypr/colors.conf`, `eww/_colors.scss`, `rofi/colors.rasi`,
+kitty `colors.conf`) are still the pre-`shadow` output, while `colors.lua`
+carries `shadow`.
 
 ### Scheduled for removal
 
@@ -111,8 +119,11 @@ fixture until the tasks that retire the code and tests targeting them:
 
 | Fixture file | Removed by |
 |---|---|
-| `config/hypr/hyprland.conf` | 11.5 (cursor env write moves to `hyprland.lua`) |
 | `config/swaync/` (`config.json`, `style.css`, `colors.css`) | 11.7 (swaync replaced by notifd) |
+
+The hyprlang input file went with task 11.4 and the hyprlang main config with
+task 11.5 (its cursor copy now lives in `hyprland.lua`), together with every
+test that targeted them.
 
 ### Anonymization rules
 
@@ -141,9 +152,11 @@ sync invariants). Everything identifying is replaced:
   `Example Monitor Corp QHD-24 0x0001`/`0x0002`; the home pair is
   `Example Home Display 27G 0x0003`/`27T 0x0004`. The two laptops are
   "laptop A" (the generic `eDP-1` rule) and "laptop B" (the `desc:` rule).
-- **Long freeform files are trimmed stand-ins** (`hyprland.conf` keeps every
-  load-bearing shape — `source=` lines, the two cursor `env =` lines, nested
-  sections, repeatable keys, commented-out lines; swaync's `style.css` keeps
+- **No personal setup details in comments.** A comment that names an
+  application the user runs or a machine-specific value is reworded without
+  them: the Electron note in `uwsm/env` omits the real comment's example
+  application and the laptop's scale factor, and is otherwise unchanged.
+- **Long freeform files are trimmed stand-ins** (swaync's `style.css` keeps
   only the palette import) rather than full copies. The exception is
   `hyprland.lua`, copied whole because the Lua-literal editor must be tested
   against the real mix of addressable lines and opaque code. It has no
