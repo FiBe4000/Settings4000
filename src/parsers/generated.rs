@@ -3,16 +3,24 @@
 //!
 //! # What this file is, and why it is read-only
 //!
-//! Running `scripts/generate-colors <scheme>` regenerates a fixed set of per-app
-//! files from the single palette source `colors/<scheme>`: six color partials
-//! (`config/hypr/colors.conf`, `config/eww/_colors.scss`, …), three font partials,
-//! and a `state/active-scheme` marker (analysis §6.4, §6.5). Every one of those is
-//! headed `# Generated from colors/<scheme> — do not edit manually` and is a
-//! **read-only input** to this app: the app never writes them, because a palette
-//! change goes through re-running `generate-colors` (R3.2), not a hand edit of the
-//! outputs. Accordingly this module has **no write/edit path at all** — only
-//! parsing/reading — in deliberate contrast to the sibling parsers, which all
-//! expose a surgical writer.
+//! Running `scripts/generate-colors <scheme>` regenerates a fixed set of ten
+//! files from the single palette source `colors/<scheme>`: six color partials,
+//! three font partials, and a `state/active-scheme` marker (analysis §6.4, §6.5,
+//! §8.3 — listed in [`GENERATED_COLOR_PARTIALS`], [`GENERATED_FONT_PARTIALS`] and
+//! [`ACTIVE_SCHEME_MARKER`]). Each partial starts with the header
+//! `# Generated from colors/<scheme> — do not edit manually` (or `theme/fonts`
+//! for the font partials) behind its format's comment marker: bare for hyprlang,
+//! kitty and zsh, `// ` for SCSS, `/* … */` for rasi and `-- ` for the Lua
+//! partial `colors.lua` (see [`HEADER_COMMENT_MARKERS`]). Every one of those files
+//! is a **read-only input** to this app: the app never writes them, because a
+//! palette change goes through re-running `generate-colors` (R3.2), not a hand
+//! edit of the outputs. Accordingly this module has **no write/edit path at
+//! all** — only parsing/reading — in deliberate contrast to the sibling parsers,
+//! which all expose a surgical writer.
+//!
+//! The former `config/swaync/colors.css` partial is no longer generated (the
+//! swaync notification daemon was replaced, analysis §8.3) and is not part of
+//! the set.
 //!
 //! # What it provides
 //!
@@ -26,9 +34,10 @@
 //!   file (located via the repo root discovered from a deployed config symlink,
 //!   R8.5 — that discovery is task 4.3's job, so this module simply accepts the
 //!   contents or a path), [`parse_scheme_swatch`] reuses the task-3.1 palette
-//!   parser ([`super::palette::PaletteFile`]) to read the 17 schema colors for
-//!   swatch previews in the theme drop-down (task 6.3). It stays read-only: it
-//!   reads values through the palette parser and never edits.
+//!   parser ([`super::palette::PaletteFile`]) to read the schema colors (18
+//!   today, whatever the given [`PaletteSchema`] lists) for swatch previews in
+//!   the theme drop-down (task 6.3). It stays read-only: it reads values
+//!   through the palette parser and never edits.
 //!
 //! # The `state/active-scheme` marker
 //!
@@ -42,7 +51,63 @@
 
 use std::path::Path;
 
-use super::palette::{PALETTE_KEYS, PaletteFile, SchemaValidation};
+use super::palette::{PaletteFile, PaletteSchema, SchemaValidation};
+
+/// The color partials `generate-colors` writes, as repo-relative paths
+/// (analysis §8.3). Each is headed `… Generated from colors/<scheme> …`, so any
+/// of them names the active scheme; the app reads only `config/hypr/colors.conf`
+/// for that (R3.2), because it is the one with a stable deployed path the
+/// palette-source discovery already relies on.
+///
+/// `config/hypr/colors.lua` is the Lua-provider copy of the palette
+/// (`hyprland.lua` loads it with `dofile`, analysis §7.6). It sits beside
+/// `hyprland.lua`, which the cursor setting *does* write, so it is listed here
+/// explicitly: no app write may ever target it.
+pub const GENERATED_COLOR_PARTIALS: [&str; 6] = [
+    "config/hypr/colors.conf",
+    "config/hypr/colors.lua",
+    "config/eww/_colors.scss",
+    "config/rofi/colors.rasi",
+    "config/kitty/colors.conf",
+    "zsh/colors.zsh",
+];
+
+/// The font partials `generate-colors` templates from `theme/fonts`, as
+/// repo-relative paths (analysis §6.5). Their header names `theme/fonts`
+/// instead of a scheme. Fonts are out of v1 scope; the set is listed so the
+/// "never a write target" rule covers every generator output.
+pub const GENERATED_FONT_PARTIALS: [&str; 3] = [
+    "config/kitty/fonts.conf",
+    "config/eww/_fonts.scss",
+    "config/rofi/fonts.rasi",
+];
+
+/// The repo-relative path of the one-line active-scheme marker
+/// `generate-colors` writes last (analysis §6.4). It has no header.
+pub const ACTIVE_SCHEME_MARKER: &str = "state/active-scheme";
+
+/// The comment markers that may wrap a generator header in front of its `#`:
+/// `-- # Generated …` (Lua), `// # Generated …` (SCSS), `/* # Generated … */`
+/// (rasi). A bare `# Generated …` (hyprlang, kitty, zsh) needs none.
+///
+/// The generator builds every header from one `# Generated from …` string and
+/// prefixes it with the target format's comment marker, which is why the `#`
+/// is still required after the marker.
+pub const HEADER_COMMENT_MARKERS: [&str; 3] = ["--", "//", "/*"];
+
+/// Every file `generate-colors` writes, as repo-relative paths: the
+/// [color](GENERATED_COLOR_PARTIALS) and [font](GENERATED_FONT_PARTIALS)
+/// partials and the [marker](ACTIVE_SCHEME_MARKER) — ten in total.
+///
+/// They are read-only inputs (module docs). Running the generator is the only
+/// way they change, and its run is the last write step of an Apply because a
+/// rollback restores only files the app wrote itself (architecture §6).
+pub fn generated_files() -> impl Iterator<Item = &'static str> {
+    GENERATED_COLOR_PARTIALS
+        .into_iter()
+        .chain(GENERATED_FONT_PARTIALS)
+        .chain(std::iter::once(ACTIVE_SCHEME_MARKER))
+}
 
 /// The palette scheme currently applied, as detected from a generated file's
 /// header.
@@ -82,15 +147,19 @@ impl ActiveScheme {
 /// file (in v1, `~/.config/hypr/colors.conf`).
 ///
 /// It scans for the first line that matches the generator's header shape,
-/// `# Generated from colors/<scheme> …` (analysis §6.4, §2), and returns the
-/// `<scheme>` token. The header is conventionally the file's first line, but this
+/// `# Generated from colors/<scheme> …` (analysis §6.4, §2), optionally behind
+/// one of the [`HEADER_COMMENT_MARKERS`] (so the header of any
+/// [color partial](GENERATED_COLOR_PARTIALS), `colors.lua`'s
+/// `-- # Generated …` included, is recognised), and returns the `<scheme>`
+/// token. The header is conventionally the file's first line, but this
 /// scans every line and returns the first match; that tolerates an incidental
 /// leading blank or comment line without risk, because the `Generated from
 /// colors/` shape is specific to the generator's header and does not occur in the
 /// generated body (which is `$key = rgb(…)` assignments, SCSS, etc.).
 ///
 /// Recognition is deliberately tolerant but does not over-match: leading
-/// whitespace, a missing space after `#`, arbitrary internal whitespace, and
+/// whitespace, a missing space after `#` or after the comment marker,
+/// arbitrary internal whitespace, and
 /// ASCII-case differences in the words `Generated`/`from` and the `colors/` prefix
 /// are all accepted, while the two words and the literal `colors/` prefix followed
 /// by a non-empty scheme token are all *required*. Anything else yields
@@ -131,16 +200,16 @@ pub fn read_active_scheme(generated_file_path: &Path) -> ActiveScheme {
 /// The colors of one palette scheme, read for swatch display (task 6.3).
 ///
 /// Produced by [`parse_scheme_swatch`] from a `colors/<scheme>` source file. It
-/// carries the schema colors that are actually present, in the canonical schema
+/// carries the schema colors that are actually present, in the schema's
 /// order, plus the palette's [`SchemaValidation`] so a consumer can tell a
 /// complete, well-formed scheme from a broken one (e.g. one missing a key). It is
 /// purely a read view — there is no way to edit through it.
 #[derive(Debug, PartialEq, Eq)]
 pub struct SchemeSwatch {
-    /// The schema colors present in the file, in canonical [`PALETTE_KEYS`] order.
+    /// The schema colors present in the file, in the [`PaletteSchema`]'s order.
     /// A schema key with no entry in the file is omitted (a swatch can only show a
-    /// color it has), so on a valid palette this holds all 17 and on a malformed
-    /// one it holds fewer.
+    /// color it has), so on a valid palette this holds every schema key and on a
+    /// malformed one it holds fewer.
     colors: Vec<SwatchColor>,
     /// The palette's schema check (missing/unknown/duplicate keys). Lets the theme
     /// page flag or skip a malformed scheme; a swatch is still returned regardless
@@ -163,7 +232,8 @@ impl SchemeSwatch {
     }
 
     /// The palette's schema-validity report, for deciding whether the scheme is
-    /// complete and well-formed.
+    /// complete and well-formed; it also names the key list it was checked
+    /// against.
     pub fn validation(&self) -> &SchemaValidation {
         &self.validation
     }
@@ -178,16 +248,16 @@ impl SchemeSwatch {
 /// [`SchemeSwatch::validation`] and the palette parser's own warnings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SwatchColor {
-    /// The canonical schema key (e.g. `bg0`, `accent0`).
-    key: &'static str,
+    /// The schema key (e.g. `bg0`, `accent0`).
+    key: String,
     /// The value as read from the file (a bare-hex color on a well-formed scheme).
     value: String,
 }
 
 impl SwatchColor {
-    /// The canonical schema key.
-    pub fn key(&self) -> &'static str {
-        self.key
+    /// The schema key.
+    pub fn key(&self) -> &str {
+        &self.key
     }
 
     /// The value as read from the file.
@@ -197,14 +267,14 @@ impl SwatchColor {
 }
 
 /// Parses a `colors/<scheme>` source file's contents into a [`SchemeSwatch`],
-/// reusing the task-3.1 palette parser.
+/// reusing the task-3.1 palette parser and checking it against `schema`.
 ///
 /// This never fails and never panics: [`PaletteFile::parse`] preserves every line
 /// and only surfaces problems as warnings, so a malformed palette simply yields a
 /// swatch with whichever schema colors it could read and a [`SchemaValidation`] that
 /// reports what is wrong. The result is display-only and read-only — nothing here
 /// writes the file.
-pub fn parse_scheme_swatch(scheme_contents: &str) -> SchemeSwatch {
+pub fn parse_scheme_swatch(scheme_contents: &str, schema: &PaletteSchema) -> SchemeSwatch {
     // This parse is used both for the active scheme and to *probe* arbitrary files
     // while enumerating schemes (task 6.3), so the warnings are never surfaced at
     // `warn` (a non-palette file such as a README would otherwise log one per line).
@@ -224,33 +294,35 @@ pub fn parse_scheme_swatch(scheme_contents: &str) -> SchemeSwatch {
         );
     }
 
-    let mut colors = Vec::new();
-    for key in PALETTE_KEYS {
-        if let Some(value) = palette.value(key) {
-            colors.push(SwatchColor {
-                key,
+    let colors = schema
+        .keys()
+        .iter()
+        .filter_map(|key| {
+            palette.value(key).map(|value| SwatchColor {
+                key: key.clone(),
                 value: value.to_string(),
-            });
-        }
-    }
+            })
+        })
+        .collect();
 
     SchemeSwatch {
         colors,
-        validation: palette.validate(),
+        validation: palette.validate(schema),
     }
 }
 
 /// Reads a `colors/<scheme>` source file from disk and parses it into a
-/// [`SchemeSwatch`], returning `None` when the file cannot be read.
+/// [`SchemeSwatch`] checked against `schema`, returning `None` when the file
+/// cannot be read.
 ///
 /// The theme page (task 6.3) calls this per scheme once the repo root has been
 /// discovered (task 4.3). A `None` means the file was absent, permission-denied,
 /// or not valid UTF-8 — treated as "no swatch for this scheme" rather than an
 /// error, consistent with how missing sources degrade elsewhere (R4, R8.5). Only
 /// the path is logged, never the file contents (R7.3).
-pub fn read_scheme_swatch(scheme_path: &Path) -> Option<SchemeSwatch> {
+pub fn read_scheme_swatch(scheme_path: &Path, schema: &PaletteSchema) -> Option<SchemeSwatch> {
     match std::fs::read_to_string(scheme_path) {
-        Ok(contents) => Some(parse_scheme_swatch(&contents)),
+        Ok(contents) => Some(parse_scheme_swatch(&contents, schema)),
         Err(error) => {
             tracing::debug!(
                 path = %scheme_path.display(),
@@ -263,7 +335,8 @@ pub fn read_scheme_swatch(scheme_path: &Path) -> Option<SchemeSwatch> {
 }
 
 /// Extracts the `<scheme>` token from a single line if it is a generator header of
-/// the shape `# Generated from colors/<scheme> …`, otherwise returns `None`.
+/// the shape `# Generated from colors/<scheme> …`, optionally behind one of the
+/// [`HEADER_COMMENT_MARKERS`], otherwise returns `None`.
 ///
 /// Using [`str::split_whitespace`] collapses every run of whitespace, so a header
 /// with unusual spacing (`#   Generated   from   colors/nord …`) is handled for
@@ -272,10 +345,17 @@ pub fn read_scheme_swatch(scheme_path: &Path) -> Option<SchemeSwatch> {
 /// returned verbatim (case preserved) because it is a file name. An empty scheme
 /// token (`colors/` with nothing after it) is rejected.
 fn scheme_from_header_line(line: &str) -> Option<String> {
-    // A header is a comment: it must start with `#` (after any indentation). The
-    // space after `#` is optional because `split_whitespace` on the remainder
-    // handles both `# Generated` and `#Generated`.
-    let comment_body = line.trim_start().strip_prefix('#')?;
+    // A header is a comment: it must start with `#` (after any indentation and
+    // an optional format comment marker such as `-- ` or `// `). The space after
+    // `#` is optional because `split_whitespace` on the remainder handles both
+    // `# Generated` and `#Generated`. A rasi header's closing `*/` is a separate
+    // trailing word and is ignored like the "do not edit manually" suffix.
+    let line = line.trim_start();
+    let line = HEADER_COMMENT_MARKERS
+        .iter()
+        .find_map(|marker| line.strip_prefix(marker))
+        .map_or(line, str::trim_start);
+    let comment_body = line.strip_prefix('#')?;
 
     let mut words = comment_body.split_whitespace();
     if !words.next()?.eq_ignore_ascii_case("generated") {
@@ -321,8 +401,8 @@ $fg0 = rgb(d3c6aa)
 $accent0 = rgb(83c092)
 ";
 
-    /// A complete, valid `colors/<scheme>` source with all 17 schema keys and
-    /// realistic Everforest bare-hex values (analysis §2, §6.4).
+    /// A complete, valid `colors/<scheme>` source with all 18 schema keys and
+    /// realistic Everforest bare-hex values (analysis §2, §6.4, §7.6).
     const SCHEME_FIXTURE: &str = "\
 # Everforest Dark palette
 bg0=272e33
@@ -342,6 +422,7 @@ yellow=dbbc7f
 green=a7c080
 blue=7fbbb3
 purple=d699b6
+shadow=0a0c0d
 ";
 
     #[test]
@@ -465,24 +546,26 @@ purple=d699b6
             .expect("write raw bytes");
 
         assert_eq!(read_active_scheme(file.path()), ActiveScheme::Unknown);
-        assert!(read_scheme_swatch(file.path()).is_none());
+        assert!(read_scheme_swatch(file.path(), &PaletteSchema::built_in()).is_none());
     }
 
     #[test]
-    fn swatch_parse_reads_all_seventeen_colors_via_the_palette_parser() {
-        // Accept criterion / R8.5: reuse the palette parser to read the 17 colors
-        // for swatch display.
-        let swatch = parse_scheme_swatch(SCHEME_FIXTURE);
+    fn swatch_parse_reads_every_schema_color_via_the_palette_parser() {
+        // Accept criterion / R8.5: reuse the palette parser to read the schema
+        // colors (18 on the built-in list) for swatch display.
+        let schema = PaletteSchema::built_in();
+        let swatch = parse_scheme_swatch(SCHEME_FIXTURE, &schema);
 
         assert_eq!(
             swatch.colors().len(),
-            PALETTE_KEYS.len(),
-            "a complete scheme yields all 17 schema colors"
+            schema.keys().len(),
+            "a complete scheme yields every schema color"
         );
         // Values come straight from the palette parser.
         assert_eq!(swatch.color("bg0"), Some("272e33"));
         assert_eq!(swatch.color("accent0"), Some("83c092"));
         assert_eq!(swatch.color("purple"), Some("d699b6"));
+        assert_eq!(swatch.color("shadow"), Some("0a0c0d"));
         assert_eq!(swatch.color("not-a-key"), None);
 
         // The colors are in canonical schema order and expose their key/value.
@@ -504,7 +587,7 @@ bg0=272e33
 this line is not an assignment
 accent0=83c092
 ";
-        let swatch = parse_scheme_swatch(malformed);
+        let swatch = parse_scheme_swatch(malformed, &PaletteSchema::built_in());
 
         // Only the two real entries are present; the junk line is not a color.
         assert_eq!(swatch.colors().len(), 2);
@@ -522,12 +605,76 @@ accent0=83c092
         file.write_all(SCHEME_FIXTURE.as_bytes())
             .expect("write fixture");
 
-        let swatch = read_scheme_swatch(file.path()).expect("readable scheme file");
-        assert_eq!(swatch.colors().len(), PALETTE_KEYS.len());
+        let schema = PaletteSchema::built_in();
+        let swatch = read_scheme_swatch(file.path(), &schema).expect("readable scheme file");
+        assert_eq!(swatch.colors().len(), schema.keys().len());
         assert_eq!(swatch.color("accent0"), Some("83c092"));
 
         // A missing file yields None (no swatch), never an error.
         let missing = Path::new("/nonexistent/settings4000/colors/everforest");
-        assert!(read_scheme_swatch(missing).is_none());
+        assert!(read_scheme_swatch(missing, &schema).is_none());
+    }
+
+    #[test]
+    fn every_color_partial_header_shape_names_the_scheme() {
+        // The first line of each color partial exactly as the generator's
+        // heredocs emit it (analysis §7.6, §8.3), `colors.lua`'s `-- ` marker
+        // included.
+        for header in [
+            "# Generated from colors/everforest — do not edit manually",
+            "-- # Generated from colors/everforest — do not edit manually",
+            "// # Generated from colors/everforest — do not edit manually",
+            "/* # Generated from colors/everforest — do not edit manually */",
+        ] {
+            let contents = format!("{header}\n\nbody\n");
+            assert_eq!(
+                detect_active_scheme(&contents),
+                ActiveScheme::Named("everforest".to_string()),
+                "expected `everforest` from {header:?}"
+            );
+        }
+        // Tight spacing after the marker and a rasi header with no suffix.
+        assert_eq!(
+            detect_active_scheme("--# Generated from colors/nord\n").name(),
+            Some("nord")
+        );
+        assert_eq!(
+            detect_active_scheme("/* # Generated from colors/nord */\n").name(),
+            Some("nord")
+        );
+    }
+
+    #[test]
+    fn a_comment_marker_without_the_generator_hash_is_not_a_header() {
+        // The generator always keeps the `#` after the format's marker, so a Lua
+        // or SCSS comment that merely reads like the header is not one, and an
+        // unknown marker is not stripped.
+        for input in [
+            "-- Generated from colors/everforest\n",
+            "// Generated from colors/everforest\n",
+            "--- # Generated from colors/everforest\n",
+            "; # Generated from colors/everforest\n",
+            "return { -- # Generated from colors/everforest\n",
+        ] {
+            assert_eq!(
+                detect_active_scheme(input),
+                ActiveScheme::Unknown,
+                "expected Unknown from {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_generated_file_set_is_the_ten_outputs_of_the_current_generator() {
+        // Analysis §8.3: six color partials (with the Lua one, without the retired
+        // swaync stylesheet), three font partials and the marker.
+        let files: Vec<&str> = generated_files().collect();
+        assert_eq!(files.len(), 10);
+        assert!(files.contains(&"config/hypr/colors.lua"));
+        assert!(files.contains(&ACTIVE_SCHEME_MARKER));
+        assert!(
+            !files.iter().any(|file| file.contains("swaync")),
+            "swaync/colors.css is no longer generated"
+        );
     }
 }

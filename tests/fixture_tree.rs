@@ -22,13 +22,17 @@ use std::process::Command;
 
 use settings4000::core::detect::{Capabilities, DetectionInputs, HyprConfigProvider};
 use settings4000::core::model::validate_image_path;
+use settings4000::core::theme::load_palette_schema;
 use settings4000::parsers::env::{EnvFile, GtkThemeOverride};
-use settings4000::parsers::generated::{ActiveScheme, read_active_scheme};
+use settings4000::parsers::generated::{
+    ActiveScheme, GENERATED_COLOR_PARTIALS, detect_active_scheme, generated_files,
+    read_active_scheme,
+};
 use settings4000::parsers::hyprlang::{HyprlangFile, KeyPath, SectionStep};
 use settings4000::parsers::ini::IniFile;
 use settings4000::parsers::lua_literal::{LuaConfigFile, LuaValue, TableStatus};
 use settings4000::parsers::monitors::{MonitorField, MonitorsFile};
-use settings4000::parsers::palette::PaletteFile;
+use settings4000::parsers::palette::{PaletteFile, PaletteSchema, SchemaSource};
 use settings4000::parsers::swaync::SwayncConfigFile;
 use settings4000::testing::{
     FixtureDotfiles, HOME_PLACEHOLDER, assert_repo_untouched_except, repo_snapshot,
@@ -97,7 +101,6 @@ fn deployed_config_paths_are_symlinks_into_the_repo() {
         "gtk-4.0/settings.ini",
         "uwsm/env",
         "swaync/config.json",
-        "swaync/colors.css",
         "swaync/style.css",
         "kitty/kitty.conf",
         "kitty/colors.conf",
@@ -183,21 +186,63 @@ fn detection_discovers_the_palette_source_behind_the_deployed_symlink() {
     assert_eq!(caps.hypr_config_provider(), HyprConfigProvider::Lua);
 }
 
-/// The palette scheme files parse with the full 17-key schema and round-trip
-/// byte-identically (R3.2, R8.3).
+/// The palette scheme files parse, satisfy the schema read from the fixture
+/// generator's `NAMES` line (18 keys, `shadow` last), and round-trip
+/// byte-identically (R3.2, R8.3; task 11.6).
 #[test]
 fn palette_schemes_parse_and_satisfy_the_schema() {
     let fx = FixtureDotfiles::install();
+
+    // The stub's header comment mentions `NAMES` as well; only the verbatim
+    // script's column-0 assignment may be read.
+    let generator = fx.repo_path("scripts/generate-colors");
+    let schema = load_palette_schema(&generator);
+    assert_eq!(schema.source(), &SchemaSource::Generator(generator));
+    assert_eq!(
+        schema.keys(),
+        PaletteSchema::built_in().keys(),
+        "the fixture generator lists the same 18 keys as the built-in fallback"
+    );
 
     for scheme in ["everforest", "nord"] {
         let input = read(&fx.repo_path(&format!("colors/{scheme}")));
         let (palette, warnings) = PaletteFile::parse(&input);
         assert!(warnings.is_empty(), "{scheme}: unexpected {warnings:?}");
+        let report = palette.validate(&schema);
         assert!(
-            palette.validate().is_valid(),
-            "{scheme} should satisfy the 17-key schema"
+            report.is_valid(),
+            "{scheme} should satisfy the generator's schema: {report:?}"
         );
+        assert!(palette.value("shadow").is_some(), "{scheme} defines shadow");
         assert_eq!(palette.emit(), input, "{scheme} should round-trip");
+    }
+}
+
+/// Every generator output named by `parsers::generated` exists in the fixture
+/// repo, and every color partial's header — `colors.lua`'s `-- # Generated …`
+/// included — names the fixture's active scheme, read through its deployed
+/// path (analysis §7.6, §8.3; task 11.6).
+#[test]
+fn every_generated_file_exists_and_every_color_header_names_the_active_scheme() {
+    let fx = FixtureDotfiles::install();
+
+    for relative in generated_files() {
+        assert!(
+            fx.repo_path(relative).is_file(),
+            "{relative} is a generator output and must exist in the fixture"
+        );
+    }
+    for relative in GENERATED_COLOR_PARTIALS {
+        // Deployed under `$XDG_CONFIG_HOME` (`config/…`) or as `~/.zsh_colors`.
+        let live = match relative.strip_prefix("config/") {
+            Some(config_relative) => fx.config_path(config_relative),
+            None => fx.home().join(".zsh_colors"),
+        };
+        assert_eq!(
+            detect_active_scheme(&read(&live)),
+            ActiveScheme::Named("everforest".to_string()),
+            "{relative} should name the active scheme in its header"
+        );
     }
 }
 

@@ -30,11 +30,13 @@
 //! ([`ReloadAction::SwayncReloadConfig`] and [`ReloadAction::SwayncReloadCss`]) rather
 //! than one: a Notifications change (position/timeout in `config.json`) needs `-R`,
 //! and a palette switch — whose `generate-colors` run rewrites `swaync/colors.css` and
-//! nothing else swaync reads — needs only `-rs`. Because each change class needs just
-//! its own flag, neither action ever has to combine them, and each runs as its own
-//! `swaync-client` invocation — which also keeps the reloads working on clients older
-//! than SwayNotificationCenter PR #580, where several flags on one command line were
-//! parsed as a single command so only one reload happened (its issue #534). Current
+//! nothing else swaync reads — needs only `-rs`. (Correction: `swaync/colors.css` is no
+//! longer generated since the swaync removal, analysis §8.3, so that `-rs` step now
+//! reloads nothing; the swaync reload step is removed in task 11.7.) Because each change
+//! class needs just its own flag, neither action ever has to combine them, and each runs
+//! as its own `swaync-client` invocation — which also keeps the reloads working on
+//! clients older than SwayNotificationCenter PR #580, where several flags on one command
+//! line were parsed as a single command so only one reload happened (its issue #534). Current
 //! clients accept a combined `-R -rs` (v0.12.6's `src/client.vala` loops over the
 //! arguments its command parser has not consumed), so keeping the invocations separate
 //! is a compatibility choice, not a limitation of the client.
@@ -220,8 +222,10 @@ impl BackingFile {
             }
             // A palette switch reloads every component whose colors were regenerated,
             // in the apply-theme order (analysis §6.1). swaync gets the *CSS* reload
-            // (`-rs`) only: `generate-colors` rewrites `swaync/colors.css`, which
-            // `style.css` imports, and never touches `config.json`.
+            // (`-rs`) only: `generate-colors` rewrote `swaync/colors.css`, which
+            // `style.css` imports, and never touched `config.json`. That file is no
+            // longer generated since the swaync removal (analysis §8.3); the swaync
+            // reload step is removed in task 11.7.
             BackingFile::Palette => vec![
                 ReloadAction::HyprctlReload(HyprlandReloadScope::Full),
                 ReloadAction::EwwReload,
@@ -356,8 +360,10 @@ pub enum ReloadAction {
     /// edited notification position or timeout takes effect live (R5.3).
     SwayncReloadConfig,
     /// `swaync-client -rs` (`--reload-css`) — swaync re-reads its stylesheet only. This
-    /// is the palette chain's swaync step, because `generate-colors` regenerates
-    /// `swaync/colors.css`; it does **not** pick up `config.json` changes.
+    /// is the palette chain's swaync step, because `generate-colors` used to regenerate
+    /// `swaync/colors.css`; it does **not** pick up `config.json` changes. That file is
+    /// no longer generated since the swaync removal (analysis §8.3); the swaync reload
+    /// step is removed in task 11.7.
     SwayncReloadCss,
     /// SIGUSR1 to every running kitty, which re-reads its config (v1 has no kitty
     /// remote-control reload; analysis §6.1).
@@ -1051,8 +1057,10 @@ mod tests {
     fn palette_change_maps_to_the_apply_theme_chain_in_order() {
         // Accept criterion: a palette change is the broad apply-theme chain, in the
         // canonical order (analysis §6.1) — hyprctl reload, eww reload, swaync -rs,
-        // kitty SIGUSR1. swaync's step is the CSS reload: `generate-colors` rewrites
-        // `swaync/colors.css` and no swaync config key (task 9.9).
+        // kitty SIGUSR1. swaync's step is the CSS reload: `generate-colors` rewrote
+        // `swaync/colors.css` and no swaync config key (task 9.9). That file is no
+        // longer generated since the swaync removal (analysis §8.3); the swaync reload
+        // step is removed in task 11.7.
         assert_eq!(
             BackingFile::Palette.reload_actions(&ReloadParams::default()),
             vec![

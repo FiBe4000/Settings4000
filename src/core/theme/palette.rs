@@ -38,6 +38,16 @@
 //! Apply contribution populates [`ApplyPlan::palette`](crate::core::apply::ApplyPlan),
 //! not `writes`.
 //!
+//! # Which keys a scheme needs (R8.3, analysis §7.6)
+//!
+//! A scheme is only offered when `generate-colors` would accept it, and the
+//! generator decides that with its own `NAMES=(…)` key list. The model therefore
+//! reads that list from the discovered script at load ([`load_palette_schema`]) and
+//! validates every `colors/` entry against it, falling back to the built-in 18-key
+//! list when the script cannot be read or understood. The schema that applied —
+//! keys and source — is kept on the model ([`PaletteModel::schema`]) and logged, so
+//! a scheme missing from the drop-down can be traced to the list that rejected it.
+//!
 //! # Read-only degrade (R3.2)
 //!
 //! With fewer than two schemes there is nothing to switch *to*, so the model reports
@@ -48,6 +58,53 @@ use std::path::{Path, PathBuf};
 
 use crate::core::apply::PaletteSwitch;
 use crate::parsers::generated;
+use crate::parsers::palette::PaletteSchema;
+
+/// Reads the palette schema from the `generate-colors` script at `generate_colors`
+/// (R8.3, R8.5; analysis §7.6).
+///
+/// The path is the one detection discovered behind the deployed config symlink
+/// ([`PaletteSource::generate_colors`](crate::core::detect::PaletteSource::generate_colors)),
+/// so the schema is the list the very generator an Apply will run checks. The
+/// script's `NAMES=(…)` line is parsed by
+/// [`PaletteSchema::from_generator_script`]; when the script is unreadable (absent,
+/// permission denied, not UTF-8) or the line is absent or malformed, this falls back to
+/// [`PaletteSchema::built_in`] and says why at `info` — a fallback is not an error,
+/// and the built-in list matches the generator as of the dotfiles this app targets.
+/// Nothing here fails. Only the path and the reason are logged, never the script
+/// (R7.3).
+pub fn load_palette_schema(generate_colors: &Path) -> PaletteSchema {
+    let script = match std::fs::read_to_string(generate_colors) {
+        Ok(script) => script,
+        Err(error) => {
+            tracing::info!(
+                path = %generate_colors.display(),
+                %error,
+                "generate-colors unreadable; validating palettes against the built-in key list"
+            );
+            return PaletteSchema::built_in();
+        }
+    };
+    match PaletteSchema::from_generator_script(&script, generate_colors) {
+        Ok(schema) => {
+            tracing::debug!(
+                path = %generate_colors.display(),
+                keys = schema.keys().len(),
+                "palette schema read from the generator's NAMES line"
+            );
+            schema
+        }
+        Err(reason) => {
+            tracing::info!(
+                path = %generate_colors.display(),
+                %reason,
+                "generate-colors has no usable NAMES line; validating palettes against \
+                 the built-in key list"
+            );
+            PaletteSchema::built_in()
+        }
+    }
+}
 
 /// One discovered, switchable palette scheme.
 ///
@@ -96,6 +153,9 @@ pub struct PaletteModel {
     /// The discovered `scripts/generate-colors` path (R8.5), passed verbatim into the
     /// Apply contribution so the pipeline runs it with no shell.
     generate_colors: PathBuf,
+    /// The key list the `colors/` entries were validated against — read from
+    /// `generate_colors` or the built-in fallback (R8.3).
+    schema: PaletteSchema,
 }
 
 impl PaletteModel {
@@ -106,21 +166,26 @@ impl PaletteModel {
     /// [`PaletteSource`](crate::core::detect::PaletteSource); `active_scheme_source` is
     /// the deployed generated color file (`~/.config/hypr/colors.conf`) whose header
     /// names the active scheme (task 3.7). All three are injected so the model can be
-    /// built against a temporary fixture in tests. Nothing here fails: an unreadable
-    /// directory yields no schemes and an unrecognized header yields an unknown active
-    /// scheme, both of which the UI renders as the read-only degrade.
+    /// built against a temporary fixture in tests. The scheme files are validated
+    /// against the schema [`load_palette_schema`] reads from `generate_colors`. Nothing
+    /// here fails: an unreadable directory yields no schemes and an unrecognized header
+    /// an unknown active scheme (the UI renders both as the read-only degrade), and an
+    /// unreadable generator means the built-in key list.
     pub fn load(
         colors_dir: &Path,
         active_scheme_source: &Path,
         generate_colors: PathBuf,
     ) -> PaletteModel {
-        let schemes = enumerate_schemes(colors_dir);
+        let schema = load_palette_schema(&generate_colors);
+        let schemes = enumerate_schemes(colors_dir, &schema);
         let active = generated::read_active_scheme(active_scheme_source)
             .name()
             .map(str::to_string);
         tracing::info!(
             schemes = schemes.len(),
             active = ?active,
+            schema_keys = schema.keys().len(),
+            schema_source = %schema.source(),
             "loaded palette schemes for the Theme page (task 6.3, R3.2)"
         );
         PaletteModel {
@@ -128,7 +193,15 @@ impl PaletteModel {
             active,
             staged: None,
             generate_colors,
+            schema,
         }
+    }
+
+    /// The schema the schemes were validated against, with its
+    /// [source](crate::parsers::palette::SchemaSource): the discovered generator's
+    /// `NAMES` line, or the built-in fallback (R8.3).
+    pub fn schema(&self) -> &PaletteSchema {
+        &self.schema
     }
 
     /// The discovered schemes, in drop-down order.
@@ -242,14 +315,14 @@ impl PaletteModel {
 /// (R3.2, R8.5).
 ///
 /// An entry is a scheme only when it is (1) not a dotfile, (2) a regular file
-/// (following symlinks, so subdirectories are excluded), and (3) a schema-valid
-/// palette. The schema-validity check is what filters out a `README.md`, an
+/// (following symlinks, so subdirectories are excluded), and (3) a palette valid on
+/// `schema`. The schema-validity check is what filters out a `README.md`, an
 /// `active-scheme`-style marker, or any other non-palette file: only a file with all
-/// the palette's schema keys present parses as valid — the same bar
-/// `generate-colors` uses, so every scheme offered here is one it would accept. The
-/// result is sorted by name for a deterministic drop-down order regardless of the
-/// directory's iteration order.
-fn enumerate_schemes(colors_dir: &Path) -> Vec<Scheme> {
+/// of `schema`'s keys present parses as valid — the same bar `generate-colors` uses
+/// when `schema` came from its `NAMES` line, so every scheme offered here is one it
+/// would accept. The result is sorted by name for a deterministic drop-down order
+/// regardless of the directory's iteration order.
+fn enumerate_schemes(colors_dir: &Path, schema: &PaletteSchema) -> Vec<Scheme> {
     let mut schemes = Vec::new();
     let entries = match std::fs::read_dir(colors_dir) {
         Ok(entries) => entries,
@@ -281,14 +354,37 @@ fn enumerate_schemes(colors_dir: &Path) -> Vec<Scheme> {
         }
         // A scheme must parse as a schema-valid palette; this is what excludes
         // README.md, a state marker, or any other non-palette file (task 3.7 swatch).
-        let Some(swatch) = generated::read_scheme_swatch(&entry.path()) else {
+        let Some(swatch) = generated::read_scheme_swatch(&entry.path(), schema) else {
             continue;
         };
-        if !swatch.validation().is_valid() {
-            tracing::debug!(
-                scheme = name,
-                "skipping a colors/ entry that is not a complete palette"
-            );
+        let validation = swatch.validation();
+        if !validation.is_valid() {
+            if validation.missing_keys().is_empty() && !validation.unknown_keys().is_empty() {
+                // Every schema key is there and only extras disqualify the file. A
+                // README or marker can never look like this (it lacks the schema
+                // keys); it is the signature of a scheme that is *ahead* of the schema
+                // — typically the generator gained a key while its `NAMES` line became
+                // unreadable to us, so the built-in list applied. That hides a scheme
+                // the generator would accept, so it is worth a `warn`.
+                tracing::warn!(
+                    scheme = name,
+                    unknown = ?validation.unknown_keys(),
+                    duplicate = ?validation.duplicate_keys(),
+                    schema_source = %validation.schema_source(),
+                    "skipping a colors/ scheme whose only problem is keys outside the \
+                     palette schema; the schema may be older than the generator"
+                );
+            } else {
+                // `debug`, not `warn`: a README or marker in `colors/` lands here too.
+                tracing::debug!(
+                    scheme = name,
+                    missing = ?validation.missing_keys(),
+                    unknown = ?validation.unknown_keys(),
+                    duplicate = ?validation.duplicate_keys(),
+                    schema_source = %validation.schema_source(),
+                    "skipping a colors/ entry that is not a complete palette"
+                );
+            }
             continue;
         }
         // Accepted edge: the bar here is schema validity, not the file name, so a
@@ -341,10 +437,11 @@ mod tests {
     use crate::core::detect::{Binary, Capabilities, Daemon};
     use crate::core::freshness::FreshnessTracker;
     use crate::core::reload::ReloadParams;
+    use crate::parsers::palette::SchemaSource;
     use crate::system::command::{Command, MockCommandRunner};
     use crate::system::signal::{MockProcessSignaller, SignalCall};
 
-    /// A complete, schema-valid `colors/<scheme>` source with all 17 keys.
+    /// A complete, schema-valid `colors/<scheme>` source with all 18 built-in keys.
     const VALID_SCHEME: &str = "\
 bg0=272e33
 bg1=2e383c
@@ -363,6 +460,7 @@ yellow=dbbc7f
 green=a7c080
 blue=7fbbb3
 purple=d699b6
+shadow=0a0c0d
 ";
 
     /// Writes a `colors/` directory with the given scheme files, plus the non-scheme
@@ -411,7 +509,7 @@ purple=d699b6
         let colors = dir.path().join("colors");
         write_colors_dir(&colors, &["everforest", "nord"]);
 
-        let schemes = enumerate_schemes(&colors);
+        let schemes = enumerate_schemes(&colors, &PaletteSchema::built_in());
         let names: Vec<&str> = schemes.iter().map(Scheme::name).collect();
         assert_eq!(
             names,
@@ -423,17 +521,17 @@ purple=d699b6
     #[test]
     fn a_valid_scheme_carries_a_parsed_preview() {
         // The swatch parse (task 3.7) feeds a preview strip: a complete palette yields
-        // all 17 colors as RGB, and the first entry (`bg0=272e33`) parses correctly.
+        // all 18 colors as RGB, and the first entry (`bg0=272e33`) parses correctly.
         let dir = tempfile::tempdir().expect("temp dir");
         let colors = dir.path().join("colors");
         write_colors_dir(&colors, &["nord"]);
 
-        let schemes = enumerate_schemes(&colors);
+        let schemes = enumerate_schemes(&colors, &PaletteSchema::built_in());
         let nord = schemes.iter().find(|s| s.name() == "nord").expect("nord");
         assert_eq!(
             nord.preview().len(),
-            17,
-            "a complete palette previews all 17"
+            18,
+            "a complete palette previews all 18"
         );
         let (r, g, b) = nord.preview()[0];
         assert!((r - f64::from(0x27) / 255.0).abs() < 1e-9);
@@ -698,6 +796,165 @@ purple=d699b6
                 signal: Signal::SIGUSR1,
                 pids: vec![4242],
             }]
+        );
+    }
+
+    /// Writes a `generate-colors` script whose schema line lists `names`, preceded
+    /// by a comment that mentions a different `NAMES=(…)` list — which must not be
+    /// the one read.
+    fn write_generator(path: &Path, names: &[&str]) {
+        fs::write(
+            path,
+            format!(
+                "#!/usr/bin/env bash\n# not this one: NAMES=(bogus)\nNAMES=({})\n",
+                names.join(" ")
+            ),
+        )
+        .expect("write a generator script");
+    }
+
+    /// The 18 built-in keys, as the generator lists them.
+    fn built_in_keys() -> Vec<&'static str> {
+        crate::parsers::palette::BUILT_IN_PALETTE_KEYS.to_vec()
+    }
+
+    #[test]
+    fn the_schema_is_read_from_the_generator_and_a_17_key_scheme_is_not_offered() {
+        // The generator's 18-name list applies: a pre-`shadow` 17-key scheme is one
+        // `generate-colors` would abort on, so it is not offered, while the complete
+        // scheme is (R8.3, analysis §7.6).
+        let dir = tempfile::tempdir().expect("temp dir");
+        let colors = dir.path().join("colors");
+        write_colors_dir(&colors, &["everforest", "nord"]);
+        let without_shadow = VALID_SCHEME.replace("shadow=0a0c0d\n", "");
+        fs::write(colors.join("old"), without_shadow).expect("write a 17-key scheme");
+        let generator = dir.path().join("generate-colors");
+        write_generator(&generator, &built_in_keys());
+        let active_source = dir.path().join("colors.conf");
+        write_active_source(&active_source, "nord");
+
+        let model = PaletteModel::load(&colors, &active_source, generator.clone());
+        assert_eq!(
+            model.schema().source(),
+            &SchemaSource::Generator(generator),
+            "the discovered generator's NAMES line applied"
+        );
+        assert_eq!(model.schema().keys().len(), 18);
+        let names: Vec<&str> = model.schemes().iter().map(Scheme::name).collect();
+        assert_eq!(names, vec!["everforest", "nord"], "`old` lacks shadow");
+    }
+
+    #[test]
+    fn a_19th_generator_name_makes_a_19_key_scheme_valid_without_a_code_change() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let colors = dir.path().join("colors");
+        write_colors_dir(&colors, &["nord"]);
+        fs::write(
+            colors.join("future"),
+            format!("{VALID_SCHEME}glow=ffffff\n"),
+        )
+        .expect("write a 19-key scheme");
+        let generator = dir.path().join("generate-colors");
+        let mut names = built_in_keys();
+        names.push("glow");
+        write_generator(&generator, &names);
+        let active_source = dir.path().join("colors.conf");
+        write_active_source(&active_source, "nord");
+
+        let model = PaletteModel::load(&colors, &active_source, generator);
+        assert_eq!(model.schema().keys().len(), 19);
+        let offered: Vec<&str> = model.schemes().iter().map(Scheme::name).collect();
+        assert_eq!(
+            offered,
+            vec!["future"],
+            "only the 19-key scheme satisfies the 19-name generator; `nord` lacks `glow`"
+        );
+        assert_eq!(model.schemes()[0].preview().len(), 19);
+    }
+
+    #[test]
+    fn an_unreadable_or_unparseable_generator_falls_back_to_the_built_in_keys() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        // Absent script: the built-in 18-key list, and the model says so.
+        let schema = load_palette_schema(&dir.path().join("missing"));
+        assert_eq!(schema, PaletteSchema::built_in());
+        assert_eq!(schema.source(), &SchemaSource::BuiltIn);
+        assert_eq!(schema.keys().last().map(String::as_str), Some("shadow"));
+
+        // A script whose only `NAMES` is in a comment has no schema line.
+        let commented = dir.path().join("commented");
+        fs::write(&commented, "#!/bin/sh\n# NAMES=(bg0)\n").expect("write a script");
+        assert_eq!(
+            load_palette_schema(&commented).source(),
+            &SchemaSource::BuiltIn
+        );
+
+        // A script that is not UTF-8 is unreadable as text.
+        let binary = dir.path().join("binary");
+        fs::write(&binary, [0xFF, 0xFE, 0x00]).expect("write raw bytes");
+        assert_eq!(
+            load_palette_schema(&binary).source(),
+            &SchemaSource::BuiltIn
+        );
+
+        // The model built over the absent script reports the fallback and still
+        // offers the complete built-in schemes.
+        let colors = dir.path().join("colors");
+        write_colors_dir(&colors, &["everforest", "nord"]);
+        let active_source = dir.path().join("colors.conf");
+        write_active_source(&active_source, "nord");
+        let model = PaletteModel::load(&colors, &active_source, dir.path().join("missing"));
+        assert_eq!(model.schema().source(), &SchemaSource::BuiltIn);
+        assert_eq!(model.schemes().len(), 2);
+    }
+
+    #[test]
+    fn a_scheme_with_only_extra_keys_is_skipped_with_a_warning() {
+        // A 19-key scheme on the built-in 18-key fallback (here: no generator at
+        // all): nothing is missing, only `glow` is unknown, so the schema is the
+        // likely culprit and the skip is logged at `warn` naming the extra key and
+        // the list that applied. The README in the same directory (missing keys)
+        // stays at `debug`.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let colors = dir.path().join("colors");
+        write_colors_dir(&colors, &["nord"]);
+        fs::write(
+            colors.join("future"),
+            format!("{VALID_SCHEME}glow=ffffff\n"),
+        )
+        .expect("write a 19-key scheme");
+
+        let mut names = Vec::new();
+        let events = crate::testing::capture_logs(|| {
+            names = enumerate_schemes(&colors, &PaletteSchema::built_in())
+                .iter()
+                .map(|scheme| scheme.name().to_string())
+                .collect();
+        });
+        assert_eq!(names, vec!["nord"], "the 19-key scheme is not offered");
+
+        let warnings: Vec<_> = events
+            .iter()
+            .filter(|event| event.level == tracing::Level::WARN)
+            .collect();
+        assert_eq!(warnings.len(), 1, "exactly one warning: {events:?}");
+        let fields = &warnings[0].fields;
+        assert!(fields.contains("scheme=\"future\""), "{fields}");
+        assert!(
+            fields.contains("glow"),
+            "the unknown key is named: {fields}"
+        );
+        assert!(
+            fields.contains("the built-in 18-key list"),
+            "the schema source is named: {fields}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.level == tracing::Level::DEBUG
+                    && event.fields.contains("README.md")),
+            "the README skip stays at debug: {events:?}"
         );
     }
 

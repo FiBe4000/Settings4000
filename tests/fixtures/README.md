@@ -22,17 +22,18 @@ files are deliberately still in their §6 shape; see "Known divergences from
 
 ### What it contains
 
-- `colors/` — the two palette schemes (`everforest`, `nord`) plus a
-  `README.md`, which scheme enumeration must skip. They are still the §6
-  **17-key** versions without `shadow`; the real schema is now 18 keys (see
-  "Known divergences").
+- `colors/` — the two palette schemes (`everforest`, `nord`, verbatim
+  `8a5b20b`: **18 keys**, `shadow` last) plus a short stand-in `README.md`,
+  which scheme enumeration must skip.
 - `scripts/generate-colors` — an executable stub that exits 2 on its first
   command, so an accidental real invocation fails loudly (tests drive the
   generator through `MockCommandRunner`; detection only checks presence).
   Below the `exit 2` it carries a verbatim, never-executed copy of the real
   script at `8a5b20b`, so the file holds the real `NAMES=(…)` schema line
   (18 keys, `shadow` last) and the `colors.lua` emitter as text for the app
-  to read (task 11.6 parses the `NAMES` line).
+  to read: since task 11.6 the palette schema is parsed from that line,
+  matched only at the start of a line because the stub's own header comment
+  mentions `NAMES` too.
 - `scripts/hypr-toggle-laptop-display`, `scripts/notifctl` — executable
   no-op stubs. Each writes one line (script name plus shell-quoted arguments)
   to stderr, appends the same line to the file named by
@@ -94,6 +95,17 @@ Since this refresh every cursor copy in the fixture agrees on
 `breeze_cursors`/`24`: both `settings.ini`, `uwsm/env`, the two `hl.env`
 lines of `hyprland.lua`, and `icons/default/index.theme`.
 
+### Refreshed to `8a5b20b` in task 11.6
+
+- The eight palette files are verbatim `8a5b20b`: `colors/everforest`,
+  `colors/nord` (they gained `shadow`) and the six generated color partials
+  `config/hypr/colors.conf`, `config/hypr/colors.lua`,
+  `config/eww/_colors.scss`, `config/rofi/colors.rasi`,
+  `config/kitty/colors.conf`, `zsh/colors.zsh` (generated there from
+  `everforest`, the fixture's active scheme; three of them gained their
+  `shadow` line, the rest were already current). `colors/README.md` stays a
+  stand-in; its key list now names all 18 keys.
+
 ### Known divergences from `8a5b20b`
 
 Each of these files is kept in its §6 shape because the `8a5b20b` version
@@ -103,14 +115,8 @@ was verified by refreshing each file in turn and running the suite.
 
 | Fixture file | `8a5b20b` has | Existing tests it breaks | Refresh with |
 |---|---|---|---|
-| `colors/everforest`, `colors/nord` | an 18th key `shadow` | `fixture_tree::palette_schemes_parse_and_satisfy_the_schema` (unknown key on the 17-key schema); `apply_theme::a_palette_switch_runs_generate_colors_then_the_reload_chain`, `apply_theme::a_generate_colors_failure_rolls_back_the_theme_writes_and_reloads_nothing`, `apply_assembly::the_bespoke_models_compose_into_one_plan` (nord) | 11.6 |
 | `config/hypr/hypridle.conf` | `--grace 10` in `lock_cmd`, dual-form dpms commands, `idle-dim` dim/restore, explanatory comments | `apply_power::a_lock_command_edit_restarts_via_the_kill_and_respawn_fallback` (expects the old `lock_cmd` text) | 11.13 |
 | `config/hypr/hyprlock.conf`, `config/hypr/hyprpaper.conf` | `path = ~/Pictures/wallpaper/18.jpg` | `fixture_tree::hyprlang_configs_parse_losslessly_at_their_deployed_paths`, `apply_theme::a_wallpaper_change_dual_writes_hyprpaper_and_hyprlock_and_reloads`, `apply_theme::a_tilde_shaped_wallpaper_original_is_replaced_surgically` (all expect the substituted absolute path of an existing file) | 11.10 |
-
-Consequence to keep in mind until 11.6 lands: the generated partials other
-than `colors.lua` (`hypr/colors.conf`, `eww/_colors.scss`, `rofi/colors.rasi`,
-kitty `colors.conf`) are still the pre-`shadow` output, while `colors.lua`
-carries `shadow`.
 
 ### Scheduled for removal
 
@@ -120,6 +126,10 @@ fixture until the tasks that retire the code and tests targeting them:
 | Fixture file | Removed by |
 |---|---|
 | `config/swaync/` (`config.json`, `style.css`, `colors.css`) | 11.7 (swaync replaced by notifd) |
+
+`swaync/colors.css` is no longer a generator output (analysis §8.3): since
+task 11.6 no test expects it to exist or to be deployed, and it is not in the
+app's generated-file set; the copy only waits for the directory's removal.
 
 The hyprlang input file went with task 11.4 and the hyprlang main config with
 task 11.5 (its cursor copy now lives in `hyprland.lua`), together with every

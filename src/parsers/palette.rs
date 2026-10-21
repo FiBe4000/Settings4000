@@ -44,22 +44,249 @@
 //! ([`set_value`](PaletteFile::set_value)) exists for the R6.1 round-trip
 //! coverage and to support future per-key palette editing; it is intentionally
 //! present and tested even though nothing wires it to a widget yet.
+//!
+//! # The schema comes from the generator
+//!
+//! Which keys a scheme must define is decided by `generate-colors`, which
+//! aborts unless every name of its `NAMES=(…)` bash array is present. That list
+//! grew from 17 to 18 keys when `shadow` was added (analysis §7.6), and a
+//! hard-coded copy in this app would reject every valid scheme the next time it
+//! grows. So validation takes a [`PaletteSchema`] value: normally built by
+//! [`parse_names_line`] from the generator's own text, otherwise the built-in
+//! [`BUILT_IN_PALETTE_KEYS`] fallback, and always labelled with its
+//! [`SchemaSource`] so a validation report can say which list it applied
+//! (R8.3). This module only parses text it is given; finding and reading the
+//! script (via the palette source discovered per R8.5) happens in
+//! [`crate::core::theme`].
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 
-/// The fixed 17-name palette schema every scheme file must define
-/// (analysis §2, §6.4).
+/// The built-in palette schema: the 18 keys `scripts/generate-colors` requires
+/// as of dotfiles commit `8a5b20b` (analysis §7.6), in the generator's order.
 ///
-/// `generate-colors` validates that all of these keys are present before it
-/// emits anything, and treats the palette as invalid if any is missing. The
-/// order here is the canonical order used throughout the dotfiles docs; it is
-/// used only to report [missing keys](SchemaValidation::missing_keys) in a
-/// stable, human-recognizable order and does **not** constrain the order keys
-/// may appear in a file.
-pub const PALETTE_KEYS: [&str; 17] = [
+/// This is only the **fallback**. The authoritative key list is the
+/// generator's own `NAMES=(…)` array, which [`PaletteSchema::from_generator_script`]
+/// reads, so a key added to the dotfiles (as `shadow` was, after the original
+/// 17) does not make every valid scheme fail validation until the app is
+/// updated. The fallback applies when the script cannot be read or its `NAMES`
+/// line cannot be understood; it should be kept in step with the real script so
+/// the fallback is as close to the truth as possible.
+pub const BUILT_IN_PALETTE_KEYS: [&str; 18] = [
     "bg0", "bg1", "bg2", "bg3", "fg0", "fg1", "fg2", "accent0", "accent1", "accent2", "accent3",
-    "red", "orange", "yellow", "green", "blue", "purple",
+    "red", "orange", "yellow", "green", "blue", "purple", "shadow",
 ];
+
+/// The exact text that opens the generator's schema line. It must start the
+/// line (column 0): the real script assigns the array at top level, and a
+/// comment or an indented mention elsewhere in the file (the fixture stub's
+/// header talks about `NAMES`, for example) is not the assignment.
+const NAMES_LINE_PREFIX: &str = "NAMES=(";
+
+/// Where the key list of a [`PaletteSchema`] came from.
+///
+/// Carried into every [`SchemaValidation`] so a validation failure can say
+/// which list it was checked against (R8.3): "missing `shadow` according to
+/// `<repo>/scripts/generate-colors`" and "missing `shadow` according to the
+/// app's built-in list" call for different fixes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SchemaSource {
+    /// The keys were read from the `NAMES=(…)` line of this generator script —
+    /// the same list the generator itself checks before it emits anything.
+    Generator(PathBuf),
+    /// The generator script was unreadable or its `NAMES` line was absent or
+    /// malformed, so the app's [`BUILT_IN_PALETTE_KEYS`] applied.
+    BuiltIn,
+}
+
+impl fmt::Display for SchemaSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SchemaSource::Generator(path) => {
+                write!(f, "the NAMES line of {}", path.display())
+            }
+            SchemaSource::BuiltIn => {
+                write!(f, "the built-in {}-key list", BUILT_IN_PALETTE_KEYS.len())
+            }
+        }
+    }
+}
+
+/// The set of keys every `colors/<scheme>` file must define, together with
+/// where that set came from (R3.2, R8.3; analysis §7.6).
+///
+/// A value rather than a constant because the authoritative list lives in the
+/// dotfiles, not in this app: `generate-colors` aborts on any key of its
+/// `NAMES` array that a scheme lacks, so the app validates against that same
+/// array whenever it can read it. Building one is pure — the caller supplies
+/// the script's text; locating and reading the script is the caller's job
+/// ([`load_palette_schema`](crate::core::theme::load_palette_schema)), which
+/// keeps detection logic out of this parser module.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaletteSchema {
+    /// The required keys in the order the source lists them, without
+    /// duplicates. Never empty.
+    keys: Vec<String>,
+    /// Which list the keys came from.
+    source: SchemaSource,
+}
+
+impl PaletteSchema {
+    /// The fallback schema: [`BUILT_IN_PALETTE_KEYS`], labelled
+    /// [`SchemaSource::BuiltIn`].
+    pub fn built_in() -> PaletteSchema {
+        PaletteSchema {
+            keys: BUILT_IN_PALETTE_KEYS
+                .iter()
+                .map(|key| key.to_string())
+                .collect(),
+            source: SchemaSource::BuiltIn,
+        }
+    }
+
+    /// Builds the schema from the text of a `generate-colors` script, labelled
+    /// with the script's `path`.
+    ///
+    /// Fails with the reason when the script's `NAMES=(…)` line is absent or
+    /// malformed (see [`parse_names_line`]); the caller then falls back to
+    /// [`PaletteSchema::built_in`] and logs the reason. `path` is used only as
+    /// the [`SchemaSource::Generator`] label — nothing is read from it here.
+    pub fn from_generator_script(
+        script: &str,
+        path: &Path,
+    ) -> Result<PaletteSchema, NamesLineError> {
+        Ok(PaletteSchema {
+            keys: parse_names_line(script)?,
+            source: SchemaSource::Generator(path.to_path_buf()),
+        })
+    }
+
+    /// The required keys, in the source's order.
+    pub fn keys(&self) -> &[String] {
+        &self.keys
+    }
+
+    /// Where the keys came from.
+    pub fn source(&self) -> &SchemaSource {
+        &self.source
+    }
+
+    /// Whether `key` is one of the required keys.
+    pub fn contains(&self, key: &str) -> bool {
+        self.keys.iter().any(|schema_key| schema_key == key)
+    }
+}
+
+/// Why a generator script's `NAMES=(…)` line could not be used as the palette
+/// schema. Every case makes the caller fall back to the built-in list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NamesLineError {
+    /// No line starts with `NAMES=(`.
+    Absent,
+    /// More than one line starts with `NAMES=(`. Which assignment the
+    /// generator's check sees depends on bash control flow this parser does not
+    /// model, so neither is trusted. Carries the 1-based line numbers.
+    Ambiguous(Vec<usize>),
+    /// The array is not closed by `)` on the same line. A multi-line array is
+    /// valid bash, but the generator has always written the schema on one line,
+    /// so anything else is treated as unrecognised rather than half-understood.
+    /// Carries the 1-based line number.
+    Unterminated(usize),
+    /// The closing `)` is followed by something other than whitespace or a `#`
+    /// comment — e.g. a second command on the same line, which this parser does
+    /// not interpret. Carries the 1-based line number.
+    TrailingText(usize),
+    /// The parentheses hold no names. Carries the 1-based line number.
+    Empty(usize),
+    /// An element is not a bare palette key (ASCII letters, digits and `_`):
+    /// a quoted word, a `$variable` or a glob would need bash to expand it.
+    /// Carries the 1-based line number and the offending word.
+    InvalidName(usize, String),
+}
+
+impl fmt::Display for NamesLineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NamesLineError::Absent => write!(f, "no line starts with `{NAMES_LINE_PREFIX}`"),
+            NamesLineError::Ambiguous(lines) => {
+                write!(
+                    f,
+                    "several lines start with `{NAMES_LINE_PREFIX}`: {lines:?}"
+                )
+            }
+            NamesLineError::Unterminated(line) => write!(
+                f,
+                "line {line}: the NAMES array is not closed on its own line"
+            ),
+            NamesLineError::TrailingText(line) => write!(
+                f,
+                "line {line}: the NAMES array is not followed only by whitespace or a comment"
+            ),
+            NamesLineError::Empty(line) => write!(f, "line {line}: the NAMES array is empty"),
+            NamesLineError::InvalidName(line, word) => {
+                write!(f, "line {line}: `{word}` is not a bare palette key")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NamesLineError {}
+
+/// Extracts the palette key list from the `NAMES=(…)` line of a
+/// `generate-colors` script (analysis §7.6).
+///
+/// The real script declares its schema as one top-level bash array,
+/// `NAMES=(bg0 bg1 … purple shadow)`, and aborts when a scheme lacks any of
+/// them. This reads exactly that shape: a line beginning at column 0 with
+/// `NAMES=(`, whitespace-separated bare words, and a closing `)` on the same
+/// line optionally followed by a `#` comment. Lines that merely mention
+/// `NAMES` (comments, the `"${NAMES[@]}"` loop) never match because of the
+/// column-0 anchor. A repeated name is kept once, in first-seen order — bash
+/// would simply check it twice. Anything this does not understand is an
+/// error, never a guess, so the caller can fall back to the built-in list.
+pub fn parse_names_line(script: &str) -> Result<Vec<String>, NamesLineError> {
+    let candidates: Vec<(usize, &str)> = script
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            line.strip_prefix(NAMES_LINE_PREFIX)
+                .map(|rest| (index + 1, rest))
+        })
+        .collect();
+    let (line_number, rest) = match candidates.as_slice() {
+        [] => return Err(NamesLineError::Absent),
+        [single] => *single,
+        several => {
+            return Err(NamesLineError::Ambiguous(
+                several.iter().map(|(line, _)| *line).collect(),
+            ));
+        }
+    };
+
+    // `lines()` already dropped the `\n`; a CRLF file leaves a `\r`, which
+    // `trim` below treats as whitespace.
+    let Some((inside, after)) = rest.split_once(')') else {
+        return Err(NamesLineError::Unterminated(line_number));
+    };
+    let after = after.trim();
+    if !after.is_empty() && !after.starts_with('#') {
+        return Err(NamesLineError::TrailingText(line_number));
+    }
+
+    let mut keys: Vec<String> = Vec::new();
+    for word in inside.split_whitespace() {
+        if !word.chars().all(is_key_char) {
+            return Err(NamesLineError::InvalidName(line_number, word.to_string()));
+        }
+        if !keys.iter().any(|key| key == word) {
+            keys.push(word.to_string());
+        }
+    }
+    if keys.is_empty() {
+        return Err(NamesLineError::Empty(line_number));
+    }
+    Ok(keys)
+}
 
 /// A parsed palette source file that can re-emit itself byte-for-byte and edit
 /// individual values in place.
@@ -191,29 +418,35 @@ pub enum ParseWarningKind {
     },
 }
 
-/// The result of checking a palette against the fixed 17-key schema
-/// (analysis §2, §6.4).
+/// The result of checking a palette against a [`PaletteSchema`] (R8.3;
+/// analysis §7.6).
 ///
 /// A file is schema-valid (see [`SchemaValidation::is_valid`]) exactly when all
 /// three lists are empty: every schema key is present exactly once and no
 /// out-of-schema key appears. This is intentionally *stricter* than what
-/// `generate-colors` is documented to enforce: the generator validates only that
-/// the 17 keys are all present (not value format, and it is not documented to
-/// reject extra/unknown keys — analysis §2, §6.4). We additionally reject
-/// unknown keys, and check for duplicates because each of the 17 keys is meant
-/// to appear exactly once and a duplicate would make [`PaletteFile::set_value`]'s
-/// first-match edit ambiguous.
-#[derive(Debug, Default, PartialEq, Eq)]
+/// `generate-colors` enforces: the generator checks only that every key of its
+/// `NAMES` array is present (not the value format, and it ignores extra keys —
+/// analysis §6.4, §7.6). We additionally reject unknown keys, because a key the
+/// generator never reads is almost certainly a typo of one it does, and check
+/// for duplicates because each key is meant to appear exactly once and a
+/// duplicate would make [`PaletteFile::set_value`]'s first-match edit
+/// ambiguous.
+///
+/// The report records which key list it was checked against
+/// ([`schema_source`](Self::schema_source)), so a rejection can be explained
+/// as "according to the generator" or "according to the app's built-in list".
+#[derive(Debug, PartialEq, Eq)]
 pub struct SchemaValidation {
-    /// Entry keys present in the file that are **not** part of the 17-key
-    /// schema, in first-seen order. A generator run would reject the file for
-    /// carrying these.
+    /// Where the schema this report was checked against came from.
+    schema_source: SchemaSource,
+    /// Entry keys present in the file that are **not** part of the schema, in
+    /// first-seen order.
     unknown_keys: Vec<String>,
-    /// Schema keys with **no** entry in the file, in canonical schema order.
+    /// Schema keys with **no** entry in the file, in schema order.
     /// `generate-colors` aborts on a missing key, so these must be filled before
     /// a palette apply can succeed. (A key whose only line is malformed or
     /// commented-out counts as missing, since neither is an entry.)
-    missing_keys: Vec<&'static str>,
+    missing_keys: Vec<String>,
     /// Keys that appear as an entry more than once, in first-seen order — a
     /// well-formed palette defines each key exactly once. Includes both schema
     /// and out-of-schema keys.
@@ -221,21 +454,26 @@ pub struct SchemaValidation {
 }
 
 impl SchemaValidation {
-    /// Whether the palette conforms to the schema: all 17 keys present exactly
-    /// once and no extras.
+    /// Whether the palette conforms to the schema: every schema key present
+    /// exactly once and no extras.
     pub fn is_valid(&self) -> bool {
         self.unknown_keys.is_empty()
             && self.missing_keys.is_empty()
             && self.duplicate_keys.is_empty()
     }
 
-    /// Entry keys outside the fixed 17-key schema.
+    /// Which key list the palette was checked against.
+    pub fn schema_source(&self) -> &SchemaSource {
+        &self.schema_source
+    }
+
+    /// Entry keys outside the schema.
     pub fn unknown_keys(&self) -> &[String] {
         &self.unknown_keys
     }
 
     /// Schema keys with no entry in the file.
-    pub fn missing_keys(&self) -> &[&'static str] {
+    pub fn missing_keys(&self) -> &[String] {
         &self.missing_keys
     }
 
@@ -397,14 +635,14 @@ impl PaletteFile {
         Err(SetValueError::UnknownKey(key.to_string()))
     }
 
-    /// Checks the file's entry keys against the fixed 17-key schema.
+    /// Checks the file's entry keys against `schema` (R8.3).
     ///
     /// See [`SchemaValidation`] for the exact semantics: it reports out-of-schema
     /// keys, missing schema keys, and duplicate keys, and considers the palette
     /// valid only when all three are empty. This is independent of value-format
     /// validation — a present-but-non-hex value counts the key as present here
     /// and is flagged instead by a parse [`ParseWarningKind::InvalidHexValue`].
-    pub fn validate(&self) -> SchemaValidation {
+    pub fn validate(&self, schema: &PaletteSchema) -> SchemaValidation {
         // Count each entry key's occurrences, preserving first-seen order for
         // stable, readable reports.
         let mut counts: Vec<(String, usize)> = Vec::new();
@@ -419,7 +657,7 @@ impl PaletteFile {
 
         let unknown_keys = counts
             .iter()
-            .filter(|(key, _)| !PALETTE_KEYS.contains(&key.as_str()))
+            .filter(|(key, _)| !schema.contains(key))
             .map(|(key, _)| key.clone())
             .collect();
 
@@ -429,13 +667,15 @@ impl PaletteFile {
             .map(|(key, _)| key.clone())
             .collect();
 
-        let missing_keys = PALETTE_KEYS
+        let missing_keys = schema
+            .keys()
             .iter()
-            .copied()
-            .filter(|schema_key| !counts.iter().any(|(key, _)| key.as_str() == *schema_key))
+            .filter(|schema_key| !counts.iter().any(|(key, _)| key == *schema_key))
+            .cloned()
             .collect();
 
         SchemaValidation {
+            schema_source: schema.source().clone(),
             unknown_keys,
             missing_keys,
             duplicate_keys,
@@ -551,9 +791,9 @@ mod tests {
     use super::*;
 
     /// A realistic `colors/<scheme>` fixture: a header comment, blank-line
-    /// grouping, a commented-out example entry, all 17 schema keys with real
-    /// Everforest-style bare-hex values, and a trailing newline — the shape of a
-    /// hand-maintained palette source (analysis §2, §6.4).
+    /// grouping, a commented-out example entry, all 18 schema keys with real
+    /// Everforest bare-hex values, and a trailing newline — the shape of a
+    /// hand-maintained palette source (analysis §2, §6.4, §7.6).
     const EVERFOREST_FIXTURE: &str = "\
 # Everforest Dark palette
 # edit this file, then run: scripts/generate-colors everforest
@@ -583,6 +823,9 @@ green=a7c080
 blue=7fbbb3
 purple=d699b6
 
+# Shadow tint
+shadow=0a0c0d
+
 # example override (disabled): highlight=ffffff
 ";
 
@@ -605,8 +848,8 @@ purple=d699b6
             palette.value("highlight").is_none(),
             "a commented-out line must never be treated as an entry"
         );
-        // A clean fixture with all 17 keys is schema-valid.
-        assert!(palette.validate().is_valid());
+        // A clean fixture with all 18 keys is valid on the built-in schema.
+        assert!(palette.validate(&PaletteSchema::built_in()).is_valid());
     }
 
     #[test]
@@ -715,7 +958,8 @@ purple=d699b6
     #[test]
     fn validation_flags_unknown_and_missing_keys() {
         // Accept criterion: schema validation reports out-of-schema keys and
-        // missing keys. This palette drops `purple` and adds an unknown `magenta`.
+        // missing keys. This palette drops `purple` and adds an unknown `magenta`
+        // (and, being a pre-`shadow` 17-key layout, also lacks `shadow`).
         let input = "\
 bg0=272e33
 bg1=2e383c
@@ -736,11 +980,12 @@ blue=7fbbb3
 magenta=d699b6
 ";
         let (palette, _) = PaletteFile::parse(input);
-        let report = palette.validate();
+        let report = palette.validate(&PaletteSchema::built_in());
         assert!(!report.is_valid());
         assert_eq!(report.unknown_keys(), ["magenta".to_string()]);
-        assert_eq!(report.missing_keys(), ["purple"]);
+        assert_eq!(report.missing_keys(), ["purple", "shadow"]);
         assert!(report.duplicate_keys().is_empty());
+        assert_eq!(report.schema_source(), &SchemaSource::BuiltIn);
     }
 
     #[test]
@@ -748,13 +993,13 @@ magenta=d699b6
         // A key defined twice is a schema violation and would make set_value's
         // first-match edit ambiguous, so it is reported.
         let mut input = String::new();
-        for key in PALETTE_KEYS {
+        for key in BUILT_IN_PALETTE_KEYS {
             input.push_str(&format!("{key}=abcdef\n"));
         }
         input.push_str("bg0=123456\n"); // bg0 now appears twice
 
         let (palette, _) = PaletteFile::parse(&input);
-        let report = palette.validate();
+        let report = palette.validate(&PaletteSchema::built_in());
         assert!(!report.is_valid());
         assert_eq!(report.duplicate_keys(), ["bg0".to_string()]);
         assert!(report.unknown_keys().is_empty());
@@ -893,5 +1138,157 @@ bg1=2e383c
         assert!(!is_bare_hex("272e333"), "too long");
         assert!(!is_bare_hex("gggggg"), "non-hex digits");
         assert!(!is_bare_hex(""), "empty");
+    }
+
+    /// The schema-bearing excerpt of the real `scripts/generate-colors` at
+    /// dotfiles commit `8a5b20b`: the comment and loop lines around it mention
+    /// `NAMES` too, which is exactly why the match is anchored at column 0.
+    const GENERATOR_EXCERPT: &str = "\
+#!/usr/bin/env bash
+# the palette schema is taken from its `NAMES` array line
+declare -A colors
+NAMES=(bg0 bg1 bg2 bg3 fg0 fg1 fg2 accent0 accent1 accent2 accent3 red orange yellow green blue purple shadow)
+
+# Verify all expected colors are present
+for name in \"${NAMES[@]}\"; do
+    :
+done
+";
+
+    /// Renders a palette with one `key=abcdef` entry per key.
+    fn palette_with(keys: &[&str]) -> PaletteFile {
+        let text: String = keys.iter().map(|key| format!("{key}=abcdef\n")).collect();
+        PaletteFile::parse(&text).0
+    }
+
+    #[test]
+    fn the_names_line_of_the_real_generator_yields_the_18_key_schema() {
+        let keys = parse_names_line(GENERATOR_EXCERPT).expect("the real line parses");
+        assert_eq!(
+            keys, BUILT_IN_PALETTE_KEYS,
+            "the fallback mirrors the script"
+        );
+        assert_eq!(keys.last().map(String::as_str), Some("shadow"));
+
+        let path = Path::new("/repo/scripts/generate-colors");
+        let schema = PaletteSchema::from_generator_script(GENERATOR_EXCERPT, path)
+            .expect("the real line parses");
+        assert_eq!(
+            schema.source(),
+            &SchemaSource::Generator(path.to_path_buf())
+        );
+    }
+
+    #[test]
+    fn a_names_mention_that_does_not_start_the_line_is_never_matched() {
+        // Comments, indented assignments and the `"${NAMES[@]}"` loop all
+        // contain `NAMES`, some even `NAMES=(`; none is the top-level schema.
+        let only_mentions = "\
+# NAMES=(fake list in a comment)
+    NAMES=(indented inside a function)
+echo NAMES=(not an assignment)
+for name in \"${NAMES[@]}\"; do :; done
+";
+        assert_eq!(parse_names_line(only_mentions), Err(NamesLineError::Absent));
+
+        // With the real line present as well, the mentions do not make it
+        // ambiguous, and only the real line's keys are taken.
+        let with_real_line = format!("{only_mentions}NAMES=(bg0 shadow)\n");
+        assert_eq!(
+            parse_names_line(&with_real_line),
+            Ok(vec!["bg0".to_string(), "shadow".to_string()])
+        );
+    }
+
+    #[test]
+    fn the_names_line_tolerates_spacing_a_trailing_comment_crlf_and_repeats() {
+        assert_eq!(
+            parse_names_line("NAMES=(  bg0\tbg1  bg0 )  # the schema\r\n"),
+            Ok(vec!["bg0".to_string(), "bg1".to_string()]),
+            "extra whitespace, a comment after `)`, a CR and a repeated name are fine"
+        );
+    }
+
+    #[test]
+    fn a_names_line_the_parser_cannot_understand_is_an_error_not_a_guess() {
+        // Each of these makes the caller fall back to the built-in list.
+        let cases = [
+            ("x=1\n", NamesLineError::Absent),
+            ("NAMES=(bg0\n  bg1)\n", NamesLineError::Unterminated(1)),
+            ("NAMES=(bg0 bg1) extra\n", NamesLineError::TrailingText(1)),
+            ("NAMES=( )\n", NamesLineError::Empty(1)),
+            (
+                "NAMES=(bg0 \"bg1\")\n",
+                NamesLineError::InvalidName(1, "\"bg1\"".to_string()),
+            ),
+            (
+                "NAMES=(bg0 $EXTRA)\n",
+                NamesLineError::InvalidName(1, "$EXTRA".to_string()),
+            ),
+            (
+                "NAMES=(bg0)\nNAMES=(bg0 bg1)\n",
+                NamesLineError::Ambiguous(vec![1, 2]),
+            ),
+        ];
+        for (script, expected) in cases {
+            assert_eq!(parse_names_line(script), Err(expected), "for {script:?}");
+            assert!(
+                PaletteSchema::from_generator_script(script, Path::new("/g")).is_err(),
+                "no schema is built from {script:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_17_key_scheme_is_missing_shadow_according_to_the_generator() {
+        // The pre-`shadow` layout of every scheme before analysis §7.6.
+        let path = Path::new("/repo/scripts/generate-colors");
+        let schema = PaletteSchema::from_generator_script(GENERATOR_EXCERPT, path)
+            .expect("the real line parses");
+        let report = palette_with(&BUILT_IN_PALETTE_KEYS[..17]).validate(&schema);
+        assert!(!report.is_valid());
+        assert_eq!(report.missing_keys(), ["shadow"]);
+        assert!(report.unknown_keys().is_empty());
+        assert_eq!(
+            report.schema_source(),
+            &SchemaSource::Generator(path.to_path_buf()),
+            "the report names the generator as the list it applied"
+        );
+    }
+
+    #[test]
+    fn a_19th_generator_name_is_required_without_a_code_change() {
+        // A future dotfiles key: the generator grows a 19th name, so a 19-key
+        // scheme is valid and today's 18-key scheme lacks the new key.
+        let script = GENERATOR_EXCERPT.replace("purple shadow)", "purple shadow glow)");
+        let schema = PaletteSchema::from_generator_script(&script, Path::new("/g"))
+            .expect("the extended line parses");
+        assert_eq!(schema.keys().len(), 19);
+
+        let mut nineteen: Vec<&str> = BUILT_IN_PALETTE_KEYS.to_vec();
+        nineteen.push("glow");
+        assert!(palette_with(&nineteen).validate(&schema).is_valid());
+        // The same 19-key file is invalid on the built-in list (unknown `glow`).
+        assert_eq!(
+            palette_with(&nineteen)
+                .validate(&PaletteSchema::built_in())
+                .unknown_keys(),
+            ["glow"]
+        );
+
+        let report = palette_with(&BUILT_IN_PALETTE_KEYS).validate(&schema);
+        assert_eq!(report.missing_keys(), ["glow"]);
+    }
+
+    #[test]
+    fn the_schema_source_reads_as_a_plain_sentence_fragment() {
+        assert_eq!(
+            SchemaSource::Generator(PathBuf::from("/repo/scripts/generate-colors")).to_string(),
+            "the NAMES line of /repo/scripts/generate-colors"
+        );
+        assert_eq!(
+            SchemaSource::BuiltIn.to_string(),
+            "the built-in 18-key list"
+        );
     }
 }

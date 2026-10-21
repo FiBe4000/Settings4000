@@ -38,6 +38,7 @@ use settings4000::core::theme::{
     PaletteModel, ThemeRoots, ThemesModel, ThemesPaths, WallpaperModel, WallpaperPaths,
 };
 use settings4000::parsers::lua_literal::{LuaConfigFile, LuaValue};
+use settings4000::parsers::palette::SchemaSource;
 use settings4000::system::command::{Command, CommandOutput, MockCommandRunner};
 use settings4000::system::signal::{MockProcessSignaller, SignalCall};
 use settings4000::testing::{
@@ -66,11 +67,18 @@ fn load_palette(fx: &FixtureDotfiles) -> PaletteModel {
     let source = source_caps
         .palette_source()
         .expect("the deployed symlink reveals the palette source");
-    PaletteModel::load(
+    let model = PaletteModel::load(
         source.colors_dir(),
         &anchor,
         source.generate_colors().to_path_buf(),
-    )
+    );
+    // Task 11.6: the schemes are validated against the fixture generator's own
+    // `NAMES` line (18 keys with `shadow`), not the built-in fallback.
+    assert_eq!(
+        model.schema().source(),
+        &SchemaSource::Generator(source.generate_colors().to_path_buf())
+    );
+    model
 }
 
 /// Builds the GTK/icon/cursor model exactly as the startup worker does (task 6.4),
@@ -183,7 +191,8 @@ fn a_palette_switch_runs_generate_colors_then_the_reload_chain() {
     );
 
     // No repo file changed: the generator was mocked, and the app itself never
-    // touches the palette sources or the generated partials (R3.2).
+    // touches the palette sources or the generated partials (R3.2) — `colors.lua`
+    // included, which is why the exception list is empty.
     assert_repo_untouched_except(&fx, &before, &[]);
 }
 

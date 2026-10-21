@@ -51,7 +51,7 @@ mod palette;
 mod themes;
 mod wallpaper;
 
-pub use palette::{PaletteModel, Scheme};
+pub use palette::{PaletteModel, Scheme, load_palette_schema};
 pub use themes::{
     CursorCopy, GtkThemeOverrideSource, ThemeRoots, ThemesApply, ThemesModel, ThemesPaths,
 };

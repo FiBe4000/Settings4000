@@ -33,7 +33,7 @@ use settings4000::core::assemble::{
     ApplySources, AssembledPlan, ConflictedSource, FailedWrite, ModelCommits, PrepareFailure,
     assemble_apply_plan,
 };
-use settings4000::core::detect::{Binary, Capabilities, DetectionInputs};
+use settings4000::core::detect::{Binary, Capabilities, Daemon, DetectionInputs};
 use settings4000::core::display::DisplayModel;
 use settings4000::core::input::InputModel;
 use settings4000::core::model::{SettingId, Value};
@@ -43,6 +43,7 @@ use settings4000::core::store::SettingsStore;
 use settings4000::core::theme::{
     PaletteModel, ThemeRoots, ThemesModel, ThemesPaths, WallpaperModel, WallpaperPaths,
 };
+use settings4000::parsers::generated::generated_files;
 use settings4000::system::command::{CommandOutput, MockCommandRunner};
 use settings4000::system::signal::MockProcessSignaller;
 use settings4000::testing::{
@@ -434,6 +435,101 @@ fn the_bespoke_models_compose_into_one_plan() {
         },
         "all four models contributed, so all four must be committed on success"
     );
+}
+
+#[test]
+fn no_assembled_write_ever_targets_a_generated_file() {
+    // Generated files are read-only inputs (R3.2, architecture §3): only
+    // `generate-colors` changes them. The likeliest accident is the Lua palette
+    // partial `colors.lua` (task 11.6), which sits beside the cursor setting's
+    // `hyprland.lua` target. Stage every write-producing control at once — an Input
+    // edit, a monitor scale, a palette switch, GTK/icon/cursor themes and a
+    // wallpaper — and prove no planned write resolves to any generator output, and
+    // that applying the plan (generator mocked) leaves every one byte-identical.
+    let fx = FixtureDotfiles::install();
+    fs::create_dir_all(fx.home().join(".themes/Fixture-Theme/gtk-3.0"))
+        .expect("create a discoverable GTK theme");
+    fs::create_dir_all(fx.home().join(".icons/Fixture-Cursors/cursors"))
+        .expect("create a discoverable cursor theme");
+    let new_wallpaper = fx.home().join("Pictures/wallpaper/next.png");
+    fs::write(&new_wallpaper, b"fixture next wallpaper").expect("create the new image");
+    let before = repo_snapshot(&fx);
+
+    let mut store = loaded_store(&fx);
+    store
+        .stage(SettingId::TouchpadNaturalScroll, Value::Bool(false))
+        .expect("a touchpad toggle stages");
+    let input = input_model(&fx);
+    let mut display = display_model(&fx);
+    display.stage_scale(0, "1.5".to_string());
+    let mut palette = palette_model(&fx);
+    palette.stage("nord");
+    let mut themes = themes_model(&fx);
+    themes.stage_gtk_theme("Fixture-Theme");
+    themes.stage_cursor_theme("Fixture-Cursors");
+    themes.stage_cursor_size("32");
+    let mut wallpaper = wallpaper_model(&fx);
+    wallpaper
+        .stage_wallpaper(new_wallpaper.to_str().expect("UTF-8 path"))
+        .expect("an existing image stages");
+
+    let assembled = assemble_apply_plan(ApplySources {
+        display: Some(&display),
+        input: Some(&input),
+        palette: Some(&palette),
+        themes: Some(&themes),
+        wallpaper: Some(&wallpaper),
+        ..ApplySources::for_store(&store)
+    })
+    .expect("every contribution renders");
+    assert!(
+        write_paths(&assembled.plan).contains(&fx.config_path("hypr/hyprland.lua")),
+        "the cursor write to colors.lua's neighbour is in the plan"
+    );
+    assert!(
+        assembled.plan.palette.is_some(),
+        "the palette switch is planned"
+    );
+
+    // Compare resolved targets, so a write reaching a generated file through any
+    // symlink would be caught too.
+    let generated: Vec<PathBuf> = generated_files()
+        .map(|relative| {
+            fs::canonicalize(fx.repo_path(relative))
+                .unwrap_or_else(|e| panic!("{relative} should exist in the fixture: {e}"))
+        })
+        .collect();
+    for write in &assembled.plan.writes {
+        let target = fs::canonicalize(&write.path).unwrap_or_else(|_| write.path.clone());
+        assert!(
+            !generated.contains(&target),
+            "{} is a generated file and must never be a write target",
+            write.path.display()
+        );
+    }
+
+    let caps = Capabilities::for_tests(
+        &[Binary::Hyprctl, Binary::Gsettings],
+        &[Daemon::Eww, Daemon::Kitty],
+        true,
+    );
+    let outcome = apply::run(
+        &assembled.plan,
+        store.freshness(),
+        &caps,
+        &MockCommandRunner::new(),
+        &MockProcessSignaller::new(),
+    );
+    // Reload replies from the bare mock may be refused; only the writes matter here.
+    let (_, written) = expect_applied(outcome);
+    assert!(!written.is_empty(), "the plan's writes were made");
+    for relative in generated_files() {
+        assert_eq!(
+            fs::read(fx.repo_path(relative)).expect("read a generated file"),
+            before[relative],
+            "{relative} must be byte-identical after an app Apply"
+        );
+    }
 }
 
 #[test]

@@ -539,12 +539,13 @@ pub fn run(
 /// module docs on step 2 for why the blocking set is scoped this way.
 ///
 /// "Writes those files not at all" covers the palette step too, which mutates files that
-/// are *not* in `plan.writes` (the generated colour and font partials, `swaync/colors.css`,
-/// `state/active-scheme`). That is safe only because generated files are read-only inputs
-/// this app never loads into the store, so they can never be tracked and can never turn up
-/// as a conflict here. If a generated file ever did become store-loaded, this partition
-/// would call a conflict in it unrelated while a palette apply rewrote it — so keep that
-/// invariant, or teach this function about the generator's outputs.
+/// are *not* in `plan.writes` (the generated colour and font partials and
+/// `state/active-scheme`, listed by [`crate::parsers::generated::generated_files`]). That
+/// is safe only because generated files are read-only inputs this app never loads into
+/// the store, so they can never be tracked and can never turn up as a conflict here. If a
+/// generated file ever did become store-loaded, this partition would call a conflict in
+/// it unrelated while a palette apply rewrote it — so keep that invariant, or teach this
+/// function about the generator's outputs.
 ///
 /// Matching is by exact path equality, which is sound because both sides are the *same*
 /// live XDG path: the tracker is keyed by the path the loader read each file from
