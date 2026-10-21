@@ -336,8 +336,8 @@ pub fn unit_is_active_command() -> Command {
 
 /// A method of notifd's control interface the app calls.
 ///
-/// Only the methods the Notifications page uses are listed; the `Reload()` call of
-/// tasks 11.14/11.15 joins them as one more variant when it gains its caller.
+/// The Notifications page uses the state and action methods; the reload table
+/// ([`crate::core::reload`]) uses [`Reload`](Self::Reload).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NotifdMethod {
     /// `GetState()` → `bubb` (≥ 1.1).
@@ -348,6 +348,12 @@ pub enum NotifdMethod {
     OpenCenter,
     /// `Clear()` — removes every notification from the history and the screen.
     Clear,
+    /// `Reload()` (≥ 1.1) — re-reads `~/.config/notifd/config` and the icon theme
+    /// (from `gtk-3.0/settings.ini`) in place, keeping on-screen popups, timers,
+    /// inhibitors and the history (analysis §8.2). This is the only way the app
+    /// makes notifd pick up a change: a unit restart would drop the popups and
+    /// SIGHUP stops the daemon.
+    Reload,
 }
 
 /// `busctl --user --auto-start=no call se.dotfiles.Notifd /se/dotfiles/Notifd
@@ -372,6 +378,7 @@ pub fn control_command(method: NotifdMethod) -> Command {
         }
         NotifdMethod::OpenCenter => command.args(["SetCenter", "s", "open"]),
         NotifdMethod::Clear => command.arg("Clear"),
+        NotifdMethod::Reload => command.arg("Reload"),
     }
 }
 
@@ -621,6 +628,7 @@ mod tests {
             (NotifdMethod::SetDnd(false), "SetDnd s off"),
             (NotifdMethod::OpenCenter, "SetCenter s open"),
             (NotifdMethod::Clear, "Clear"),
+            (NotifdMethod::Reload, "Reload"),
         ] {
             assert_eq!(
                 argv(&control_command(method)).join(" "),
@@ -639,6 +647,7 @@ mod tests {
             control_command(NotifdMethod::SetDnd(true)),
             control_command(NotifdMethod::OpenCenter),
             control_command(NotifdMethod::Clear),
+            control_command(NotifdMethod::Reload),
         ];
         for command in notifd_calls {
             assert!(
@@ -925,6 +934,7 @@ mod tests {
             control_command(NotifdMethod::SetDnd(false)),
             control_command(NotifdMethod::OpenCenter),
             control_command(NotifdMethod::Clear),
+            control_command(NotifdMethod::Reload),
         ];
         for command in all {
             assert!(!command.to_string().contains("sway"), "{command}");

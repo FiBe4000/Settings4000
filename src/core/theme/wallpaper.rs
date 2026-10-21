@@ -6,8 +6,9 @@
 //! the page presents one wallpaper path plus a fit-mode drop-down and an optional "use a
 //! different lock-screen image" override: with no override the same path is written to
 //! both files; with one, the wallpaper goes to `hyprpaper.conf` and the override to
-//! `hyprlock.conf`. A wallpaper change reloads live via `hyprctl hyprpaper
-//! preload`/`wallpaper`, while a hyprlock-only change issues **no** reload (hyprlock
+//! `hyprlock.conf`. A wallpaper change reloads live via one `hyprctl hyprpaper
+//! wallpaper` request (plus the eww bar's text-tone follow-up where present, task
+//! 11.14), while a hyprlock-only change issues **no** reload (hyprlock
 //! reads its config only at the next lock — intentional, architecture §6). Chosen image
 //! paths are validated (exists + readable + image extension, R8.3) before staging.
 //! Both files may store their path home-relative (`~/Pictures/…`, analysis §7.4); how
@@ -46,6 +47,10 @@ const LOCK_PATH_KEY: &str = "path";
 /// selectable (see [`WallpaperModel::load`]), mirroring the cursor-size and
 /// monitor-scale drop-downs, so an unusual on-disk value is never silently dropped.
 const CURATED_FIT_MODES: &[&str] = &["cover", "contain", "fill", "tile"];
+
+/// The fit mode the config file accepts but a live wallpaper change cannot show (see
+/// [`WallpaperModel::fit_preview_note`]).
+const FILL_FIT_MODE: &str = "fill";
 
 /// The live XDG paths of the two config files a wallpaper / lock-background change
 /// writes (R8.5), plus the home directory their `~/…` image paths are relative to.
@@ -125,8 +130,10 @@ impl WrittenWallpaperValues {
 ///
 /// # Reload asymmetry (the load-bearing hyprlock rule)
 ///
-/// A change that writes `hyprpaper.conf` reloads live (`hyprctl hyprpaper preload` +
-/// `wallpaper`); a change that writes **only** `hyprlock.conf` issues no reload command
+/// A change that writes `hyprpaper.conf` reloads live (one `hyprctl hyprpaper
+/// wallpaper` request, then the eww bar's text-tone script when it exists — see
+/// [`ReloadAction::HyprpaperWallpaper`](crate::core::reload::ReloadAction::HyprpaperWallpaper));
+/// a change that writes **only** `hyprlock.conf` issues no reload command
 /// at all — hyprlock reads its config only at launch, so a lock-background change takes
 /// effect at the next lock (intentional, architecture §6). This is enforced by the
 /// reload table ([`BackingFile::HyprlockConf`] maps to no action) and by
@@ -335,6 +342,27 @@ impl WallpaperModel {
     /// The preselected index of the fit-mode drop-down.
     pub fn selected_fit_index(&self) -> Option<usize> {
         self.fit.selected_index()
+    }
+
+    /// The note the Theme page shows under the fit-mode drop-down while the effective
+    /// fit (the staged one, else the configured one) is `fill`, or `None` otherwise
+    /// (task 11.14).
+    ///
+    /// `hyprpaper.conf` accepts `fill` and hyprpaper renders it as a stretch at
+    /// start-up, but the live wallpaper request the Apply sends cannot express it:
+    /// over hyprpaper's IPC only `contain` and `tile` render differently from the
+    /// default `cover`, so the reload leaves the fit out for every other mode (see
+    /// [`ReloadAction::HyprpaperWallpaper`](crate::core::reload::ReloadAction::HyprpaperWallpaper)).
+    /// The file keeps `fill`; only the live preview differs until hyprpaper next
+    /// starts, which the note says. A configured `fill` that is being changed to
+    /// another mode gets no note, because that mode does show live.
+    pub fn fit_preview_note(&self) -> Option<String> {
+        (self.fit.effective() == Some(FILL_FIT_MODE)).then(|| {
+            "The live preview shows \"fill\" as \"cover\" until hyprpaper next starts: \
+             changing the wallpaper while it runs only renders \"contain\" and \"tile\" \
+             differently."
+                .to_string()
+        })
     }
 
     /// Whether the lock-screen override is on (a different image than the wallpaper).
@@ -648,8 +676,9 @@ impl WallpaperModel {
     /// The reload parameters for the change (task 4.4).
     ///
     /// The wallpaper path **and** the fit mode are set only when `hyprpaper.conf` is
-    /// written, so the live `hyprctl hyprpaper wallpaper <monitor>,<path>,<fit>` applies
-    /// the current fit (a fit-only change re-sets the same image with the new fit). A
+    /// written, so the live `hyprctl hyprpaper wallpaper ,<path>[,<fit>]` applies the
+    /// current fit (a fit-only change re-sets the same image with the new fit; which
+    /// fit values reach the IPC is decided by the reload action). A
     /// hyprlock-only change carries no wallpaper parameter — and, combined with
     /// [`BackingFile::HyprlockConf`] mapping to no action, issues no reload command at
     /// all (the intentional hyprlock behaviour, architecture §6).
@@ -794,8 +823,8 @@ label {
     #[test]
     fn a_wallpaper_and_fit_change_writes_both_files_and_reloads_hyprpaper() {
         // Accept criterion: a staged wallpaper path + fit-mode edit produces the exact
-        // surgical hyprpaper.conf/hyprlock.conf FileWrite diffs AND the hyprctl hyprpaper
-        // preload/wallpaper command sequence. With no override, the same path is written
+        // surgical hyprpaper.conf/hyprlock.conf FileWrite diffs AND the single hyprctl
+        // hyprpaper wallpaper request (task 11.14). With no override, the same path is written
         // to both files (the single-wallpaper UX, analysis §6.2).
         let tmp = tempfile::tempdir().expect("temp dir");
         let config = tmp.path().join("config");
@@ -870,17 +899,59 @@ label {
             expected_hyprlock
         );
 
-        // The reload: preload the image, then set it on all outputs (empty monitor
+        // The reload: one request setting the image on all outputs (empty monitor
         // field before the comma) with the staged fit as the third comma-field, so the
-        // fit is applied live (task 6.5). No hyprlock reload (see the dedicated test).
+        // fit is applied live (task 6.5) — no `preload` step (task 11.14). No hyprlock
+        // reload (see the dedicated test).
         let set_arg = format!(",{wall},contain");
         assert_eq!(
             runner.recorded(),
-            vec![
-                Command::new("hyprctl").args(["hyprpaper", "preload", wall.as_str()]),
-                Command::new("hyprctl").args(["hyprpaper", "wallpaper", set_arg.as_str()]),
-            ]
+            vec![Command::new("hyprctl").args(["hyprpaper", "wallpaper", set_arg.as_str()])]
         );
+    }
+
+    #[test]
+    fn the_fit_preview_note_appears_only_while_fill_is_in_effect() {
+        // Task 11.14: the live wallpaper request cannot render `fill`, so the page says
+        // so while `fill` is staged or configured — and not for the modes that do show
+        // live, nor once a configured `fill` is being changed away from.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_wallpaper_fixture(&config);
+
+        let mut model = WallpaperModel::load(paths.clone(), true);
+        assert_eq!(
+            model.fit_preview_note(),
+            None,
+            "the fixture's cover shows live"
+        );
+        for fit in ["contain", "tile", "cover"] {
+            model.stage_fit(fit);
+            assert_eq!(model.fit_preview_note(), None, "{fit} shows live");
+        }
+        model.stage_fit("fill");
+        let note = model.fit_preview_note().expect("a staged fill is noted");
+        assert!(note.contains("until hyprpaper next starts"), "got {note}");
+        model.reset();
+        assert_eq!(
+            model.fit_preview_note(),
+            None,
+            "reset drops the staged fill"
+        );
+
+        // A file that already says `fill` is noted with nothing staged.
+        fs::write(
+            &paths.hyprpaper_conf,
+            HYPRPAPER_CONF.replace("fit_mode = cover", "fit_mode = fill"),
+        )
+        .expect("configure fill");
+        let mut model = WallpaperModel::load(paths, true);
+        assert!(
+            model.fit_preview_note().is_some(),
+            "a configured fill is noted"
+        );
+        model.stage_fit("tile");
+        assert_eq!(model.fit_preview_note(), None, "changing away shows live");
     }
 
     #[test]
@@ -956,10 +1027,7 @@ label {
         let set_arg = format!(",{absolute},tile");
         assert_eq!(
             runner.recorded(),
-            vec![
-                Command::new("hyprctl").args(["hyprpaper", "preload", absolute.as_str()]),
-                Command::new("hyprctl").args(["hyprpaper", "wallpaper", set_arg.as_str()]),
-            ]
+            vec![Command::new("hyprctl").args(["hyprpaper", "wallpaper", set_arg.as_str()])]
         );
     }
 
@@ -1670,13 +1738,11 @@ label {
             fs::read_to_string(&paths.hyprlock_conf).unwrap(),
             HYPRLOCK_CONF.replace("~/Pictures/wallpaper/18.jpg", "~/Pictures/next.png")
         );
-        let set_arg = format!(",{chosen},cover");
+        // `cover` is hyprpaper's IPC default, so the fit field is left out (task 11.14).
+        let set_arg = format!(",{chosen}");
         assert_eq!(
             recorded,
-            vec![
-                Command::new("hyprctl").args(["hyprpaper", "preload", chosen.as_str()]),
-                Command::new("hyprctl").args(["hyprpaper", "wallpaper", set_arg.as_str()]),
-            ],
+            vec![Command::new("hyprctl").args(["hyprpaper", "wallpaper", set_arg.as_str()])],
             "hyprpaper's IPC receives the absolute path, never `~/…`"
         );
     }

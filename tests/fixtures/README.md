@@ -25,7 +25,7 @@ shape for the sake of a test. The files that still differ from `8a5b20b` are:
   `config/hypr/monitors.conf`, `config/uwsm/env`;
 - stand-ins and stubs (see "What it contains"): `colors/README.md`,
   `scripts/generate-colors`, `scripts/hypr-toggle-laptop-display`,
-  `scripts/notifctl`;
+  `scripts/notifctl`, `config/eww/scripts/bar-text-tone`;
 - two task-7.1 copies that were never refreshed because the app reads nothing
   that changed in them: `config/kitty/kitty.conf` (lacks the later
   `remember_window_size no` block; the app only sends kitty a signal) and
@@ -81,6 +81,16 @@ Every other file is the `8a5b20b` content byte for byte.
     expands and the fixture never runs). Deployed like every `config/` file, as
     `~/.config/systemd/user/notifd.service`; detection counts its presence as
     "notifd installed, will activate" when the daemon's bus name has no owner.
+
+  New in task 11.14:
+  - `eww/scripts/bar-text-tone` — an executable no-op stub of the same shape
+    as `scripts/notifctl` (records its argv to stderr and to
+    `SETTINGS4000_FIXTURE_STUB_LOG`, exits 0). The real script (Python, at
+    `8a5b20b`) re-picks the eww bar's text colours from the wallpaper and,
+    with `--apply`, pushes them with `eww update`. Deployed as
+    `~/.config/eww/scripts/bar-text-tone`; detection finds it there and the
+    wallpaper reload runs `<that path> --apply` through `CommandRunner`, so
+    tests never execute it unless they mean to.
 - `zsh/colors.zsh` — a generated color partial (deployed as `~/.zsh_colors`).
 
 The installer creates two links outside `$XDG_CONFIG_HOME`: `~/.zsh_colors`
@@ -201,9 +211,11 @@ sync invariants). Everything identifying is replaced:
 
 The real deployment (analysis §1) symlinks a few items the fixture does not
 carry, because the app never reads or writes them and they are effectively
-code rather than config: `eww/eww.scss`, `eww/eww.yuck`, `eww/scripts` (a
-whole-**directory** symlink — a link shape the installer never creates; it
-links files only), `rofi/config.rasi`, and the home-level `~/.zshrc`. Since
+code rather than config: `eww/eww.scss`, `eww/eww.yuck`, the rest of
+`eww/scripts` (deployed as a whole-**directory** symlink — a link shape the
+installer never creates; it links files only, so the one script the fixture
+carries, `bar-text-tone`, is deployed as a file link inside a plain
+`~/.config/eww/scripts/`), `rofi/config.rasi`, and the home-level `~/.zshrc`. Since
 task 11.1 the same holds for the `wayland-dev` additions the app does not read
 yet: `scripts/notifd` itself and the D-Bus activation file
 `local/share/dbus-1/services/org.freedesktop.Notifications.service` (the app

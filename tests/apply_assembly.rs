@@ -37,7 +37,7 @@ use settings4000::core::detect::{Binary, Capabilities, Daemon, DetectionInputs};
 use settings4000::core::display::DisplayModel;
 use settings4000::core::input::InputModel;
 use settings4000::core::model::{SettingId, Value};
-use settings4000::core::notifd::NotifdReplies;
+use settings4000::core::notifd::{NotifdReplies, NotifdStatus, NotifdVersion};
 use settings4000::core::power::PowerModel;
 use settings4000::core::store::SettingsStore;
 use settings4000::core::theme::{
@@ -45,7 +45,7 @@ use settings4000::core::theme::{
 };
 use settings4000::parsers::generated::generated_files;
 use settings4000::system::command::{Command, CommandOutput, MockCommandRunner};
-use settings4000::system::signal::MockProcessSignaller;
+use settings4000::system::signal::{MockProcessSignaller, SignalCall};
 use settings4000::testing::{
     FixtureDotfiles, assert_repo_untouched_except, expect_applied, load_into_store, loaders,
     repo_snapshot,
@@ -120,6 +120,7 @@ fn palette_model(fx: &FixtureDotfiles) -> PaletteModel {
         hyprland_lua_config: fx.config_path("hypr/hyprland.lua"),
         notifd_replies: NotifdReplies::default(),
         notifd_unit_file: fx.config_path("systemd/user/notifd.service"),
+        bar_text_tone_script: fx.config_path("eww/scripts/bar-text-tone"),
     };
     let source = Capabilities::detect(&inputs);
     let source = source
@@ -921,4 +922,98 @@ fn an_assembled_plan_applies_and_reconciles_every_source() {
         outcome,
         ApplyOutcome::Applied { ref written, .. } if written.is_empty()
     ));
+}
+
+#[test]
+fn an_assembled_theme_apply_runs_the_follow_up_reloads_in_order_and_once() {
+    // Task 11.14 end to end (architecture §6): one assembled Apply switches the
+    // palette, the icon theme and the wallpaper, with every component running. The
+    // reloads come out in the canonical order — the apply-theme chain around the
+    // single hyprpaper request, the bar text tone after `eww reload` (which
+    // re-initialises the bar's `bar_tone` poll to its `:initial` value) and notifd's
+    // `Reload()` once, last.
+    let fx = FixtureDotfiles::install();
+    let icons = fx.home().join(".icons/Fixture-Icons");
+    fs::create_dir_all(icons.join("48x48")).expect("create a discoverable icon theme");
+    fs::write(icons.join("index.theme"), b"[Icon Theme]\n").expect("write its index");
+    let new_wallpaper = fx.home().join("Pictures/wallpaper/next.png");
+    fs::write(&new_wallpaper, b"fixture next wallpaper").expect("create the new image");
+    let new_wallpaper = new_wallpaper.to_str().expect("UTF-8 path").to_string();
+
+    let store = loaded_store(&fx);
+    let mut palette = palette_model(&fx);
+    palette.stage("nord");
+    let mut themes = themes_model(&fx);
+    themes.stage_icon_theme("Fixture-Icons");
+    let mut wallpaper = wallpaper_model(&fx);
+    wallpaper
+        .stage_wallpaper(&new_wallpaper)
+        .expect("an existing image stages");
+
+    let assembled = assemble_apply_plan(ApplySources {
+        palette: Some(&palette),
+        themes: Some(&themes),
+        wallpaper: Some(&wallpaper),
+        ..ApplySources::for_store(&store)
+    })
+    .expect("every contribution renders");
+
+    let script = fx.config_path("eww/scripts/bar-text-tone");
+    let caps = Capabilities::for_tests(
+        &[Binary::Hyprctl, Binary::Gsettings],
+        &[Daemon::Eww, Daemon::Kitty, Daemon::Hyprpaper],
+        true,
+    )
+    .with_notifd_for_tests(NotifdStatus::Running {
+        version: NotifdVersion::parse("1.1"),
+    })
+    .with_bar_text_tone_script_for_tests(script.clone());
+    let runner = MockCommandRunner::new();
+    let signaller = MockProcessSignaller::with_running([("kitty".to_string(), vec![77])]);
+    let outcome = apply::run(
+        &assembled.plan,
+        store.freshness(),
+        &caps,
+        &runner,
+        &signaller,
+    );
+    let (reload_failures, _) = expect_applied(outcome);
+    assert!(reload_failures.is_empty(), "every reload succeeded");
+
+    let wallpaper_arg = format!(",{new_wallpaper}");
+    assert_eq!(
+        runner.recorded(),
+        vec![
+            // The palette generator is the last write step, before every reload.
+            Command::new(fx.repo_path("scripts/generate-colors").to_string_lossy()).arg("nord"),
+            Command::new("hyprctl").args(["reload", "config-only"]),
+            Command::new("gsettings").args([
+                "set",
+                "org.gnome.desktop.interface",
+                "icon-theme",
+                "Fixture-Icons",
+            ]),
+            Command::new("hyprctl").args(["hyprpaper", "wallpaper", wallpaper_arg.as_str()]),
+            Command::new("eww").arg("reload"),
+            Command::new(script.to_str().expect("UTF-8 path")).arg("--apply"),
+            // kitty's SIGUSR1 goes through the signaller, between these two.
+            Command::new("busctl").args([
+                "--user",
+                "--auto-start=no",
+                "call",
+                "se.dotfiles.Notifd",
+                "/se/dotfiles/Notifd",
+                "se.dotfiles.Notifd",
+                "Reload",
+            ]),
+        ]
+    );
+    assert_eq!(
+        signaller.calls(),
+        vec![SignalCall {
+            process_name: "kitty".to_string(),
+            signal: nix::sys::signal::Signal::SIGUSR1,
+            pids: vec![77],
+        }]
+    );
 }

@@ -23,6 +23,12 @@
 //!   absolute paths keeps them, and hyprpaper's IPC always gets the absolute
 //!   path.
 //!
+//! Task 11.14 adds the two follow-up reloads: an icon-theme change ends with
+//! notifd's `Reload()` D-Bus call (none on a notifd older than 1.1, which gets a
+//! page note instead), and a wallpaper change is one `hyprctl hyprpaper
+//! wallpaper` request (no `preload`) followed by the fixture's
+//! `~/.config/eww/scripts/bar-text-tone --apply` while eww runs.
+//!
 //! Like Display, these models own their files' freshness (R5.6): the window
 //! checks `check_conflict()` and aborts before building the plan, so the
 //! conflict test asserts that guard.
@@ -37,7 +43,7 @@ use settings4000::core::apply::{self, ApplyOutcome, ApplyPlan, WriteFailureCause
 use settings4000::core::detect::{Binary, Capabilities, Daemon, DetectionInputs};
 use settings4000::core::freshness::FreshnessTracker;
 use settings4000::core::model::validate_image_value;
-use settings4000::core::notifd::NotifdReplies;
+use settings4000::core::notifd::{NotifdReplies, NotifdStatus, NotifdVersion};
 use settings4000::core::reload::BackingFile;
 use settings4000::core::reload::ReloadParams;
 use settings4000::core::theme::{
@@ -70,6 +76,7 @@ fn load_palette(fx: &FixtureDotfiles) -> PaletteModel {
         hyprland_lua_config: fx.config_path("hypr/hyprland.lua"),
         notifd_replies: NotifdReplies::default(),
         notifd_unit_file: fx.config_path("systemd/user/notifd.service"),
+        bar_text_tone_script: fx.config_path("eww/scripts/bar-text-tone"),
     };
     let source_caps = Capabilities::detect(&inputs);
     let source = source_caps
@@ -138,7 +145,16 @@ const FIXTURE_WALLPAPER: &str = "~/Pictures/wallpaper/18.jpg";
 
 /// Stages `chosen` as the wallpaper of a freshly loaded fixture model, applies it
 /// through the real pipeline with a mock runner, and returns the recorded commands.
+///
+/// Hyprland and hyprpaper run, eww does not, so the bar text-tone follow-up is not
+/// part of the sequence; [`apply_wallpaper_with`] takes the capabilities instead.
 fn apply_wallpaper(fx: &FixtureDotfiles, chosen: &str) -> Vec<Command> {
+    let caps = Capabilities::for_tests(&[Binary::Hyprctl], &[Daemon::Hyprpaper], true);
+    apply_wallpaper_with(fx, chosen, &caps)
+}
+
+/// [`apply_wallpaper`] under the given capabilities.
+fn apply_wallpaper_with(fx: &FixtureDotfiles, chosen: &str, caps: &Capabilities) -> Vec<Command> {
     let mut wallpaper = load_wallpaper(fx);
     assert!(!wallpaper.override_on(), "the fixture unifies both paths");
     wallpaper
@@ -153,12 +169,11 @@ fn apply_wallpaper(fx: &FixtureDotfiles, chosen: &str) -> Vec<Command> {
     plan.validations.extend(contribution.validations);
     plan.reload_params = contribution.reload_params;
 
-    let caps = Capabilities::for_tests(&[Binary::Hyprctl], &[Daemon::Hyprpaper], true);
     let runner = MockCommandRunner::new();
     let outcome = apply::run(
         &plan,
         &FreshnessTracker::new(),
-        &caps,
+        caps,
         &runner,
         &MockProcessSignaller::new(),
     );
@@ -198,13 +213,33 @@ fn assert_only_the_path_changed(
     );
 }
 
-/// The two hyprpaper reload commands for `absolute` with the fixture's `cover` fit.
+/// The hyprpaper reload for `absolute` with the fixture's `cover` fit: one
+/// `wallpaper` request on every output (task 11.14 — no `preload`, which the
+/// installed hyprctl does not know), without the fit field, because `cover` is what
+/// hyprpaper's IPC shows when the field is left out.
 fn hyprpaper_reload(absolute: &str) -> Vec<Command> {
-    let wallpaper_arg = format!(",{absolute},cover");
-    vec![
-        Command::new("hyprctl").args(["hyprpaper", "preload", absolute]),
-        Command::new("hyprctl").args(["hyprpaper", "wallpaper", wallpaper_arg.as_str()]),
-    ]
+    let wallpaper_arg = format!(",{absolute}");
+    vec![Command::new("hyprctl").args(["hyprpaper", "wallpaper", wallpaper_arg.as_str()])]
+}
+
+/// A running notifd reporting `version` (task 11.7's capability).
+fn notifd_running(version: &str) -> NotifdStatus {
+    NotifdStatus::Running {
+        version: NotifdVersion::parse(version),
+    }
+}
+
+/// notifd's `Reload()` call, exactly as the reload table issues it (task 11.14).
+fn notifd_reload() -> Command {
+    Command::new("busctl").args([
+        "--user",
+        "--auto-start=no",
+        "call",
+        "se.dotfiles.Notifd",
+        "/se/dotfiles/Notifd",
+        "se.dotfiles.Notifd",
+        "Reload",
+    ])
 }
 
 /// An empty plan to fold a Theme contribution into; the Theme models carry their
@@ -240,7 +275,10 @@ fn a_palette_switch_runs_generate_colors_then_the_reload_chain() {
     plan.palette = palette.apply_contribution();
     assert!(plan.palette.is_some(), "a staged switch contributes");
 
-    let caps = Capabilities::for_tests(&[Binary::Hyprctl], &[Daemon::Eww, Daemon::Kitty], true);
+    // notifd runs and could reload (task 11.14), which pins that a palette switch
+    // still asks it for nothing.
+    let caps = Capabilities::for_tests(&[Binary::Hyprctl], &[Daemon::Eww, Daemon::Kitty], true)
+        .with_notifd_for_tests(notifd_running("1.1"));
     let freshness = FreshnessTracker::new();
     let runner = MockCommandRunner::new();
     let signaller = MockProcessSignaller::with_running([("kitty".to_string(), vec![77])]);
@@ -308,7 +346,10 @@ fn a_gtk_theme_change_writes_both_settings_ini_identically() {
     plan.writes.extend(contribution.writes);
     plan.reload_params = contribution.reload_params;
 
-    let caps = Capabilities::for_tests(&[Binary::Gsettings], &[], false);
+    // A notifd that could reload runs (task 11.14), so the absence of its `Reload()`
+    // below proves a GTK-theme-only change never asks for it.
+    let caps = Capabilities::for_tests(&[Binary::Gsettings], &[], false)
+        .with_notifd_for_tests(notifd_running("1.1"));
     let freshness = FreshnessTracker::new();
     let runner = MockCommandRunner::new();
     let signaller = MockProcessSignaller::new();
@@ -334,7 +375,8 @@ fn a_gtk_theme_change_writes_both_settings_ini_identically() {
         );
     }
 
-    // (b) The exact reload: one gsettings call, no cursor/icon commands.
+    // (b) The exact reload: one gsettings call, no cursor/icon commands, and no
+    // notifd `Reload()`.
     assert_eq!(
         runner.recorded(),
         vec![Command::new("gsettings").args([
@@ -608,6 +650,145 @@ fn a_cursor_change_creates_a_missing_xcursor_fallback_theme() {
     );
 }
 
+/// Installs a discoverable icon theme named `name` under the fixture home's
+/// `.icons` (an `index.theme` plus a size directory, which is what discovery
+/// requires of an icon theme) and returns a themes model that offers it.
+fn themes_with_icon_theme(fx: &FixtureDotfiles, name: &str) -> ThemesModel {
+    let theme = fx.home().join(".icons").join(name);
+    fs::create_dir_all(theme.join("48x48")).expect("create the icon theme");
+    fs::write(theme.join("index.theme"), b"[Icon Theme]\n").expect("write its index");
+    let themes = load_themes(fx);
+    assert!(
+        themes.icon_themes().iter().any(|theme| theme == name),
+        "the drop-down offers {name}"
+    );
+    themes
+}
+
+/// Applies `themes`' contribution under `caps` and returns the recorded commands.
+fn apply_themes(themes: &ThemesModel, caps: &Capabilities) -> Vec<Command> {
+    let mut plan = empty_plan();
+    let contribution = themes
+        .apply_contribution()
+        .expect("a dirty theme contributes");
+    plan.writes.extend(contribution.writes);
+    plan.reload_params = contribution.reload_params;
+    let runner = MockCommandRunner::new();
+    let outcome = apply::run(
+        &plan,
+        &FreshnessTracker::new(),
+        caps,
+        &runner,
+        &MockProcessSignaller::new(),
+    );
+    let (reload_failures, written) = expect_applied(outcome);
+    assert!(reload_failures.is_empty());
+    assert_eq!(written.len(), 2, "both settings.ini files are written");
+    runner.recorded()
+}
+
+#[test]
+fn an_icon_theme_change_ends_with_exactly_one_notifd_reload() {
+    // Task 11.14 (R5.3, analysis §8.2): notifd reads the icon theme from
+    // gtk-3.0/settings.ini at start and on `Reload()`, so after writing both INI
+    // files the Apply sets the gsettings key and then calls `Reload()` once — over
+    // `busctl --auto-start=no`, never a unit restart.
+    let fx = FixtureDotfiles::install();
+    let before = repo_snapshot(&fx);
+    let mut themes = themes_with_icon_theme(&fx, "Fixture-Icons");
+    themes.stage_icon_theme("Fixture-Icons");
+
+    let caps = Capabilities::for_tests(&[Binary::Gsettings], &[], false)
+        .with_notifd_for_tests(notifd_running("1.1"));
+    let recorded = apply_themes(&themes, &caps);
+
+    assert_eq!(
+        recorded,
+        vec![
+            Command::new("gsettings").args([
+                "set",
+                "org.gnome.desktop.interface",
+                "icon-theme",
+                "Fixture-Icons",
+            ]),
+            notifd_reload(),
+        ]
+    );
+    assert_eq!(
+        recorded.iter().filter(|c| **c == notifd_reload()).count(),
+        1,
+        "exactly one Reload call"
+    );
+    assert!(
+        recorded.iter().all(|c| c.program() != "systemctl"),
+        "notifd is never restarted"
+    );
+    // The file notifd re-reads holds the new name.
+    let gtk3 = fs::read_to_string(fx.config_path("gtk-3.0/settings.ini")).expect("read gtk-3.0");
+    assert!(gtk3.contains("gtk-icon-theme-name=Fixture-Icons"), "{gtk3}");
+    assert_repo_untouched_except(
+        &fx,
+        &before,
+        &["config/gtk-3.0/settings.ini", "config/gtk-4.0/settings.ini"],
+    );
+}
+
+#[test]
+fn an_older_notifd_gets_no_reload_and_the_page_says_when_icons_follow() {
+    // Task 11.14: notifd 1.0, as real detection resolves it from the probe replies,
+    // has no `Reload()`. The Apply still writes the icon theme and sets gsettings,
+    // issues no notifd call at all, and the Theme page carries the note that
+    // notification icons follow at the next notifd start.
+    let fx = FixtureDotfiles::install();
+    let detected = Capabilities::detect(&DetectionInputs {
+        path: None,
+        running_processes: Vec::new(),
+        hyprland_socket: None,
+        palette_config_anchor: fx.config_path("hypr/colors.conf"),
+        config_paths: Vec::new(),
+        hyprctl_status: None,
+        hyprland_lua_config: fx.config_path("hypr/hyprland.lua"),
+        notifd_replies: NotifdReplies {
+            name_has_owner: Some("b true\n".to_string()),
+            server_information: Some("ssss \"notifd\" \"dotfiles\" \"1.0\" \"1.2\"\n".to_string()),
+            unit_active: None,
+        },
+        notifd_unit_file: fx.config_path("systemd/user/notifd.service"),
+        bar_text_tone_script: fx.config_path("eww/scripts/bar-text-tone"),
+    });
+    assert_eq!(detected.notifd(), notifd_running("1.0"));
+
+    let mut themes =
+        themes_with_icon_theme(&fx, "Fixture-Icons").with_notifd_status(detected.notifd());
+    let note = themes
+        .notification_icons_note()
+        .expect("an older running notifd is noted");
+    assert!(note.contains("next time"), "got {note}");
+    themes.stage_icon_theme("Fixture-Icons");
+
+    let caps = Capabilities::for_tests(&[Binary::Gsettings], &[], false)
+        .with_notifd_for_tests(detected.notifd());
+    let recorded = apply_themes(&themes, &caps);
+    assert_eq!(
+        recorded,
+        vec![Command::new("gsettings").args([
+            "set",
+            "org.gnome.desktop.interface",
+            "icon-theme",
+            "Fixture-Icons",
+        ])],
+        "no busctl Reload and no restart on a 1.0 daemon"
+    );
+
+    // A 1.1 daemon gets the reload instead, and no note.
+    assert_eq!(
+        load_themes(&fx)
+            .with_notifd_status(notifd_running("1.1"))
+            .notification_icons_note(),
+        None
+    );
+}
+
 #[test]
 fn the_fixture_wallpaper_value_loads_as_an_existing_image() {
     // Task 11.10: the configured `~/…` value is read verbatim, and its expanded
@@ -629,9 +810,10 @@ fn the_fixture_wallpaper_value_loads_as_an_existing_image() {
 fn a_wallpaper_change_dual_writes_hyprpaper_and_hyprlock_and_reloads() {
     // Task 6.5 (the unified-wallpaper gotcha): with the lock override off, one
     // wallpaper change writes the SAME new path to hyprpaper.conf and
-    // hyprlock.conf, then reloads hyprpaper live (preload + wallpaper with the
-    // fit as the third comma-field). hyprlock gets no reload — it reads its
-    // config at launch (intentional).
+    // hyprlock.conf, then reloads hyprpaper live with one `wallpaper` request
+    // (task 11.14: no `preload`; the fixture's `cover` fit is the IPC default, so
+    // no fit field). hyprlock gets no reload — it reads its config at launch
+    // (intentional).
     //
     // Task 11.10: the image lies under the home directory and both files store
     // `~/…`, so both receive `~/…`, while the reload names the absolute path
@@ -668,6 +850,81 @@ fn a_wallpaper_change_dual_writes_hyprpaper_and_hyprlock_and_reloads() {
         &before,
         &["config/hypr/hyprpaper.conf", "config/hypr/hyprlock.conf"],
     );
+}
+
+/// The capabilities of a session where Hyprland, hyprpaper and eww run and
+/// detection found the fixture's bar text-tone stub at its live path.
+fn bar_tone_capabilities(fx: &FixtureDotfiles, daemons: &[Daemon]) -> Capabilities {
+    let detected = detect_fixture(fx, &[]);
+    let script = detected
+        .bar_text_tone_script()
+        .expect("real detection finds the fixture's bar-text-tone stub");
+    assert_eq!(script, fx.config_path("eww/scripts/bar-text-tone"));
+    Capabilities::for_tests(&[Binary::Hyprctl], daemons, true)
+        .with_bar_text_tone_script_for_tests(script.to_path_buf())
+}
+
+/// Stages and applies a new wallpaper under `caps`, returning the new image's
+/// absolute path and the recorded commands.
+fn apply_new_wallpaper(fx: &FixtureDotfiles, caps: &Capabilities) -> (String, Vec<Command>) {
+    let new_wallpaper = fx.home().join("Pictures/wallpaper/next.png");
+    fs::write(&new_wallpaper, b"fixture next wallpaper").expect("create the new image");
+    let new_wallpaper_str = new_wallpaper.to_str().expect("UTF-8 path").to_string();
+    let recorded = apply_wallpaper_with(fx, &new_wallpaper_str, caps);
+    (new_wallpaper_str, recorded)
+}
+
+#[test]
+fn a_wallpaper_apply_pushes_the_bar_text_tone_after_the_single_hyprpaper_request() {
+    // Task 11.14 (architecture §6, analysis §7.8): with eww running and the script
+    // present, the wallpaper request is followed by `bar-text-tone --apply`, run by
+    // its live XDG path. The sequence has no `preload` and exactly one `wallpaper`
+    // request, carrying the absolute image path.
+    let fx = FixtureDotfiles::install();
+    let caps = bar_tone_capabilities(&fx, &[Daemon::Hyprpaper, Daemon::Eww]);
+    let (absolute, recorded) = apply_new_wallpaper(&fx, &caps);
+
+    let script = fx.config_path("eww/scripts/bar-text-tone");
+    let mut expected = hyprpaper_reload(&absolute);
+    expected.push(Command::new(script.to_str().expect("UTF-8 path")).arg("--apply"));
+    assert_eq!(recorded, expected);
+
+    assert!(
+        recorded
+            .iter()
+            .all(|c| !c.args_slice().iter().any(|a| a == "preload")),
+        "no preload request: {recorded:?}"
+    );
+    let wallpaper_requests: Vec<&Command> = recorded
+        .iter()
+        .filter(|c| c.args_slice().get(1).is_some_and(|a| a == "wallpaper"))
+        .collect();
+    assert_eq!(wallpaper_requests.len(), 1, "{recorded:?}");
+    assert_eq!(
+        wallpaper_requests[0].args_slice()[2],
+        format!(",{absolute}"),
+        "the request names the absolute path, never `~/…`"
+    );
+}
+
+#[test]
+fn the_bar_text_tone_is_skipped_without_eww_or_without_the_script() {
+    // Task 11.14: eww not running — there is no bar to update, so only the hyprpaper
+    // request runs.
+    let fx = FixtureDotfiles::install();
+    let caps = bar_tone_capabilities(&fx, &[Daemon::Hyprpaper]);
+    let (absolute, recorded) = apply_new_wallpaper(&fx, &caps);
+    assert_eq!(recorded, hyprpaper_reload(&absolute));
+
+    // The script absent from the deployed tree: real detection reports none, and
+    // the follow-up is skipped even though eww runs.
+    let fx = FixtureDotfiles::install();
+    fs::remove_file(fx.config_path("eww/scripts/bar-text-tone")).expect("remove the stub link");
+    let detected = detect_fixture(&fx, &[]);
+    assert!(detected.bar_text_tone_script().is_none());
+    let caps = Capabilities::for_tests(&[Binary::Hyprctl], &[Daemon::Hyprpaper, Daemon::Eww], true);
+    let (absolute, recorded) = apply_new_wallpaper(&fx, &caps);
+    assert_eq!(recorded, hyprpaper_reload(&absolute));
 }
 
 #[test]
@@ -934,6 +1191,7 @@ fn detect_fixture(fx: &FixtureDotfiles, running: &[&str]) -> Capabilities {
         hyprland_lua_config: fx.config_path("hypr/hyprland.lua"),
         notifd_replies: NotifdReplies::default(),
         notifd_unit_file: fx.config_path("systemd/user/notifd.service"),
+        bar_text_tone_script: fx.config_path("eww/scripts/bar-text-tone"),
     })
 }
 
@@ -1095,6 +1353,7 @@ fn plain_settings_ini_files_without_a_dotfiles_repo_are_not_reported() {
         hyprland_lua_config: config.join("hypr/hyprland.lua"),
         notifd_replies: NotifdReplies::default(),
         notifd_unit_file: config.join("systemd/user/notifd.service"),
+        bar_text_tone_script: config.join("eww/scripts/bar-text-tone"),
     });
     assert_eq!(caps.dotfiles_repo_root(), None);
 

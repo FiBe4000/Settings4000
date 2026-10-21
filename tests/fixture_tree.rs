@@ -12,7 +12,8 @@
 //!
 //! Since task 11.1 this file also holds the only tests that execute the fixture
 //! shell stubs (`scripts/generate-colors`, `scripts/hypr-toggle-laptop-display`,
-//! `scripts/notifctl`) as real subprocesses, to prove the stubs behave as their
+//! `scripts/notifctl`, and since task 11.14 `config/eww/scripts/bar-text-tone`)
+//! as real subprocesses, to prove the stubs behave as their
 //! headers promise. Every other suite drives those scripts through
 //! `MockCommandRunner` and must never spawn them.
 
@@ -168,6 +169,7 @@ fn detection_discovers_the_palette_source_behind_the_deployed_symlink() {
         hyprland_lua_config: fx.config_path("hypr/hyprland.lua"),
         notifd_replies: NotifdReplies::default(),
         notifd_unit_file: fx.config_path("systemd/user/notifd.service"),
+        bar_text_tone_script: fx.config_path("eww/scripts/bar-text-tone"),
     };
     let caps = Capabilities::detect(&inputs);
 
@@ -184,6 +186,12 @@ fn detection_discovers_the_palette_source_behind_the_deployed_symlink() {
     // Task 11.2: with no running session, the deployed `hyprland.lua` makes the
     // host read as a Lua-config host, so the Lua-only controls stay visible.
     assert_eq!(caps.hypr_config_provider(), HyprConfigProvider::Lua);
+    // Task 11.14: the eww bar-text-tone stub is found at its live XDG path (the
+    // deployed link into the repo), not through the repo root.
+    assert_eq!(
+        caps.bar_text_tone_script(),
+        Some(fx.config_path("eww/scripts/bar-text-tone").as_path())
+    );
 }
 
 /// The palette scheme files parse, satisfy the schema read from the fixture
@@ -573,10 +581,10 @@ fn the_generator_stub_carries_the_real_schema_line_and_stays_inert() {
     assert_repo_untouched_except(&fx, &before, &[]);
 }
 
-/// The two action-script stubs are executable no-ops that succeed and record
-/// their argv (task 11.1): one line per call, script name plus shell-quoted
-/// arguments, appended to the file named by `SETTINGS4000_FIXTURE_STUB_LOG`.
-/// Running them changes nothing in the repo.
+/// The three action-script stubs are executable no-ops that succeed and record
+/// their argv (tasks 11.1, 11.14): one line per call, script name plus
+/// shell-quoted arguments, appended to the file named by
+/// `SETTINGS4000_FIXTURE_STUB_LOG`. Running them changes nothing in the repo.
 #[test]
 fn the_action_script_stubs_record_their_argv_and_succeed() {
     let fx = FixtureDotfiles::install();
@@ -584,13 +592,15 @@ fn the_action_script_stubs_record_their_argv_and_succeed() {
     let log = fx.home().join("stub-calls.log");
     let before = repo_snapshot(&fx);
 
-    let calls: [(&str, &[&str]); 3] = [
-        ("hypr-toggle-laptop-display", &[]),
-        ("notifctl", &["dnd", "on"]),
-        ("notifctl", &["inhibit", "add", "two words"]),
+    let calls: [(&str, &[&str]); 4] = [
+        ("scripts/hypr-toggle-laptop-display", &[]),
+        ("scripts/notifctl", &["dnd", "on"]),
+        ("scripts/notifctl", &["inhibit", "add", "two words"]),
+        ("config/eww/scripts/bar-text-tone", &["--apply"]),
     ];
-    for (script, args) in calls {
-        let path = fx.repo_path(&format!("scripts/{script}"));
+    for (relative, args) in calls {
+        let path = fx.repo_path(relative);
+        let script = relative.rsplit('/').next().unwrap_or(relative);
         let mode = fs::metadata(&path)
             .unwrap_or_else(|e| panic!("{} should exist: {e}", path.display()))
             .permissions()
@@ -613,7 +623,8 @@ fn the_action_script_stubs_record_their_argv_and_succeed() {
 
     assert_eq!(
         read(&log),
-        "hypr-toggle-laptop-display\nnotifctl dnd on\nnotifctl inhibit add two\\ words\n"
+        "hypr-toggle-laptop-display\nnotifctl dnd on\nnotifctl inhibit add two\\ words\n\
+         bar-text-tone --apply\n"
     );
     assert_repo_untouched_except(&fx, &before, &[]);
 }

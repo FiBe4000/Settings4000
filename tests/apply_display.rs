@@ -398,6 +398,7 @@ fn detect(fx: &FixtureDotfiles) -> Capabilities {
         hyprland_lua_config: fx.config_path("hypr/hyprland.lua"),
         notifd_replies: NotifdReplies::default(),
         notifd_unit_file: fx.config_path("systemd/user/notifd.service"),
+        bar_text_tone_script: fx.config_path("eww/scripts/bar-text-tone"),
     })
 }
 

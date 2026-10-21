@@ -88,6 +88,9 @@ fn main() {
         // even though the fixture deploys its unit file.
         notifd_replies: NotifdReplies::default(),
         notifd_unit_file: fx.config_path("systemd/user/notifd.service"),
+        // The fixture ships the eww bar-text-tone stub, so the wallpaper follow-up
+        // reads as available (task 11.14).
+        bar_text_tone_script: fx.config_path("eww/scripts/bar-text-tone"),
     };
     let detected = Capabilities::detect(&inputs);
     let generate_colors = detected

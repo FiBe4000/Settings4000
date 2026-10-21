@@ -455,7 +455,9 @@ fn load_palette(capabilities: &Capabilities) -> Option<PaletteModel> {
 /// the settings portal (R2.2), and passes the app's own `GTK_THEME` environment value
 /// so an override disables the GTK-theme drop-down (R3.3). It also hands the model the
 /// discovered dotfiles repo root and whether `xsettingsd` runs, for the Theme page's
-/// two "another program may rewrite GTK settings" notes (task 11.12). Running the
+/// two "another program may rewrite GTK settings" notes (task 11.12), and the notifd
+/// status, for the note that a notifd too old to reload shows a new icon theme only
+/// after its next start (task 11.14). Running the
 /// discovery here, on the startup worker, keeps its filesystem scans off the main
 /// thread and inside the R8.1 cold-start budget (architecture §8).
 fn load_themes(capabilities: &Capabilities) -> Option<ThemesModel> {
@@ -470,7 +472,8 @@ fn load_themes(capabilities: &Capabilities) -> Option<ThemesModel> {
             capabilities.settings_portal_available(),
             std::env::var("GTK_THEME").ok(),
         )
-        .with_xsettingsd_running(capabilities.is_daemon_live(Daemon::Xsettingsd)),
+        .with_xsettingsd_running(capabilities.is_daemon_live(Daemon::Xsettingsd))
+        .with_notifd_status(capabilities.notifd()),
     )
 }
 

@@ -22,15 +22,50 @@
 //! `gtk`/`relm4` import. Side effects are reached only through the two `system/`
 //! traits.
 //!
-//! # No notification-daemon reload
+//! # notifd: no palette step, one `Reload()` for the icon theme
 //!
 //! The notification daemon, notifd (task 11.7), draws its popups and center as eww
 //! widgets styled from the generated `_colors.scss`, so a palette switch reaches it
 //! through `eww reload`; the palette chain has no notification step. notifd's own
-//! `Reload()` method re-reads `~/.config/notifd/config` and the icon theme; it gets a
-//! [`ReloadAction`] when the first write that needs it exists (the icon-theme
-//! follow-up and the notifd config file, tasks 11.14 and 11.15). The D-Bus call
-//! itself is built in [`crate::core::notifd`].
+//! `Reload()` D-Bus method re-reads `~/.config/notifd/config` and the icon theme
+//! (from `gtk-3.0/settings.ini`) without dropping popups, timers, inhibitors or
+//! history (analysis §8.2), so it is the [`ReloadAction::NotifdReload`] step: a
+//! `settings.ini` write that changed the icon theme asks for it (task 11.14), and
+//! the notifd config file (task 11.15) will ask for it too. [`plan_reloads`]
+//! deduplicates, so one Apply calls it once however many writes asked. It needs a
+//! running daemon of version 1.1 or later, the first with `Reload()`; an older one
+//! is skipped and the Theme page says that notification icons follow at the next
+//! notifd start. The app never restarts the unit (that would drop the popups on
+//! screen) and never sends SIGHUP (which stops the daemon). The D-Bus call itself is
+//! built in [`crate::core::notifd`].
+//!
+//! # The wallpaper reload and its bar follow-up
+//!
+//! A `hyprpaper.conf` change is applied live with **one** IPC request, `hyprctl
+//! hyprpaper wallpaper ,<absolute path>[,<fit>]` — there is no `preload` step:
+//! hyprctl on the target stack (hyprpaper 0.8.4) knows only the `wallpaper` and
+//! `listactive` requests, so a `preload` request fails and, run first, kept the
+//! wallpaper from ever being set (task 11.14). Which fit modes are passed is
+//! explained on [`ReloadAction::HyprpaperWallpaper`]. After it, when the eww bar's
+//! `~/.config/eww/scripts/bar-text-tone` script exists and eww runs, the script runs
+//! with `--apply` so the bar re-picks its text colour from the new image
+//! ([`ReloadAction::BarTextTone`]; architecture §6, analysis §7.8).
+//!
+//! # Reload order
+//!
+//! [`plan_reloads`] sorts the actions into one fixed order (the private
+//! `ReloadAction::order_key`): the Hyprland reload, the `gsettings` keys,
+//! `hyprctl setcursor`, the hyprpaper wallpaper, the hypridle restart, `eww reload`,
+//! the bar text tone, kitty's SIGUSR1, and notifd's `Reload()`. The bar text tone
+//! follows `eww reload`: the bar's tone is an eww `defpoll` (`bar_tone`, polled
+//! hourly from the same script), which `eww reload` re-initialises to its `:initial`
+//! value and re-polls (analysis §7.8). A tone pushed before the reload would be
+//! thrown away; pushing it afterwards with `--apply` guarantees the result
+//! regardless of poll timing. It also follows the hyprpaper request so the bar's
+//! colour changes with the new image rather than before it (the script reads the
+//! image from `hyprpaper.conf`, already rewritten by the write phase). notifd's
+//! `Reload()` depends on nothing but the written `settings.ini`, so it goes last,
+//! after the steps the user sees on the desktop.
 //!
 //! # Kept in sync with `scripts/apply-theme`
 //!
@@ -72,10 +107,12 @@
 
 use std::fmt;
 use std::io;
+use std::path::Path;
 
 use nix::sys::signal::Signal;
 
 use crate::core::detect::{Binary, Capabilities, Daemon};
+use crate::core::notifd::{NotifdMethod, control_command};
 use crate::parsers::lua_literal::{LuaLiteral, LuaLiteralError, is_identifier};
 use crate::system::command::{Command, CommandError, CommandRunner, STDERR_EXCERPT_LIMIT};
 use crate::system::signal::ProcessSignaller;
@@ -99,6 +136,14 @@ const KITTY_PROCESS: &str = "kitty";
 const HYPRIDLE_PROCESS: &str = "hypridle";
 /// The systemd user unit name tried first when restarting hypridle.
 const HYPRIDLE_UNIT: &str = "hypridle";
+
+/// The argument that makes the eww bar's `bar-text-tone` script push its result with
+/// `eww update bar_tone=…` instead of only printing it (analysis §7.8).
+const BAR_TEXT_TONE_APPLY: &str = "--apply";
+
+/// The fit modes hyprpaper's IPC renders differently from its default, `cover`
+/// (see [`ReloadAction::HyprpaperWallpaper`]).
+const LIVE_FIT_MODES: &[&str] = &["contain", "tile"];
 
 /// A config file the app writes, identified by the reload its change requires
 /// (architecture §6 / analysis §6.6).
@@ -134,11 +179,15 @@ pub enum BackingFile {
     /// its config only at launch, so a change takes effect at the next lock
     /// (intentional, architecture §6, task 6.5).
     HyprlockConf,
-    /// `config/hypr/hyprpaper.conf` — the wallpaper; applied live with
-    /// `hyprctl hyprpaper preload`/`wallpaper` (task 6.5).
+    /// `config/hypr/hyprpaper.conf` — the wallpaper; applied live with one
+    /// `hyprctl hyprpaper wallpaper` request (no `preload`, which the installed
+    /// hyprctl does not know), followed by the eww bar's text-tone script when it is
+    /// present (tasks 6.5, 11.14).
     HyprpaperConf,
     /// The GTK 3/4 `settings.ini` files — GTK/icon/cursor theme; applied live with
-    /// `gsettings set` (+ `hyprctl setcursor` for the cursor), task 6.4.
+    /// `gsettings set` (+ `hyprctl setcursor` for the cursor), task 6.4. An icon-theme
+    /// change also asks notifd to `Reload()`, because notifd reads the icon theme
+    /// from `gtk-3.0/settings.ini` only when it starts or reloads (task 11.14).
     GtkSettings,
     /// `config/uwsm/env` — the cursor `XCURSOR_*` env copy; the cursor is applied
     /// live with `gsettings set cursor-*` + `hyprctl setcursor` (task 6.4).
@@ -181,9 +230,19 @@ impl BackingFile {
     /// wallpaper path, the cursor theme/size, the GTK/icon theme names). The Apply
     /// pipeline (task 4.5) fills a field only for a value that actually changed, so
     /// e.g. a change that touched only the icon theme yields only the icon-theme
-    /// `gsettings set`. A parameterized file whose value is missing from `params`
-    /// yields no action for it (with a warning) rather than an ill-formed command.
-    pub fn reload_actions(self, params: &ReloadParams) -> Vec<ReloadAction> {
+    /// `gsettings set` and notifd's `Reload()`. A parameterized file whose value is
+    /// missing from `params` yields no action for it (with a warning) rather than an
+    /// ill-formed command.
+    ///
+    /// `capabilities` is consulted only to *locate* a follow-up script detection
+    /// found — the eww bar's text-tone script, whose path the action must carry;
+    /// whether a component is running is still decided by
+    /// [`ReloadAction::is_available`] in [`plan_reloads`].
+    pub fn reload_actions(
+        self,
+        params: &ReloadParams,
+        capabilities: &Capabilities,
+    ) -> Vec<ReloadAction> {
         match self {
             // An input or cursor change only needs Hyprland to re-run its config,
             // not to re-apply the monitor layout, so it takes the lighter
@@ -203,10 +262,14 @@ impl BackingFile {
             // hyprlock intentionally has no reload (see the variant docs).
             BackingFile::HyprlockConf => Vec::new(),
             BackingFile::HyprpaperConf => match &params.wallpaper {
-                Some(path) => vec![ReloadAction::HyprpaperWallpaper {
-                    path: path.clone(),
-                    fit: params.fit.clone(),
-                }],
+                Some(path) => {
+                    let mut actions = vec![ReloadAction::HyprpaperWallpaper {
+                        path: path.clone(),
+                        fit: params.fit.clone(),
+                    }];
+                    actions.extend(bar_text_tone_action(capabilities));
+                    actions
+                }
                 None => {
                     tracing::warn!(
                         "hyprpaper.conf changed but no wallpaper path was provided; \
@@ -235,10 +298,37 @@ impl BackingFile {
     }
 }
 
+/// The eww bar's text-tone follow-up of a wallpaper change, or `None` when detection
+/// found no runnable script (task 11.14; architecture §6, analysis §7.8).
+///
+/// The script decides the bar's text colour from the wallpaper image and `--apply`
+/// pushes it to the running bar. Its absence is not a problem the user must hear
+/// about — detection already logged it at `info` — so it is only noted at `debug`
+/// here.
+fn bar_text_tone_action(capabilities: &Capabilities) -> Option<ReloadAction> {
+    let Some(script) = capabilities.bar_text_tone_script() else {
+        tracing::debug!(
+            "no eww bar-text-tone script was detected; the bar text colour is not \
+             refreshed after this wallpaper change"
+        );
+        return None;
+    };
+    // Detection reports only UTF-8 paths (a command's program is a `String`), so
+    // this conversion is never lossy; a non-UTF-8 path is skipped like an absent one.
+    let script = script.to_str()?;
+    Some(ReloadAction::BarTextTone {
+        script: script.to_string(),
+    })
+}
+
 /// Builds the theme/cursor reload actions from `params`.
 ///
 /// When `include_gtk_icon` is set (the `settings.ini` files, which hold those keys)
-/// the GTK and icon theme `gsettings set` calls are emitted for whichever changed.
+/// the GTK and icon theme `gsettings set` calls are emitted for whichever changed,
+/// and an icon-theme change also emits notifd's `Reload()`: notifd looks up
+/// notification icons in the theme named by `gtk-3.0/settings.ini`, which it reads
+/// only at start and on `Reload()` (analysis §8.2). A GTK-theme or cursor change
+/// does not affect notifd and does not emit it.
 /// The cursor part — `gsettings set cursor-theme`/`cursor-size` plus
 /// `hyprctl setcursor` — is emitted whenever a cursor value is present, for both the
 /// `settings.ini` files and `uwsm/env`, so a cursor change reloads identically
@@ -257,6 +347,7 @@ fn theme_and_cursor_actions(params: &ReloadParams, include_gtk_icon: bool) -> Ve
                 key: GSETTINGS_ICON_THEME,
                 value: theme.clone(),
             });
+            actions.push(ReloadAction::NotifdReload);
         }
     }
     if let Some(cursor) = &params.cursor {
@@ -288,10 +379,11 @@ pub struct ReloadParams {
     /// The new wallpaper path, for the hyprpaper reload (task 6.5).
     pub wallpaper: Option<String>,
     /// The new wallpaper fit mode, applied live in the same hyprpaper reload (task
-    /// 6.5). hyprpaper's `wallpaper` IPC takes the fit as a third comma-field
-    /// (`monitor,path,fit_mode`), so without this a fit change would be written to
-    /// `hyprpaper.conf` but never take effect until hyprpaper restarts. Set only when
-    /// a fit is configured; the reload falls back to `,<path>` when it is `None`.
+    /// 6.5). hyprpaper's `wallpaper` IPC takes the fit as an optional third
+    /// comma-field (`monitor,path,fit_mode`), so without this a fit change would be
+    /// written to `hyprpaper.conf` but never take effect until hyprpaper restarts.
+    /// Set only when a fit is configured; which values actually reach the IPC is
+    /// decided by [`ReloadAction::HyprpaperWallpaper`].
     pub fit: Option<String>,
     /// The new cursor theme and size, for `hyprctl setcursor` and the `gsettings`
     /// cursor keys (task 6.4).
@@ -367,16 +459,31 @@ pub enum ReloadAction {
     /// SIGUSR1 to every running kitty, which re-reads its config (v1 has no kitty
     /// remote-control reload; analysis §6.1).
     KittyColors,
-    /// Set the wallpaper via hyprpaper: `hyprctl hyprpaper preload <path>` then
-    /// `hyprctl hyprpaper wallpaper <monitor>,<path>[,<fit>]` (empty monitor field =
-    /// all outputs). The optional third comma-field is hyprpaper's fit mode, so a fit
-    /// change takes effect live rather than only on the next hyprpaper restart (task
-    /// 6.5).
+    /// Set the wallpaper via hyprpaper with exactly one request, `hyprctl hyprpaper
+    /// wallpaper ,<path>[,<fit>]` (tasks 6.5, 11.14). The empty first field is the
+    /// monitor: empty means every output.
+    ///
+    /// There is deliberately no `hyprctl hyprpaper preload` first: the hyprctl of
+    /// the target stack (hyprpaper 0.8.4) knows only the `wallpaper` and
+    /// `listactive` requests, answers `preload` with "invalid hyprpaper request",
+    /// and the `wallpaper` request loads the image itself.
+    ///
+    /// The fit field is sent only for `contain` and `tile`. Over IPC, hyprctl's
+    /// fit parser recognises only `contain`, `tile` and `fit`/`stretch`, and the
+    /// daemon renders the last two as `cover`, its default when the field is left
+    /// out — so `contain` and `tile` are the only modes that look different live.
+    /// `cover`, `fill` (which the config file accepts and the app writes there) and
+    /// any other value are therefore sent without the field: the live result is the
+    /// same `cover` it would be with a passed-through value, without ever sending a
+    /// token whose handling the IPC does not define. The file keeps the chosen
+    /// mode, so a `fill` wallpaper is shown stretched from the next hyprpaper start
+    /// on.
     HyprpaperWallpaper {
-        /// The image path to preload and display.
+        /// The absolute image path to display (hyprpaper's IPC rejects a path that
+        /// does not start with `/`; the wallpaper model expands `~/` before this).
         path: String,
-        /// The fit mode to apply, or `None` to leave hyprpaper's default (the reload
-        /// then omits the third comma-field).
+        /// The configured fit mode, or `None` when the file sets none; see the
+        /// variant docs for which values reach the IPC.
         fit: Option<String>,
     },
     /// Restart hypridle so it re-reads its config: restart its systemd user unit
@@ -399,6 +506,26 @@ pub enum ReloadAction {
         /// The cursor size in pixels.
         size: u32,
     },
+    /// `<script> --apply` — the eww bar's `bar-text-tone` script re-scores the bar's
+    /// text colour against the wallpaper behind it and pushes the result with `eww
+    /// update` (task 11.14; architecture §6, analysis §7.8). Runs after a wallpaper
+    /// change, only while eww runs (an `eww update` without a daemon has no bar to
+    /// update). Best-effort and non-fatal like every reload (R5.5).
+    BarTextTone {
+        /// The detected script path
+        /// ([`Capabilities::bar_text_tone_script`], always UTF-8).
+        script: String,
+    },
+    /// notifd's `Reload()` D-Bus method: `busctl --user --auto-start=no call
+    /// se.dotfiles.Notifd /se/dotfiles/Notifd se.dotfiles.Notifd Reload` (task
+    /// 11.14; R5.3; analysis §8.2). notifd re-reads its config file and the icon
+    /// theme in place, keeping popups, timers, inhibitors and history. Only a
+    /// running daemon of version 1.1 or later has the method; never replaced by a
+    /// unit restart (which drops the popups on screen) or SIGHUP (which stops it).
+    /// One variant serves every write that needs it — the icon theme in
+    /// `settings.ini` now, the notifd config file later (task 11.15) — so
+    /// [`plan_reloads`]' deduplication issues it once per Apply.
+    NotifdReload,
 }
 
 impl ReloadAction {
@@ -410,8 +537,13 @@ impl ReloadAction {
     /// client plus a live IPC socket; the hyprpaper action additionally requires the
     /// hyprpaper daemon to be running. The daemon reloads (`eww`, kitty, hypridle)
     /// require that daemon to be live. `gsettings set` requires the
-    /// `gsettings` binary. A component that is absent or stopped yields `false`, so
-    /// [`plan_reloads`] drops the action.
+    /// `gsettings` binary. The bar text tone requires the detected script (the very
+    /// path the action carries) and a running eww. notifd's `Reload()` requires a
+    /// running notifd of version 1.1 or later
+    /// ([`NotifdStatus::supports_state_and_reload`](crate::core::notifd::NotifdStatus::supports_state_and_reload));
+    /// an older or stopped daemon picks the icon theme up at its next start. A
+    /// component that is absent or stopped yields `false`, so [`plan_reloads`] drops
+    /// the action.
     pub fn is_available(&self, capabilities: &Capabilities) -> bool {
         match self {
             ReloadAction::HyprctlReload(_) | ReloadAction::HyprctlSetCursor { .. } => {
@@ -424,6 +556,11 @@ impl ReloadAction {
             ReloadAction::KittyColors => capabilities.is_daemon_live(Daemon::Kitty),
             ReloadAction::HypridleRestart => capabilities.is_daemon_live(Daemon::Hypridle),
             ReloadAction::GsettingsSet { .. } => capabilities.has_binary(Binary::Gsettings),
+            ReloadAction::BarTextTone { script } => {
+                capabilities.bar_text_tone_script() == Some(Path::new(script))
+                    && capabilities.is_daemon_live(Daemon::Eww)
+            }
+            ReloadAction::NotifdReload => capabilities.notifd().supports_state_and_reload(),
         }
     }
 
@@ -433,7 +570,12 @@ impl ReloadAction {
     /// always reloads in the same sequence, and so a palette change's chain comes
     /// out in the apply-theme order (`hyprctl reload config-only` → `eww reload` →
     /// kitty; analysis §6.1). The second element sub-orders the several
-    /// `gsettings set` keys deterministically.
+    /// `gsettings set` keys deterministically. Why the two follow-ups of task 11.14
+    /// sit where they do is explained under "Reload order" in the module docs: the
+    /// bar text tone after the hyprpaper request *and* after `eww reload` (which
+    /// re-initialises the bar's `bar_tone` poll to its `:initial` value and re-polls
+    /// it, so the `--apply` guarantees the result regardless of poll timing),
+    /// notifd's `Reload()` last.
     fn order_key(&self) -> (u8, u8) {
         match self {
             // Both forms share the Hyprland slot so they stay adjacent in the sorted
@@ -446,7 +588,9 @@ impl ReloadAction {
             ReloadAction::HyprpaperWallpaper { .. } => (3, 0),
             ReloadAction::HypridleRestart => (4, 0),
             ReloadAction::EwwReload => (5, 0),
-            ReloadAction::KittyColors => (6, 0),
+            ReloadAction::BarTextTone { .. } => (6, 0),
+            ReloadAction::KittyColors => (7, 0),
+            ReloadAction::NotifdReload => (8, 0),
         }
     }
 
@@ -472,32 +616,13 @@ impl ReloadAction {
                 Command::new("hyprctl").arg("reload").arg("config-only"),
             ),
             ReloadAction::EwwReload => run_and_check(runner, Command::new("eww").arg("reload")),
-            ReloadAction::HyprpaperWallpaper { path, fit } => {
-                // Preload the image, then set it on all outputs (empty monitor
-                // field). Preload must succeed first, so short-circuit on its
-                // failure rather than trying to display an unloaded image.
-                run_and_check(
-                    runner,
-                    Command::new("hyprctl")
-                        .arg("hyprpaper")
-                        .arg("preload")
-                        .arg(path.as_str()),
-                )?;
-                // hyprpaper's `wallpaper` IPC takes the fit as a third comma-field
-                // (`monitor,path,fit_mode`); include it when set so a fit change is
-                // applied live, otherwise fall back to the two-field form.
-                let wallpaper_arg = match fit {
-                    Some(fit) => format!(",{path},{fit}"),
-                    None => format!(",{path}"),
-                };
-                run_and_check(
-                    runner,
-                    Command::new("hyprctl")
-                        .arg("hyprpaper")
-                        .arg("wallpaper")
-                        .arg(wallpaper_arg),
-                )
-            }
+            ReloadAction::HyprpaperWallpaper { path, fit } => run_and_check(
+                runner,
+                Command::new("hyprctl")
+                    .arg("hyprpaper")
+                    .arg("wallpaper")
+                    .arg(hyprpaper_wallpaper_argument(path, fit.as_deref())),
+            ),
             ReloadAction::GsettingsSet { key, value } => run_and_check(
                 runner,
                 Command::new("gsettings")
@@ -515,7 +640,26 @@ impl ReloadAction {
             ),
             ReloadAction::KittyColors => reload_kitty(signaller),
             ReloadAction::HypridleRestart => restart_hypridle(runner, signaller),
+            ReloadAction::BarTextTone { script } => run_and_check(
+                runner,
+                Command::new(script.as_str()).arg(BAR_TEXT_TONE_APPLY),
+            ),
+            ReloadAction::NotifdReload => {
+                run_and_check(runner, control_command(NotifdMethod::Reload))
+            }
         }
+    }
+}
+
+/// The single argument of the `hyprctl hyprpaper wallpaper` request:
+/// `,<path>,<fit>` for the fit modes that render differently live (`contain`,
+/// `tile`), `,<path>` for every other value or none — see
+/// [`ReloadAction::HyprpaperWallpaper`] for why. The leading empty field targets
+/// every output.
+fn hyprpaper_wallpaper_argument(path: &str, fit: Option<&str>) -> String {
+    match fit {
+        Some(fit) if LIVE_FIT_MODES.contains(&fit) => format!(",{path},{fit}"),
+        _ => format!(",{path}"),
     }
 }
 
@@ -537,19 +681,46 @@ fn gsettings_key_rank(key: &str) -> u8 {
 /// is absent or not running ([`ReloadAction::is_available`]), then sorts by
 /// [`ReloadAction::order_key`] and removes duplicates so a change touching several
 /// files that share a reload (e.g. a cursor written to `settings.ini`, `uwsm/env`,
-/// `hyprland.lua` and `index.theme`) issues each reload once, in a deterministic order. When both
-/// Hyprland reload forms are planned, only the full one is kept (see
-/// [`HyprlandReloadScope`]). This is the list the Apply pipeline (task 4.5) executes
-/// after writing the files.
+/// `hyprland.lua` and `index.theme`, or an icon theme and the notifd config file
+/// that both ask for notifd's `Reload()`) issues each reload once, in a
+/// deterministic order. When both Hyprland reload forms are planned, only the full
+/// one is kept (see [`HyprlandReloadScope`]). This is the list the Apply pipeline
+/// (task 4.5) executes after writing the files.
 pub fn plan_reloads(
     changed: &[BackingFile],
     params: &ReloadParams,
     capabilities: &Capabilities,
 ) -> Vec<ReloadAction> {
-    let mut actions: Vec<ReloadAction> = changed
+    let requested = changed
         .iter()
-        .flat_map(|file| file.reload_actions(params))
-        .filter(|action| action.is_available(capabilities))
+        .flat_map(|file| file.reload_actions(params, capabilities))
+        .collect();
+    gate_order_and_dedup(requested, capabilities)
+}
+
+/// The second half of [`plan_reloads`]: drops the actions whose component is absent
+/// or stopped, sorts the rest into the canonical order, collapses duplicates, and
+/// lets a full Hyprland reload absorb the `config-only` form.
+///
+/// Kept separate so the deduplication can be tested on a raw action list — for
+/// example two requests for notifd's `Reload()` from different files, as an icon
+/// theme plus a notifd config write will produce — independently of which
+/// [`BackingFile`]s exist today.
+fn gate_order_and_dedup(
+    requested: Vec<ReloadAction>,
+    capabilities: &Capabilities,
+) -> Vec<ReloadAction> {
+    let mut actions: Vec<ReloadAction> = requested
+        .into_iter()
+        .filter(|action| {
+            let available = action.is_available(capabilities);
+            if !available {
+                // "Reload only what is running" (R5.3): a skipped reload is normal,
+                // not a failure, so it is only traced.
+                tracing::debug!(?action, "component absent or not running; reload skipped");
+            }
+            available
+        })
         .collect();
     // A stable sort by the canonical order key groups equal actions together; the
     // subsequent `dedup` (which removes only consecutive equal elements) then
@@ -877,22 +1048,104 @@ impl std::error::Error for ReloadError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::notifd::{NotifdStatus, NotifdVersion};
     use crate::system::command::{CommandOutput, MockCommandRunner};
     use crate::system::signal::{MockProcessSignaller, SignalCall};
 
+    /// The bar text-tone script path the test capabilities report.
+    const BAR_TEXT_TONE: &str = "/home/u/.config/eww/scripts/bar-text-tone";
+
+    /// A running notifd reporting `version`, as detection resolves it.
+    fn notifd_running(version: &str) -> NotifdStatus {
+        NotifdStatus::Running {
+            version: NotifdVersion::parse(version),
+        }
+    }
+
+    /// The live components of [`all_capabilities`], for tests that narrow one.
+    const ALL_DAEMONS: &[Daemon] = &[
+        Daemon::Eww,
+        Daemon::Kitty,
+        Daemon::Hyprpaper,
+        Daemon::Hypridle,
+    ];
+
     /// A capabilities value with every reload target present and running — the
-    /// baseline for mapping tests, which a gating test then narrows.
+    /// baseline for mapping tests, which a gating test then narrows. notifd runs
+    /// version 1.1 (it has `Reload()`) and the eww bar's text-tone script exists.
     fn all_capabilities() -> Capabilities {
-        Capabilities::for_tests(
-            &[Binary::Hyprctl, Binary::Gsettings],
-            &[
-                Daemon::Eww,
-                Daemon::Kitty,
-                Daemon::Hyprpaper,
-                Daemon::Hypridle,
-            ],
-            true,
-        )
+        Capabilities::for_tests(&[Binary::Hyprctl, Binary::Gsettings], ALL_DAEMONS, true)
+            .with_notifd_for_tests(notifd_running("1.1"))
+            .with_bar_text_tone_script_for_tests(BAR_TEXT_TONE.into())
+    }
+
+    /// The bar text-tone follow-up for [`all_capabilities`]' script.
+    fn bar_text_tone() -> ReloadAction {
+        ReloadAction::BarTextTone {
+            script: BAR_TEXT_TONE.to_string(),
+        }
+    }
+
+    /// A short name for an action's kind, without its data, so a test can state a
+    /// plan's shape. The match has no `_` arm: a new [`ReloadAction`] variant does not
+    /// compile until it is named here, and the order and availability tests below then
+    /// fail until its sample is added to [`one_of_each_action`].
+    fn kind(action: &ReloadAction) -> &'static str {
+        match action {
+            ReloadAction::HyprctlReload(HyprlandReloadScope::Full) => "hyprctl reload",
+            ReloadAction::HyprctlReload(HyprlandReloadScope::ConfigOnly) => {
+                "hyprctl reload config-only"
+            }
+            ReloadAction::GsettingsSet { key, .. } => match *key {
+                GSETTINGS_GTK_THEME => "gsettings gtk-theme",
+                GSETTINGS_ICON_THEME => "gsettings icon-theme",
+                GSETTINGS_CURSOR_THEME => "gsettings cursor-theme",
+                GSETTINGS_CURSOR_SIZE => "gsettings cursor-size",
+                _ => "gsettings (other key)",
+            },
+            ReloadAction::HyprctlSetCursor { .. } => "hyprctl setcursor",
+            ReloadAction::HyprpaperWallpaper { .. } => "hyprpaper wallpaper",
+            ReloadAction::HypridleRestart => "hypridle restart",
+            ReloadAction::EwwReload => "eww reload",
+            ReloadAction::BarTextTone { .. } => "bar text tone",
+            ReloadAction::KittyColors => "kitty SIGUSR1",
+            ReloadAction::NotifdReload => "notifd Reload",
+        }
+    }
+
+    /// The kinds of `actions`, in order.
+    fn kinds(actions: &[ReloadAction]) -> Vec<&'static str> {
+        actions.iter().map(kind).collect()
+    }
+
+    /// One action of every kind [`kind`] names (each `gsettings` key once), in
+    /// declaration order — the input of the order and availability tests.
+    fn one_of_each_action() -> Vec<ReloadAction> {
+        let gsettings = |key| ReloadAction::GsettingsSet {
+            key,
+            value: "x".to_string(),
+        };
+        vec![
+            ReloadAction::HyprctlReload(HyprlandReloadScope::Full),
+            ReloadAction::HyprctlReload(HyprlandReloadScope::ConfigOnly),
+            ReloadAction::EwwReload,
+            ReloadAction::KittyColors,
+            ReloadAction::HyprpaperWallpaper {
+                path: "/w.jpg".to_string(),
+                fit: None,
+            },
+            ReloadAction::HypridleRestart,
+            gsettings(GSETTINGS_GTK_THEME),
+            gsettings(GSETTINGS_ICON_THEME),
+            gsettings(GSETTINGS_CURSOR_THEME),
+            gsettings(GSETTINGS_CURSOR_SIZE),
+            ReloadAction::HyprctlSetCursor {
+                theme: "t".to_string(),
+                size: 24,
+            },
+            bar_text_tone(),
+            ReloadAction::NotifdReload,
+        ]
     }
 
     /// Params carrying every parameterized value, so the theme/cursor/wallpaper
@@ -916,7 +1169,7 @@ mod tests {
     /// change needs no Hyprland reload at all.
     fn hyprland_scope(file: BackingFile) -> Option<HyprlandReloadScope> {
         let scopes: Vec<HyprlandReloadScope> = file
-            .reload_actions(&full_params())
+            .reload_actions(&full_params(), &all_capabilities())
             .into_iter()
             .filter_map(|action| match action {
                 ReloadAction::HyprctlReload(scope) => Some(scope),
@@ -953,6 +1206,143 @@ mod tests {
         for &file in BackingFile::ALL {
             assert_eq!(hyprland_scope(file), expected(file), "{file:?}");
         }
+
+        // Task 11.14 extends the same exhaustive table to the whole planned reload of
+        // each file, with every component running and every value changed: the
+        // wallpaper gains the bar text tone after the single hyprpaper request, and
+        // only the settings.ini files ask for notifd's `Reload()` (the icon theme
+        // lives there) — never the cursor-only copies. A future notifd config file
+        // (task 11.15) adds one arm here mapping to `["notifd Reload"]`.
+        let expected_plan = |file: BackingFile| -> Vec<&'static str> {
+            match file {
+                BackingFile::MonitorsConf => vec!["hyprctl reload"],
+                BackingFile::InputLua | BackingFile::HyprlandLua => {
+                    vec!["hyprctl reload config-only"]
+                }
+                BackingFile::HypridleConf => vec!["hypridle restart"],
+                BackingFile::HyprlockConf => vec![],
+                BackingFile::HyprpaperConf => vec!["hyprpaper wallpaper", "bar text tone"],
+                BackingFile::GtkSettings => vec![
+                    "gsettings gtk-theme",
+                    "gsettings icon-theme",
+                    "gsettings cursor-theme",
+                    "gsettings cursor-size",
+                    "hyprctl setcursor",
+                    "notifd Reload",
+                ],
+                BackingFile::UwsmEnv | BackingFile::CursorFallbackTheme => vec![
+                    "gsettings cursor-theme",
+                    "gsettings cursor-size",
+                    "hyprctl setcursor",
+                ],
+                BackingFile::Palette => {
+                    vec!["hyprctl reload config-only", "eww reload", "kitty SIGUSR1"]
+                }
+            }
+        };
+        for &file in BackingFile::ALL {
+            assert_eq!(
+                kinds(&plan_reloads(&[file], &full_params(), &all_capabilities())),
+                expected_plan(file),
+                "{file:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_action_kind_has_its_place_in_the_canonical_order() {
+        // Pins `order_key` for every variant (architecture §6, module docs "Reload
+        // order"): fed in a scrambled order, the plan comes out with the bar text tone
+        // after both the hyprpaper request and `eww reload` (which re-initialises the
+        // bar's `bar_tone` poll to its `:initial` value), and notifd's `Reload()` last.
+        let mut scrambled = one_of_each_action();
+        scrambled.reverse();
+        scrambled.rotate_left(5);
+        let planned = gate_order_and_dedup(scrambled, &all_capabilities());
+        assert_eq!(
+            kinds(&planned),
+            vec![
+                // The full reload absorbs `config-only` when both are present.
+                "hyprctl reload",
+                "gsettings gtk-theme",
+                "gsettings icon-theme",
+                "gsettings cursor-theme",
+                "gsettings cursor-size",
+                "hyprctl setcursor",
+                "hyprpaper wallpaper",
+                "hypridle restart",
+                "eww reload",
+                "bar text tone",
+                "kitty SIGUSR1",
+                "notifd Reload",
+            ]
+        );
+    }
+
+    #[test]
+    fn every_action_kind_is_dropped_without_its_component() {
+        // Pins `is_available` for every variant: everything runs under
+        // `all_capabilities`, nothing under an empty capability set (no binaries, no
+        // daemons, no Hyprland socket, no notifd, no script).
+        let caps = all_capabilities();
+        for action in one_of_each_action() {
+            assert!(
+                action.is_available(&caps),
+                "{} with everything",
+                kind(&action)
+            );
+        }
+        let nothing = Capabilities::for_tests(&[], &[], false);
+        for action in one_of_each_action() {
+            assert!(
+                !action.is_available(&nothing),
+                "{} with nothing",
+                kind(&action)
+            );
+        }
+    }
+
+    #[test]
+    fn notifd_reload_needs_a_running_daemon_of_at_least_1_1() {
+        // Analysis §8.2: `Reload()` exists from notifd 1.1 on. An older or
+        // unversioned daemon, a stopped one and an absent one all skip it — the
+        // stopped daemon reads the icon theme when it starts anyway.
+        let with = |notifd| Capabilities::for_tests(&[], &[], false).with_notifd_for_tests(notifd);
+        let cases = [
+            (notifd_running("1.1"), true),
+            (notifd_running("2.0"), true),
+            (notifd_running("1.0"), false),
+            (NotifdStatus::Running { version: None }, false),
+            (NotifdStatus::Installed, false),
+            (NotifdStatus::Absent, false),
+        ];
+        for (notifd, expected) in cases {
+            assert_eq!(
+                ReloadAction::NotifdReload.is_available(&with(notifd)),
+                expected,
+                "{notifd}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_bar_text_tone_needs_its_detected_script_and_a_running_eww() {
+        // Task 11.14: skipped when eww is not running (an `eww update` would find no
+        // bar), and when detection reported no script or a different one.
+        let without_eww = Capabilities::for_tests(&[], &[Daemon::Kitty], false)
+            .with_bar_text_tone_script_for_tests(BAR_TEXT_TONE.into());
+        assert!(!bar_text_tone().is_available(&without_eww));
+
+        let without_script = Capabilities::for_tests(&[], &[Daemon::Eww], false);
+        assert!(!bar_text_tone().is_available(&without_script));
+
+        let other_script = Capabilities::for_tests(&[], &[Daemon::Eww], false)
+            .with_bar_text_tone_script_for_tests("/elsewhere/bar-text-tone".into());
+        assert!(!bar_text_tone().is_available(&other_script));
+
+        let both = Capabilities::for_tests(&[], &[Daemon::Eww], false)
+            .with_bar_text_tone_script_for_tests(BAR_TEXT_TONE.into());
+        assert!(bar_text_tone().is_available(&both));
     }
 
     #[test]
@@ -960,7 +1350,7 @@ mod tests {
         // The monitor layout is re-applied only by the full `hyprctl reload`
         // (architecture §6). No params are needed.
         assert_eq!(
-            BackingFile::MonitorsConf.reload_actions(&ReloadParams::default()),
+            BackingFile::MonitorsConf.reload_actions(&ReloadParams::default(), &all_capabilities()),
             vec![ReloadAction::HyprctlReload(HyprlandReloadScope::Full)]
         );
     }
@@ -972,7 +1362,7 @@ mod tests {
         // `scripts/apply-theme` does.
         for file in [BackingFile::InputLua, BackingFile::HyprlandLua] {
             assert_eq!(
-                file.reload_actions(&ReloadParams::default()),
+                file.reload_actions(&ReloadParams::default(), &all_capabilities()),
                 vec![ReloadAction::HyprctlReload(HyprlandReloadScope::ConfigOnly)],
                 "{file:?}"
             );
@@ -1027,7 +1417,7 @@ mod tests {
         // hyprlock.conf change issues no reload at all (intentional).
         assert!(
             BackingFile::HyprlockConf
-                .reload_actions(&ReloadParams::default())
+                .reload_actions(&ReloadParams::default(), &all_capabilities())
                 .is_empty(),
             "hyprlock.conf must yield no reload"
         );
@@ -1047,17 +1437,27 @@ mod tests {
     fn distinct_hypr_files_map_to_distinct_reloads() {
         let params = full_params();
         assert_eq!(
-            BackingFile::HypridleConf.reload_actions(&params),
+            BackingFile::HypridleConf.reload_actions(&params, &all_capabilities()),
             vec![ReloadAction::HypridleRestart],
             "hypridle.conf restarts hypridle, not `hyprctl reload`"
         );
         assert_eq!(
-            BackingFile::HyprpaperConf.reload_actions(&params),
-            vec![ReloadAction::HyprpaperWallpaper {
-                path: "/home/u/Pictures/wall.jpg".to_string(),
-                fit: Some("cover".to_string()),
-            }],
-            "hyprpaper.conf maps to the hyprpaper wallpaper action carrying the fit"
+            BackingFile::HyprpaperConf.reload_actions(&params, &all_capabilities()),
+            vec![
+                ReloadAction::HyprpaperWallpaper {
+                    path: "/home/u/Pictures/wall.jpg".to_string(),
+                    fit: Some("cover".to_string()),
+                },
+                bar_text_tone(),
+            ],
+            "hyprpaper.conf maps to the hyprpaper wallpaper action carrying the fit, \
+             then the bar text tone"
+        );
+        // Without a detected script the follow-up is simply not requested.
+        let no_script = Capabilities::for_tests(&[Binary::Hyprctl], ALL_DAEMONS, true);
+        assert_eq!(
+            kinds(&BackingFile::HyprpaperConf.reload_actions(&params, &no_script)),
+            vec!["hyprpaper wallpaper"]
         );
     }
 
@@ -1069,7 +1469,7 @@ mod tests {
         // no notification-daemon step (task 11.7: notifd's popups are eww widgets,
         // recolored by the eww reload).
         assert_eq!(
-            BackingFile::Palette.reload_actions(&ReloadParams::default()),
+            BackingFile::Palette.reload_actions(&ReloadParams::default(), &all_capabilities()),
             vec![
                 ReloadAction::HyprctlReload(HyprlandReloadScope::ConfigOnly),
                 ReloadAction::EwwReload,
@@ -1082,7 +1482,7 @@ mod tests {
                 &ReloadParams::default(),
                 &all_capabilities()
             ),
-            BackingFile::Palette.reload_actions(&ReloadParams::default()),
+            BackingFile::Palette.reload_actions(&ReloadParams::default(), &all_capabilities()),
             "with everything live the planned chain is exactly the three steps, in order"
         );
     }
@@ -1090,9 +1490,10 @@ mod tests {
     #[test]
     fn gtk_settings_maps_to_theme_and_cursor_gsettings_plus_setcursor() {
         // settings.ini carries GTK theme, icon theme, and cursor: all three
-        // `gsettings set` calls (in key order) plus `hyprctl setcursor`.
+        // `gsettings set` calls (in key order) plus `hyprctl setcursor`, and the icon
+        // theme also asks notifd to `Reload()` (task 11.14).
         assert_eq!(
-            BackingFile::GtkSettings.reload_actions(&full_params()),
+            BackingFile::GtkSettings.reload_actions(&full_params(), &all_capabilities()),
             vec![
                 ReloadAction::GsettingsSet {
                     key: GSETTINGS_GTK_THEME,
@@ -1102,6 +1503,7 @@ mod tests {
                     key: GSETTINGS_ICON_THEME,
                     value: "Everforest-Dark".to_string()
                 },
+                ReloadAction::NotifdReload,
                 ReloadAction::GsettingsSet {
                     key: GSETTINGS_CURSOR_THEME,
                     value: "Nordic-cursors".to_string()
@@ -1124,7 +1526,7 @@ mod tests {
         // never emit the GTK/icon theme gsettings — only the cursor keys and setcursor.
         for file in [BackingFile::UwsmEnv, BackingFile::CursorFallbackTheme] {
             assert_eq!(
-                file.reload_actions(&full_params()),
+                file.reload_actions(&full_params(), &all_capabilities()),
                 cursor_reload_actions(),
                 "{file:?}"
             );
@@ -1153,17 +1555,158 @@ mod tests {
     fn a_changed_setting_only_emits_actions_for_provided_params() {
         // The pipeline provides a param only for a value that changed; a settings.ini
         // change that touched only the icon theme yields only the icon-theme
-        // gsettings — no gtk-theme, no cursor.
+        // gsettings and notifd's `Reload()` — no gtk-theme, no cursor.
         let params = ReloadParams {
             icon_theme: Some("Papirus".to_string()),
             ..ReloadParams::default()
         };
         assert_eq!(
-            BackingFile::GtkSettings.reload_actions(&params),
-            vec![ReloadAction::GsettingsSet {
+            BackingFile::GtkSettings.reload_actions(&params, &all_capabilities()),
+            vec![
+                ReloadAction::GsettingsSet {
+                    key: GSETTINGS_ICON_THEME,
+                    value: "Papirus".to_string()
+                },
+                ReloadAction::NotifdReload,
+            ]
+        );
+    }
+
+    #[test]
+    fn an_icon_theme_change_plans_exactly_one_notifd_reload() {
+        // Task 11.14 (R5.3, analysis §8.2): an icon-theme-only Apply ends with one
+        // `Reload()`; a GTK-theme-only or cursor-only Apply has none, because notifd
+        // reads only the icon theme from settings.ini.
+        let icon_only = ReloadParams {
+            icon_theme: Some("Papirus".to_string()),
+            ..ReloadParams::default()
+        };
+        assert_eq!(
+            kinds(&plan_reloads(
+                &[BackingFile::GtkSettings],
+                &icon_only,
+                &all_capabilities()
+            )),
+            vec!["gsettings icon-theme", "notifd Reload"]
+        );
+
+        let gtk_only = ReloadParams {
+            gtk_theme: Some("Everforest-Green-Dark".to_string()),
+            ..ReloadParams::default()
+        };
+        assert_eq!(
+            kinds(&plan_reloads(
+                &[BackingFile::GtkSettings],
+                &gtk_only,
+                &all_capabilities()
+            )),
+            vec!["gsettings gtk-theme"]
+        );
+
+        let cursor_only = ReloadParams {
+            cursor: full_params().cursor,
+            ..ReloadParams::default()
+        };
+        let planned = plan_reloads(
+            &[
+                BackingFile::GtkSettings,
+                BackingFile::UwsmEnv,
+                BackingFile::HyprlandLua,
+                BackingFile::CursorFallbackTheme,
+            ],
+            &cursor_only,
+            &all_capabilities(),
+        );
+        assert!(
+            !planned.contains(&ReloadAction::NotifdReload),
+            "a cursor change does not reload notifd: {planned:?}"
+        );
+    }
+
+    #[test]
+    fn notifd_reload_is_issued_once_however_many_writes_ask_for_it() {
+        // Task 11.14: the icon theme and the notifd config file (task 11.15) will both
+        // ask for `Reload()` in one Apply; the planner issues it once, last.
+        let requested = vec![
+            ReloadAction::NotifdReload,
+            ReloadAction::GsettingsSet {
                 key: GSETTINGS_ICON_THEME,
-                value: "Papirus".to_string()
-            }]
+                value: "Papirus".to_string(),
+            },
+            ReloadAction::NotifdReload,
+        ];
+        assert_eq!(
+            kinds(&gate_order_and_dedup(requested, &all_capabilities())),
+            vec!["gsettings icon-theme", "notifd Reload"]
+        );
+    }
+
+    #[test]
+    fn an_older_notifd_gets_no_reload_call() {
+        // Analysis §8.2: notifd 1.0 has no `Reload()`; the icon change is still
+        // applied through gsettings and notifd picks it up at its next start. The unit
+        // is never restarted in its place.
+        let caps = Capabilities::for_tests(&[Binary::Hyprctl, Binary::Gsettings], &[], true)
+            .with_notifd_for_tests(notifd_running("1.0"));
+        let params = ReloadParams {
+            icon_theme: Some("Papirus".to_string()),
+            ..ReloadParams::default()
+        };
+        let planned = plan_reloads(&[BackingFile::GtkSettings], &params, &caps);
+        assert_eq!(kinds(&planned), vec!["gsettings icon-theme"]);
+    }
+
+    #[test]
+    fn a_wallpaper_change_runs_the_bar_text_tone_after_hyprpaper_only_with_eww() {
+        // Task 11.14 (architecture §6): the bar text tone follows the hyprpaper
+        // request, and is skipped when eww is down or the script is absent.
+        let planned = plan_reloads(
+            &[BackingFile::HyprpaperConf],
+            &full_params(),
+            &all_capabilities(),
+        );
+        assert_eq!(
+            kinds(&planned),
+            vec!["hyprpaper wallpaper", "bar text tone"]
+        );
+
+        let eww_down = Capabilities::for_tests(&[Binary::Hyprctl], &[Daemon::Hyprpaper], true)
+            .with_bar_text_tone_script_for_tests(BAR_TEXT_TONE.into());
+        assert_eq!(
+            kinds(&plan_reloads(
+                &[BackingFile::HyprpaperConf],
+                &full_params(),
+                &eww_down
+            )),
+            vec!["hyprpaper wallpaper"]
+        );
+
+        let no_script = Capabilities::for_tests(&[Binary::Hyprctl], ALL_DAEMONS, true);
+        assert_eq!(
+            kinds(&plan_reloads(
+                &[BackingFile::HyprpaperConf],
+                &full_params(),
+                &no_script
+            )),
+            vec!["hyprpaper wallpaper"]
+        );
+
+        // With a palette switch in the same Apply, the tone is pushed after `eww
+        // reload`, which would otherwise re-initialise it to its `:initial` value.
+        let planned = plan_reloads(
+            &[BackingFile::HyprpaperConf, BackingFile::Palette],
+            &full_params(),
+            &all_capabilities(),
+        );
+        assert_eq!(
+            kinds(&planned),
+            vec![
+                "hyprctl reload config-only",
+                "hyprpaper wallpaper",
+                "eww reload",
+                "bar text tone",
+                "kitty SIGUSR1",
+            ]
         );
     }
 
@@ -1173,7 +1716,7 @@ mod tests {
         // supplied (a caller bug) yields no action rather than a malformed command.
         assert!(
             BackingFile::HyprpaperConf
-                .reload_actions(&ReloadParams::default())
+                .reload_actions(&ReloadParams::default(), &all_capabilities())
                 .is_empty()
         );
     }
@@ -1354,80 +1897,125 @@ mod tests {
         );
     }
 
-    #[test]
-    fn hyprpaper_action_preloads_then_sets_the_wallpaper_with_the_fit() {
-        // The single hyprpaper action expands to two ordered commands: preload the
-        // path, then set it on all outputs (empty monitor field before the comma) with
-        // the fit as the third comma-field, so a fit change is applied live (task 6.5).
+    /// Runs a hyprpaper action for `fit` and returns the recorded commands.
+    fn hyprpaper_commands(fit: Option<&str>) -> Vec<Command> {
         let runner = MockCommandRunner::new();
-        let signaller = MockProcessSignaller::new();
-
         ReloadAction::HyprpaperWallpaper {
             path: "/home/u/Pictures/wall.jpg".to_string(),
-            fit: Some("tile".to_string()),
+            fit: fit.map(str::to_string),
         }
-        .execute(&runner, &signaller)
+        .execute(&runner, &MockProcessSignaller::new())
         .expect("hyprpaper reload succeeds");
-
-        assert_eq!(
-            runner.recorded(),
-            vec![
-                Command::new("hyprctl").args(["hyprpaper", "preload", "/home/u/Pictures/wall.jpg"]),
-                Command::new("hyprctl").args([
-                    "hyprpaper",
-                    "wallpaper",
-                    ",/home/u/Pictures/wall.jpg,tile"
-                ]),
-            ]
-        );
+        runner.recorded()
     }
 
     #[test]
-    fn hyprpaper_action_omits_the_fit_field_when_no_fit_is_set() {
-        // With no fit configured, the wallpaper arg falls back to the two-field
-        // `,<path>` form (hyprpaper keeps its default fit).
-        let runner = MockCommandRunner::new();
-        let signaller = MockProcessSignaller::new();
-
-        ReloadAction::HyprpaperWallpaper {
-            path: "/home/u/Pictures/wall.jpg".to_string(),
-            fit: None,
+    fn hyprpaper_action_sets_the_wallpaper_in_one_request_with_a_live_fit() {
+        // Task 11.14: exactly one `wallpaper` request — no `preload`, which the
+        // installed hyprctl rejects — on all outputs (empty monitor field before the
+        // comma), with the fit as the third comma-field for the modes that render
+        // differently live.
+        for fit in ["tile", "contain"] {
+            assert_eq!(
+                hyprpaper_commands(Some(fit)),
+                vec![Command::new("hyprctl").args([
+                    "hyprpaper".to_string(),
+                    "wallpaper".to_string(),
+                    format!(",/home/u/Pictures/wall.jpg,{fit}"),
+                ])],
+                "{fit}"
+            );
         }
-        .execute(&runner, &signaller)
-        .expect("hyprpaper reload succeeds");
+    }
 
-        assert_eq!(
-            runner.recorded(),
-            vec![
-                Command::new("hyprctl").args(["hyprpaper", "preload", "/home/u/Pictures/wall.jpg"]),
-                Command::new("hyprctl").args([
+    #[test]
+    fn hyprpaper_action_omits_every_fit_that_renders_as_cover_live() {
+        // Over IPC only `contain` and `tile` differ from the default `cover`; `cover`
+        // itself, `fill` (valid in the file, unknown to the IPC), `stretch` and no fit
+        // at all are all sent as the two-field form, which hyprpaper shows as cover.
+        for fit in [
+            None,
+            Some("cover"),
+            Some("fill"),
+            Some("stretch"),
+            Some("odd"),
+        ] {
+            assert_eq!(
+                hyprpaper_commands(fit),
+                vec![Command::new("hyprctl").args([
                     "hyprpaper",
                     "wallpaper",
                     ",/home/u/Pictures/wall.jpg"
-                ]),
-            ]
-        );
+                ])],
+                "{fit:?}"
+            );
+        }
     }
 
     #[test]
-    fn hyprpaper_wallpaper_is_not_set_when_preload_fails() {
-        // If preload fails, the wallpaper command must not run (short-circuit), and
-        // the failure is surfaced as a ReloadError.
+    fn a_failed_hyprpaper_request_is_a_reload_error_after_one_command() {
+        // A failing `wallpaper` request is surfaced (R5.5); nothing else was tried.
         let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake(1))]);
-        let signaller = MockProcessSignaller::new();
-
         let result = ReloadAction::HyprpaperWallpaper {
             path: "/x.jpg".to_string(),
-            fit: Some("cover".to_string()),
+            fit: Some("tile".to_string()),
         }
-        .execute(&runner, &signaller);
+        .execute(&runner, &MockProcessSignaller::new());
 
         assert!(matches!(result, Err(ReloadError::NonZeroExit { .. })));
         assert_eq!(
             runner.recorded(),
-            vec![Command::new("hyprctl").args(["hyprpaper", "preload", "/x.jpg"])],
-            "the wallpaper command must be skipped after a failed preload"
+            vec![Command::new("hyprctl").args(["hyprpaper", "wallpaper", ",/x.jpg,tile"])]
         );
+    }
+
+    // --- Execution: the task 11.14 follow-ups --------------------------------
+
+    #[test]
+    fn the_bar_text_tone_runs_its_script_with_apply() {
+        let runner = MockCommandRunner::new();
+        bar_text_tone()
+            .execute(&runner, &MockProcessSignaller::new())
+            .expect("the script succeeds under the default mock");
+        assert_eq!(
+            runner.recorded(),
+            vec![Command::new(BAR_TEXT_TONE).arg("--apply")]
+        );
+
+        // A failing script is a non-fatal reload error like any other (R5.5).
+        let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake(1))]);
+        assert!(matches!(
+            bar_text_tone().execute(&runner, &MockProcessSignaller::new()),
+            Err(ReloadError::NonZeroExit { .. })
+        ));
+    }
+
+    #[test]
+    fn notifd_reload_is_the_busctl_reload_call() {
+        // Analysis §8.2: the same `busctl --user --auto-start=no` form as every other
+        // notifd call, so it can never D-Bus-activate a daemon; never systemctl.
+        let runner = MockCommandRunner::new();
+        ReloadAction::NotifdReload
+            .execute(&runner, &MockProcessSignaller::new())
+            .expect("the call succeeds under the default mock");
+        assert_eq!(
+            runner.recorded(),
+            vec![Command::new("busctl").args([
+                "--user",
+                "--auto-start=no",
+                "call",
+                "se.dotfiles.Notifd",
+                "/se/dotfiles/Notifd",
+                "se.dotfiles.Notifd",
+                "Reload",
+            ])]
+        );
+
+        let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake(1))]);
+        assert!(matches!(
+            ReloadAction::NotifdReload.execute(&runner, &MockProcessSignaller::new()),
+            Err(ReloadError::NonZeroExit { program, .. }) if program == "busctl"
+        ));
     }
 
     // --- Execution: the kitty signal seam ------------------------------------

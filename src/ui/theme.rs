@@ -285,8 +285,9 @@ impl Inner {
     /// Builds the GTK/icon/cursor appearance section: the GTK-theme, icon-theme,
     /// cursor-theme, and cursor-size drop-downs, preselected from the backing config,
     /// with the `GTK_THEME` override banner, the live-restyle note (task 6.4), the
-    /// cursor-copy and next-login notes (task 11.5), and the external-writer notes
-    /// (task 11.12).
+    /// cursor-copy and next-login notes (task 11.5), the external-writer notes
+    /// (task 11.12), and the note that an older notifd shows a new icon theme only
+    /// after its next start (task 11.14).
     ///
     /// When `settings.ini` is unreadable the rows are hidden behind a note (R4.4); when
     /// a `GTK_THEME` override is active the GTK-theme drop-down is disabled and the
@@ -358,6 +359,13 @@ impl Inner {
             ThemeKind::Icon,
         );
         section.append(&labelled_row("Icon theme", &icon_dropdown));
+        // Task 11.14 (analysis §8.2): an Apply reloads notifd's icon theme through its
+        // `Reload()` method; a running notifd older than 1.1 has none, and the app
+        // never restarts it (that drops the popups on screen), so say when the change
+        // reaches notifications instead.
+        if let Some(icons) = model.notification_icons_note() {
+            section.append(&note(&icons));
+        }
 
         // Cursor theme.
         let cursor_dropdown = self.theme_dropdown(
@@ -431,6 +439,8 @@ impl Inner {
     /// Builds the wallpaper section: a wallpaper image picker, a fit-mode drop-down, and
     /// an optional lock-screen override toggle that reveals a second picker (task 6.5).
     ///
+    /// A `fill` fit gets a note that its live preview shows as cover (task 11.14).
+    ///
     /// When `hyprpaper.conf` is unreadable the rows are hidden behind a note (R4.4); the
     /// lock-override toggle is shown only when hyprlock is present (R4.2).
     fn build_wallpaper_section(self: &Rc<Self>) -> Frame {
@@ -479,6 +489,12 @@ impl Inner {
             },
         );
         section.append(&labelled_row("Fit", &fit_dropdown));
+        // Task 11.14: the live wallpaper request renders only contain and tile
+        // differently from cover, so a "fill" fit previews as cover until hyprpaper
+        // restarts; the file still keeps "fill".
+        if let Some(preview) = model.fit_preview_note() {
+            section.append(&note(&preview));
+        }
 
         // The optional lock-screen override — only when hyprlock is present (R4.2).
         if model.lock_editable() {

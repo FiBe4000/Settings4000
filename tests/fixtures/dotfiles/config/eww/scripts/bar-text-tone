@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Fixture stand-in for the real dotfiles config/eww/scripts/bar-text-tone.
+#
+# The real script (Python) picks the eww bar's text colours per monitor from
+# the wallpaper behind them and, with `--apply`, pushes the result to the
+# running bar with `eww update bar_tone=…` (docs/dotfiles_analysis.md §7.8).
+# Running it from a test would update the live session's bar.
+#
+# The app runs `<this script> --apply` after a wallpaper change through the
+# CommandRunner seam (task 11.14), which tests replace with MockCommandRunner;
+# the fixture carries this file so detection finds an executable script at
+# ~/.config/eww/scripts/bar-text-tone. When a test does run it for real on
+# purpose, the stub is a no-op that records how it was called:
+#
+# - one line naming the script and its shell-quoted arguments goes to stderr,
+#   which the command runner captures and logs;
+# - the same line is appended to the file named by SETTINGS4000_FIXTURE_STUB_LOG
+#   when that variable is set, so the test can assert the exact argv;
+#
+# and it exits 0.
+record="${0##*/}"
+for arg in "$@"; do
+    record+=" $(printf '%q' "$arg")"
+done
+printf 'settings4000 fixture stub: %s\n' "$record" >&2
+if [[ -n "${SETTINGS4000_FIXTURE_STUB_LOG:-}" ]]; then
+    printf '%s\n' "$record" >>"$SETTINGS4000_FIXTURE_STUB_LOG"
+fi
+exit 0

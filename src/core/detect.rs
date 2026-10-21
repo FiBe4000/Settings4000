@@ -71,7 +71,8 @@
 //! - Hyprland liveness and the palette anchor and config files are given as
 //!   **paths** ([`DetectionInputs::hyprland_socket`],
 //!   [`DetectionInputs::palette_config_anchor`], [`DetectionInputs::config_paths`],
-//!   [`DetectionInputs::hyprland_lua_config`]), which [`Capabilities::detect`]
+//!   [`DetectionInputs::hyprland_lua_config`],
+//!   [`DetectionInputs::bar_text_tone_script`]), which [`Capabilities::detect`]
 //!   checks against the real filesystem — so a test builds a temp-dir fixture (a
 //!   fake socket file, a config symlinked into a fake repo, an unreadable config)
 //!   and gets faithful behavior;
@@ -98,8 +99,9 @@
 //!
 //! Absent page-gating binaries, an absent palette source, an absent settings
 //! portal, a non-Lua Hyprland config provider and an absent or stopped notifd are
-//! logged at `info` (the "hidden item" signal, R4.2), as is a running `xsettingsd`
-//! (a user-visible Theme-page note, task 11.12); a missing or unreadable config
+//! logged at `info` (the "hidden item" signal, R4.2), as are a running `xsettingsd`
+//! (a user-visible Theme-page note, task 11.12) and a missing eww `bar-text-tone`
+//! script (a skipped wallpaper follow-up, task 11.14); a missing or unreadable config
 //! is logged at `warn` (R4.4); a one-line detection summary, naming the config
 //! provider and the notifd status, is logged at `info` (R7.3). File *contents* are
 //! never logged.
@@ -343,6 +345,11 @@ const REPO_ANCHOR_RELATIVE: &[&str] = &["config", "hypr", "colors.conf"];
 /// (R8.5).
 const LAPTOP_TOGGLE_SCRIPT_RELATIVE: &[&str] = &["scripts", "hypr-toggle-laptop-display"];
 
+/// The eww bar's text-tone script, relative to the XDG config directory (task 11.14;
+/// analysis §7.8). The dotfiles deploy `eww/scripts` as a directory link into the
+/// repo, so the live path reaches the repo copy without the app resolving the repo.
+const BAR_TEXT_TONE_SCRIPT_RELATIVE: &[&str] = &["eww", "scripts", "bar-text-tone"];
+
 /// The dotfiles palette source located behind a deployed config symlink (R3.2,
 /// R8.5).
 ///
@@ -430,6 +437,14 @@ pub struct DetectionInputs {
     /// `~/.config/systemd/user/notifd.service` (the dotfiles link it there). Its
     /// existence marks notifd as installed when the daemon is not running.
     pub notifd_unit_file: PathBuf,
+    /// The live path of the eww bar's text-tone script, conventionally
+    /// `~/.config/eww/scripts/bar-text-tone` (task 11.14). When it is an executable
+    /// file the reload table runs it with `--apply` after a wallpaper change, so the
+    /// bar re-picks its text colour from the new image (architecture §6, analysis
+    /// §7.8). It is addressed by its XDG path like every other file the app uses,
+    /// not through the dotfiles repo, because it ships inside the deployed eww
+    /// config directory.
+    pub bar_text_tone_script: PathBuf,
 }
 
 impl DetectionInputs {
@@ -474,6 +489,7 @@ impl DetectionInputs {
             hyprland_lua_config: default_config_path(&["hypr", "hyprland.lua"]),
             notifd_replies,
             notifd_unit_file: default_config_path(&["systemd", "user", "notifd.service"]),
+            bar_text_tone_script: default_config_path(BAR_TEXT_TONE_SCRIPT_RELATIVE),
         }
     }
 }
@@ -508,6 +524,10 @@ pub struct Capabilities {
     /// no repo behind the config or the script is missing or not executable — the
     /// gate of the Display page's laptop-panel switch (task 11.8; R4.2, R8.5).
     laptop_toggle_script: Option<PathBuf>,
+    /// The eww bar's `bar-text-tone` script at its XDG path, or `None` when it is
+    /// missing, not executable or not addressable as UTF-8 — the gate of the
+    /// wallpaper follow-up reload (task 11.14).
+    bar_text_tone_script: Option<PathBuf>,
     /// Backing config paths that could not be read (missing or unreadable, R4.4).
     unreadable_configs: BTreeSet<PathBuf>,
     /// The Hyprland config provider in use, the guard for the Lua-only input and
@@ -575,6 +595,8 @@ impl Capabilities {
         let palette_source = detect_palette_source(repo_root.as_deref());
         let laptop_toggle_script = detect_laptop_toggle_script(repo_root.as_deref());
 
+        let bar_text_tone_script = detect_bar_text_tone_script(&inputs.bar_text_tone_script);
+
         let unreadable_configs = check_configs(&inputs.config_paths);
 
         let notifd =
@@ -589,6 +611,7 @@ impl Capabilities {
             repo_root,
             palette_source,
             laptop_toggle_script,
+            bar_text_tone_script,
             unreadable_configs,
             hypr_config_provider,
             notifd,
@@ -619,6 +642,7 @@ impl Capabilities {
             repo_root: None,
             palette_source: None,
             laptop_toggle_script: None,
+            bar_text_tone_script: None,
             unreadable_configs: BTreeSet::new(),
             hypr_config_provider: HyprConfigProvider::Hyprlang,
             notifd: NotifdStatus::Absent,
@@ -721,6 +745,19 @@ impl Capabilities {
         self.laptop_toggle_script.as_deref()
     }
 
+    /// The eww bar's text-tone script, or `None` when the wallpaper follow-up must be
+    /// skipped (task 11.14; architecture §6, analysis §7.8).
+    ///
+    /// Present only when `$XDG_CONFIG_HOME/eww/scripts/bar-text-tone` (falling back
+    /// to `~/.config/…`) is an executable file with a UTF-8 path. After a wallpaper
+    /// write the reload table runs it with `--apply`, which re-scores the bar's text
+    /// colour against the new image and pushes it with `eww update`; the run is
+    /// additionally gated on eww running, because there is no bar to update
+    /// otherwise.
+    pub fn bar_text_tone_script(&self) -> Option<&Path> {
+        self.bar_text_tone_script.as_deref()
+    }
+
     /// Whether the backing config at `path` was found readable (R4.4).
     ///
     /// Returns `true` for any path that was not among the [`DetectionInputs::config_paths`]
@@ -755,6 +792,7 @@ impl Capabilities {
             dotfiles_repo = self.repo_root.is_some(),
             palette_source = self.palette_source.is_some(),
             laptop_toggle_script = self.laptop_toggle_script.is_some(),
+            bar_text_tone_script = self.bar_text_tone_script.is_some(),
             unreadable_configs = self.unreadable_configs.len(),
             hypr_config_provider = %self.hypr_config_provider,
             notifd = %self.notifd,
@@ -794,6 +832,7 @@ impl Capabilities {
             repo_root: None,
             palette_source: None,
             laptop_toggle_script: None,
+            bar_text_tone_script: None,
             unreadable_configs: BTreeSet::new(),
             hypr_config_provider: HyprConfigProvider::Lua,
             notifd: NotifdStatus::Absent,
@@ -805,6 +844,15 @@ impl Capabilities {
     /// [`Self::with_hypr_config_provider_for_tests`].
     pub fn with_notifd_for_tests(mut self, notifd: NotifdStatus) -> Capabilities {
         self.notifd = notifd;
+        self
+    }
+
+    /// Returns `self` with the given bar text-tone script marked present, for tests of
+    /// the wallpaper follow-up reload (task 11.14) — builder-style, like
+    /// [`Self::with_notifd_for_tests`]. The path is taken as given; a test of the
+    /// presence check itself runs [`Capabilities::detect`] instead.
+    pub fn with_bar_text_tone_script_for_tests(mut self, script: PathBuf) -> Capabilities {
+        self.bar_text_tone_script = Some(script);
         self
     }
 
@@ -1192,6 +1240,38 @@ fn detect_laptop_toggle_script(repo_root: Option<&Path>) -> Option<PathBuf> {
     }
 }
 
+/// Decides whether the eww bar's text-tone script at its live XDG path can be run
+/// (task 11.14; architecture §6, analysis §7.8).
+///
+/// Present only as an executable regular file (a symlink is followed, since the
+/// dotfiles link the whole `eww/scripts` directory into the repo) whose path is
+/// valid UTF-8 — a command's program is a `String`, so a lossy conversion would name
+/// a different file. Anything else skips the wallpaper follow-up, logged at `info`:
+/// it is a best-effort refinement of the bar, not a control, so nothing on a page
+/// is hidden by its absence.
+fn detect_bar_text_tone_script(script: &Path) -> Option<PathBuf> {
+    // Presence first, so a missing script under a non-UTF-8 config directory is
+    // reported as missing — the common reason — rather than as a path problem.
+    if !is_executable_file(script) {
+        tracing::info!(
+            script = %script.display(),
+            "the eww bar-text-tone script is missing or not executable; the bar text \
+             colour is not refreshed after a wallpaper change"
+        );
+        None
+    } else if script.to_str().is_none() {
+        tracing::info!(
+            script = %script.display(),
+            "the eww bar-text-tone script path is not valid UTF-8, so it cannot be run; \
+             the bar text colour is not refreshed after a wallpaper change"
+        );
+        None
+    } else {
+        tracing::debug!(script = %script.display(), "eww bar-text-tone script discovered");
+        Some(script.to_path_buf())
+    }
+}
+
 /// Checks each config path for readability, returning the ones that failed (R4.4).
 ///
 /// A path that cannot be read — missing, permission-revoked, or otherwise
@@ -1365,6 +1445,9 @@ mod tests {
             notifd_replies: NotifdReplies::default(),
             notifd_unit_file: PathBuf::from(
                 "/nonexistent/settings4000/systemd/user/notifd.service",
+            ),
+            bar_text_tone_script: PathBuf::from(
+                "/nonexistent/settings4000/eww/scripts/bar-text-tone",
             ),
         }
     }
@@ -1897,6 +1980,114 @@ mod tests {
                     && event.message.contains("not valid UTF-8")
                     && event.message.contains("laptop-display toggle is hidden")),
             "the reason must be logged at info, got {events:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_executable_bar_text_tone_script_at_its_xdg_path_is_detected() {
+        // Task 11.14: the script is looked up at its live XDG path, independently of
+        // any dotfiles repo (none is behind `base_inputs`), and reported as given.
+        let root = tempfile::tempdir().expect("temp dir");
+        let scripts = root.path().join("eww").join("scripts");
+        fs::create_dir_all(&scripts).expect("create the eww scripts dir");
+        let script = write_executable(&scripts, "bar-text-tone");
+
+        let mut inputs = base_inputs();
+        inputs.bar_text_tone_script = script.clone();
+        let caps = Capabilities::detect(&inputs);
+        assert_eq!(caps.bar_text_tone_script(), Some(script.as_path()));
+        assert!(caps.dotfiles_repo_root().is_none(), "no repo was needed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_or_non_executable_bar_text_tone_script_is_absent_and_logged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Missing: absent, with the skipped follow-up logged at `info`.
+        let root = tempfile::tempdir().expect("temp dir");
+        let script = root.path().join("bar-text-tone");
+        let mut inputs = base_inputs();
+        inputs.bar_text_tone_script = script.clone();
+        let mut caps = None;
+        let events = crate::testing::capture_logs(|| caps = Some(Capabilities::detect(&inputs)));
+        assert!(
+            caps.expect("detection ran")
+                .bar_text_tone_script()
+                .is_none()
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.level == tracing::Level::INFO
+                    && event.message.contains("bar-text-tone script is missing")),
+            "a missing script must be logged at info, got {events:?}"
+        );
+
+        // Present but not executable: still absent, since it could not be run.
+        fs::write(&script, b"#!/bin/sh\n").expect("write the script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o644))
+            .expect("clear the executable bits");
+        assert!(
+            Capabilities::detect(&inputs)
+                .bar_text_tone_script()
+                .is_none()
+        );
+
+        // A directory of that name is not a script either.
+        let dir = root.path().join("dir-named-bar-text-tone");
+        fs::create_dir(&dir).expect("create a directory");
+        inputs.bar_text_tone_script = dir;
+        assert!(
+            Capabilities::detect(&inputs)
+                .bar_text_tone_script()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_bar_text_tone_script_path_is_absent() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let dir = root.path().join(OsStr::from_bytes(b"conf\xffig"));
+        fs::create_dir_all(&dir).expect("create a non-UTF-8 dir");
+        let script = write_executable(&dir, "bar-text-tone");
+        assert!(is_executable_file(&script));
+
+        let mut detected = None;
+        let events =
+            crate::testing::capture_logs(|| detected = detect_bar_text_tone_script(&script));
+        assert!(detected.is_none(), "a non-UTF-8 path must not be reported");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.level == tracing::Level::INFO
+                    && event.message.contains("not valid UTF-8")),
+            "the reason must be logged at info, got {events:?}"
+        );
+
+        // A script that does not exist there is reported as missing, not as a path
+        // problem.
+        let missing = dir.join("absent-bar-text-tone");
+        let events =
+            crate::testing::capture_logs(|| detected = detect_bar_text_tone_script(&missing));
+        assert!(detected.is_none());
+        assert!(
+            events
+                .iter()
+                .any(|event| event.level == tracing::Level::INFO
+                    && event.message.contains("missing or not executable")),
+            "a missing script is logged as missing, got {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.message.contains("not valid UTF-8")),
+            "{events:?}"
         );
     }
 

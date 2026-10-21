@@ -13,13 +13,17 @@
 //! It also reports two conditions that mean another program is likely to rewrite the
 //! GTK settings after the app does (task 11.12, analysis §7.7, §8.4): a `settings.ini`
 //! that is a plain file although the dotfiles repo carries a copy of it, and a running
-//! `xsettingsd`. [`ThemesModel`]'s own docs carry the rest.
+//! `xsettingsd`. An icon-theme change also reaches the notification daemon, notifd,
+//! through its `Reload()` method (task 11.14); on a notifd too old to have it, the
+//! model supplies the note that notification icons follow at notifd's next start.
+//! [`ThemesModel`]'s own docs carry the rest.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::core::apply::{FileWrite, WriteMode, WriteValidation};
 use crate::core::home_path::contract_home;
+use crate::core::notifd::NotifdStatus;
 use crate::core::reload::{BackingFile, CursorValue, ReloadParams};
 use crate::parsers::env::{EnvFile, GtkThemeOverride};
 use crate::parsers::ini::IniFile;
@@ -420,6 +424,10 @@ pub struct ThemesModel {
     /// Whether detection found `xsettingsd` running — the trace of an external
     /// GTK-settings writer (task 11.12; see [`Self::with_xsettingsd_running`]).
     xsettingsd_running: bool,
+    /// What detection found of the notifd notification daemon, which decides whether
+    /// an icon-theme change reaches its notifications live (task 11.14; see
+    /// [`Self::with_notifd_status`]).
+    notifd: NotifdStatus,
 }
 
 /// A live `settings.ini` that is a plain file while the dotfiles repo carries its own
@@ -546,6 +554,7 @@ impl ThemesModel {
             app_env_gtk_theme,
             unlinked_gtk_settings,
             xsettingsd_running: false,
+            notifd: NotifdStatus::Absent,
         }
     }
 
@@ -558,6 +567,41 @@ impl ThemesModel {
     pub fn with_xsettingsd_running(mut self, running: bool) -> ThemesModel {
         self.xsettingsd_running = running;
         self
+    }
+
+    /// Returns `self` recording the notifd status detection found
+    /// ([`Capabilities::notifd`](crate::core::detect::Capabilities::notifd)), which
+    /// decides [`Self::notification_icons_note`] (task 11.14).
+    ///
+    /// A builder like [`Self::with_xsettingsd_running`], for the same reason: it only
+    /// feeds a note. The `Reload()` call itself is planned by the reload table, gated
+    /// on the same status. [`Self::reload`] carries it over. Without it the model
+    /// assumes notifd is absent and shows no note.
+    pub fn with_notifd_status(mut self, notifd: NotifdStatus) -> ThemesModel {
+        self.notifd = notifd;
+        self
+    }
+
+    /// The note shown under the icon-theme control while a running notifd is too old
+    /// to reload its icon theme, or `None` otherwise (task 11.14; analysis §8.2).
+    ///
+    /// notifd looks notification icons up in the theme named by
+    /// `gtk-3.0/settings.ini`, which it reads at start and — from version 1.1 on — on
+    /// its `Reload()` D-Bus method, which the Apply calls after an icon-theme change.
+    /// A running daemon below 1.1, or one that reported no version (treated as
+    /// older), has no such method, so its notifications keep the old icons until it
+    /// next starts; the app deliberately does not restart it, because a restart drops
+    /// the popups on screen. A stopped or absent daemon needs no note: it reads the
+    /// new theme when it starts.
+    pub fn notification_icons_note(&self) -> Option<String> {
+        let too_old = matches!(self.notifd, NotifdStatus::Running { .. })
+            && !self.notifd.supports_state_and_reload();
+        too_old.then(|| {
+            "Notification icons follow an icon-theme change the next time the \
+             notification daemon (notifd) starts: this notifd version cannot reload \
+             its icon theme while running."
+                .to_string()
+        })
     }
 
     /// The live `settings.ini` paths that are plain files although the dotfiles repo
@@ -931,6 +975,7 @@ impl ThemesModel {
             self.app_env_gtk_theme.clone(),
         )
         .with_xsettingsd_running(self.xsettingsd_running)
+        .with_notifd_status(self.notifd)
     }
 
     /// The Theme page's GTK/icon/cursor contribution to the Apply plan, or `None` when
@@ -3500,5 +3545,44 @@ export XCURSOR_SIZE=16
         assert!(note.starts_with("xsettingsd is running"), "got {note}");
         assert!(noted.themes_editable(), "the note gates no control");
         assert_eq!(noted.reload().external_gtk_writer_note(), Some(note));
+    }
+
+    #[test]
+    fn the_notification_icons_note_appears_only_for_a_running_notifd_without_reload() {
+        // Task 11.14 (analysis §8.2): only a running notifd older than 1.1 (or one that
+        // reported no version) cannot pick up an icon-theme change live; a 1.1 daemon
+        // is reloaded by the Apply, and a stopped or absent one reads the theme when it
+        // starts. The note gates nothing and survives a conflict reload.
+        use crate::core::notifd::NotifdVersion;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let paths = write_backing_fixture(tmp.path(), "");
+        let with = |notifd| {
+            ThemesModel::load(&no_theme_roots(), paths.clone(), false, None)
+                .with_notifd_status(notifd)
+        };
+        let running = |version| NotifdStatus::Running {
+            version: NotifdVersion::parse(version),
+        };
+
+        let default = ThemesModel::load(&no_theme_roots(), paths.clone(), false, None);
+        assert_eq!(default.notification_icons_note(), None);
+        for quiet in [
+            running("1.1"),
+            running("2.0"),
+            NotifdStatus::Installed,
+            NotifdStatus::Absent,
+        ] {
+            assert_eq!(with(quiet).notification_icons_note(), None, "{quiet}");
+        }
+
+        for old in [running("1.0"), NotifdStatus::Running { version: None }] {
+            let model = with(old);
+            let note = model
+                .notification_icons_note()
+                .unwrap_or_else(|| panic!("{old} must be noted"));
+            assert!(note.contains("next time"), "got {note}");
+            assert!(model.themes_editable(), "the note gates no control");
+            assert_eq!(model.reload().notification_icons_note(), Some(note));
+        }
     }
 }
