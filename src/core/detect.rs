@@ -1,4 +1,4 @@
-//! Installed-app detection and dynamic visibility (tasks 4.3, 11.2, 11.7; architecture
+//! Installed-app detection and dynamic visibility (tasks 4.3, 11.2, 11.7, 11.8; architecture
 //! §4; R4.1–R4.4, R2.2, R3.2, R8.5, R6.1, R7.3).
 //!
 //! # What this module is
@@ -6,11 +6,12 @@
 //! At startup the app must decide which settings to show. A page or row is shown
 //! only when the thing it edits is actually present — the compositor is running,
 //! the daemon it reloads is installed, the config it writes is readable, the
-//! dotfiles palette source exists. This module runs those probes once and returns
-//! a plain [`Capabilities`] value that the UI (tasks 5.x/6.x) consults to hide the
-//! rows/pages it cannot support (R4.2), that the reload table (task 4.4) consults
-//! to skip a reload for a component that is not running, and that the Apply
-//! pipeline (task 4.5) consults for the palette source's repo root (R8.5).
+//! dotfiles palette source or laptop-display toggle script exists. This module runs
+//! those probes once and returns a plain [`Capabilities`] value that the UI (tasks
+//! 5.x/6.x) consults to hide the rows/pages it cannot support (R4.2), that the
+//! reload table (task 4.4) consults to skip a reload for a component that is not
+//! running, and that the Apply pipeline (task 4.5) consults for the palette
+//! source's repo root (R8.5).
 //!
 //! It lives in `core/` because it is pure domain logic driven by injected inputs
 //! (see below), so it is headlessly testable (R6.2) and the layering guard in
@@ -319,6 +320,13 @@ impl fmt::Display for HyprConfigProvider {
 /// matches before trusting the derived root.
 const REPO_ANCHOR_RELATIVE: &[&str] = &["config", "hypr", "colors.conf"];
 
+/// The repo-relative path of the dotfiles' laptop-display toggle script (analysis
+/// §7.3), whose presence gates the Display page's laptop-panel switch (task 11.8).
+/// It has no XDG location — the dotfiles bind it to a key and call it by repo path —
+/// so it is found only under the repo root resolved from [`REPO_ANCHOR_RELATIVE`]
+/// (R8.5).
+const LAPTOP_TOGGLE_SCRIPT_RELATIVE: &[&str] = &["scripts", "hypr-toggle-laptop-display"];
+
 /// The dotfiles palette source located behind a deployed config symlink (R3.2,
 /// R8.5).
 ///
@@ -381,7 +389,8 @@ pub struct DetectionInputs {
     pub hyprland_socket: Option<PathBuf>,
     /// The deployed config path used to discover the dotfiles repo root (R8.5),
     /// conventionally `~/.config/hypr/colors.conf`. It must be a symlink into the
-    /// repo for the palette source to be considered present.
+    /// repo for the repo-only sources — the palette source and the laptop-display
+    /// toggle script (task 11.8) — to be considered present.
     pub palette_config_anchor: PathBuf,
     /// The live XDG paths of backing config files to check for readability (R4.4).
     /// Each unreadable path is recorded and logged at `warn`.
@@ -473,6 +482,10 @@ pub struct Capabilities {
     /// The dotfiles palette source, or `None` when there is no repo behind the
     /// config (R3.2, R8.5).
     palette_source: Option<PaletteSource>,
+    /// The dotfiles' `scripts/hypr-toggle-laptop-display`, or `None` when there is
+    /// no repo behind the config or the script is missing or not executable — the
+    /// gate of the Display page's laptop-panel switch (task 11.8; R4.2, R8.5).
+    laptop_toggle_script: Option<PathBuf>,
     /// Backing config paths that could not be read (missing or unreadable, R4.4).
     unreadable_configs: BTreeSet<PathBuf>,
     /// The Hyprland config provider in use, the guard for the Lua-only input and
@@ -527,7 +540,9 @@ impl Capabilities {
             );
         }
 
-        let palette_source = detect_palette_source(&inputs.palette_config_anchor);
+        let repo_root = resolve_repo_root(&inputs.palette_config_anchor);
+        let palette_source = detect_palette_source(repo_root.as_deref());
+        let laptop_toggle_script = detect_laptop_toggle_script(repo_root.as_deref());
 
         let unreadable_configs = check_configs(&inputs.config_paths);
 
@@ -541,6 +556,7 @@ impl Capabilities {
             hyprland_ipc,
             settings_portal,
             palette_source,
+            laptop_toggle_script,
             unreadable_configs,
             hypr_config_provider,
             notifd,
@@ -569,6 +585,7 @@ impl Capabilities {
             hyprland_ipc: false,
             settings_portal: false,
             palette_source: None,
+            laptop_toggle_script: None,
             unreadable_configs: BTreeSet::new(),
             hypr_config_provider: HyprConfigProvider::Hyprlang,
             notifd: NotifdStatus::Absent,
@@ -645,6 +662,19 @@ impl Capabilities {
         self.palette_source.as_ref()
     }
 
+    /// The dotfiles' laptop-display toggle script, or `None` when the Display page's
+    /// laptop-panel switch must be hidden (task 11.8; R4.2, R8.5).
+    ///
+    /// Resolved from the same repo root as [`Self::palette_source`] and present only
+    /// when `<repo>/scripts/hypr-toggle-laptop-display` is an executable file. The
+    /// app runs it instead of re-implementing it, because the script owns every step
+    /// of a toggle — the live `hl.monitor` call, the hotplug watcher's
+    /// `/tmp/hypr-laptop-display-forced` override and the eww bar relaunch
+    /// (analysis §7.3, §8.1).
+    pub fn laptop_toggle_script(&self) -> Option<&Path> {
+        self.laptop_toggle_script.as_deref()
+    }
+
     /// Whether the backing config at `path` was found readable (R4.4).
     ///
     /// Returns `true` for any path that was not among the [`DetectionInputs::config_paths`]
@@ -677,6 +707,7 @@ impl Capabilities {
             hyprland_ipc = self.hyprland_ipc,
             settings_portal = self.settings_portal,
             palette_source = self.palette_source.is_some(),
+            laptop_toggle_script = self.laptop_toggle_script.is_some(),
             unreadable_configs = self.unreadable_configs.len(),
             hypr_config_provider = %self.hypr_config_provider,
             notifd = %self.notifd,
@@ -714,6 +745,7 @@ impl Capabilities {
             hyprland_ipc,
             settings_portal: false,
             palette_source: None,
+            laptop_toggle_script: None,
             unreadable_configs: BTreeSet::new(),
             hypr_config_provider: HyprConfigProvider::Lua,
             notifd: NotifdStatus::Absent,
@@ -973,21 +1005,21 @@ fn is_process_running(running: &[String], name: &str) -> bool {
     running.iter().any(|candidate| candidate == name)
 }
 
-/// Discovers the dotfiles palette source behind the config `anchor` (R3.2, R8.5).
+/// Resolves the dotfiles repository root behind the config `anchor` (R8.5).
 ///
 /// The anchor must be a **symlink** — the deployment method for this dotfiles setup
-/// (analysis §1). A plain file means there is no repo behind it, so the palette
-/// switcher is hidden exactly like a missing app (the explicit accept criterion);
-/// this is logged at `info` as a hidden item. When it is a symlink, it is
-/// canonicalized to the real repo file, the repo root is derived by stripping the
-/// known [`REPO_ANCHOR_RELATIVE`] tail, and the source is present only when both
-/// `colors/` and `scripts/generate-colors` exist under that root. Any filesystem
-/// failure (a dangling symlink, an unexpected resolved layout) degrades to `None`.
+/// (analysis §1). A plain file means there is no repo behind it; when it is a
+/// symlink, it is canonicalized to the real repo file and the root is derived by
+/// stripping the known [`REPO_ANCHOR_RELATIVE`] tail, after verifying the resolved
+/// path really ends in it. Any filesystem failure (a missing anchor, a dangling
+/// symlink, an unexpected resolved layout) degrades to `None`.
 ///
-/// Every path that ends in a hidden palette source is logged at `info`, matching
-/// the "hidden item" convention for the rest of detection (R4.2), so all the reasons
-/// the switcher is absent surface uniformly in the journal.
-fn detect_palette_source(anchor: &Path) -> Option<PaletteSource> {
+/// Two repo-only controls hang off this root and are hidden like a missing app when
+/// it is absent: the palette switcher ([`detect_palette_source`]) and the
+/// laptop-display toggle ([`detect_laptop_toggle_script`]). Every reason for a
+/// missing root is therefore logged here, once, at `info` — the "hidden item"
+/// convention for the rest of detection (R4.2) — naming both controls.
+fn resolve_repo_root(anchor: &Path) -> Option<PathBuf> {
     // `symlink_metadata` does not follow the link, so it tells us whether the
     // anchor *itself* is a symlink — the signal that a dotfiles repo is deployed
     // behind it. A plain file (or a missing/unreadable anchor) means no repo.
@@ -996,7 +1028,8 @@ fn detect_palette_source(anchor: &Path) -> Option<PaletteSource> {
         Ok(_) => {
             tracing::info!(
                 anchor = %anchor.display(),
-                "palette config is not a symlink into a dotfiles repo; palette switcher hidden (R3.2/R8.5)"
+                "palette config is not a symlink into a dotfiles repo; the palette switcher \
+                 and the laptop-display toggle are hidden (R3.2/R4.2/R8.5)"
             );
             return None;
         }
@@ -1004,7 +1037,8 @@ fn detect_palette_source(anchor: &Path) -> Option<PaletteSource> {
             tracing::info!(
                 anchor = %anchor.display(),
                 %error,
-                "palette config anchor is absent or unreadable; palette switcher hidden (R3.2/R8.5)"
+                "palette config anchor is absent or unreadable; the palette switcher and \
+                 the laptop-display toggle are hidden (R3.2/R4.2/R8.5)"
             );
             return None;
         }
@@ -1017,7 +1051,8 @@ fn detect_palette_source(anchor: &Path) -> Option<PaletteSource> {
             tracing::info!(
                 anchor = %anchor.display(),
                 %error,
-                "palette config symlink could not be resolved (dangling?); palette switcher hidden (R3.2/R8.5)"
+                "palette config symlink could not be resolved (dangling?); the palette \
+                 switcher and the laptop-display toggle are hidden (R3.2/R4.2/R8.5)"
             );
             return None;
         }
@@ -1027,25 +1062,35 @@ fn detect_palette_source(anchor: &Path) -> Option<PaletteSource> {
     // tail matches (rather than blindly dropping three components) guards against a
     // symlink that points somewhere with an unexpected shape.
     let relative: PathBuf = REPO_ANCHOR_RELATIVE.iter().collect();
-    let Some(repo_root) = canonical
+    let repo_root = canonical
         .ends_with(&relative)
         .then(|| canonical.ancestors().nth(REPO_ANCHOR_RELATIVE.len()))
         .flatten()
-        .map(Path::to_path_buf)
-    else {
+        .map(Path::to_path_buf);
+    if repo_root.is_none() {
         tracing::info!(
             resolved = %canonical.display(),
-            "palette config resolved outside the expected repo layout; palette switcher hidden (R3.2/R8.5)"
+            "palette config resolved outside the expected repo layout; the palette \
+             switcher and the laptop-display toggle are hidden (R3.2/R4.2/R8.5)"
         );
-        return None;
-    };
+    }
+    repo_root
+}
 
+/// Discovers the dotfiles palette source under `repo_root` (R3.2, R8.5).
+///
+/// The source is present only when both `colors/` and `scripts/generate-colors`
+/// exist under the root resolved by [`resolve_repo_root`]; an incomplete repo hides
+/// the palette switcher exactly like a missing app, logged at `info` (R4.2). A
+/// `None` root was already logged by [`resolve_repo_root`].
+fn detect_palette_source(repo_root: Option<&Path>) -> Option<PaletteSource> {
+    let repo_root = repo_root?;
     let colors_dir = repo_root.join("colors");
     let generate_colors = repo_root.join("scripts").join("generate-colors");
     if colors_dir.is_dir() && generate_colors.is_file() {
         tracing::debug!(repo_root = %repo_root.display(), "palette source discovered");
         Some(PaletteSource {
-            repo_root,
+            repo_root: repo_root.to_path_buf(),
             colors_dir,
             generate_colors,
         })
@@ -1054,6 +1099,43 @@ fn detect_palette_source(anchor: &Path) -> Option<PaletteSource> {
             repo_root = %repo_root.display(),
             "dotfiles repo found but its palette source is incomplete (missing colors/ or \
              scripts/generate-colors); palette switcher hidden (R3.2)"
+        );
+        None
+    }
+}
+
+/// Discovers the dotfiles' laptop-display toggle script under `repo_root` (task
+/// 11.8; R4.2, R8.5; analysis §7.3).
+///
+/// The Display page's laptop-panel switch runs this script rather than
+/// re-implementing it, so the switch exists only when the script does: the path
+/// [`LAPTOP_TOGGLE_SCRIPT_RELATIVE`] under the root resolved by
+/// [`resolve_repo_root`] must be an executable regular file. Anything else hides the
+/// switch like a missing app, logged at `info` (R4.2); the rest of the Display page
+/// is unaffected. A `None` root was already logged by [`resolve_repo_root`].
+fn detect_laptop_toggle_script(repo_root: Option<&Path>) -> Option<PathBuf> {
+    let repo_root = repo_root?;
+    let script: PathBuf = std::iter::once(repo_root)
+        .chain(LAPTOP_TOGGLE_SCRIPT_RELATIVE.iter().map(Path::new))
+        .collect();
+    // A command's program is a `String`, so a path that is not valid UTF-8 could only
+    // be run after a lossy conversion — that is, a different path. Treat it as not
+    // runnable, so detection never reports a script the Display page cannot run.
+    if script.to_str().is_none() {
+        tracing::info!(
+            script = %script.display(),
+            "the dotfiles laptop-display toggle script path is not valid UTF-8, so it \
+             cannot be run; the laptop-display toggle is hidden (R4.2)"
+        );
+        None
+    } else if is_executable_file(&script) {
+        tracing::debug!(script = %script.display(), "laptop-display toggle script discovered");
+        Some(script)
+    } else {
+        tracing::info!(
+            script = %script.display(),
+            "the dotfiles laptop-display toggle script is missing or not executable; the \
+             laptop-display toggle is hidden (R4.2)"
         );
         None
     }
@@ -1611,6 +1693,126 @@ mod tests {
             Capabilities::detect(&base_inputs())
                 .palette_source()
                 .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_executable_toggle_script_in_the_repo_yields_the_laptop_toggle() {
+        // Task 11.8 (R4.2/R8.5): the laptop-display toggle script is found under the
+        // same repo root as the palette source and is present only as an executable
+        // file. The palette source's own completeness does not matter to it.
+        let root = tempfile::tempdir().expect("temp dir");
+        let (anchor, repo) = build_repo_with_symlinked_anchor(root.path(), false, false);
+        let scripts = repo.join("scripts");
+        fs::create_dir_all(&scripts).expect("create scripts dir");
+        write_executable(&scripts, "hypr-toggle-laptop-display");
+
+        let mut inputs = base_inputs();
+        inputs.palette_config_anchor = anchor;
+        let caps = Capabilities::detect(&inputs);
+
+        let expected = fs::canonicalize(&repo)
+            .expect("canonicalize the repo root")
+            .join("scripts")
+            .join("hypr-toggle-laptop-display");
+        assert_eq!(caps.laptop_toggle_script(), Some(expected.as_path()));
+        assert!(
+            caps.palette_source().is_none(),
+            "the incomplete palette source is hidden independently"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_or_non_executable_toggle_script_hides_the_laptop_toggle() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A complete palette repo without the script: the toggle is hidden and the
+        // reason is logged at `info` as a hidden item (R4.2).
+        let root = tempfile::tempdir().expect("temp dir");
+        let (anchor, repo) = build_repo_with_symlinked_anchor(root.path(), true, true);
+        let mut inputs = base_inputs();
+        inputs.palette_config_anchor = anchor;
+
+        let mut caps = None;
+        let events = crate::testing::capture_logs(|| caps = Some(Capabilities::detect(&inputs)));
+        let caps = caps.expect("detection ran");
+        assert!(caps.laptop_toggle_script().is_none());
+        assert!(caps.palette_source().is_some());
+        assert!(
+            events
+                .iter()
+                .any(|event| event.level == tracing::Level::INFO
+                    && event.message.contains("laptop-display toggle is hidden")),
+            "a missing toggle script must be logged at info, got {events:?}"
+        );
+
+        // Present but not executable: still hidden, since the app could not run it.
+        let script = repo.join("scripts").join("hypr-toggle-laptop-display");
+        fs::write(&script, b"#!/bin/sh\n").expect("write the script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o644))
+            .expect("clear the executable bits");
+        assert!(
+            Capabilities::detect(&inputs)
+                .laptop_toggle_script()
+                .is_none(),
+            "a non-executable script must hide the toggle"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_toggle_script_path_hides_the_laptop_toggle() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        // An executable script under a repo root whose path is not valid UTF-8 could
+        // only be run through a lossy conversion, so it is reported absent and the
+        // reason is logged at `info` with the other hide reasons (R4.2).
+        let root = tempfile::tempdir().expect("temp dir");
+        let repo = root.path().join(OsStr::from_bytes(b"dot\xfffiles"));
+        let scripts = repo.join("scripts");
+        fs::create_dir_all(&scripts).expect("create a non-UTF-8 repo dir");
+        write_executable(&scripts, "hypr-toggle-laptop-display");
+        assert!(is_executable_file(
+            &scripts.join("hypr-toggle-laptop-display")
+        ));
+
+        let mut script = None;
+        let events =
+            crate::testing::capture_logs(|| script = detect_laptop_toggle_script(Some(&repo)));
+        assert!(script.is_none(), "a non-UTF-8 path must not be reported");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.level == tracing::Level::INFO
+                    && event.message.contains("not valid UTF-8")
+                    && event.message.contains("laptop-display toggle is hidden")),
+            "the reason must be logged at info, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn no_repo_behind_the_config_hides_the_laptop_toggle() {
+        // Without a repo root there is nowhere to find the script (R8.5); the shared
+        // root resolution logs once at `info`, naming both repo-backed controls.
+        let mut caps = None;
+        let events = crate::testing::capture_logs(|| {
+            caps = Some(Capabilities::detect(&base_inputs()));
+        });
+        assert!(
+            caps.expect("detection ran")
+                .laptop_toggle_script()
+                .is_none()
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.level == tracing::Level::INFO
+                    && event.message.contains("palette switcher")
+                    && event.message.contains("laptop-display toggle")),
+            "the missing repo root must be logged at info naming both controls, got {events:?}"
         );
     }
 

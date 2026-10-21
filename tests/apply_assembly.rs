@@ -104,7 +104,7 @@ fn display_model(fx: &FixtureDotfiles) -> DisplayModel {
         HYPRCTL_MONITORS_JSON,
         "",
     ))]);
-    DisplayModel::load(&probe, fx.config_path("hypr/monitors.conf"))
+    DisplayModel::load(&probe, fx.config_path("hypr/monitors.conf"), None)
         .expect("a successful probe yields a model")
 }
 

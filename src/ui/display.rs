@@ -1,5 +1,5 @@
-//! The Display page's bespoke GTK glue (task 6.1; architecture §7; R2.3, R4.2,
-//! R4.4, R5.2).
+//! The Display page's bespoke GTK glue (tasks 6.1, 11.8; architecture §7; R2.3,
+//! R4.2, R4.4, R5.2).
 //!
 //! # Why this page is bespoke, not declarative
 //!
@@ -36,10 +36,22 @@
 //! into the model and written to `monitors.conf` on Apply; the page reports each
 //! through the shared `on_changed` callback so the window's Apply/Reset chrome lights
 //! up (as the declarative pages do). The laptop panel's enable control is
-//! **runtime-only**: toggling it calls [`DisplayModel::toggle_laptop`] immediately
-//! (writing the hotplug state file + a live `hyprctl reload`), never staging and never
-//! marking the page dirty. Its mode/scale, by contrast, are staged like any monitor's
-//! (the single-source gotcha, analysis §6.2).
+//! **runtime-only**: toggling it calls [`DisplayModel::toggle_laptop`] immediately,
+//! which runs the dotfiles' `scripts/hypr-toggle-laptop-display` between two reads of
+//! the compositor's monitor list (task 11.8), never staging and never marking the
+//! page dirty. The switch is re-drawn from the state *read* afterwards, so a toggle
+//! that did not take snaps back and shows why underneath. The control exists only
+//! when detection found the script (R4.2). Its mode/scale, by contrast, are staged
+//! like any monitor's (the single-source gotcha, analysis §6.2).
+//!
+//! The script runs synchronously on the GTK main thread through the real
+//! [`CommandRunner`](crate::system::command::CommandRunner), like the other runtime
+//! controls (Sound, Network, Notifications). Its 5 s timeout bounds the script
+//! itself, **not** the wait for its bar-relaunch child: on a timeout the runner
+//! kills only the script's shell and then keeps reading the captured output until
+//! the orphaned `launch-eww-bars` closes the pipes it inherited, so a slow eww
+//! restart can freeze the window for longer. Moving the toggle off the main thread
+//! is a recorded follow-up in `docs/tasks.md`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -82,6 +94,9 @@ impl DisplayPage {
     /// Rebuilds the controls from the current model — called by the window after a
     /// Reset or a committed Apply so the drop-downs snap to the model's values.
     pub(crate) fn rerender(&self) {
+        // A Reset or Apply is unrelated to the last laptop toggle, so its failure
+        // note must not survive into the re-rendered page.
+        self.inner.laptop_error.replace(None);
         self.inner.rebuild();
     }
 }
@@ -101,6 +116,9 @@ struct Inner {
     /// Display page's dirty marker (task 5.3). Not called for the runtime laptop
     /// toggle, which never changes dirty state.
     on_changed: Rc<dyn Fn()>,
+    /// Why the last laptop toggle did not take, shown under the switch until the
+    /// next toggle (R5.5), or `None` after a successful one.
+    laptop_error: RefCell<Option<String>>,
 }
 
 impl Inner {
@@ -151,10 +169,16 @@ impl Inner {
         section.set_margin_start(SECTION_SPACING);
         section.set_margin_end(SECTION_SPACING);
 
-        // The enable control. A laptop panel's is the runtime toggle (R5.2); a
-        // non-laptop's is a staged monitors.conf edit (only when the file is editable).
+        // The enable control. A laptop panel's is the runtime toggle (R5.2), shown
+        // only when the dotfiles script behind it was detected (R4.2); a non-laptop's
+        // is a staged monitors.conf edit (only when the file is editable).
         if model.is_laptop(index) {
-            section.append(&self.build_laptop_toggle(model, index));
+            if model.laptop_toggle_available(index) {
+                section.append(&self.build_laptop_toggle(model, index));
+                if let Some(error) = self.laptop_error.borrow().as_deref() {
+                    section.append(&note(error));
+                }
+            }
         } else if model.records_editable() {
             section.append(&self.build_enable_switch(model, index));
         }
@@ -176,10 +200,9 @@ impl Inner {
         frame
     }
 
-    /// The runtime laptop-display enable toggle (R5.2): flipping it applies the panel
-    /// on/off live via a `hyprctl eval 'hl.monitor({ … })'` call and writes/removes the
-    /// hotplug state file, never staging or touching `monitors.conf`. Its position
-    /// reflects the panel's current live state.
+    /// The runtime laptop-display enable toggle (R5.2): flipping it runs the dotfiles'
+    /// toggle script (task 11.8), never staging or touching `monitors.conf`. Its
+    /// position is the panel's last *read* state.
     fn build_laptop_toggle(self: &Rc<Self>, model: &DisplayModel, index: usize) -> GtkBox {
         let switch = Switch::new();
         switch.set_halign(Align::End);
@@ -316,19 +339,20 @@ impl Inner {
     /// Applies the runtime laptop toggle immediately (R5.2), then rebuilds.
     ///
     /// Runtime-only: it does not stage or change dirty state, so it does not call
-    /// `on_changed`; the live `hyprctl eval` monitor call runs through the real
-    /// system runner. The model records the new live-enabled state, which the rebuild
-    /// reflects.
+    /// `on_changed`. The script and the reads around it run through the real system
+    /// runner; the model has already logged any failure, so here it is only kept for
+    /// the rebuild to show under the switch, which is re-drawn from the read state.
     fn toggle_laptop(self: &Rc<Self>, index: usize, enable: bool) {
         let runner = SystemCommandRunner::new();
-        {
-            let mut model = self.model.borrow_mut();
-            if let Some(model) = model.as_mut() {
-                if let Err(error) = model.toggle_laptop(index, enable, &runner) {
-                    tracing::error!(%error, "the laptop-display toggle could not update its state file");
-                }
-            }
-        }
+        let result = self
+            .model
+            .borrow_mut()
+            .as_mut()
+            .map(|model| model.toggle_laptop(index, enable, &runner));
+        self.laptop_error.replace(match result {
+            Some(Err(error)) => Some(format!("The laptop display was not switched: {error}.")),
+            Some(Ok(())) | None => None,
+        });
         self.rebuild();
     }
 }
@@ -354,6 +378,7 @@ pub(crate) fn build(
         content: content.clone(),
         model,
         on_changed,
+        laptop_error: RefCell::new(None),
     });
     inner.rebuild();
 

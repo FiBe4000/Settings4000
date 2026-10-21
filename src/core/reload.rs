@@ -628,31 +628,6 @@ impl HyprlandEval {
         })
     }
 
-    /// A monitor rule applied live, rendered as a flat `hl.monitor({ … })` call with
-    /// the fields in the given order, e.g.
-    /// `hl.monitor({ output = "eDP-1", disabled = true })`.
-    ///
-    /// This is the Lua replacement for `hyprctl keyword monitor …` and the exact form
-    /// the dotfiles' own `scripts/hypr-toggle-laptop-display` issues (dotfiles commit
-    /// `8a5b20b`). `hl.monitor` *merges* into the existing rule for the output, so a
-    /// re-enable must pass `disabled = false` explicitly (analysis §7.1). Fails with
-    /// [`LuaLiteralError::InvalidKey`] when a field name is not a bare Lua key.
-    pub fn monitor<K: AsRef<str>>(
-        fields: &[(K, LuaLiteral)],
-    ) -> Result<HyprlandEval, LuaLiteralError> {
-        if let Some((bad, _)) = fields.iter().find(|(key, _)| !is_identifier(key.as_ref())) {
-            return Err(LuaLiteralError::InvalidKey(bad.as_ref().to_string()));
-        }
-        let body = fields
-            .iter()
-            .map(|(key, value)| format!("{} = {value}", key.as_ref()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        Ok(HyprlandEval {
-            code: format!("hl.monitor({{ {body} }})"),
-        })
-    }
-
     /// The rendered Lua source.
     pub fn code(&self) -> &str {
         &self.code
@@ -1677,25 +1652,6 @@ mod tests {
                 "{path:?} must be refused as a table path"
             );
         }
-        assert!(matches!(
-            HyprlandEval::monitor(&[("output-name", LuaLiteral::boolean(true))]),
-            Err(LuaLiteralError::InvalidKey(_))
-        ));
-    }
-
-    #[test]
-    fn eval_renders_a_flat_monitor_rule_in_field_order() {
-        // The exact call `scripts/hypr-toggle-laptop-display` issues to turn the panel
-        // off (dotfiles commit 8a5b20b).
-        let eval = HyprlandEval::monitor(&[
-            ("output", LuaLiteral::string("eDP-1").unwrap()),
-            ("disabled", LuaLiteral::boolean(true)),
-        ])
-        .expect("renders");
-        assert_eq!(
-            eval.code(),
-            r#"hl.monitor({ output = "eDP-1", disabled = true })"#
-        );
     }
 
     #[test]

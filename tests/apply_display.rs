@@ -14,18 +14,25 @@
 //! the model** (R5.6): the window checks [`DisplayModel::check_conflict`] and
 //! aborts *before* building the plan, so the conflict test here asserts that
 //! guard rather than an [`ApplyOutcome::Conflicted`].
+//!
+//! The runtime laptop toggle (task 11.8) is covered here too, from detection
+//! onwards: the fixture repo's `scripts/hypr-toggle-laptop-display` stub is
+//! discovered behind the deployed symlinks (R8.5) and run — through the mock
+//! runner only, never for real — and a tree without it hides the toggle (R4.2).
 
 use std::fs;
 
 use settings4000::core::apply::{self, ApplyPlan};
-use settings4000::core::detect::{Binary, Capabilities};
+use settings4000::core::detect::{Binary, Capabilities, DetectionInputs};
 use settings4000::core::display::DisplayModel;
 use settings4000::core::freshness::FreshnessTracker;
+use settings4000::core::notifd::NotifdReplies;
 use settings4000::core::reload::ReloadParams;
 use settings4000::system::command::{Command, CommandOutput, MockCommandRunner};
 use settings4000::system::signal::MockProcessSignaller;
 use settings4000::testing::{
-    FixtureDotfiles, assert_repo_untouched_except, expect_applied, replace_once, repo_snapshot,
+    FixtureDotfiles, assert_repo_untouched_except, capture_logs, expect_applied, replace_once,
+    repo_snapshot,
 };
 
 /// A canned `hyprctl monitors all -j` payload for the fixture's laptop panel.
@@ -59,7 +66,7 @@ fn load_model(fx: &FixtureDotfiles) -> DisplayModel {
         HYPRCTL_MONITORS_JSON,
         "",
     ))]);
-    let model = DisplayModel::load(&probe_runner, fx.config_path("hypr/monitors.conf"))
+    let model = DisplayModel::load(&probe_runner, fx.config_path("hypr/monitors.conf"), None)
         .expect("a successful probe yields a model");
     // Sanity-check the probe went through the seam as the app issues it.
     assert_eq!(
@@ -266,4 +273,127 @@ fn an_external_edit_trips_the_models_conflict_guard_before_any_write() {
         externally_edited,
         "nothing was written; the external edit stands"
     );
+}
+
+/// Runs real capability detection over the installed tree, with no binaries,
+/// daemons or compositor — only the filesystem-backed repo discovery matters to
+/// the laptop toggle (R8.5).
+fn detect(fx: &FixtureDotfiles) -> Capabilities {
+    Capabilities::detect(&DetectionInputs {
+        path: None,
+        running_processes: Vec::new(),
+        hyprland_socket: None,
+        palette_config_anchor: fx.config_path("hypr/colors.conf"),
+        config_paths: Vec::new(),
+        hyprctl_status: None,
+        hyprland_lua_config: fx.config_path("hypr/hyprland.lua"),
+        notifd_replies: NotifdReplies::default(),
+        notifd_unit_file: fx.config_path("systemd/user/notifd.service"),
+    })
+}
+
+/// [`HYPRCTL_MONITORS_JSON`] with the panel switched off, as `monitors all -j`
+/// lists a disabled output.
+fn monitors_json_disabled() -> String {
+    let disabled = HYPRCTL_MONITORS_JSON.replace(r#""disabled": false"#, r#""disabled": true"#);
+    assert_ne!(disabled, HYPRCTL_MONITORS_JSON);
+    disabled
+}
+
+#[test]
+fn the_laptop_toggle_runs_the_detected_repo_script_between_two_reads() {
+    // Task 11.8 acceptance, end to end from detection: the toggle script is resolved
+    // from the fixture repo root behind the deployed symlinks (R8.5); toggling issues
+    // exactly `hyprctl monitors all -j`, the script by its repo path with no
+    // arguments, and the re-read; the switch shows the re-read state; and no repo
+    // file — monitors.conf included — changes.
+    let fx = FixtureDotfiles::install();
+    let before = repo_snapshot(&fx);
+    let caps = detect(&fx);
+    let script = fx.repo_path("scripts/hypr-toggle-laptop-display");
+    assert_eq!(caps.laptop_toggle_script(), Some(script.as_path()));
+
+    let probe_runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake_with_streams(
+        0,
+        HYPRCTL_MONITORS_JSON,
+        "",
+    ))]);
+    let mut model = DisplayModel::load(
+        &probe_runner,
+        fx.config_path("hypr/monitors.conf"),
+        caps.laptop_toggle_script().map(|path| path.to_path_buf()),
+    )
+    .expect("a successful probe yields a model");
+    assert!(model.laptop_toggle_available(0));
+    assert!(model.laptop_enabled(0));
+
+    let runner = MockCommandRunner::with_outcomes([
+        Ok(CommandOutput::fake_with_streams(
+            0,
+            HYPRCTL_MONITORS_JSON,
+            "",
+        )),
+        Ok(CommandOutput::fake(0)),
+        Ok(CommandOutput::fake_with_streams(
+            0,
+            &monitors_json_disabled(),
+            "",
+        )),
+    ]);
+    model
+        .toggle_laptop(0, false, &runner)
+        .expect("the re-read confirms the switch");
+
+    let script_program = script.to_str().expect("the fixture path is UTF-8");
+    assert_eq!(
+        runner.recorded(),
+        vec![
+            Command::new("hyprctl").args(["monitors", "all", "-j"]),
+            Command::new(script_program),
+            Command::new("hyprctl").args(["monitors", "all", "-j"]),
+        ]
+    );
+    assert!(!model.laptop_enabled(0), "the switch shows the read state");
+    assert!(!model.is_dirty(), "the runtime toggle never stages");
+    assert_repo_untouched_except(&fx, &before, &[]);
+}
+
+#[test]
+fn a_tree_without_the_toggle_script_hides_the_laptop_toggle_and_logs_it() {
+    // R4.2: with the script gone from the repo, detection reports no toggle script
+    // and logs the hidden control at `info`; the model built from that offers no
+    // laptop toggle while the panel's mode/scale rows (monitors.conf) stay.
+    let fx = FixtureDotfiles::install();
+    fs::remove_file(fx.repo_path("scripts/hypr-toggle-laptop-display"))
+        .expect("remove the toggle script stub");
+
+    let mut caps = None;
+    let events = capture_logs(|| caps = Some(detect(&fx)));
+    let caps = caps.expect("detection ran");
+    assert!(caps.laptop_toggle_script().is_none());
+    assert!(
+        events
+            .iter()
+            .any(|event| event.level == tracing::Level::INFO
+                && event.message.contains("laptop-display toggle is hidden")),
+        "the hidden toggle must be logged at info, got {events:?}"
+    );
+    assert!(
+        caps.palette_source().is_some(),
+        "the rest of the repo-backed detection is unaffected"
+    );
+
+    let model = DisplayModel::load(
+        &MockCommandRunner::with_outcomes([Ok(CommandOutput::fake_with_streams(
+            0,
+            HYPRCTL_MONITORS_JSON,
+            "",
+        ))]),
+        fx.config_path("hypr/monitors.conf"),
+        caps.laptop_toggle_script().map(|path| path.to_path_buf()),
+    )
+    .expect("a successful probe yields a model");
+    assert!(model.is_laptop(0));
+    assert!(!model.laptop_toggle_available(0), "no script, no toggle");
+    assert!(model.records_editable(), "the file-backed rows stay");
 }

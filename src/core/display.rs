@@ -1,5 +1,5 @@
-//! GTK-free Display-page domain model (task 6.1; architecture §6 "Staging" + the
-//! Display page; R2.3, R4.2, R4.4, R5.2, R5.4, R8.3, R6.2).
+//! GTK-free Display-page domain model (tasks 6.1, 11.8; architecture §6 "Staging" +
+//! the Display page; R2.3, R4.2, R4.4, R5.2, R5.4, R8.3, R8.5, R6.2).
 //!
 //! # What this module is
 //!
@@ -7,7 +7,7 @@
 //! `config/hypr/monitors.conf`, applied on **Apply**) and offers a runtime-only
 //! laptop-display toggle (applied immediately, R5.2). Unlike every other setting in
 //! the app, monitors are **discovered at runtime** — their names, count, and the
-//! modes they support come from `hyprctl monitors -j` — so they do not fit the
+//! modes they support come from `hyprctl monitors all -j` — so they do not fit the
 //! fixed, fieldless [`SettingId`](crate::core::model::SettingId) enum the
 //! [`SettingsStore`](crate::core::store) is keyed by.
 //!
@@ -28,11 +28,12 @@
 //! (R6.2); the layering guard in `tests/module_boundaries.rs` forbids any
 //! `gtk`/`relm4` import here.
 //!
-//! # The merge: `monitors.conf` records + `hyprctl monitors -j`
+//! # The merge: `monitors.conf` records + `hyprctl monitors all -j`
 //!
 //! [`DisplayModel::from_sources`] merges two views of each output (R2.3):
 //!
-//! - the **live** state from `hyprctl monitors -j` — which outputs exist, the modes
+//! - the **live** state from `hyprctl monitors all -j` (`all` so a disabled output
+//!   is still listed, with `"disabled": true`) — which outputs exist, the modes
 //!   they *support* (for the resolution/refresh drop-downs), and their current
 //!   mode/scale/position/enabled state;
 //! - the **configured** values from the matching `monitor=` record — the drop-downs'
@@ -56,24 +57,27 @@
 //! comma/newline/`#` in any written value, so the record stays awk-parseable. The
 //! app never touches the script.
 //!
-//! # The laptop-display toggle is runtime-only (R5.2)
+//! # The laptop-display toggle runs the dotfiles script (R5.2; task 11.8)
 //!
 //! The internal panel's on/off state is **not** a `monitor=…,disable` record — the
-//! hotplug watcher (`scripts/hypr-monitor-hotplug`) would fight one. Instead the
-//! toggle mirrors the dotfiles' own `scripts/hypr-toggle-laptop-display`: it applies
-//! the on/off state live with one `hl.monitor({ … })` call sent through `hyprctl eval`
-//! (`disabled = true` to turn off; the record's mode, position, scale and extras with
-//! `disabled = false` to turn on — see [`HyprlandEval::monitor`]) and writes/removes
-//! `/tmp/hypr-laptop-display-forced` (the watcher's manual override: present = keep
-//! the panel on rather than auto-disabling it when docked). `hyprctl keyword monitor`
-//! is not used: Hyprland's Lua config provider rejects it (analysis §7.1). The live
-//! call — not `hyprctl reload`, which re-reads the still-active record and so cannot
-//! turn the panel off — is what actually toggles the panel. Task 11.8 replaces this
-//! in-app toggle with a run of the dotfiles script itself. It never stages, never
-//! becomes dirty, and never touches `monitors.conf`
-//! ([`Self::toggle_laptop`]). The panel's *mode and scale*, by contrast, live in the
-//! eDP `monitor=` record and are edited like any other monitor (the single-source
-//! gotcha) — only its enablement is runtime.
+//! hotplug watcher (`scripts/hypr-monitor-hotplug`) and the Lua monitor loader in
+//! `hyprland.lua` own the docked state, and a record would fight them (analysis
+//! §7.3, §8.1). The dotfiles ship a script for exactly this switch,
+//! `scripts/hypr-toggle-laptop-display`: it issues the live `hl.monitor({ … })`
+//! call, creates or removes the `/tmp/hypr-laptop-display-forced` override the
+//! watcher and the loader read, sends a desktop notification and relaunches the eww
+//! bars. The app runs that script — found under the dotfiles repo root by detection
+//! (R8.5), and the switch is hidden when it is absent (R4.2) — instead of
+//! re-implementing any of its steps, so it never writes the state file, never
+//! launches bars and never issues a monitor call itself.
+//!
+//! The script is a **pure toggle** (it takes no arguments and flips whatever state
+//! it finds), so the app brackets it with two reads of the compositor's view and
+//! renders the switch from the *read* state, never from an assumed one
+//! ([`DisplayModel::toggle_laptop`]). The toggle never stages, never becomes dirty,
+//! and never touches `monitors.conf`. The panel's *mode and scale*, by contrast,
+//! live in the eDP `monitor=` record and are edited like any other monitor (the
+//! single-source gotcha) — only its enablement is runtime.
 
 use std::fmt;
 use std::fs;
@@ -81,23 +85,21 @@ use std::path::PathBuf;
 
 use serde_json::Value as JsonValue;
 
-use crate::core::apply::{FileWrite, WriteMode, WriteValidation};
+use crate::core::apply::{FileWrite, WriteMode, WriteValidation, stderr_excerpt};
 use crate::core::freshness::FreshnessTracker;
 use crate::core::model::{
     SCALE_RANGE, SettingId, Value, validate_float_range, validate_monitor_mode,
     validate_monitor_position,
 };
-use crate::core::reload::{BackingFile, HyprlandEval};
-use crate::parsers::lua_literal::{LuaLiteral, LuaLiteralError};
+use crate::core::reload::BackingFile;
 use crate::parsers::monitors::{EditError, MonitorField, MonitorState, MonitorsFile};
-use crate::system::command::{Command, CommandRunner};
+use crate::system::command::{Command, CommandError, CommandRunner};
 
-/// The hotplug state-file path the laptop-display toggle writes/removes (analysis
-/// §4/§6.2). Its presence tells `scripts/hypr-monitor-hotplug` to keep the internal
-/// panel on rather than auto-disabling it when an external monitor is connected. The
-/// path is a field of [`DisplayModel`] (defaulting to this) so tests inject a
-/// temporary path instead of touching the real `/tmp` file.
-const LAPTOP_STATE_FILE: &str = "/tmp/hypr-laptop-display-forced";
+/// The output the dotfiles' toggle script switches. `scripts/hypr-toggle-laptop-display`
+/// hard-codes `eDP-1` (analysis §7.3), so the app offers the switch only on the
+/// output of that name: on a panel named anything else the script would flip a
+/// different output than the one the switch is drawn under.
+const TOGGLE_SCRIPT_OUTPUT: &str = "eDP-1";
 
 /// Output-name prefix identifying an internal laptop panel (`eDP-1`, `eDP-2`, …),
 /// matched case-insensitively. Such a monitor's enablement uses the runtime toggle
@@ -162,11 +164,12 @@ struct Monitor {
     /// Whether this is an internal laptop panel (its enablement is the runtime
     /// toggle, R5.2). Its mode/scale are still edited via the record.
     is_laptop: bool,
-    /// Whether the compositor currently reports this output as enabled (`!disabled`
-    /// from `hyprctl`). For a laptop panel this — not the record — drives the runtime
-    /// enable switch's position (the panel's live on/off state), matching how
-    /// `scripts/hypr-toggle-laptop-display` reads the current state; it is updated in
-    /// place when [`DisplayModel::toggle_laptop`] flips the panel.
+    /// Whether the compositor last reported this output as enabled (`!disabled` in
+    /// `hyprctl monitors all -j`). For a laptop panel this — not the record — drives
+    /// the runtime enable switch's position (the panel's live on/off state). It is
+    /// only ever set from a read: at load, and by [`DisplayModel::toggle_laptop`]
+    /// from the reads around the toggle script, never from the state a toggle was
+    /// expected to produce.
     live_enabled: bool,
     /// The `monitor=` record name that specifically configures this output (an exact
     /// name or a matched `desc:` rule), or `None` when only the catch-all/defaults
@@ -208,7 +211,7 @@ impl Monitor {
 }
 
 /// The Display page's staging model: the merged monitors, the parsed `monitors.conf`,
-/// and the runtime laptop-toggle state file (task 6.1).
+/// and the dotfiles script behind the runtime laptop toggle (tasks 6.1, 11.8).
 ///
 /// See the module docs for the design. Built by [`Self::load`] (production) or
 /// [`Self::from_sources`] (tests, with canned `hyprctl` JSON). Its file-backed edits
@@ -225,9 +228,11 @@ pub struct DisplayModel {
     /// (R8.5). The writer canonicalizes it, so a symlink into a dotfiles repo has its
     /// real target rewritten and the link preserved.
     monitors_conf_path: PathBuf,
-    /// The hotplug state-file path the laptop toggle writes/removes. Defaults to
-    /// [`LAPTOP_STATE_FILE`]; overridden in tests.
-    state_file: PathBuf,
+    /// The dotfiles' `scripts/hypr-toggle-laptop-display`, as found by detection
+    /// ([`Capabilities::laptop_toggle_script`](crate::core::detect::Capabilities::laptop_toggle_script)),
+    /// or `None` when it is absent — which hides the laptop toggle (R4.2) while the
+    /// rest of the page stays.
+    laptop_toggle_script: Option<PathBuf>,
     /// The freshness baseline for `monitors.conf`, recorded from the exact bytes read
     /// at load (R5.6). [`Self::apply_contribution`]'s caller conflict-checks against it
     /// before writing so an external edit is not clobbered, and [`Self::commit`]
@@ -273,6 +278,189 @@ impl fmt::Display for DisplayWriteError {
 
 impl std::error::Error for DisplayWriteError {}
 
+/// Why [`DisplayModel::toggle_laptop`] did not leave the laptop panel in the
+/// requested state (task 11.8).
+///
+/// Every variant is non-fatal (R5.5): the page shows the message next to the switch,
+/// which is re-drawn from the last *read* panel state. The script's own failure, when
+/// there was one, rides along — it explains a failed switch, but on its own does not
+/// make a switch fail (see [`DisplayModel::toggle_laptop`]).
+#[derive(Debug)]
+pub enum LaptopToggleError {
+    /// The toggle is not offered for this monitor: detection found no toggle script,
+    /// or the monitor is not the output the script switches. The page hides the
+    /// switch in that case, so this is reached only by a caller that skipped
+    /// [`DisplayModel::laptop_toggle_available`].
+    Unavailable,
+    /// The state could not be read *before* the script, so the script was not run:
+    /// without that read a pure toggle could flip the panel the wrong way.
+    ReadBefore(PanelReadError),
+    /// The script ran, but the state could not be read afterwards, so whether the
+    /// panel switched is unknown; the switch keeps showing the state read before.
+    ReadAfter {
+        /// Why the second read failed.
+        error: PanelReadError,
+        /// The script's own failure, or `None` when it reported success.
+        script: Option<ToggleScriptFailure>,
+    },
+    /// The script ran, but the panel is still in the state it was in before — the
+    /// script failed, or something else (the hotplug watcher) switched it back.
+    Unchanged {
+        /// The panel's state, read after the script (unchanged from before).
+        enabled: bool,
+        /// The script's own failure, or `None` when it reported success.
+        script: Option<ToggleScriptFailure>,
+    },
+}
+
+impl fmt::Display for LaptopToggleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LaptopToggleError::Unavailable => {
+                f.write_str("the laptop-display toggle script is not available for this panel")
+            }
+            LaptopToggleError::ReadBefore(error) => write!(
+                f,
+                "the panel's current state could not be read, so the toggle script was not \
+                 run: {error}"
+            ),
+            LaptopToggleError::ReadAfter { error, script } => {
+                write!(
+                    f,
+                    "the toggle script ran, but the panel's new state could not be read: {error}"
+                )?;
+                write_script_failure(f, script.as_ref())
+            }
+            LaptopToggleError::Unchanged { enabled, script } => {
+                let state = if *enabled { "on" } else { "off" };
+                write!(
+                    f,
+                    "the panel is still {state} after running the toggle script"
+                )?;
+                write_script_failure(f, script.as_ref())
+            }
+        }
+    }
+}
+
+impl std::error::Error for LaptopToggleError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LaptopToggleError::Unavailable => None,
+            LaptopToggleError::ReadBefore(error) | LaptopToggleError::ReadAfter { error, .. } => {
+                Some(error)
+            }
+            LaptopToggleError::Unchanged { script, .. } => {
+                script.as_ref().map(|failure| failure as _)
+            }
+        }
+    }
+}
+
+/// Appends `; <script failure>` to a [`LaptopToggleError`] message when the script
+/// itself reported one.
+fn write_script_failure(
+    f: &mut fmt::Formatter<'_>,
+    script: Option<&ToggleScriptFailure>,
+) -> fmt::Result {
+    match script {
+        Some(failure) => write!(f, "; {failure}"),
+        None => Ok(()),
+    }
+}
+
+/// Why the laptop panel's state could not be read from `hyprctl monitors all -j`
+/// around a toggle (task 11.8).
+#[derive(Debug)]
+pub enum PanelReadError {
+    /// `hyprctl` could not be run at all (not found, timed out).
+    Command(CommandError),
+    /// `hyprctl` ran and reported failure — typically the compositor is gone.
+    Failed {
+        /// The exit code, or `None` when the process was terminated by a signal.
+        code: Option<i32>,
+    },
+    /// The reply does not list the panel (or is not the expected JSON), so its
+    /// state is unknown.
+    OutputMissing {
+        /// The output that was looked for (`eDP-1`).
+        output: String,
+    },
+}
+
+impl fmt::Display for PanelReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PanelReadError::Command(error) => write!(f, "could not run hyprctl: {error}"),
+            PanelReadError::Failed { code: Some(code) } => {
+                write!(f, "hyprctl monitors exited with status {code}")
+            }
+            PanelReadError::Failed { code: None } => {
+                f.write_str("hyprctl monitors was terminated by a signal")
+            }
+            PanelReadError::OutputMissing { output } => {
+                write!(f, "hyprctl does not list the output {output}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PanelReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PanelReadError::Command(error) => Some(error),
+            PanelReadError::Failed { .. } | PanelReadError::OutputMissing { .. } => None,
+        }
+    }
+}
+
+/// How the dotfiles' laptop-display toggle script failed (task 11.8). Carried by a
+/// [`LaptopToggleError`] to explain a failed switch, and logged at `warn` when the
+/// panel switched despite it.
+#[derive(Debug)]
+pub enum ToggleScriptFailure {
+    /// The script could not be run (spawn failure) or overran the runner's timeout
+    /// and was killed.
+    Command(CommandError),
+    /// The script ran and exited unsuccessfully.
+    Failed {
+        /// The exit code, or `None` when the process was terminated by a signal.
+        code: Option<i32>,
+        /// The start of the captured stderr, bounded and marked like the Apply
+        /// pipeline's excerpts, or `None` when the script wrote nothing to stderr.
+        stderr: Option<String>,
+    },
+}
+
+impl fmt::Display for ToggleScriptFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ToggleScriptFailure::Command(error) => {
+                write!(f, "the toggle script could not be run: {error}")
+            }
+            ToggleScriptFailure::Failed { code, stderr } => {
+                match code {
+                    Some(code) => write!(f, "the toggle script exited with status {code}")?,
+                    None => f.write_str("the toggle script was terminated by a signal")?,
+                }
+                match stderr {
+                    Some(stderr) => write!(f, ": {stderr}"),
+                    None => Ok(()),
+                }
+            }
+        }
+    }
+}
+
+impl std::error::Error for ToggleScriptFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ToggleScriptFailure::Command(error) => Some(error),
+            ToggleScriptFailure::Failed { .. } => None,
+        }
+    }
+}
+
 /// The Display page's contribution to an [`ApplyPlan`](crate::core::apply::ApplyPlan):
 /// the single `monitors.conf` write plus the value validations to re-check (R8.3).
 #[derive(Debug)]
@@ -294,18 +482,15 @@ impl DisplayModel {
     /// enumerate — so the Display page degrades to a placeholder (R4.2). A readable
     /// probe with an unreadable `monitors.conf` still yields a model (the file-backed
     /// controls are then hidden, R4.4).
-    pub fn load(runner: &dyn CommandRunner, monitors_conf_path: PathBuf) -> Option<Self> {
-        Self::load_with(runner, monitors_conf_path, PathBuf::from(LAPTOP_STATE_FILE))
-    }
-
-    /// [`Self::load`] with an explicit laptop state-file path, so tests exercise the
-    /// runtime toggle against a temporary path instead of the real `/tmp` file.
-    fn load_with(
+    ///
+    /// `laptop_toggle_script` is the detected dotfiles toggle script (R8.5); `None`
+    /// hides the laptop toggle (R4.2) — detection has already logged why.
+    pub fn load(
         runner: &dyn CommandRunner,
         monitors_conf_path: PathBuf,
-        state_file: PathBuf,
+        laptop_toggle_script: Option<PathBuf>,
     ) -> Option<Self> {
-        let command = Command::new("hyprctl").args(["monitors", "all", "-j"]);
+        let command = monitors_probe();
         let output = match runner.run(&command) {
             Ok(output) if output.success() => output,
             Ok(_) => {
@@ -340,11 +525,11 @@ impl DisplayModel {
             monitors_conf.as_deref(),
             &json,
             monitors_conf_path,
-            state_file,
+            laptop_toggle_script,
         ))
     }
 
-    /// Merges `monitors.conf` (if readable) with the `hyprctl monitors -j` JSON into
+    /// Merges `monitors.conf` (if readable) with the `hyprctl monitors all -j` JSON into
     /// the page model — the pure core, tested with canned JSON (R6.2).
     ///
     /// Each live monitor from the JSON is matched to a specific `monitor=` record
@@ -357,15 +542,31 @@ impl DisplayModel {
         monitors_conf: Option<&str>,
         hyprctl_json: &str,
         monitors_conf_path: PathBuf,
-        state_file: PathBuf,
+        laptop_toggle_script: Option<PathBuf>,
     ) -> Self {
         let records = monitors_conf.map(|text| MonitorsFile::parse(text).0);
         let live = parse_hyprctl_monitors(hyprctl_json);
 
-        let monitors = live
+        let monitors: Vec<Monitor> = live
             .into_iter()
             .map(|monitor| merge_monitor(monitor, records.as_ref()))
             .collect();
+
+        // A laptop panel the script does not address gets no toggle (see
+        // `TOGGLE_SCRIPT_OUTPUT`); say so, since detection found the script and the
+        // user would otherwise wonder where the switch went (R4.2).
+        if laptop_toggle_script.is_some() {
+            for monitor in monitors
+                .iter()
+                .filter(|monitor| monitor.is_laptop && monitor.output_name != TOGGLE_SCRIPT_OUTPUT)
+            {
+                tracing::info!(
+                    output = %monitor.output_name,
+                    "the dotfiles laptop-display toggle script only switches {TOGGLE_SCRIPT_OUTPUT}; \
+                     no laptop toggle is offered for this panel (R4.2)"
+                );
+            }
+        }
 
         // Baseline monitors.conf from the exact bytes read, so a pre-write conflict
         // check catches an external edit since load (R5.6). Nothing is recorded when
@@ -379,7 +580,7 @@ impl DisplayModel {
             monitors,
             records,
             monitors_conf_path,
-            state_file,
+            laptop_toggle_script,
             freshness,
         }
     }
@@ -485,17 +686,25 @@ impl DisplayModel {
 
     /// Whether monitor `index` is currently enabled (staged-or-original). For a
     /// non-laptop output this drives its enable switch; a laptop panel's live
-    /// enablement is the runtime toggle instead (see [`Self::laptop_forced_on`]).
+    /// enablement is the runtime toggle instead (see [`Self::laptop_enabled`]).
     pub fn effective_enabled(&self, index: usize) -> bool {
         self.monitors[index].effective().enabled
     }
 
-    /// Whether the laptop panel `index` is currently on, from the live `hyprctl`
-    /// state (`!disabled`). This drives the runtime laptop enable switch's position —
-    /// the panel's actual on/off state, as `scripts/hypr-toggle-laptop-display` reads
-    /// it — independent of the staged record edits.
+    /// Whether the laptop panel `index` is currently on, from the last `hyprctl`
+    /// read (`!disabled`). This drives the runtime laptop enable switch's position —
+    /// the panel's actual on/off state — independent of the staged record edits.
     pub fn laptop_enabled(&self, index: usize) -> bool {
         self.monitors[index].live_enabled
+    }
+
+    /// Whether monitor `index` gets the runtime laptop toggle (R4.2, R5.2; task
+    /// 11.8): it is the output the dotfiles' toggle script switches (`eDP-1`, which
+    /// the script hard-codes) and detection found the script. Otherwise the toggle
+    /// is hidden, never shown greyed out; the panel's file-backed mode and scale
+    /// controls are unaffected.
+    pub fn laptop_toggle_available(&self, index: usize) -> bool {
+        self.toggle_program(index).is_some()
     }
 
     /// Whether `monitors.conf` changed on disk since it was loaded (R5.6).
@@ -517,10 +726,10 @@ impl DisplayModel {
     /// based on the superseded bytes) so a subsequent Apply builds on the current
     /// contents. Returns `None` if the compositor can no longer be probed.
     pub fn reload(&self, runner: &dyn CommandRunner) -> Option<Self> {
-        Self::load_with(
+        Self::load(
             runner,
             self.monitors_conf_path.clone(),
-            self.state_file.clone(),
+            self.laptop_toggle_script.clone(),
         )
     }
 
@@ -790,152 +999,169 @@ impl DisplayModel {
         validations
     }
 
-    /// Applies the laptop-display enable toggle immediately (runtime-only, R5.2),
-    /// mirroring `scripts/hypr-toggle-laptop-display` (analysis §7.1, §8.1).
+    /// Turns the laptop panel `index` on (`enable == true`) or off right away by
+    /// running the dotfiles' toggle script (runtime-only, R5.2; task 11.8; analysis
+    /// §7.3, §8.1).
     ///
-    /// Turning the panel **on** re-applies its configured record live with
-    /// `hyprctl eval 'hl.monitor({ output = "<output>", mode = …, position = …,
-    /// scale = …[, <extras>], disabled = false })'` and **creates** the hotplug
-    /// override state file; turning it **off** sends `hl.monitor({ output =
-    /// "<output>", disabled = true })` and **removes** the state file. A live call is
-    /// deliberate: `hyprctl reload` would re-read the (active) `monitor=` record and so
-    /// cannot turn the panel off. `disabled = false` must be explicit on re-enable
-    /// because `hl.monitor` merges into the existing rule, so an earlier `disabled =
-    /// true` would otherwise stick. The state file is the manual override the hotplug
-    /// watcher and the Lua monitor loader read (present = keep the panel on when
-    /// docked), so neither fights the choice.
+    /// `scripts/hypr-toggle-laptop-display` is a **pure toggle** — no arguments, it
+    /// flips whatever state it finds — and it owns every step of a switch: the live
+    /// `hl.monitor` call, the hotplug watcher's `/tmp/hypr-laptop-display-forced`
+    /// override, the desktop notification and the eww bar relaunch. The app only
+    /// brackets it with reads, issuing exactly this sequence through `runner`:
     ///
-    /// This never stages, never becomes dirty, and **never touches `monitors.conf`**
-    /// (which would fight the watcher). The live call is best-effort (R5.5): a refusal
-    /// or a failure to run is logged but does not fail the toggle, since the persistent
-    /// override is still recorded. The stored live-enabled state is updated so the
-    /// switch reflects the new state. (Task 11.8 replaces this with a run of the
-    /// dotfiles script, which owns the state file itself.)
+    /// 1. `hyprctl monitors all -j` — the panel's current state (`all` also lists a
+    ///    disabled output, with `"disabled": true`). When the panel already is in the
+    ///    requested state — the hotplug watcher or the keybind changed it since the
+    ///    page was drawn — nothing else runs: the pure toggle would flip it *away*
+    ///    from what the user asked for. The switch just catches up with the read.
+    /// 2. the script, with no arguments. It inherits the app's environment (the
+    ///    [`SystemCommandRunner`](crate::system::command::SystemCommandRunner) never
+    ///    clears it), which it needs: `HYPRLAND_INSTANCE_SIGNATURE` to reach the
+    ///    compositor and `HOME` to find its helper scripts.
+    /// 3. `hyprctl monitors all -j` again — the state the switch shows afterwards.
+    ///
+    /// Only that second read decides the outcome, never the script's exit status:
+    /// the script ends with the bar relaunch, whose failure says nothing about the
+    /// panel, and the runner's 5 s timeout can stop it after the monitor call already
+    /// went through. A changed state is success (a script failure alongside it is
+    /// logged at `warn`); an unchanged state is [`LaptopToggleError::Unchanged`].
+    /// The stored state — and with it [`Self::laptop_enabled`] and the switch — is
+    /// only ever updated from a read. Every failure is logged and returned for the
+    /// page to show; none is fatal (R5.5).
+    ///
+    /// This never stages, never becomes dirty, and never touches `monitors.conf`.
     pub fn toggle_laptop(
         &mut self,
         index: usize,
         enable: bool,
         runner: &dyn CommandRunner,
-    ) -> std::io::Result<()> {
-        // Apply live; every failure is non-fatal (R5.5). `HyprlandEval::run` logs a
-        // refusal itself, so only a value that cannot be rendered is logged here.
-        match self.laptop_monitor_eval(index, enable) {
-            Ok(eval) => {
-                let _ = eval.run(runner);
-            }
-            Err(error) => tracing::error!(
+    ) -> Result<(), LaptopToggleError> {
+        let Some(script) = self.toggle_program(index).map(str::to_string) else {
+            return Err(LaptopToggleError::Unavailable);
+        };
+        let output = self.monitors[index].output_name.clone();
+
+        let before = read_output_enabled(runner, &output).map_err(|error| {
+            tracing::error!(
+                %output,
                 %error,
-                "the laptop panel's monitor rule cannot be rendered as a Lua call; \
-                 skipping the live toggle (R5.5)"
-            ),
+                "could not read the laptop panel's state; the toggle script was not run (R5.5)"
+            );
+            LaptopToggleError::ReadBefore(error)
+        })?;
+        self.monitors[index].live_enabled = before;
+        if before == enable {
+            tracing::info!(
+                %output,
+                enabled = before,
+                "the laptop panel is already in the requested state; the toggle script was \
+                 not run (R5.2)"
+            );
+            return Ok(());
         }
 
-        // Record/clear the hotplug override, matching the toggle script's directions
-        // (on ⇒ touch, off ⇒ remove).
-        if enable {
-            fs::write(&self.state_file, b"")?;
-            tracing::info!(
-                path = %self.state_file.display(),
-                "enabled the laptop display and set the hotplug override (R5.2)"
-            );
-        } else {
-            match fs::remove_file(&self.state_file) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
+        let script_failure = run_toggle_script(runner, &script).err();
+
+        let after = match read_output_enabled(runner, &output) {
+            Ok(after) => after,
+            Err(error) => {
+                tracing::error!(
+                    %output,
+                    %error,
+                    "the laptop-display toggle script ran, but the panel's new state could \
+                     not be read (R5.5)"
+                );
+                return Err(LaptopToggleError::ReadAfter {
+                    error,
+                    script: script_failure,
+                });
             }
-            tracing::info!(
-                path = %self.state_file.display(),
-                "disabled the laptop display and cleared the hotplug override (R5.2)"
+        };
+        self.monitors[index].live_enabled = after;
+
+        if after == before {
+            tracing::error!(
+                %output,
+                enabled = after,
+                "the laptop panel did not change state after the toggle script (R5.5)"
+            );
+            return Err(LaptopToggleError::Unchanged {
+                enabled: after,
+                script: script_failure,
+            });
+        }
+        if let Some(failure) = &script_failure {
+            tracing::warn!(
+                %output,
+                %failure,
+                "the laptop-display toggle script reported a failure, but the panel did switch"
             );
         }
-
-        self.monitors[index].live_enabled = enable;
+        tracing::info!(
+            %output,
+            enabled = after,
+            "switched the laptop display with the dotfiles toggle script (R5.2)"
+        );
         Ok(())
     }
 
-    /// The live `hl.monitor({ … })` call that turns the laptop panel at `index` on or
-    /// off (see [`Self::toggle_laptop`]).
+    /// The toggle script to run for monitor `index`, as the program string of a
+    /// [`Command`], or `None` when the laptop toggle is unavailable for it (see
+    /// [`Self::laptop_toggle_available`]).
     ///
-    /// The re-enable fields come from the panel's configured `monitor=` record — the
-    /// single source of its mode and scale (analysis §6.2) — so the live re-enable
-    /// matches the on-disk record, extras and all. They are converted the way the
-    /// dotfiles' Lua monitor loader in `hyprland.lua` converts a record: the mode,
-    /// position and scale stay strings, and each trailing `key,value` pair becomes a
-    /// field whose value is a number when it reads as one (`bitdepth = 10`) and a
-    /// string otherwise. With no record body (an unreadable `monitors.conf`, or a
-    /// record-less output) the merged config's mode/position/scale are used.
-    ///
-    /// This deliberately differs from `scripts/hypr-toggle-laptop-display` in one
-    /// field: the script hard-codes `position = "0x1440"` while the app passes the
-    /// record's own position (often `auto`). Task 11.8 replaces this in-app call with
-    /// the script itself, so the difference is interim and not worth reconciling.
-    fn laptop_monitor_eval(
-        &self,
-        index: usize,
-        enable: bool,
-    ) -> Result<HyprlandEval, LuaLiteralError> {
-        let mut fields = vec![(
-            "output".to_string(),
-            LuaLiteral::string(&self.monitors[index].output_name)?,
-        )];
-        if enable {
-            let body = self.laptop_record_body(index);
-            let parts: Vec<&str> = body.split(',').map(str::trim).collect();
-            // Fields 1-3 of the body are mode, position, scale, with the loader's
-            // defaults for a short record.
-            for (position, (key, default)) in [
-                ("mode", "preferred"),
-                ("position", "auto"),
-                ("scale", "auto"),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let value = parts.get(position).copied().unwrap_or(default);
-                fields.push((key.to_string(), LuaLiteral::string(value)?));
-            }
-            // The frozen grammar allows only `key,value` pairs after the scale; an odd
-            // trailing field without a value is ignored, exactly as the loader does.
-            for pair in parts.get(3..).unwrap_or_default().chunks_exact(2) {
-                fields.push((pair[0].to_string(), lua_number_or_string(pair[1])?));
-            }
+    /// Detection only reports a script whose path is valid UTF-8 (a [`Command`] holds
+    /// its program as a `String`), so the `to_str` here cannot fail for a detected
+    /// script; it is a plain conversion, never a lossy one.
+    fn toggle_program(&self, index: usize) -> Option<&str> {
+        if self.monitors[index].output_name != TOGGLE_SCRIPT_OUTPUT {
+            return None;
         }
-        fields.push(("disabled".to_string(), LuaLiteral::boolean(!enable)));
-        HyprlandEval::monitor(&fields)
-    }
-
-    /// The `<mode>,<position>,<scale>[,<extras>]` body of the laptop panel's
-    /// configured `monitor=` record, or the merged config's mode/position/scale when
-    /// there is no record body (an unreadable `monitors.conf`, or a record-less
-    /// output).
-    fn laptop_record_body(&self, index: usize) -> String {
-        if let (Some(records), Some(name)) =
-            (&self.records, self.monitors[index].record_name.as_deref())
-        {
-            if let Some(body) = records.record_body(name) {
-                return body.to_string();
-            }
-        }
-        let config = &self.monitors[index].original;
-        format!("{},{},{}", config.mode, config.position, config.scale)
+        self.laptop_toggle_script.as_deref()?.to_str()
     }
 }
 
-/// Converts a `monitors.conf` extra value the way `hyprland.lua`'s monitor loader
-/// does with Lua's `tonumber(v) or v`: an integer or a finite decimal becomes a bare
-/// number, anything else a quoted string (subject to the forbidden-character rule).
-/// Lua's `tonumber` also accepts hex (`0x10`), which this does not; the frozen
-/// `monitors.conf` grammar never carries hex extras, so the two agree in practice.
-fn lua_number_or_string(value: &str) -> Result<LuaLiteral, LuaLiteralError> {
-    if let Ok(integer) = value.parse::<i64>() {
-        return Ok(LuaLiteral::integer(integer));
+/// The compositor probe both the page load and the laptop toggle read the monitors
+/// from: `hyprctl monitors all -j`. `all` matters — without it a disabled output is
+/// simply missing from the list, while with it the output stays listed with
+/// `"disabled": true`, so the page can show a switched-off panel at all.
+fn monitors_probe() -> Command {
+    Command::new("hyprctl").args(["monitors", "all", "-j"])
+}
+
+/// Reads whether `output` is enabled from a fresh [`monitors_probe`] (task 11.8).
+fn read_output_enabled(runner: &dyn CommandRunner, output: &str) -> Result<bool, PanelReadError> {
+    let reply = runner
+        .run(&monitors_probe())
+        .map_err(PanelReadError::Command)?;
+    if !reply.success() {
+        return Err(PanelReadError::Failed { code: reply.code() });
     }
-    match value.parse::<f64>() {
-        // Rust also parses `inf`/`NaN`, which Lua's `tonumber` does not; those fall
-        // through to a string, as they would in the loader.
-        Ok(float) if float.is_finite() => LuaLiteral::float(float),
-        _ => LuaLiteral::string(value),
+    // Malformed JSON parses to no monitors (logged by the parser), which reads as
+    // the output missing — either way the state is unknown.
+    parse_hyprctl_monitors(&String::from_utf8_lossy(reply.stdout()))
+        .into_iter()
+        .find(|monitor| monitor.name == output)
+        .map(|monitor| !monitor.disabled)
+        .ok_or_else(|| PanelReadError::OutputMissing {
+            output: output.to_string(),
+        })
+}
+
+/// Runs the dotfiles' toggle script `program` with no arguments (task 11.8).
+///
+/// The failure, if any, is returned for [`DisplayModel::toggle_laptop`] to weigh
+/// against its re-read; the runner has already logged the invocation (R7.3).
+fn run_toggle_script(runner: &dyn CommandRunner, program: &str) -> Result<(), ToggleScriptFailure> {
+    let reply = runner
+        .run(&Command::new(program))
+        .map_err(ToggleScriptFailure::Command)?;
+    if reply.success() {
+        Ok(())
+    } else {
+        Err(ToggleScriptFailure::Failed {
+            code: reply.code(),
+            stderr: stderr_excerpt(reply.stderr()),
+        })
     }
 }
 
@@ -1004,7 +1230,7 @@ fn active_state(config: &MonitorConfig) -> MonitorState {
     }
 }
 
-/// A monitor as reported by `hyprctl monitors -j`, before merging with the records.
+/// A monitor as reported by `hyprctl monitors all -j`, before merging with the records.
 struct LiveMonitor {
     name: String,
     description: String,
@@ -1017,7 +1243,7 @@ struct LiveMonitor {
     available: Vec<Mode>,
 }
 
-/// Parses the `hyprctl monitors -j` JSON array into [`LiveMonitor`]s, skipping any
+/// Parses the `hyprctl monitors all -j` JSON array into [`LiveMonitor`]s, skipping any
 /// entry without a name. Malformed JSON yields an empty list — never a panic.
 fn parse_hyprctl_monitors(json: &str) -> Vec<LiveMonitor> {
     let parsed: JsonValue = match serde_json::from_str(json) {
@@ -1239,9 +1465,9 @@ fn trim_float(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::system::command::{Command, CommandOutput, MockCommandRunner};
+    use crate::system::command::{Command, CommandError, CommandOutput, MockCommandRunner};
 
-    /// A realistic `hyprctl monitors -j` payload for the personal laptop: one eDP-1
+    /// A realistic `hyprctl monitors all -j` payload for the personal laptop: one eDP-1
     /// output (desc `AU Optronics 0x2036`) with a single available mode, scale 1.07.
     const HYPRCTL_LAPTOP: &str = r#"[
         {
@@ -1283,14 +1509,14 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         String::from_utf8(rendered_contribution(model).write.contents).expect("utf-8")
     }
 
-    /// Builds a laptop-only model with an injected (nonexistent) state file, from the
-    /// canned sources — the merge under test.
+    /// Builds a laptop-only model without a detected toggle script, from the canned
+    /// sources — the merge under test.
     fn laptop_model(dir: &std::path::Path) -> DisplayModel {
         DisplayModel::from_sources(
             Some(MONITORS_CONF),
             HYPRCTL_LAPTOP,
             dir.join("monitors.conf"),
-            dir.join("forced"),
+            None,
         )
     }
 
@@ -1339,8 +1565,8 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             HYPRCTL_LAPTOP,
             "",
         ))]);
-        let model = DisplayModel::load_with(&runner, path, dir.path().join("forced"))
-            .expect("a successful probe yields a model");
+        let model =
+            DisplayModel::load(&runner, path, None).expect("a successful probe yields a model");
 
         assert_eq!(model.monitor_count(), 1);
         assert_eq!(model.effective_scale(0), "1.066667");
@@ -1357,14 +1583,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         // window shows a placeholder rather than an empty page (R4.2).
         let dir = tempfile::tempdir().expect("temp dir");
         let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake(1))]);
-        assert!(
-            DisplayModel::load_with(
-                &runner,
-                dir.path().join("monitors.conf"),
-                dir.path().join("f")
-            )
-            .is_none()
-        );
+        assert!(DisplayModel::load(&runner, dir.path().join("monitors.conf"), None).is_none());
     }
 
     #[test]
@@ -1378,12 +1597,8 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             HYPRCTL_LAPTOP,
             "",
         ))]);
-        let mut model = DisplayModel::load_with(
-            &runner,
-            dir.path().join("does-not-exist.conf"),
-            dir.path().join("forced"),
-        )
-        .expect("the probe succeeded");
+        let mut model = DisplayModel::load(&runner, dir.path().join("does-not-exist.conf"), None)
+            .expect("the probe succeeded");
 
         assert_eq!(model.monitor_count(), 1);
         assert!(
@@ -1458,12 +1673,8 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         // A monitors.conf where eDP-1 is the ONLY matching record (no later desc rule).
         let conf = "monitor=eDP-1,2880x1800@120,auto,1.333333,bitdepth,10\n";
         let hyprctl = r#"[{"name":"eDP-1","description":"Internal","width":2880,"height":1800,"refreshRate":120.0,"x":0,"y":0,"scale":1.333333,"disabled":false,"availableModes":["2880x1800@120.00Hz","1920x1200@60.00Hz"]}]"#;
-        let mut model = DisplayModel::from_sources(
-            Some(conf),
-            hyprctl,
-            dir.path().join("monitors.conf"),
-            dir.path().join("forced"),
-        );
+        let mut model =
+            DisplayModel::from_sources(Some(conf), hyprctl, dir.path().join("monitors.conf"), None);
 
         model.stage_resolution(0, "1920x1200".to_string());
         let emitted = rendered_text(&model);
@@ -1588,12 +1799,8 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         let dir = tempfile::tempdir().expect("temp dir");
         let conf = "monitor=DP-1,preferred,,1\n";
         let hyprctl = r#"[{"name":"DP-1","description":"Ext","width":1920,"height":1080,"refreshRate":60.0,"x":0,"y":0,"scale":1.0,"disabled":false,"availableModes":["1920x1080@60.00Hz"]}]"#;
-        let mut model = DisplayModel::from_sources(
-            Some(conf),
-            hyprctl,
-            dir.path().join("monitors.conf"),
-            dir.path().join("forced"),
-        );
+        let mut model =
+            DisplayModel::from_sources(Some(conf), hyprctl, dir.path().join("monitors.conf"), None);
         assert_eq!(
             model.effective_position(0),
             "",
@@ -1633,12 +1840,8 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         let dir = tempfile::tempdir().expect("temp dir");
         let conf = "monitor=DP-1,1920x1080\n";
         let hyprctl = r#"[{"name":"DP-1","description":"Ext","width":1920,"height":1080,"refreshRate":60.0,"x":0,"y":0,"scale":1.0,"disabled":false,"availableModes":["1920x1080@60.00Hz"]}]"#;
-        let mut model = DisplayModel::from_sources(
-            Some(conf),
-            hyprctl,
-            dir.path().join("monitors.conf"),
-            dir.path().join("forced"),
-        );
+        let mut model =
+            DisplayModel::from_sources(Some(conf), hyprctl, dir.path().join("monitors.conf"), None);
 
         model.stage_scale(0, "1.25".to_string());
         assert!(model.is_dirty());
@@ -1671,7 +1874,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             Some(MONITORS_CONF),
             hyprctl,
             dir.path().join("monitors.conf"),
-            dir.path().join("forced"),
+            None,
         );
         assert!(!model.is_laptop(0));
         assert!(model.effective_enabled(0));
@@ -1684,74 +1887,89 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         );
     }
 
-    #[test]
-    fn laptop_toggle_uses_hyprctl_eval_and_the_state_file_without_touching_monitors_conf() {
-        // Test #3 (F1), revised by task 11.2: the runtime laptop toggle mirrors
-        // hypr-toggle-laptop-display — it applies the on/off state with a live
-        // `hl.monitor({ … })` call through `hyprctl eval` (NOT `hyprctl reload`, which
-        // cannot disable the panel, and NOT `hyprctl keyword`, which a Lua-config
-        // session rejects), creates the state file on enable and removes it on
-        // disable, and never writes monitors.conf.
-        let dir = tempfile::tempdir().expect("temp dir");
-        let conf_path = dir.path().join("monitors.conf");
-        std::fs::write(&conf_path, MONITORS_CONF).expect("write monitors.conf");
-        let state_file = dir.path().join("forced");
-        let mut model = DisplayModel::from_sources(
+    /// A placeholder path for the detected toggle script. The mock runner never
+    /// executes anything, so the file need not exist.
+    const TOGGLE_SCRIPT: &str = "/test/dotfiles/scripts/hypr-toggle-laptop-display";
+
+    /// [`HYPRCTL_LAPTOP`] with the panel switched off, as `monitors all -j` lists it.
+    fn hyprctl_laptop_disabled() -> String {
+        let disabled = HYPRCTL_LAPTOP.replace(r#""disabled": false"#, r#""disabled": true"#);
+        assert_ne!(disabled, HYPRCTL_LAPTOP, "the fixture must carry the field");
+        disabled
+    }
+
+    /// A successful `hyprctl monitors all -j` reply carrying `json`.
+    fn probe_reply(json: &str) -> Result<CommandOutput, CommandError> {
+        Ok(CommandOutput::fake_with_streams(0, json, ""))
+    }
+
+    /// The exact command sequence of a toggle that ran the script: read, the script
+    /// with no arguments, read again.
+    fn toggle_sequence() -> Vec<Command> {
+        vec![
+            Command::new("hyprctl").args(["monitors", "all", "-j"]),
+            Command::new(TOGGLE_SCRIPT),
+            Command::new("hyprctl").args(["monitors", "all", "-j"]),
+        ]
+    }
+
+    /// The laptop model with the toggle script detected, backed by a real
+    /// `monitors.conf` at `conf_path` so a test can prove the file is never written.
+    fn toggle_model(conf_path: &std::path::Path) -> DisplayModel {
+        std::fs::write(conf_path, MONITORS_CONF).expect("write monitors.conf");
+        DisplayModel::from_sources(
             Some(MONITORS_CONF),
             HYPRCTL_LAPTOP,
-            conf_path.clone(),
-            state_file.clone(),
-        );
-        assert!(model.is_laptop(0));
+            conf_path.to_path_buf(),
+            Some(PathBuf::from(TOGGLE_SCRIPT)),
+        )
+    }
+
+    #[test]
+    fn laptop_toggle_reads_runs_the_script_and_re_reads_without_touching_monitors_conf() {
+        // Task 11.8 acceptance: the toggle issues exactly `hyprctl monitors all -j`,
+        // then the dotfiles script with no arguments, then the re-read; the switch
+        // follows the re-read; monitors.conf is never written (nor is any state file
+        // — the model has no path to one any more).
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conf_path = dir.path().join("monitors.conf");
+        let mut model = toggle_model(&conf_path);
+        assert!(model.laptop_toggle_available(0));
         assert!(
             model.laptop_enabled(0),
-            "the live probe reports the panel on, so the switch starts on"
+            "the load probe reports the panel on"
         );
-        assert!(!state_file.exists());
 
+        // Off: the panel reads on, the script runs, the panel reads off.
         let runner = MockCommandRunner::with_outcomes([
-            Ok(CommandOutput::fake_with_streams(0, "ok", "")),
-            Ok(CommandOutput::fake_with_streams(0, "ok", "")),
+            probe_reply(HYPRCTL_LAPTOP),
+            Ok(CommandOutput::fake(0)),
+            probe_reply(&hyprctl_laptop_disabled()),
         ]);
-
-        // Turn OFF: `hl.monitor({ output = "eDP-1", disabled = true })` + remove the
-        // state file.
         model
             .toggle_laptop(0, false, &runner)
-            .expect("toggle off succeeds");
+            .expect("a toggle the re-read confirms succeeds");
+        assert!(!model.laptop_enabled(0), "the switch shows the read state");
+        let recorded = runner.recorded();
+        assert_eq!(recorded, toggle_sequence());
         assert!(
-            !model.laptop_enabled(0),
-            "the switch reflects the panel now off"
+            recorded[1].args_slice().is_empty(),
+            "the pure-toggle script takes no arguments"
         );
-        assert!(!state_file.exists(), "disable removes the state file");
 
-        // Turn ON: re-apply the record live with an explicit `disabled = false` +
-        // create the state file. The fields are sourced from the winning eDP desc
-        // record (2560x1440,auto,1.066667).
+        // On again: the same sequence, the other way round.
+        let runner = MockCommandRunner::with_outcomes([
+            probe_reply(&hyprctl_laptop_disabled()),
+            Ok(CommandOutput::fake(0)),
+            probe_reply(HYPRCTL_LAPTOP),
+        ]);
         model
             .toggle_laptop(0, true, &runner)
-            .expect("toggle on succeeds");
-        assert!(
-            model.laptop_enabled(0),
-            "the switch reflects the panel now on"
-        );
-        assert!(state_file.exists(), "enable creates the state file");
+            .expect("a toggle the re-read confirms succeeds");
+        assert!(model.laptop_enabled(0));
+        assert_eq!(runner.recorded(), toggle_sequence());
 
-        assert_eq!(
-            runner.recorded(),
-            vec![
-                Command::new("hyprctl").args([
-                    "eval",
-                    r#"hl.monitor({ output = "eDP-1", disabled = true })"#,
-                ]),
-                Command::new("hyprctl").args([
-                    "eval",
-                    r#"hl.monitor({ output = "eDP-1", mode = "2560x1440", position = "auto", scale = "1.066667", disabled = false })"#,
-                ]),
-            ],
-            "the toggle applies via a live hl.monitor eval, never hyprctl reload or keyword"
-        );
-        // The toggle is runtime-only: monitors.conf on disk is byte-for-byte unchanged.
+        assert!(!model.is_dirty(), "the runtime toggle never stages");
         assert_eq!(
             std::fs::read_to_string(&conf_path).expect("read monitors.conf"),
             MONITORS_CONF,
@@ -1760,74 +1978,267 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     }
 
     #[test]
-    fn laptop_re_enable_carries_the_record_extras_as_lua_fields() {
-        // A panel matched by the generic `eDP-1` record (not the AU Optronics desc
-        // rule) re-enables with that record's trailing `bitdepth,10` pair, converted
-        // the way hyprland.lua's monitor loader converts it: a numeric value is a bare
-        // number, the mode/position/scale stay strings.
+    fn an_unchanged_panel_after_the_script_is_an_error_and_the_switch_follows_the_read() {
+        // The script is a pure toggle the app cannot see into: when the re-read shows
+        // no change (the script failed without saying so, or the hotplug watcher
+        // switched the panel straight back), the toggle fails and the switch keeps
+        // the read state rather than the requested one.
         let dir = tempfile::tempdir().expect("temp dir");
-        let hyprctl = r#"[{"name":"eDP-1","description":"Some Panel 0x1234","width":2880,"height":1800,"refreshRate":120.0,"x":0,"y":0,"scale":1.333333,"disabled":false,"availableModes":["2880x1800@120.00Hz"]}]"#;
-        let mut model = DisplayModel::from_sources(
-            Some(MONITORS_CONF),
-            hyprctl,
-            dir.path().join("monitors.conf"),
-            dir.path().join("forced"),
-        );
-        assert!(model.is_laptop(0));
+        let mut model = toggle_model(&dir.path().join("monitors.conf"));
+        let runner = MockCommandRunner::with_outcomes([
+            probe_reply(HYPRCTL_LAPTOP),
+            Ok(CommandOutput::fake(0)),
+            probe_reply(HYPRCTL_LAPTOP),
+        ]);
 
-        let runner =
-            MockCommandRunner::with_outcomes([Ok(CommandOutput::fake_with_streams(0, "ok", ""))]);
+        let error = model
+            .toggle_laptop(0, false, &runner)
+            .expect_err("no change is a failure");
+        assert!(
+            matches!(
+                error,
+                LaptopToggleError::Unchanged {
+                    enabled: true,
+                    script: None
+                }
+            ),
+            "got {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "the panel is still on after running the toggle script"
+        );
+        assert!(model.laptop_enabled(0), "the switch stays on, as read");
+        assert_eq!(runner.recorded(), toggle_sequence());
+    }
+
+    #[test]
+    fn the_script_exit_status_alone_never_decides_the_outcome() {
+        // The script ends with the eww bar relaunch, which exits 1 when it finds no
+        // usable monitor — after the panel already switched. A failed script with a
+        // changed panel is therefore a success; with an unchanged panel the script's
+        // failure explains the error.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut model = toggle_model(&dir.path().join("monitors.conf"));
+        let runner = MockCommandRunner::with_outcomes([
+            probe_reply(HYPRCTL_LAPTOP),
+            Ok(CommandOutput::fake(1)),
+            probe_reply(&hyprctl_laptop_disabled()),
+        ]);
         model
+            .toggle_laptop(0, false, &runner)
+            .expect("the panel switched, so the toggle succeeded");
+        assert!(!model.laptop_enabled(0));
+
+        let runner = MockCommandRunner::with_outcomes([
+            probe_reply(&hyprctl_laptop_disabled()),
+            Ok(CommandOutput::fake_with_streams(
+                2,
+                "",
+                "jq: command not found\n",
+            )),
+            probe_reply(&hyprctl_laptop_disabled()),
+        ]);
+        let error = model
             .toggle_laptop(0, true, &runner)
-            .expect("toggle on succeeds");
+            .expect_err("the panel did not switch");
+        match &error {
+            LaptopToggleError::Unchanged {
+                enabled: false,
+                script:
+                    Some(ToggleScriptFailure::Failed {
+                        code: Some(2),
+                        stderr,
+                    }),
+            } => assert_eq!(stderr.as_deref(), Some("jq: command not found")),
+            other => panic!("expected an unchanged panel with the script failure, got {other:?}"),
+        }
+        assert_eq!(
+            error.to_string(),
+            "the panel is still off after running the toggle script; the toggle script \
+             exited with status 2: jq: command not found"
+        );
+        assert!(!model.laptop_enabled(0));
+    }
+
+    #[test]
+    fn a_timed_out_script_with_a_changed_panel_is_a_success_logged_at_warn() {
+        // The other half of the exit-status rule: the runner's timeout can stop the
+        // script during its bar relaunch, after the monitor call already went
+        // through. The re-read shows the switch, so the toggle succeeds and the
+        // script's failure is only a `warn`.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conf_path = dir.path().join("monitors.conf");
+        let mut outcome = None;
+        let mut enabled = None;
+        // `capture_logs` runs the action twice, so each run builds its own model and
+        // runner.
+        let events = crate::testing::capture_logs(|| {
+            let mut model = toggle_model(&conf_path);
+            let runner = MockCommandRunner::with_outcomes([
+                probe_reply(HYPRCTL_LAPTOP),
+                Err(CommandError::Timeout {
+                    limit: std::time::Duration::from_secs(5),
+                }),
+                probe_reply(&hyprctl_laptop_disabled()),
+            ]);
+            outcome = Some(model.toggle_laptop(0, false, &runner));
+            enabled = Some(model.laptop_enabled(0));
+            assert_eq!(runner.recorded(), toggle_sequence());
+        });
+
+        assert!(
+            matches!(outcome, Some(Ok(()))),
+            "the panel switched, so the toggle succeeded: {outcome:?}"
+        );
+        assert_eq!(enabled, Some(false), "the switch shows the read state");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.level == tracing::Level::WARN
+                    && event
+                        .message
+                        .contains("reported a failure, but the panel did switch")),
+            "the script's timeout must be logged at warn, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_panel_already_in_the_requested_state_runs_no_script() {
+        // The page drew the panel on, but the hotplug watcher switched it off since.
+        // Running the pure toggle now would turn it back on against the user's "off";
+        // the pre-read catches that, nothing runs, and the switch catches up.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut model = toggle_model(&dir.path().join("monitors.conf"));
+        assert!(model.laptop_enabled(0));
+        let runner = MockCommandRunner::with_outcomes([probe_reply(&hyprctl_laptop_disabled())]);
+
+        model
+            .toggle_laptop(0, false, &runner)
+            .expect("the requested state already holds");
+        assert!(!model.laptop_enabled(0));
         assert_eq!(
             runner.recorded(),
-            vec![Command::new("hyprctl").args([
-                "eval",
-                r#"hl.monitor({ output = "eDP-1", mode = "2880x1800@120", position = "auto", scale = "1.333333", bitdepth = 10, disabled = false })"#,
-            ])],
+            vec![Command::new("hyprctl").args(["monitors", "all", "-j"])],
+            "only the read runs"
         );
     }
 
     #[test]
-    fn a_refused_live_laptop_toggle_still_records_the_override() {
-        // R5.5: the live call is best-effort. When Hyprland does not answer `ok` (here
-        // the reply a Lua session gives the retired `keyword` request), the toggle
-        // still records the persistent override and reflects the requested state.
+    fn a_failed_read_before_the_script_runs_nothing_else() {
+        // Without the pre-read the pure toggle could flip the panel the wrong way, so
+        // a failed read stops the toggle before the script.
         let dir = tempfile::tempdir().expect("temp dir");
-        let state_file = dir.path().join("forced");
-        let mut model = DisplayModel::from_sources(
-            Some(MONITORS_CONF),
-            HYPRCTL_LAPTOP,
-            dir.path().join("monitors.conf"),
-            state_file.clone(),
+        let mut model = toggle_model(&dir.path().join("monitors.conf"));
+        let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake(1))]);
+
+        let error = model
+            .toggle_laptop(0, false, &runner)
+            .expect_err("an unreadable state fails the toggle");
+        assert!(
+            matches!(
+                error,
+                LaptopToggleError::ReadBefore(PanelReadError::Failed { code: Some(1) })
+            ),
+            "got {error:?}"
         );
-        let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake_with_streams(
-            0,
-            "keyword can't work with non-legacy parsers. Use eval.",
-            "",
-        ))]);
-        model
-            .toggle_laptop(0, true, &runner)
-            .expect("a refused live call does not fail the toggle");
-        assert!(state_file.exists(), "the override is still recorded");
-        assert!(model.laptop_enabled(0));
+        assert!(error.to_string().contains("toggle script was not run"));
+        assert_eq!(runner.recorded().len(), 1, "the script must not run");
+        assert!(model.laptop_enabled(0), "the state is unchanged");
+
+        // A reply that does not list the panel is just as unreadable.
+        let runner = MockCommandRunner::with_outcomes([probe_reply("[]")]);
+        assert!(matches!(
+            model.toggle_laptop(0, false, &runner),
+            Err(LaptopToggleError::ReadBefore(
+                PanelReadError::OutputMissing { .. }
+            ))
+        ));
+        assert_eq!(runner.recorded().len(), 1);
     }
 
     #[test]
-    fn monitors_conf_extras_convert_like_the_lua_loader() {
-        // `tonumber(v) or v`: integers and finite decimals are bare numbers, anything
-        // else (including Rust-only spellings such as `inf`) a quoted string.
-        assert_eq!(lua_number_or_string("10").unwrap().to_string(), "10");
-        assert_eq!(lua_number_or_string("1.5").unwrap().to_string(), "1.5");
-        assert_eq!(lua_number_or_string("inf").unwrap().to_string(), "\"inf\"");
-        assert_eq!(
-            lua_number_or_string("auto").unwrap().to_string(),
-            "\"auto\""
+    fn a_failed_read_after_the_script_keeps_the_last_read_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut model = toggle_model(&dir.path().join("monitors.conf"));
+        let runner = MockCommandRunner::with_outcomes([
+            probe_reply(HYPRCTL_LAPTOP),
+            Ok(CommandOutput::fake(0)),
+            Err(CommandError::Timeout {
+                limit: std::time::Duration::from_secs(5),
+            }),
+        ]);
+
+        let error = model
+            .toggle_laptop(0, false, &runner)
+            .expect_err("an unknown outcome is a failure");
+        assert!(
+            matches!(
+                error,
+                LaptopToggleError::ReadAfter {
+                    error: PanelReadError::Command(_),
+                    script: None
+                }
+            ),
+            "got {error:?}"
         );
         assert!(
-            lua_number_or_string("a\"b").is_err(),
-            "the forbidden-character rule applies to extras"
+            model.laptop_enabled(0),
+            "the switch keeps the state read before the script"
+        );
+        assert_eq!(runner.recorded(), toggle_sequence());
+    }
+
+    #[test]
+    fn without_the_script_the_laptop_toggle_is_hidden_and_runs_nothing() {
+        // R4.2: no detected script, no switch — and a caller that tries anyway gets
+        // `Unavailable` without a single command being issued. The panel's
+        // file-backed controls stay.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut model = laptop_model(dir.path());
+        assert!(model.is_laptop(0));
+        assert!(!model.laptop_toggle_available(0));
+        assert!(
+            model.records_editable(),
+            "the mode/scale rows are unaffected"
+        );
+
+        let runner = MockCommandRunner::new();
+        assert!(matches!(
+            model.toggle_laptop(0, false, &runner),
+            Err(LaptopToggleError::Unavailable)
+        ));
+        assert!(runner.recorded().is_empty());
+    }
+
+    #[test]
+    fn only_the_output_the_script_switches_gets_the_toggle() {
+        // The script hard-codes eDP-1; a panel named eDP-2 would have the wrong
+        // output flipped under its switch, so it gets none, and that is logged.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let hyprctl = HYPRCTL_LAPTOP.replace("eDP-1", "eDP-2");
+        let mut model = None;
+        let events = crate::testing::capture_logs(|| {
+            model = Some(DisplayModel::from_sources(
+                Some(MONITORS_CONF),
+                &hyprctl,
+                dir.path().join("monitors.conf"),
+                Some(PathBuf::from(TOGGLE_SCRIPT)),
+            ));
+        });
+        let model = model.expect("built");
+        assert!(model.is_laptop(0));
+        assert!(!model.laptop_toggle_available(0));
+        assert!(
+            model.records_editable(),
+            "the mode/scale rows are unaffected"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.level == tracing::Level::INFO
+                    && event.message.contains("only switches eDP-1")),
+            "the missing toggle must be logged at info, got {events:?}"
         );
     }
 
@@ -1844,7 +2255,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             HYPRCTL_LAPTOP,
             "",
         ))]);
-        let mut model = DisplayModel::load_with(&runner, conf_path.clone(), dir.path().join("f"))
+        let mut model = DisplayModel::load(&runner, conf_path.clone(), None)
             .expect("a successful probe yields a model");
 
         assert!(
@@ -1873,8 +2284,8 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             HYPRCTL_LAPTOP,
             "",
         ))]);
-        let mut model = DisplayModel::load_with(&runner, conf_path.clone(), dir.path().join("f"))
-            .expect("the probe succeeded");
+        let mut model =
+            DisplayModel::load(&runner, conf_path.clone(), None).expect("the probe succeeded");
 
         model.stage_scale(0, "1.25".to_string());
         let contribution = rendered_contribution(&model);
@@ -1896,12 +2307,8 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         let dir = tempfile::tempdir().expect("temp dir");
         let conf = "monitor=DP-1,3840x2160@60,0x0,1\n";
         let hyprctl = r#"[{"name":"DP-1","description":"Ext","width":3840,"height":2160,"refreshRate":60.0,"x":0,"y":0,"scale":1.0,"disabled":false,"availableModes":["3840x2160@60.00Hz","2560x1440@144.00Hz","2560x1440@120.00Hz"]}]"#;
-        let mut model = DisplayModel::from_sources(
-            Some(conf),
-            hyprctl,
-            dir.path().join("monitors.conf"),
-            dir.path().join("forced"),
-        );
+        let mut model =
+            DisplayModel::from_sources(Some(conf), hyprctl, dir.path().join("monitors.conf"), None);
         assert_eq!(model.effective_resolution(0), "3840x2160");
         assert_eq!(model.effective_refresh(0), Some("60".to_string()));
 
@@ -1923,7 +2330,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             Some(MONITORS_CONF),
             "{ not json ]",
             dir.path().join("monitors.conf"),
-            dir.path().join("forced"),
+            None,
         );
         assert_eq!(model.monitor_count(), 0);
         assert!(!model.is_dirty());
@@ -1952,12 +2359,8 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         // monitors.conf configures only eDP + a catch-all; DP-5 has no specific record.
         let conf = "monitor=,preferred,auto,1\nmonitor=eDP-1,2880x1800@120,auto,1.333333\n";
         let hyprctl = r#"[{"name":"DP-5","description":"Ext","width":1920,"height":1080,"refreshRate":60.0,"x":0,"y":0,"scale":1.0,"disabled":false,"availableModes":["1920x1080@60.00Hz"]}]"#;
-        let mut model = DisplayModel::from_sources(
-            Some(conf),
-            hyprctl,
-            dir.path().join("monitors.conf"),
-            dir.path().join("forced"),
-        );
+        let mut model =
+            DisplayModel::from_sources(Some(conf), hyprctl, dir.path().join("monitors.conf"), None);
 
         // The baseline comes from the live state (no record to read).
         assert_eq!(model.effective_resolution(0), "1920x1080");
@@ -1985,12 +2388,8 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         let conf = "monitor=desc:Ext Vendor Model,disable\nmonitor=,preferred,auto,1\n";
         // The disabled output still reports its last-known mode via `monitors all -j`.
         let hyprctl = r#"[{"name":"DP-2","description":"Ext Vendor Model","width":3440,"height":1440,"refreshRate":100.0,"x":0,"y":0,"scale":1.0,"disabled":true,"availableModes":["3440x1440@100.00Hz"]}]"#;
-        let mut model = DisplayModel::from_sources(
-            Some(conf),
-            hyprctl,
-            dir.path().join("monitors.conf"),
-            dir.path().join("forced"),
-        );
+        let mut model =
+            DisplayModel::from_sources(Some(conf), hyprctl, dir.path().join("monitors.conf"), None);
         assert!(!model.is_laptop(0));
         assert!(
             !model.effective_enabled(0),
@@ -2018,12 +2417,8 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         let dir = tempfile::tempdir().expect("temp dir");
         let conf = "monitor=,preferred,auto,1\n";
         let hyprctl = r#"[{"name":"DP-7","description":"Ext","width":1920,"height":1080,"refreshRate":60.0,"x":0,"y":0,"scale":1.0,"disabled":false,"availableModes":["1920x1080@60.00Hz"]}]"#;
-        let mut model = DisplayModel::from_sources(
-            Some(conf),
-            hyprctl,
-            dir.path().join("monitors.conf"),
-            dir.path().join("forced"),
-        );
+        let mut model =
+            DisplayModel::from_sources(Some(conf), hyprctl, dir.path().join("monitors.conf"), None);
 
         // First edit: appends a specific DP-7 record, then commit.
         model.stage_scale(0, "1.25".to_string());

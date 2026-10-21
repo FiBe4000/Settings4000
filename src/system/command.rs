@@ -299,6 +299,12 @@ pub trait CommandRunner {
 /// Each invocation is spawned with no controlling shell and with stdin closed;
 /// stdout and stderr are captured and the invocation plus its exit status is
 /// logged (R7.3). A child that overruns the timeout is killed.
+///
+/// The child inherits the app's environment unchanged — it is never cleared or
+/// filtered. Session programs depend on that: `hyprctl` and the dotfiles'
+/// laptop-display toggle script (task 11.8) find the running compositor only
+/// through `HYPRLAND_INSTANCE_SIGNATURE`, and `busctl --user` finds the session
+/// bus through `DBUS_SESSION_BUS_ADDRESS`.
 #[derive(Clone, Debug)]
 pub struct SystemCommandRunner {
     /// Wall-clock deadline applied to every command this runner spawns.
@@ -852,6 +858,29 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "timeout should return shortly after the deadline, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_runner_passes_the_app_environment_through_to_the_child() {
+        // The runner never clears or rewrites the environment: a spawned program
+        // sees the app's own variables. Task 11.8 relies on this — the dotfiles'
+        // laptop-display toggle script reaches the compositor only through
+        // `HYPRLAND_INSTANCE_SIGNATURE`. One variable the test process already has
+        // is read rather than set (mutating the process environment races with the
+        // parallel test harness); `env_clear` or any filtering would drop it.
+        let Ok(path) = std::env::var("PATH") else {
+            return;
+        };
+        let output = SystemCommandRunner::new()
+            .run(&Command::new("printenv").arg("PATH"))
+            .expect("`printenv` should run to completion");
+        assert!(output.success());
+        assert_eq!(
+            output.stdout(),
+            format!("{path}\n").as_bytes(),
+            "the child must inherit PATH unchanged"
         );
     }
 

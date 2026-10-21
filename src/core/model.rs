@@ -142,9 +142,10 @@ pub enum SettingId {
     /// guarantees a writable value (R8.3).
     MonitorPosition,
     /// Whether the laptop's internal display is enabled. Runtime-only (R5.2): the
-    /// toggle drives the existing hotplug mechanism (the
-    /// `/tmp/hypr-laptop-display-forced` state file, task 6.1) and applies
-    /// immediately, so it is never staged and never dirty. It is modelled as a
+    /// toggle runs the dotfiles' `scripts/hypr-toggle-laptop-display`, which drives
+    /// the existing hotplug mechanism (the `/tmp/hypr-laptop-display-forced` state
+    /// file) itself (task 11.8), and applies immediately, so it is never staged and
+    /// never dirty. It is modelled as a
     /// [`SettingId`] purely so the UI can route it by [`SettingId::backing`]; the
     /// store (task 4.2) never holds an `original`/`staged` value for it.
     LaptopDisplayEnabled,

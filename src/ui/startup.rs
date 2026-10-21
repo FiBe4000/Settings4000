@@ -562,7 +562,8 @@ fn home_dir() -> Option<PathBuf> {
 /// probe here, on the startup worker, keeps it off the main thread and inside the
 /// R8.1 cold-start budget (architecture §8). The merge itself is the GTK-free
 /// [`DisplayModel::load`]; a failed probe or an unreadable `monitors.conf` degrades
-/// gracefully there (R4.4).
+/// gracefully there (R4.4). The detected laptop-display toggle script (task 11.8) is
+/// handed over so the model offers the laptop toggle only when it exists (R4.2).
 fn load_display(capabilities: &Capabilities) -> Option<DisplayModel> {
     if !capabilities.hyprland_reloadable() {
         tracing::info!(
@@ -573,7 +574,11 @@ fn load_display(capabilities: &Capabilities) -> Option<DisplayModel> {
         return None;
     }
     let monitors_conf = config_home().join("hypr").join("monitors.conf");
-    DisplayModel::load(&SystemCommandRunner::new(), monitors_conf)
+    DisplayModel::load(
+        &SystemCommandRunner::new(),
+        monitors_conf,
+        capabilities.laptop_toggle_script().map(Path::to_path_buf),
+    )
 }
 
 /// Reads and parses each backing file at `paths`, returning one [`LoadedFile`] per
