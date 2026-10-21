@@ -142,7 +142,7 @@ fn position_and_timeout_apply_byte_exactly_and_reload_swaync() {
 fn a_mid_plan_write_failure_rolls_back_the_earlier_category_write() {
     // Failure injection (1), R5.4: a two-category plan — the Input write first, the
     // Notifications write second, in the window's fold order — where the second
-    // write fails. The already-written input.conf must be restored to its pre-apply
+    // write fails. The already-written input.lua must be restored to its pre-apply
     // bytes, the failure surfaced, and no reload attempted.
     //
     // The injection: the repo's swaync/ directory is made read-only, so the atomic
@@ -151,16 +151,17 @@ fn a_mid_plan_write_failure_rolls_back_the_earlier_category_write() {
     // R5.6) still passes and the pipeline genuinely reaches the write phase.
     let fx = FixtureDotfiles::install();
     let before = repo_snapshot(&fx);
-    let input_path = fx.config_path("hypr/input.conf");
+    let input_path = fx.config_path("hypr/input.lua");
     let swaync_path = swaync_config(&fx);
 
     let mut store = SettingsStore::new();
-    load_into_store(&mut store, &input_path, loaders::input_conf);
+    load_into_store(&mut store, &input_path, loaders::input_lua);
     load_into_store(&mut store, &swaync_path, loaders::swaync_config);
     let input_model = InputModel::load(
         input_path.clone(),
         std::path::Path::new("/nonexistent/evdev.xml"),
-    );
+    )
+    .expect("the fixture input.lua backs the Input page");
     let notifications_model = NotificationsModel::load(swaync_path.clone());
 
     store
@@ -227,8 +228,8 @@ fn a_mid_plan_write_failure_rolls_back_the_earlier_category_write() {
             }
             assert_eq!(
                 failure.rolled_back,
-                vec![fx.repo_path("config/hypr/input.conf")],
-                "the already-written input.conf (resolved to its repo target) is rolled back"
+                vec![fx.repo_path("config/hypr/input.lua")],
+                "the already-written input.lua (resolved to its repo target) is rolled back"
             );
             assert!(failure.rollback_failures.is_empty());
         }

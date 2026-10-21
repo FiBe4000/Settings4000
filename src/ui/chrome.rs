@@ -294,7 +294,7 @@ pub(crate) fn assembly_warning(failure: &PrepareFailure) -> ConflictWarning {
             // edits.
             let (file, noun) = match source {
                 FailedWrite::Display => ("monitors.conf", "display"),
-                FailedWrite::Input => ("input.conf", "input"),
+                FailedWrite::Input => ("input.lua", "input"),
                 FailedWrite::Notifications => ("swaync's config.json", "notification"),
                 FailedWrite::Power => ("hypridle.conf", "power and idle"),
             };
@@ -636,8 +636,8 @@ mod tests {
         // implementation gets wrong: both notes compete for the single toast, and either
         // one silently replacing the other would hide a genuine problem.
         let dir = tempfile::tempdir().expect("temp dir");
-        let target = dir.path().join("input.conf");
-        fs::write(&target, b"kb_layout = us\n").expect("write the write target");
+        let target = dir.path().join("input.lua");
+        fs::write(&target, b"kb_layout = \"us\",\n").expect("write the write target");
         let deleted = dir.path().join("hypridle.conf");
         fs::write(&deleted, b"listener { timeout = 300 }\n").expect("write the other file");
         let mut tracker = FreshnessTracker::new();
@@ -649,9 +649,9 @@ mod tests {
             validations: Vec::new(),
             writes: vec![FileWrite {
                 path: target.clone(),
-                contents: b"kb_layout = us,se\n".to_vec(),
+                contents: b"kb_layout = \"us,se\",\n".to_vec(),
                 changed_keys: vec!["kb_layout".to_string()],
-                backing: BackingFile::InputConf,
+                backing: BackingFile::InputLua,
                 validation: WriteValidation::InPlan,
             }],
             palette: None,
@@ -765,19 +765,19 @@ mod tests {
         // the pipeline against a file edited externally after its baseline was recorded
         // (R5.6), then assert the chrome maps it to a warning naming the file.
         let dir = tempfile::tempdir().expect("temp dir");
-        let target = dir.path().join("input.conf");
-        fs::write(&target, b"kb_layout = us\n").expect("write the fixture");
+        let target = dir.path().join("input.lua");
+        fs::write(&target, b"kb_layout = \"us\",\n").expect("write the fixture");
         let mut tracker = FreshnessTracker::new();
         tracker.record(&target).expect("baseline the file");
-        fs::write(&target, b"kb_layout = se\n").expect("external edit");
+        fs::write(&target, b"kb_layout = \"se\",\n").expect("external edit");
 
         let plan = ApplyPlan {
             validations: Vec::new(),
             writes: vec![FileWrite {
                 path: target.clone(),
-                contents: b"kb_layout = us,se\n".to_vec(),
+                contents: b"kb_layout = \"us,se\",\n".to_vec(),
                 changed_keys: vec!["kb_layout".to_string()],
-                backing: BackingFile::InputConf,
+                backing: BackingFile::InputLua,
                 validation: WriteValidation::InPlan,
             }],
             palette: None,
@@ -794,7 +794,7 @@ mod tests {
         );
         match respond_to_apply(&outcome) {
             ApplyResponse::Warn { detail, .. } => assert!(
-                detail.contains("input.conf"),
+                detail.contains("input.lua"),
                 "the warning names the conflicting file: {detail}"
             ),
             other => panic!("expected Warn, got {other:?}"),
@@ -889,7 +889,7 @@ mod tests {
         // being the whole point of aborting instead of skipping the write.
         for (source, expected_file, expected_noun) in [
             (FailedWrite::Display, "monitors.conf", "display"),
-            (FailedWrite::Input, "input.conf", "input"),
+            (FailedWrite::Input, "input.lua", "input"),
             (
                 FailedWrite::Notifications,
                 "swaync's config.json",

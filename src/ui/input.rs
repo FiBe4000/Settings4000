@@ -24,13 +24,16 @@
 //! - **Touchpad** — a [`WidgetKind::Switch`] each for natural scroll and tap-to-click.
 //!
 //! Every row is [`RowCapability::Always`]: an Input change takes effect via `hyprctl
-//! reload`, and the Input category itself is already `hyprctl`-gated (task 5.1), so no
-//! row has any requirement *beyond* its category — the whole page appears or disappears
-//! with `hyprctl` as one unit (R4.2).
+//! reload config-only`, and the Input category itself is already gated on `hyprctl` and
+//! the Lua config provider (tasks 5.1, 11.2), so no row has any requirement *beyond* its
+//! category. The page additionally needs the [`InputModel`], which exists only for an
+//! `input.lua` the editor fully understands (task 11.4); [`page_rows`] yields no rows
+//! without it, so the whole page appears or disappears as one unit (R4.2).
 
-use crate::core::input::LayoutOption;
+use crate::core::detect::Capabilities;
+use crate::core::input::{InputModel, LayoutOption};
 use crate::core::model::{SENSITIVITY_RANGE, SettingId};
-use crate::ui::row::{DropDownOption, RowCapability, RowDescriptor, WidgetKind};
+use crate::ui::row::{DropDownOption, RowCapability, RowDescriptor, WidgetKind, visible_rows};
 
 /// The keyboard options the Input page exposes as curated switches, each `(token,
 /// label)` (task 6.6, requirements §3).
@@ -49,17 +52,36 @@ const CURATED_KB_OPTIONS: &[(&str, &str)] = &[
 /// the slider with steps.
 const SENSITIVITY_STEP: f64 = 0.05;
 
+/// The Input page's visible rows for the helper the startup load built (tasks 6.6, 11.4;
+/// R4.2): [`rows`] filtered through the per-row capability gate, or **no rows** when there
+/// is no [`InputModel`].
+///
+/// No model means `input.lua` cannot back the page (missing, or holding lines the editor
+/// does not understand) or the category's own gates failed; the startup load has logged
+/// which. The window drops a category whose page has no rows, so this is the one place
+/// that turns "no model" into "no Input page". Kept GTK-free so that decision is
+/// testable headlessly (R6.2).
+pub(crate) fn page_rows(
+    model: Option<&InputModel>,
+    capabilities: &Capabilities,
+) -> Vec<RowDescriptor> {
+    match model {
+        Some(model) => visible_rows(&rows(model.layout_options()), capabilities),
+        None => Vec::new(),
+    }
+}
+
 /// Builds the Input page's row descriptors, with the keyboard-layout add-control
 /// populated from the XKB `layouts` (task 6.6, R2.3).
 ///
-/// The window filters these through the per-row capability gate
-/// ([`visible_rows`](super::row::visible_rows)) and launches a
+/// [`page_rows`] filters these through the per-row capability gate
+/// ([`visible_rows`]) and the window launches a
 /// [`SettingsPage`](super::page::SettingsPage) for the survivors, exactly as the generic
 /// framework path does — the only difference from `page::plan_category` is that the
 /// candidate list is supplied at runtime here rather than hardcoded. An empty `layouts`
 /// (no XKB registry, R4.4) simply yields an add-control with no entries; the layout list
 /// itself still renders whatever is on disk.
-pub(crate) fn rows(layouts: &[LayoutOption]) -> Vec<RowDescriptor> {
+fn rows(layouts: &[LayoutOption]) -> Vec<RowDescriptor> {
     let candidates = layouts
         .iter()
         .map(|layout| {

@@ -13,7 +13,7 @@
 //!   **store-`SettingId` → `swaync/config.json` write glue**: [`render_swaync_config`]
 //!   applies the store's dirty Notifications settings to the JSON through the task-3.4
 //!   adapter, producing one [`FileWrite`] the shared Apply pipeline runs (mirroring
-//!   [`crate::core::input::render_input_conf`]). The pipeline then reloads swaync's
+//!   [`crate::core::input::render_input_lua`]). The pipeline then reloads swaync's
 //!   config with `swaync-client -R` (task 4.4; `-rs` reloads only the stylesheet, so it
 //!   would not pick a position/timeout edit up — task 9.9). Because `config.json` is
 //!   store-loaded (baselined by the store, whose tracker `apply::run` conflict-checks and
@@ -123,7 +123,7 @@ fn decompose_position(token: &str) -> Option<(&str, &str)> {
 /// line (task 6.7; R5.3 item 1).
 ///
 /// This is the pure store-`SettingId` → `config.json` glue, mirroring
-/// [`crate::core::input::render_input_conf`]. It parses the current JSON through the
+/// [`crate::core::input::render_input_lua`]. It parses the current JSON through the
 /// task-3.4 adapter (which preserves key order), then for each `(id, value)` sets **only**
 /// that setting's key(s) in place — [`SettingId::NotificationPosition`] decomposed back
 /// into `positionY`+`positionX`, [`SettingId::NotificationTimeout`] into the integer

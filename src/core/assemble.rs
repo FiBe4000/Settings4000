@@ -80,8 +80,8 @@ pub struct ApplySources<'a> {
     /// The Display page's model (task 6.1): stages monitor edits and renders the
     /// `monitors.conf` write, and owns that file's freshness itself.
     pub display: Option<&'a DisplayModel>,
-    /// The Input page's helper (task 6.6): renders the store's dirty Input settings into
-    /// the `input.conf` write. Not a staging source of its own.
+    /// The Input page's helper (tasks 6.6, 11.4): renders the store's dirty Input settings
+    /// into the `input.lua` write. Not a staging source of its own.
     pub input: Option<&'a InputModel>,
     /// The Notifications page's helper (task 6.7): renders the store's dirty
     /// position/timeout settings into the swaync `config.json` write. Not a staging
@@ -159,7 +159,7 @@ pub enum ConflictedSource {
 pub enum FailedWrite {
     /// The Display model's `monitors.conf` write (task 6.1).
     Display,
-    /// The Input page's `input.conf` write (task 6.6).
+    /// The Input page's `input.lua` write (tasks 6.6, 11.4).
     Input,
     /// The Notifications page's swaync `config.json` write (task 6.7).
     Notifications,
@@ -221,7 +221,7 @@ pub struct AssembledPlan {
     /// The plan to hand [`apply::run`](crate::core::apply::run).
     pub plan: ApplyPlan,
     /// The `(path, contents)` pairs of the writes whose freshness the **store** owns —
-    /// the `input.conf`, swaync `config.json`, and `hypridle.conf` writes — for
+    /// the `input.lua`, swaync `config.json`, and `hypridle.conf` writes — for
     /// [`SettingsStore::commit_apply`].
     ///
     /// Deliberately not every write in the plan. `commit_apply` re-baselines each listed
@@ -425,8 +425,13 @@ fn first_conflicted_source(sources: &ApplySources<'_>) -> Option<ConflictedSourc
 /// blocks. `render` is the page's renderer (e.g.
 /// [`InputModel::apply_contribution`]); `source` names the page in the resulting failure.
 ///
-/// An absent `model` returns without consulting the store: a page whose app is not
-/// installed has no settings loaded, so there is nothing dirty to render either way.
+/// An absent `model` usually means the page was never offered — its app is not installed,
+/// or (for Input) `input.lua` is missing or not fully understood — so the store holds no
+/// settings for it and there is nothing to render. But a manual Refresh can drop the model
+/// while the store still holds edits staged before it (the file was hand-edited into
+/// something the editor refuses, the app was uninstalled). Those edits have no write to
+/// land in, and planning the Apply anyway would let the commit promote values that never
+/// reached disk, so that case aborts like any other unpreparable write.
 fn fold_store_write<M, E: fmt::Display>(
     plan: &mut ApplyPlan,
     store: &SettingsStore,
@@ -435,10 +440,14 @@ fn fold_store_write<M, E: fmt::Display>(
     render: impl FnOnce(&M, &[(SettingId, Value)]) -> Result<Option<FileWrite>, E>,
     source: FailedWrite,
 ) -> Result<(), PrepareFailure> {
+    let dirty = store.dirty_in_category(category);
     let Some(model) = model else {
-        return Ok(());
+        if dirty.is_empty() {
+            return Ok(());
+        }
+        return Err(write_failure(source, PAGE_GONE));
     };
-    match render(model, &store.dirty_in_category(category)) {
+    match render(model, &dirty) {
         Ok(Some(write)) => {
             plan.writes.push(write);
             Ok(())
@@ -447,6 +456,13 @@ fn fold_store_write<M, E: fmt::Display>(
         Err(error) => Err(write_failure(source, error)),
     }
 }
+
+/// The reason quoted when a page's staged edits outlived the page itself (see
+/// [`fold_store_write`]). It tells the user both ways out, since the page — and with it
+/// the per-page controls — is no longer shown.
+const PAGE_GONE: &str = "the page these changes belong to is no longer available (its app \
+                         or its configuration file changed since they were staged); restore \
+                         it and Refresh, or Reset to discard the changes";
 
 /// Logs an aborted Apply and wraps the underlying error into a [`PrepareFailure::Write`].
 ///
@@ -461,7 +477,7 @@ fn write_failure(source: FailedWrite, error: impl fmt::Display) -> PrepareFailur
             tracing::error!(%error, "aborting apply: could not prepare the monitors.conf write")
         }
         FailedWrite::Input => {
-            tracing::error!(%error, "aborting apply: could not prepare the input.conf write")
+            tracing::error!(%error, "aborting apply: could not prepare the input.lua write")
         }
         FailedWrite::Notifications => {
             tracing::error!(%error, "aborting apply: could not prepare the swaync config.json write")

@@ -905,7 +905,7 @@ mod tests {
         // which must be refused on stage — so the framework's invalid-edit path reverts
         // the control rather than letting a bare `kb_layout=` reach Apply.
         let dir = tempfile::tempdir().expect("temp dir should be creatable");
-        let path = dir.path().join("input.conf");
+        let path = dir.path().join("input.lua");
         fs::write(&path, "us,se").expect("write the layout fixture");
         let bytes = fs::read(&path).expect("read back the layout fixture");
         let mut store = SettingsStore::new();

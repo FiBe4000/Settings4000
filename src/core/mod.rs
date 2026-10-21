@@ -74,11 +74,12 @@ pub mod store_write;
 // chrome (`ui::window`), so its public surface is exercised in a non-test build too.
 pub mod display;
 
-// The Input-page domain logic (task 6.6; R2.3, R4.2, R4.4, R5.6, R8.3). It provides the
-// store-`SettingId` -> `input.conf` write glue (rendering the store's dirty Input
-// settings into one surgical `FileWrite` through the hyprlang writer) and the XKB
-// keyboard-layout candidate list. Its `input.conf` freshness is the store's, not its
-// own. It is consumed by the Input page UI glue (`ui::input`) and the plan assembler
+// The Input-page domain logic (tasks 6.6, 11.4; R2.3, R4.2, R4.4, R5.6, R8.3). It
+// provides the read/write address map of `input.lua`, the gate deciding whether that
+// file can back the page, the store-`SettingId` -> `input.lua` write glue (rendering
+// the store's dirty Input settings into one surgical `FileWrite` through the
+// Lua-literal editor) and the XKB keyboard-layout candidate list. Its `input.lua`
+// freshness is the store's, not its own. It is consumed by the Input page UI glue (`ui::input`) and the plan assembler
 // (`assemble`), so its public surface is exercised in a non-test build too.
 pub mod input;
 

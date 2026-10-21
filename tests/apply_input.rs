@@ -1,92 +1,126 @@
-//! End-to-end staged-edit → Apply suite for the **Input** category (task 7.2;
-//! R5.3–R5.6, R6.1).
+//! End-to-end staged-edit → Apply suite for the **Input** category (tasks 7.2,
+//! 11.4; R4.2, R5.3–R5.6, R6.1, R8.3).
 //!
 //! Drives the full store-driven pipeline against the installed fixture tree
-//! (task 7.1): `input.conf` is loaded into a real [`SettingsStore`] through the
-//! app's own loader, edits are staged like the Input page stages them, the plan
-//! is assembled by the app's real plan builder plus [`InputModel`]'s write glue,
-//! and [`apply::run`] executes it with a [`MockCommandRunner`] — so the suite
-//! asserts the exact resulting file bytes at the deployed (symlinked) path, the
-//! exact reload command list, and that every untouched repo file stays
-//! byte-identical. Per-setting byte-exact coverage lives in `core::input`'s unit
-//! tests (task 6.6); this suite exercises a representative edit through real
-//! files, symlinks, and the shared harness.
+//! (task 7.1): `input.lua` — the app-owned `hl.config({ input = { … } })` table
+//! that `hyprland.lua` loads with `dofile` (analysis §7.1) — is loaded into a real
+//! [`SettingsStore`] through the app's own loader, edits are staged like the Input
+//! page stages them, the plan is assembled by the app's real plan builder plus
+//! [`InputModel`]'s write glue, and [`apply::run`] executes it with a
+//! [`MockCommandRunner`] — so the suite asserts the exact resulting file bytes at
+//! the deployed (symlinked) path, the exact reload command list (`hyprctl reload
+//! config-only`), and that every untouched repo file stays byte-identical.
+//! Per-setting byte-exact coverage lives in `core::input`'s unit tests; this suite
+//! exercises representative edits through real files, symlinks, and the shared
+//! harness, plus the two ways the page refuses: hiding for a file it does not fully
+//! understand, and aborting an Apply whose edit the Lua-literal editor refuses.
 //!
 //! One case here reaches beyond the Input page on purpose: an Input apply made while
 //! *another* page's backing file is missing, which is where the conflict check's
 //! write-target scoping is observable end to end (task 9.11).
 
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use settings4000::core::apply::{self, ApplyOutcome};
+use settings4000::core::assemble::{
+    ApplySources, FailedWrite, PrepareFailure, assemble_apply_plan,
+};
 use settings4000::core::detect::{Binary, Capabilities};
-use settings4000::core::input::InputModel;
+use settings4000::core::input::{InputLuaUnavailable, InputModel};
 use settings4000::core::model::{Category, SettingId, Value};
 use settings4000::core::power::PowerModel;
 use settings4000::core::store::SettingsStore;
 use settings4000::system::command::{Command, CommandOutput, MockCommandRunner};
 use settings4000::system::signal::MockProcessSignaller;
 use settings4000::testing::{
-    FixtureDotfiles, assert_repo_untouched_except, base_apply_plan, expect_applied,
-    load_into_store, loaders, replace_once, repo_snapshot,
+    FixtureDotfiles, assert_repo_untouched_except, base_apply_plan, differing_lines,
+    expect_applied, load_into_store, loaders, replace_once, repo_snapshot,
 };
 
-/// The deployed (live XDG) path of `input.conf` — the path the app addresses the
+/// The repo-relative path of `input.lua`, for the untouched-repo assertions.
+const REPO_INPUT_LUA: &str = "config/hypr/input.lua";
+
+/// The deployed (live XDG) path of `input.lua` — the path the app addresses the
 /// file by (R8.5), a symlink into the fixture repo.
-fn input_conf(fx: &FixtureDotfiles) -> std::path::PathBuf {
-    fx.config_path("hypr/input.conf")
+fn input_lua(fx: &FixtureDotfiles) -> PathBuf {
+    fx.config_path("hypr/input.lua")
 }
 
-/// Loads `input.conf` into a fresh store via the app's real loader and builds the
-/// Input page's write model, mirroring the startup wiring (task 5.4/6.6).
-///
-/// The XKB registry path is deliberately nonexistent: the layout add-list is not
-/// under test here, and the model degrades to an empty candidate list (R4.4).
+/// A nonexistent XKB registry: the layout add-list is not under test here, and the
+/// model degrades to an empty candidate list (R4.4).
+fn no_xkb() -> &'static Path {
+    Path::new("/nonexistent/evdev.xml")
+}
+
+/// Loads `input.lua` into a fresh store via the app's real loader and builds the
+/// Input page's write model, mirroring the startup wiring (tasks 5.4, 6.6, 11.4).
 fn store_and_model(fx: &FixtureDotfiles) -> (SettingsStore, InputModel) {
-    let path = input_conf(fx);
+    let path = input_lua(fx);
     let mut store = SettingsStore::new();
-    load_into_store(&mut store, &path, loaders::input_conf);
-    let model = InputModel::load(path, std::path::Path::new("/nonexistent/evdev.xml"));
+    load_into_store(&mut store, &path, loaders::input_lua);
+    let model =
+        InputModel::load(path, no_xkb()).expect("the fixture input.lua backs the Input page");
     (store, model)
 }
 
-/// An Input change reloads only via `hyprctl reload`, so the suite's capabilities
-/// are `hyprctl` on `$PATH` plus a live Hyprland IPC socket (task 4.4).
+/// An Input change reloads only via `hyprctl reload config-only`, so the suite's
+/// capabilities are `hyprctl` on `$PATH` plus a live Hyprland IPC socket (task 4.4).
 fn caps() -> Capabilities {
     Capabilities::for_tests(&[Binary::Hyprctl], &[], true)
 }
 
+/// The one reload an `input.lua` write triggers (task 11.4, architecture §6).
+fn config_only_reload() -> Command {
+    Command::new("hyprctl").arg("reload").arg("config-only")
+}
+
+/// Stages the store's dirty Input settings into a plan exactly as the window's Apply
+/// handler does: the base plan (validations from the store's dirty settings) plus the
+/// Input page's single surgical write.
+fn plan_with_input_write(
+    store: &SettingsStore,
+    model: &InputModel,
+) -> settings4000::core::apply::ApplyPlan {
+    let mut plan = base_apply_plan(store);
+    plan.writes.push(
+        model
+            .apply_contribution(&store.dirty_in_category(Category::Input))
+            .expect("the write renders")
+            .expect("dirty settings produce a write"),
+    );
+    plan
+}
+
 #[test]
-fn a_staged_input_edit_applies_byte_exactly_and_reloads_hyprland() {
-    // The happy path (R5.3): stage a layout reorder and a touchpad toggle, Apply,
-    // and assert the exact resulting bytes, the exact reload list, write-through
-    // to the repo target, and a clean second apply after commit (R5.6).
+fn natural_scroll_off_and_a_third_layout_rewrite_exactly_two_literals_and_reload_config_only() {
+    // The task-11.4 acceptance (R5.3): stage natural scrolling off and a third
+    // keyboard layout, Apply, and assert that exactly the two literal spans changed
+    // in input.lua — every other line byte-identical through the deployed symlink —
+    // and that the only command run is `hyprctl reload config-only`. Then a second
+    // apply after commit must not self-conflict (R5.6).
     let fx = FixtureDotfiles::install();
     let before = repo_snapshot(&fx);
-    let path = input_conf(&fx);
-    let original = fs::read_to_string(&path).expect("read the fixture input.conf");
+    let path = input_lua(&fx);
+    let original = fs::read_to_string(&path).expect("read the fixture input.lua");
 
     let (mut store, model) = store_and_model(&fx);
+    assert_eq!(
+        store.value(SettingId::KeyboardLayouts),
+        Some(&Value::String("us,se".to_string())),
+        "the fixture's layout list loads from its Lua literal"
+    );
     store
         .stage(
             SettingId::KeyboardLayouts,
-            Value::String("se,us".to_string()),
+            Value::String("us,se,de".to_string()),
         )
-        .expect("a layout reorder stages");
+        .expect("a third layout stages");
     store
         .stage(SettingId::TouchpadNaturalScroll, Value::Bool(false))
         .expect("a touchpad toggle stages");
 
-    // Assemble the plan exactly as the window's Apply handler does: the base plan
-    // (validations from the store's dirty settings) plus the Input page's single
-    // surgical FileWrite.
-    let mut plan = base_apply_plan(&store);
-    let write = model
-        .apply_contribution(&store.dirty_in_category(Category::Input))
-        .expect("the write renders")
-        .expect("dirty settings produce a write");
-    plan.writes.push(write);
-
+    let plan = plan_with_input_write(&store, &model);
     let runner = MockCommandRunner::new();
     let signaller = MockProcessSignaller::new();
     let outcome = apply::run(&plan, store.freshness(), &caps(), &runner, &signaller);
@@ -94,14 +128,30 @@ fn a_staged_input_edit_applies_byte_exactly_and_reloads_hyprland() {
     assert!(reload_failures.is_empty(), "a clean apply has no failures");
     assert_eq!(written, vec![path.clone()], "the live path is reported");
 
-    // (a) Exact resulting bytes: the original with ONLY the two value spans
-    // changed — comments, ordering, and every other byte identical (R5.3).
-    let expected = replace_once(&original, "kb_layout=us,se", "kb_layout=se,us");
-    let expected = replace_once(&expected, "natural_scroll=true", "natural_scroll=false");
+    // Exactly the two literal spans changed; nothing else moved (byte diff).
+    let applied = fs::read_to_string(&path).expect("read the applied file");
+    let layout_line = original
+        .lines()
+        .position(|line| line.trim() == "kb_layout = \"us,se\",")
+        .expect("the fixture declares kb_layout");
+    let scroll_line = original
+        .lines()
+        .position(|line| line.trim() == "natural_scroll = true,")
+        .expect("the fixture declares natural_scroll");
     assert_eq!(
-        fs::read_to_string(&path).expect("read the applied file"),
-        expected,
-        "the apply must change exactly the two edited value spans"
+        differing_lines(&original, &applied),
+        vec![layout_line, scroll_line],
+        "exactly the two edited lines differ"
+    );
+    let expected = replace_once(&original, "\"us,se\"", "\"us,se,de\"");
+    let expected = replace_once(
+        &expected,
+        "natural_scroll = true,",
+        "natural_scroll = false,",
+    );
+    assert_eq!(
+        applied, expected,
+        "only the literals changed — key, spacing, separator and line ending stay"
     );
 
     // Write-through (R5.4/R8.5): the deployed path is still a symlink and the
@@ -114,24 +164,21 @@ fn a_staged_input_edit_applies_byte_exactly_and_reloads_hyprland() {
         "the deployment symlink must be preserved by the atomic writer"
     );
     assert_eq!(
-        fs::read_to_string(fx.repo_path("config/hypr/input.conf")).expect("read the repo target"),
+        fs::read_to_string(fx.repo_path(REPO_INPUT_LUA)).expect("read the repo target"),
         expected,
         "the write must land in the repo target behind the symlink"
     );
 
-    // (b) The exact reload list: `hyprctl reload`, nothing else, no signals.
-    assert_eq!(
-        runner.recorded(),
-        vec![Command::new("hyprctl").arg("reload")]
-    );
+    // The exact reload list: `hyprctl reload config-only`, nothing else, no signals.
+    assert_eq!(runner.recorded(), vec![config_only_reload()]);
     assert!(signaller.calls().is_empty());
 
-    // (c) Every other repo file is byte-identical.
-    assert_repo_untouched_except(&fx, &before, &["config/hypr/input.conf"]);
+    // Every other repo file is byte-identical.
+    assert_repo_untouched_except(&fx, &before, &[REPO_INPUT_LUA]);
 
     // Commit as the window does (task 4.5), then a second staged edit must apply
     // without a self-conflict — the re-baseline contract (R5.6).
-    let committed: Vec<(std::path::PathBuf, Vec<u8>)> = plan
+    let committed: Vec<(PathBuf, Vec<u8>)> = plan
         .writes
         .iter()
         .map(|write| (write.path.clone(), write.contents.clone()))
@@ -142,13 +189,7 @@ fn a_staged_input_edit_applies_byte_exactly_and_reloads_hyprland() {
     store
         .stage(SettingId::MouseSensitivity, Value::Float(0.5))
         .expect("a sensitivity edit stages");
-    let mut second_plan = base_apply_plan(&store);
-    second_plan.writes.push(
-        model
-            .apply_contribution(&store.dirty_in_category(Category::Input))
-            .expect("the second write renders")
-            .expect("a dirty setting produces a write"),
-    );
+    let second_plan = plan_with_input_write(&store, &model);
     let outcome = apply::run(
         &second_plan,
         store.freshness(),
@@ -156,29 +197,167 @@ fn a_staged_input_edit_applies_byte_exactly_and_reloads_hyprland() {
         &runner,
         &signaller,
     );
-    // `expect_applied` above is what proves the no-self-conflict property: a
-    // stale baseline would have produced `Conflicted` and panicked there. This
-    // assertion only checks the second apply's reload also ran cleanly.
+    // `expect_applied` is what proves the no-self-conflict property: a stale
+    // baseline would have produced `Conflicted` and panicked there.
     let (reload_failures, _) = expect_applied(outcome);
     assert!(
         reload_failures.is_empty(),
         "the second apply's reload must succeed"
     );
-    let expected_second = replace_once(&expected, "sensitivity=0.3", "sensitivity=0.5");
     assert_eq!(
         fs::read_to_string(&path).expect("read after the second apply"),
-        expected_second,
+        replace_once(&expected, "sensitivity = 0.3,", "sensitivity = 0.5,"),
         "the second apply builds on the first apply's bytes"
     );
 }
 
 #[test]
+fn a_first_keyboard_option_is_inserted_into_an_input_lua_without_kb_options() {
+    // The insert path through real files: a hand-written input.lua that never set
+    // `kb_options` loads an empty seeded value; switching on a curated option inserts
+    // one `kb_options = "…",` field before the `input` table's closing brace, indented
+    // like its siblings, and leaves every original line in place.
+    let fx = FixtureDotfiles::install();
+    let before = repo_snapshot(&fx);
+    let path = input_lua(&fx);
+    let fixture = fs::read_to_string(&path).expect("read the fixture input.lua");
+    let options_line = fixture
+        .lines()
+        .find(|line| line.trim_start().starts_with("kb_options = "))
+        .expect("the fixture declares kb_options")
+        .to_string();
+    let without_options = fixture.replace(&format!("{options_line}\n"), "");
+    // Prepared before the store loads, so it is the baseline rather than a conflict.
+    fs::write(&path, &without_options).expect("write the hand-written input.lua");
+
+    let (mut store, model) = store_and_model(&fx);
+    assert_eq!(
+        store.value(SettingId::KeyboardOptions),
+        Some(&Value::String(String::new())),
+        "an absent kb_options is seeded empty"
+    );
+    store
+        .stage(
+            SettingId::KeyboardOptions,
+            Value::String("caps:escape".to_string()),
+        )
+        .expect("a first option stages");
+
+    let plan = plan_with_input_write(&store, &model);
+    let runner = MockCommandRunner::new();
+    let signaller = MockProcessSignaller::new();
+    expect_applied(apply::run(
+        &plan,
+        store.freshness(),
+        &caps(),
+        &runner,
+        &signaller,
+    ));
+
+    let applied = fs::read_to_string(&path).expect("read the applied file");
+    let expected = replace_once(
+        &without_options,
+        "            scroll_factor = 1.0,\n        },\n    },\n",
+        "            scroll_factor = 1.0,\n        },\n        kb_options = \"caps:escape\",\n    },\n",
+    );
+    assert_eq!(
+        applied, expected,
+        "one field is inserted, nothing else moves"
+    );
+    assert_eq!(runner.recorded(), vec![config_only_reload()]);
+    assert_repo_untouched_except(&fx, &before, &[REPO_INPUT_LUA]);
+}
+
+#[test]
+fn an_input_lua_with_an_opaque_line_in_the_input_table_is_not_offered() {
+    // Architecture §10 / R4.2: a computed value inside the `input` table means the
+    // literals around it may not be the values in effect. The store loader skips the
+    // file and no Input helper is built, so the Input page is hidden (the startup-level
+    // visibility and logging are covered in `ui::startup`'s tests).
+    let fx = FixtureDotfiles::install();
+    let path = input_lua(&fx);
+    let fixture = fs::read_to_string(&path).expect("read the fixture input.lua");
+    let edited = replace_once(
+        &fixture,
+        "follow_mouse = 1,",
+        "follow_mouse = os.getenv(\"DOCKED\") and 0 or 1,",
+    );
+    fs::write(&path, &edited).expect("write the opaque line");
+    let opaque_line = edited
+        .lines()
+        .position(|line| line.contains("os.getenv"))
+        .expect("the opaque line is in the file")
+        + 1;
+
+    match InputModel::load(path.clone(), no_xkb()) {
+        Err(InputLuaUnavailable::OpaqueLines(lines)) => assert_eq!(lines, vec![opaque_line]),
+        Err(other) => panic!("expected OpaqueLines, got {other:?}"),
+        Ok(_) => panic!("an opaque input table must not back the Input page"),
+    }
+    let error = loaders::input_lua(&path).expect_err("the store loader skips the file");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        !error.to_string().contains("getenv"),
+        "the reason names lines, never contents (R7.3): {error}"
+    );
+}
+
+#[test]
+fn a_kind_mismatch_refusal_aborts_the_apply_as_a_failed_input_lua_write() {
+    // R8.3: input.lua was hand-edited after the app loaded it so that `natural_scroll`
+    // now holds a number. The Lua-literal editor never writes a boolean over it, so
+    // preparing the Apply fails, names the Input page and input.lua, writes nothing
+    // and keeps the staged edit for a retry.
+    let fx = FixtureDotfiles::install();
+    let path = input_lua(&fx);
+    let (mut store, model) = store_and_model(&fx);
+    store
+        .stage(SettingId::TouchpadNaturalScroll, Value::Bool(false))
+        .expect("a touchpad toggle stages");
+
+    let fixture = fs::read_to_string(&path).expect("read the fixture input.lua");
+    let retyped = replace_once(&fixture, "natural_scroll = true,", "natural_scroll = 1,");
+    fs::write(fx.repo_path(REPO_INPUT_LUA), &retyped).expect("the hand edit");
+    let after_edit = repo_snapshot(&fx);
+
+    let failure = assemble_apply_plan(ApplySources {
+        input: Some(&model),
+        ..ApplySources::for_store(&store)
+    })
+    .expect_err("a refused Input edit must abort the whole apply");
+    match failure {
+        PrepareFailure::Write { source, message } => {
+            assert_eq!(
+                source,
+                FailedWrite::Input,
+                "the failure names the Input page"
+            );
+            assert!(
+                message.contains("input.lua"),
+                "the dialog's message names input.lua: {message}"
+            );
+            assert!(
+                message.contains("number") && message.contains("boolean"),
+                "the message says why: {message}"
+            );
+        }
+        other => panic!("expected a write-preparation failure, got {other:?}"),
+    }
+    assert!(store.is_dirty(), "the staged edit is kept for a retry");
+    assert_eq!(
+        repo_snapshot(&fx),
+        after_edit,
+        "nothing was written beyond the hand edit"
+    );
+}
+
+#[test]
 fn an_external_edit_between_load_and_apply_aborts_as_conflicted() {
-    // Failure injection (3), R5.6: another program edits input.conf after the store
+    // Failure injection (3), R5.6: another program edits input.lua after the store
     // loaded it. The apply must abort as Conflicted with NO writes and NO commands,
     // leaving the external edit standing.
     let fx = FixtureDotfiles::install();
-    let path = input_conf(&fx);
+    let path = input_lua(&fx);
 
     let (mut store, model) = store_and_model(&fx);
     store
@@ -190,19 +369,12 @@ fn an_external_edit_between_load_and_apply_aborts_as_conflicted() {
 
     // The external edit, through the deployed path (writes through to the repo).
     let externally_edited = format!(
-        "{}# edited by hand while the app was open\n",
+        "{}-- edited by hand while the app was open\n",
         fs::read_to_string(&path).expect("read the fixture")
     );
     fs::write(&path, &externally_edited).expect("apply the external edit");
 
-    let mut plan = base_apply_plan(&store);
-    plan.writes.push(
-        model
-            .apply_contribution(&store.dirty_in_category(Category::Input))
-            .expect("the write renders")
-            .expect("a dirty setting produces a write"),
-    );
-
+    let plan = plan_with_input_write(&store, &model);
     let runner = MockCommandRunner::new();
     let signaller = MockProcessSignaller::new();
     let outcome = apply::run(&plan, store.freshness(), &caps(), &runner, &signaller);
@@ -233,9 +405,9 @@ fn a_deleted_hypridle_conf_neither_blocks_an_input_apply_nor_lets_its_own_page_w
     // page's — is loaded into the same store and then deleted, the state the store can
     // never re-baseline on its own.
     //
-    // (i) The Input apply must still succeed. It writes only `input.conf`, so it cannot
-    //     clobber the missing file; before this fix the whole-tracker conflict check made
-    //     every category's apply return `Conflicted` until the app was restarted.
+    // (i) The Input apply must still succeed. It writes only `input.lua`, so it cannot
+    //     clobber the missing file; before task 9.11 the whole-tracker conflict check
+    //     made every category's apply return `Conflicted` until the app was restarted.
     // (ii) The missing file's own page must still refuse to write. Its write glue reads
     //     the file to render the edit, so a Power & Idle apply fails at preparation and
     //     the window aborts — the app never writes bytes rendered from contents it could
@@ -243,8 +415,8 @@ fn a_deleted_hypridle_conf_neither_blocks_an_input_apply_nor_lets_its_own_page_w
     //     target is unreadable — is unit-tested in `core::apply`.)
     let fx = FixtureDotfiles::install();
     let before = repo_snapshot(&fx);
-    let path = input_conf(&fx);
-    let original = fs::read_to_string(&path).expect("read the fixture input.conf");
+    let path = input_lua(&fx);
+    let original = fs::read_to_string(&path).expect("read the fixture input.lua");
 
     let (mut store, model) = store_and_model(&fx);
     let hypridle_conf = fx.config_path("hypr/hypridle.conf");
@@ -263,14 +435,7 @@ fn a_deleted_hypridle_conf_neither_blocks_an_input_apply_nor_lets_its_own_page_w
         )
         .expect("the Input edit stages");
 
-    let mut plan = base_apply_plan(&store);
-    plan.writes.push(
-        model
-            .apply_contribution(&store.dirty_in_category(Category::Input))
-            .expect("the write renders")
-            .expect("a dirty setting produces a write"),
-    );
-
+    let plan = plan_with_input_write(&store, &model);
     let runner = MockCommandRunner::new();
     let signaller = MockProcessSignaller::new();
     let outcome = apply::run(&plan, store.freshness(), &caps(), &runner, &signaller);
@@ -285,7 +450,7 @@ fn a_deleted_hypridle_conf_neither_blocks_an_input_apply_nor_lets_its_own_page_w
             unrelated_conflicts,
         } => {
             assert!(reload_failures.is_empty(), "the mocked reload succeeds");
-            assert_eq!(written, vec![path.clone()], "only input.conf was written");
+            assert_eq!(written, vec![path.clone()], "only input.lua was written");
             assert_eq!(
                 unrelated_conflicts.len(),
                 1,
@@ -297,12 +462,12 @@ fn a_deleted_hypridle_conf_neither_blocks_an_input_apply_nor_lets_its_own_page_w
     }
     assert_eq!(
         fs::read_to_string(&path).expect("read the applied file"),
-        replace_once(&original, "kb_layout=us,se", "kb_layout=se,us"),
+        replace_once(&original, "\"us,se\"", "\"se,us\""),
         "the Input edit was applied byte-exactly despite the unrelated missing file"
     );
     assert_eq!(
         runner.recorded(),
-        vec![Command::new("hyprctl").arg("reload")],
+        vec![config_only_reload()],
         "the apply completed normally, reload included"
     );
 
@@ -319,29 +484,23 @@ fn a_deleted_hypridle_conf_neither_blocks_an_input_apply_nor_lets_its_own_page_w
         error.to_string().contains("hypridle.conf"),
         "the abort names the file the user has to restore: {error}"
     );
-    assert_repo_untouched_except(&fx, &before, &["config/hypr/input.conf"]);
+    assert_repo_untouched_except(&fx, &before, &[REPO_INPUT_LUA]);
 }
 
 #[test]
 fn a_failed_hyprctl_reload_is_non_fatal_and_the_write_stands() {
-    // Failure injection (2), R5.5: `hyprctl reload` exits non-zero. The apply still
-    // completes, the file keeps its new bytes, and the failure is reported.
+    // Failure injection (2), R5.5: `hyprctl reload config-only` exits non-zero. The
+    // apply still completes, the file keeps its new bytes, and the failure is reported.
     let fx = FixtureDotfiles::install();
-    let path = input_conf(&fx);
-    let original = fs::read_to_string(&path).expect("read the fixture input.conf");
+    let path = input_lua(&fx);
+    let original = fs::read_to_string(&path).expect("read the fixture input.lua");
 
     let (mut store, model) = store_and_model(&fx);
     store
         .stage(SettingId::TouchpadTapToClick, Value::Bool(false))
         .expect("the edit stages");
 
-    let mut plan = base_apply_plan(&store);
-    plan.writes.push(
-        model
-            .apply_contribution(&store.dirty_in_category(Category::Input))
-            .expect("the write renders")
-            .expect("a dirty setting produces a write"),
-    );
+    let plan = plan_with_input_write(&store, &model);
 
     // The reload fails; the (already completed) write must not be rolled back.
     let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake(1))]);
@@ -353,11 +512,48 @@ fn a_failed_hyprctl_reload_is_non_fatal_and_the_write_stands() {
     assert_eq!(written, vec![path.clone()], "the write is reported applied");
     assert_eq!(
         fs::read_to_string(&path).expect("read the applied file"),
-        replace_once(&original, "tap-to-click=true", "tap-to-click=false"),
+        replace_once(&original, "tap_to_click = true,", "tap_to_click = false,"),
         "the file keeps its new bytes despite the reload failure (R5.5)"
     );
-    assert_eq!(
-        runner.recorded(),
-        vec![Command::new("hyprctl").arg("reload")]
+    assert_eq!(runner.recorded(), vec![config_only_reload()]);
+}
+
+#[test]
+fn staged_input_edits_whose_page_disappeared_on_refresh_abort_the_apply() {
+    // A manual Refresh rebuilds the Input helper from scratch. If input.lua was edited
+    // into something the editor does not understand in the meantime, no helper is built
+    // and the page hides — but edits staged before the Refresh are still in the store.
+    // They have no write to land in, so the Apply must abort rather than commit values
+    // that never reached disk (R8.3).
+    let fx = FixtureDotfiles::install();
+    let path = input_lua(&fx);
+    let (mut store, _model) = store_and_model(&fx);
+    store
+        .stage(SettingId::TouchpadNaturalScroll, Value::Bool(false))
+        .expect("a touchpad toggle stages");
+
+    let fixture = fs::read_to_string(&path).expect("read the fixture input.lua");
+    fs::write(
+        &path,
+        replace_once(&fixture, "follow_mouse = 1,", "follow_mouse = f(),"),
+    )
+    .expect("the hand edit");
+    assert!(
+        InputModel::load(path, no_xkb()).is_err(),
+        "the refreshed load builds no Input helper"
     );
+
+    let failure = assemble_apply_plan(ApplySources::for_store(&store))
+        .expect_err("orphaned Input edits must abort the apply");
+    match failure {
+        PrepareFailure::Write { source, message } => {
+            assert_eq!(source, FailedWrite::Input);
+            assert!(
+                message.contains("Reset"),
+                "the message says how to get out: {message}"
+            );
+        }
+        other => panic!("expected a write-preparation failure, got {other:?}"),
+    }
+    assert!(store.is_dirty(), "the staged edit is kept");
 }

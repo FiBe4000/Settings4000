@@ -45,9 +45,9 @@
 //! pages; today the declarative framework (task 5.2) exercises two files, so those
 //! are what this loads:
 //!
-//! - `~/.config/hypr/input.conf` (the sourced `input {}` block, analysis §6.3) via
-//!   the hyprlang parser → the Input page's keyboard layouts, keyboard options, mouse
-//!   sensitivity, and touchpad toggles (task 6.6);
+//! - `~/.config/hypr/input.lua` (the app-owned `hl.config({ input = { … } })` table,
+//!   analysis §7.1) via the Lua-literal editor → the Input page's keyboard layouts,
+//!   keyboard options, mouse sensitivity, and touchpad toggles (tasks 6.6, 11.4);
 //! - `~/.config/swaync/config.json` via the swaync JSON adapter → the Notifications
 //!   page's position and auto-dismiss timeout;
 //! - `~/.config/hypr/hypridle.conf` via the hyprlang parser → the Power & Idle page's
@@ -66,7 +66,7 @@ use std::path::{Path, PathBuf};
 
 use crate::core::detect::{Binary, Capabilities, DetectionInputs, HyprConfigProvider};
 use crate::core::display::DisplayModel;
-use crate::core::input::{InputModel, default_xkb_registry};
+use crate::core::input::{InputModel, default_xkb_registry, input_values, read_input_lua};
 use crate::core::model::{SettingId, Value};
 use crate::core::notifications::NotificationsModel;
 use crate::core::power::{PowerModel, power_key_path};
@@ -74,7 +74,7 @@ use crate::core::store::{FileReader, FileValues, RefreshReport, SettingsStore};
 use crate::core::theme::{
     PaletteModel, ThemeRoots, ThemesModel, ThemesPaths, WallpaperModel, WallpaperPaths,
 };
-use crate::parsers::hyprlang::{HyprlangFile, KeyPath};
+use crate::parsers::hyprlang::HyprlangFile;
 use crate::parsers::swaync::SwayncConfigFile;
 use crate::system::command::SystemCommandRunner;
 
@@ -111,10 +111,12 @@ pub(crate) struct StartupLoad {
     /// `hyprctl monitors -j` and reading `monitors.conf`, or `None` when there is no
     /// live compositor to enumerate (the Display page then shows a placeholder, R4.2).
     pub(crate) display: Option<DisplayModel>,
-    /// The Input page's helper (task 6.6): the `input.conf` path and XKB layout
-    /// candidates, or `None` when `hyprctl` is absent (the Input category is then hidden
-    /// entirely, R4.2). It supplies the layout add-list and renders the store's dirty
-    /// Input settings into the `input.conf` write on Apply.
+    /// The Input page's helper (tasks 6.6, 11.4): the `input.lua` path and XKB layout
+    /// candidates, or `None` when the page cannot be offered — `hyprctl` is absent,
+    /// Hyprland does not run its Lua config provider, or `input.lua` is missing or not
+    /// fully understood by the editor (the Input category is then hidden entirely,
+    /// R4.2). It supplies the layout add-list and renders the store's dirty Input
+    /// settings into the `input.lua` write on Apply.
     pub(crate) input: Option<InputModel>,
     /// The Notifications page's helper (task 6.7): the `swaync/config.json` path, or
     /// `None` when swaync is absent (the Notifications category is then hidden entirely,
@@ -149,8 +151,8 @@ pub(crate) struct StartupLoad {
 /// the loading logic can be driven with injected paths in tests without touching the
 /// real environment.
 struct BackingPaths {
-    /// `~/.config/hypr/input.conf` — the sourced `input {}` block (hyprlang).
-    input_conf: PathBuf,
+    /// `~/.config/hypr/input.lua` — the app-owned Lua input table.
+    input_lua: PathBuf,
     /// `~/.config/swaync/config.json` — the swaync notification config (JSON).
     swaync_config: PathBuf,
     /// `~/.config/hypr/hypridle.conf` — the idle timeouts + lock command (hyprlang).
@@ -166,11 +168,18 @@ impl BackingPaths {
     fn from_system() -> Self {
         let config_home = config_home();
         BackingPaths {
-            input_conf: config_home.join("hypr").join("input.conf"),
+            input_lua: input_lua_path(&config_home),
             swaync_config: config_home.join("swaync").join("config.json"),
             hypridle_conf: config_home.join("hypr").join("hypridle.conf"),
         }
     }
+}
+
+/// The live path of `input.lua` under the XDG config base directory `config_home`
+/// (R8.5) — one definition for the store loader and the Input page helper, which must
+/// agree on the file.
+fn input_lua_path(config_home: &Path) -> PathBuf {
+    config_home.join("hypr").join("input.lua")
 }
 
 /// The XDG config base directory: `$XDG_CONFIG_HOME`, else `$HOME/.config`, else a
@@ -339,22 +348,46 @@ fn load_power(capabilities: &Capabilities) -> Option<PowerModel> {
     Some(PowerModel::load(hypridle_conf))
 }
 
-/// Builds the Input page's helper on the worker thread (tasks 6.6, 11.2; R4.2).
-///
-/// Only builds when `hyprctl` is present — an Input change applies via `hyprctl reload`,
-/// so without it the Input category is hidden (task 5.1) and there is nothing to load —
-/// **and** the compositor runs its Lua config provider: the app's input settings exist
-/// only for the Lua config (`input.lua`, task 11.4), so on a hyprlang host the page is
-/// hidden like a missing app rather than writing a file the compositor ignores
-/// (analysis §8.6).
-/// When present it reads the XKB layout registry (resolved by
-/// [`default_xkb_registry`] from the well-known locations) for the keyboard-layout
-/// add-list; a missing/unparseable registry degrades to an empty list (R4.4). Reading
-/// the (large) registry here, on the startup worker, keeps it off
-/// the main thread and inside the R8.1 cold-start budget (architecture §8). The
-/// `input.conf` settings themselves are staged in the store (loaded by [`load_input_conf`]);
-/// this helper only supplies the candidates and the Apply-time write.
+/// Builds the Input page's helper on the worker thread for the real system (tasks
+/// 6.6, 11.2, 11.4; R4.2) — [`load_input_from`] with the live `input.lua` path and
+/// the XKB registry resolved by [`default_xkb_registry`].
 fn load_input(capabilities: &Capabilities) -> Option<InputModel> {
+    load_input_from(
+        capabilities,
+        input_lua_path(&config_home()),
+        &default_xkb_registry(),
+    )
+}
+
+/// Builds the Input page's helper, or decides that the page is hidden (tasks 6.6,
+/// 11.2, 11.4; R4.2).
+///
+/// Three conditions, each logged at `info` when it hides the page:
+///
+/// - `hyprctl` is present — an Input change applies via `hyprctl reload config-only`,
+///   so without it there is nothing to apply with (task 5.1);
+/// - the compositor runs its Lua config provider — the app's input settings exist
+///   only in `input.lua`, so on a hyprlang host the page is hidden like a missing app
+///   rather than writing a file the compositor ignores (analysis §8.6);
+/// - `input.lua` exists and the Lua-literal editor understands every line of it
+///   ([`check_input_lua`](crate::core::input::check_input_lua)). A computed value or
+///   any other code in the file might override the literals the page would show, so
+///   the page hides instead of guessing (architecture §10). The logged reason names
+///   line numbers only, never file contents (R7.3).
+///
+/// When all hold it reads the XKB layout registry at `xkb_registry` for the
+/// keyboard-layout add-list; a missing/unparseable registry degrades to an empty list
+/// (R4.4). Reading the (large) registry here, on the startup worker, keeps it off the
+/// main thread and inside the R8.1 cold-start budget (architecture §8). The
+/// `input.lua` settings themselves are staged in the store (loaded by
+/// [`load_input_lua`]); this helper only supplies the candidates and the Apply-time
+/// write. Split from [`load_input`] so the decision is testable against a fixture
+/// file instead of the real `~/.config`.
+fn load_input_from(
+    capabilities: &Capabilities,
+    input_lua: PathBuf,
+    xkb_registry: &Path,
+) -> Option<InputModel> {
     if !capabilities.has_binary(Binary::Hyprctl) {
         tracing::info!("hyprctl not found; the Input page is hidden (R4.2)");
         return None;
@@ -367,8 +400,18 @@ fn load_input(capabilities: &Capabilities) -> Option<InputModel> {
         );
         return None;
     }
-    let input_conf = config_home().join("hypr").join("input.conf");
-    Some(InputModel::load(input_conf, &default_xkb_registry()))
+    match InputModel::load(input_lua.clone(), xkb_registry) {
+        Ok(model) => Some(model),
+        Err(reason) => {
+            tracing::info!(
+                path = %input_lua.display(),
+                %reason,
+                "input.lua cannot back the Input page; the page is hidden (architecture \
+                 §10, R4.2)"
+            );
+            None
+        }
+    }
 }
 
 /// Builds the Theme page's wallpaper / lock-background model on the worker thread (task
@@ -553,7 +596,7 @@ fn load_display(capabilities: &Capabilities) -> Option<DisplayModel> {
 /// is skipped, never propagated, so one bad file cannot suppress the others (R4.4).
 fn load_files(paths: &BackingPaths) -> Vec<LoadedFile> {
     let mut files = Vec::new();
-    push_loaded(&mut files, &paths.input_conf, load_input_conf, "input.conf");
+    push_loaded(&mut files, &paths.input_lua, load_input_lua, "input.lua");
     push_loaded(
         &mut files,
         &paths.swaync_config,
@@ -607,72 +650,24 @@ fn push_loaded(
     }
 }
 
-/// Reads and parses `input.conf` (the sourced `input {}` block, hyprlang) into the
-/// Input-page settings it backs (task 5.2/6.6, analysis §6.3).
+/// Reads and parses `input.lua` (the app-owned Lua input table) into the Input-page
+/// settings it backs (tasks 5.2, 6.6, 11.4; analysis §7.1).
 ///
-/// A read error propagates (the caller skips the file); a parse never fails — the
-/// hyprlang parser is lossless and surfaces oddities as warnings — so only the keys
-/// actually present and parseable become settings. An out-of-range value on disk is
-/// stored verbatim as the original (the store validates only staged edits), so a
-/// hand-written config is never rejected at load.
+/// A read error propagates (the caller skips the file). So does a file the
+/// Lua-literal editor does not fully understand — unbalanced brackets, no `input`
+/// table, or any opaque line ([`check_input_lua`](crate::core::input::check_input_lua))
+/// — reported as [`io::ErrorKind::InvalidData`] with the reason (line numbers only,
+/// R7.3): the Input page is hidden for such a file, so it must not seed store values
+/// either. Which keys become settings is decided by
+/// [`input_values`], the read half of the same
+/// address map the writer uses.
 ///
 /// Crate-visible (like the other two loaders) so `crate::testing` can re-expose it
 /// to the integration suites, which must load the store through the app's real
 /// loader rather than a test re-implementation (task 7.2).
-pub(crate) fn load_input_conf(path: &Path) -> io::Result<FileValues> {
-    let bytes = std::fs::read(path)?;
-    // Scope the parse so the borrow of `bytes` (through `text`) and the parsed file
-    // are both dropped before `bytes` is moved into the returned `FileValues`.
-    let values = {
-        let text = String::from_utf8_lossy(&bytes);
-        let (file, warnings) = HyprlangFile::parse(&text);
-        for warning in &warnings {
-            tracing::warn!(file = "input.conf", %warning, "hyprlang parse warning");
-        }
-
-        let mut values = Vec::new();
-        // The ordered keyboard-layout list, kept as the raw comma-joined `kb_layout`
-        // value; the reorderable list widget (R2.3) splits/joins on commas.
-        if let Some(layouts) = file.value(&KeyPath::at(&["input"], "kb_layout")) {
-            values.push((
-                SettingId::KeyboardLayouts,
-                Value::String(layouts.to_string()),
-            ));
-        }
-        // Keyboard options, kept as the whole comma-joined `kb_options` string so the
-        // curated switches (task 6.6) can toggle one token while preserving the rest
-        // (R4.2). When the key is absent but an `input {}` section exists, seed an empty
-        // string so a curated switch can stage a first option (which the writer appends);
-        // when there is no `input {}` section there is nothing to write into, so skip it.
-        if let Some(options) = file.value(&KeyPath::at(&["input"], "kb_options")) {
-            values.push((
-                SettingId::KeyboardOptions,
-                Value::String(options.to_string()),
-            ));
-        } else if file.section_count(&[], "input") > 0 {
-            values.push((SettingId::KeyboardOptions, Value::String(String::new())));
-        }
-        // Mouse/touchpad sensitivity (a decimal in `-1.0..=1.0`). An unparseable
-        // value is skipped rather than defaulted.
-        if let Some(raw) = file.value(&KeyPath::at(&["input"], "sensitivity")) {
-            if let Ok(sensitivity) = raw.trim().parse::<f64>() {
-                values.push((SettingId::MouseSensitivity, Value::Float(sensitivity)));
-            }
-        }
-        // Touchpad toggles live one section deeper, under `input.touchpad`.
-        if let Some(raw) = file.value(&KeyPath::at(&["input", "touchpad"], "natural_scroll")) {
-            if let Some(flag) = parse_hypr_bool(raw) {
-                values.push((SettingId::TouchpadNaturalScroll, Value::Bool(flag)));
-            }
-        }
-        if let Some(raw) = file.value(&KeyPath::at(&["input", "touchpad"], "tap-to-click")) {
-            if let Some(flag) = parse_hypr_bool(raw) {
-                values.push((SettingId::TouchpadTapToClick, Value::Bool(flag)));
-            }
-        }
-        values
-    };
-
+pub(crate) fn load_input_lua(path: &Path) -> io::Result<FileValues> {
+    let (bytes, file) = read_input_lua(path)?;
+    let values = input_values(&file);
     Ok(FileValues { bytes, values })
 }
 
@@ -685,7 +680,7 @@ pub(crate) fn load_input_conf(path: &Path) -> io::Result<FileValues> {
 /// other loaders — swaync itself would reject such a file, so there is nothing to
 /// edit.
 ///
-/// Crate-visible for the same reason as [`load_input_conf`] (task 7.2).
+/// Crate-visible for the same reason as [`load_input_lua`] (task 7.2).
 pub(crate) fn load_swaync_config(path: &Path) -> io::Result<FileValues> {
     let bytes = std::fs::read(path)?;
     let values = {
@@ -727,7 +722,7 @@ pub(crate) fn load_swaync_config(path: &Path) -> io::Result<FileValues> {
 /// verbatim as the original (the store validates only staged edits), so a hand-written
 /// config is never rejected at load.
 ///
-/// Crate-visible for the same reason as [`load_input_conf`] (task 7.2).
+/// Crate-visible for the same reason as [`load_input_lua`] (task 7.2).
 pub(crate) fn load_hypridle_conf(path: &Path) -> io::Result<FileValues> {
     let bytes = std::fs::read(path)?;
     let values = {
@@ -766,19 +761,6 @@ pub(crate) fn load_hypridle_conf(path: &Path) -> io::Result<FileValues> {
     Ok(FileValues { bytes, values })
 }
 
-/// Parses a hyprlang boolean token, or `None` for anything unrecognised.
-///
-/// Hyprland accepts several spellings for a boolean keyword (`true`/`false`,
-/// `yes`/`no`, `on`/`off`, `1`/`0`), matched case-insensitively. An unrecognised
-/// token yields `None` so the caller skips the setting rather than guessing.
-fn parse_hypr_bool(raw: &str) -> Option<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "true" | "yes" | "on" | "1" => Some(true),
-        "false" | "no" | "off" | "0" => Some(false),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,19 +776,27 @@ mod tests {
         store
     }
 
+    /// A minimal usable `input.lua` whose `input` table holds only `sensitivity`.
+    fn input_lua_with_sensitivity(sensitivity: &str) -> String {
+        format!(
+            "hl.config({{\n    input = {{\n        sensitivity = {sensitivity},\n    }},\n}})\n"
+        )
+    }
+
     #[test]
-    fn input_conf_parses_into_the_input_settings() {
-        // The four Input-page settings map from their hyprlang keys, at the right
-        // section depth (`input.*` and `input.touchpad.*`), with the right kinds.
+    fn input_lua_parses_into_the_input_settings() {
+        // The five Input-page settings map from their Lua literals at the right table
+        // depth (`input.*` and `input.touchpad.*`, `tap_to_click` with an underscore),
+        // with the right kinds.
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("input.conf");
+        let path = dir.path().join("input.lua");
         std::fs::write(
             &path,
-            b"input {\n    kb_layout = us,se\n    kb_options = grp:win_space_toggle,caps:escape\n    sensitivity = 0.3\n    touchpad {\n        natural_scroll = true\n        tap-to-click = no\n    }\n}\n",
+            "hl.config({\n    input = {\n        kb_layout = \"us,se\",\n        kb_options = \"grp:win_space_toggle,caps:escape\",\n        sensitivity = 0.3,\n        touchpad = {\n            natural_scroll = true,\n            tap_to_click = false,\n        },\n    },\n})\n",
         )
-        .expect("write input.conf fixture");
+        .expect("write input.lua fixture");
 
-        let values = load_input_conf(&path).expect("input.conf loads");
+        let values = load_input_lua(&path).expect("input.lua loads");
         assert_eq!(
             values.values,
             vec![
@@ -823,37 +813,49 @@ mod tests {
                 (SettingId::TouchpadTapToClick, Value::Bool(false)),
             ],
         );
+        assert_eq!(
+            values.bytes,
+            std::fs::read(&path).expect("read back"),
+            "the freshness baseline is exactly the bytes parsed"
+        );
     }
 
     #[test]
-    fn input_conf_seeds_empty_keyboard_options_when_absent_but_the_section_exists() {
-        // With an `input {}` section but no `kb_options` key, an empty KeyboardOptions is
-        // seeded so a curated switch can stage a first option (the writer appends the
-        // key on Apply, task 6.6). With no `input {}` section at all there is nothing to
-        // write into, so the setting is skipped.
+    fn input_lua_seeds_empty_keyboard_options_when_absent() {
+        // With an `input` table but no `kb_options` field, an empty KeyboardOptions is
+        // seeded so a curated switch can stage a first option (the writer inserts the
+        // field on Apply).
         let dir = tempfile::tempdir().expect("temp dir");
-
-        let with_section = dir.path().join("with-section.conf");
-        std::fs::write(&with_section, b"input {\n    kb_layout = us\n}\n")
-            .expect("write input.conf");
-        let values = load_input_conf(&with_section).expect("loads");
+        let path = dir.path().join("input.lua");
+        std::fs::write(&path, input_lua_with_sensitivity("0.3")).expect("write input.lua");
+        let values = load_input_lua(&path).expect("loads");
         assert!(
             values
                 .values
                 .contains(&(SettingId::KeyboardOptions, Value::String(String::new()))),
-            "an empty kb_options is seeded when the input section exists"
+            "an empty kb_options is seeded when the input table exists"
         );
+    }
 
-        let no_section = dir.path().join("no-section.conf");
-        std::fs::write(&no_section, b"# no input block here\n").expect("write input.conf");
-        let values = load_input_conf(&no_section).expect("loads");
-        assert!(
-            !values
-                .values
-                .iter()
-                .any(|(id, _)| *id == SettingId::KeyboardOptions),
-            "no input section -> no KeyboardOptions to write into"
-        );
+    #[test]
+    fn an_unusable_input_lua_is_skipped_by_the_store_loader() {
+        // A file the Lua-literal editor does not fully understand seeds no store
+        // values: no `input` table, an opaque line, or unbalanced brackets are each an
+        // InvalidData error the caller skips (the Input page is hidden for it too).
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("input.lua");
+        for contents in [
+            "-- no input table here\n".to_string(),
+            input_lua_with_sensitivity("docked and 0 or 0.3"),
+            "hl.config({\n    input = {\n".to_string(),
+        ] {
+            std::fs::write(&path, &contents).expect("write input.lua");
+            let error = load_input_lua(&path).expect_err("an unusable file is skipped");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "for {contents:?}");
+        }
+        // A missing file keeps its own read error.
+        let error = load_input_lua(&dir.path().join("absent.lua")).expect_err("missing");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
@@ -934,7 +936,7 @@ mod tests {
         // backing paths at nonexistent files and assert nothing loads.
         let dir = tempfile::tempdir().expect("temp dir");
         let paths = BackingPaths {
-            input_conf: dir.path().join("no-input.conf"),
+            input_lua: dir.path().join("no-input.lua"),
             swaync_config: dir.path().join("no-swaync.json"),
             hypridle_conf: dir.path().join("no-hypridle.conf"),
         };
@@ -957,21 +959,21 @@ mod tests {
             "a malformed swaync config must surface as an error the loader skips"
         );
 
-        // And through the orchestration: only the readable input.conf loads.
+        // And through the orchestration: only the readable input.lua loads.
         std::fs::write(
-            dir.path().join("input.conf"),
-            b"input {\n    sensitivity = 0.0\n}\n",
+            dir.path().join("input.lua"),
+            input_lua_with_sensitivity("0.0"),
         )
-        .expect("write input.conf");
+        .expect("write input.lua");
         let paths = BackingPaths {
-            input_conf: dir.path().join("input.conf"),
+            input_lua: dir.path().join("input.lua"),
             swaync_config: path,
             hypridle_conf: dir.path().join("no-hypridle.conf"),
         };
         let loaded = load_files(&paths);
         assert_eq!(loaded.len(), 1, "only the parseable file loads");
-        // The input.conf yields its sensitivity plus a seeded empty KeyboardOptions
-        // (the `input {}` section exists but has no `kb_options` key — task 6.6).
+        // The input.lua yields its sensitivity plus a seeded empty KeyboardOptions
+        // (the `input` table exists but has no `kb_options` field — task 6.6).
         assert_eq!(loaded[0].initial.values.len(), 2);
     }
 
@@ -982,14 +984,14 @@ mod tests {
         // over the unchanged files reports no conflict.
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::write(
-            dir.path().join("input.conf"),
-            b"input {\n    kb_layout = us\n    sensitivity = 0.5\n}\n",
+            dir.path().join("input.lua"),
+            "hl.config({\n    input = {\n        kb_layout = \"us\",\n        sensitivity = 0.5,\n    },\n})\n",
         )
-        .expect("write input.conf");
+        .expect("write input.lua");
         std::fs::write(dir.path().join("config.json"), br#"{ "timeout": 10 }"#)
             .expect("write swaync config");
         let paths = BackingPaths {
-            input_conf: dir.path().join("input.conf"),
+            input_lua: dir.path().join("input.lua"),
             swaync_config: dir.path().join("config.json"),
             hypridle_conf: dir.path().join("hypridle.conf"),
         };
@@ -1136,38 +1138,38 @@ mod tests {
     fn refresh_merge_tracks_a_new_file_and_preserves_staged_edits() {
         // The task-9.3 refresh contract end to end at the headless seam: between the
         // startup load and a manual Refresh, one backing file appears (hypridle.conf)
-        // and one tracked file is edited externally (input.conf), while the user has a
+        // and one tracked file is edited externally (input.lua), while the user has a
         // staged edit pending. The merge must (a) start tracking the new file so its
         // settings become available, (b) reload the edited file's originals and report
         // it (R5.6), and (c) keep the staged edit (R5.1).
         let dir = tempfile::tempdir().expect("temp dir");
         let paths = BackingPaths {
-            input_conf: dir.path().join("input.conf"),
+            input_lua: dir.path().join("input.lua"),
             swaync_config: dir.path().join("no-swaync.json"),
             hypridle_conf: dir.path().join("hypridle.conf"),
         };
-        std::fs::write(&paths.input_conf, b"input {\n    sensitivity = 0.3\n}\n")
-            .expect("write input.conf");
+        std::fs::write(&paths.input_lua, input_lua_with_sensitivity("0.3"))
+            .expect("write input.lua");
 
-        // Startup: only input.conf exists; the user stages a sensitivity edit.
+        // Startup: only input.lua exists; the user stages a sensitivity edit.
         let mut store = store_from(load_files(&paths));
         store
             .stage(SettingId::MouseSensitivity, Value::Float(0.8))
             .expect("stage a valid sensitivity");
 
-        // Between load and Refresh: hypridle.conf appears, input.conf is edited
+        // Between load and Refresh: hypridle.conf appears, input.lua is edited
         // externally (sensitivity 0.3 -> 0.1).
         std::fs::write(&paths.hypridle_conf, b"listener {\n    timeout = 120\n}\n")
             .expect("write hypridle.conf");
-        std::fs::write(&paths.input_conf, b"input {\n    sensitivity = 0.1\n}\n")
-            .expect("rewrite input.conf");
+        std::fs::write(&paths.input_lua, input_lua_with_sensitivity("0.1"))
+            .expect("rewrite input.lua");
 
         // Refresh: re-run the same loader pass and merge it into the live store.
         let report = merge_refreshed_files(&mut store, load_files(&paths));
 
         assert_eq!(
             report.reloaded(),
-            std::slice::from_ref(&paths.input_conf),
+            std::slice::from_ref(&paths.input_lua),
             "the externally edited tracked file is reloaded and reported (R5.6)"
         );
         assert!(
@@ -1197,12 +1199,12 @@ mod tests {
         // the merge reports nothing (no conflict warning) and staged edits stay put.
         let dir = tempfile::tempdir().expect("temp dir");
         let paths = BackingPaths {
-            input_conf: dir.path().join("input.conf"),
+            input_lua: dir.path().join("input.lua"),
             swaync_config: dir.path().join("no-swaync.json"),
             hypridle_conf: dir.path().join("no-hypridle.conf"),
         };
-        std::fs::write(&paths.input_conf, b"input {\n    sensitivity = 0.3\n}\n")
-            .expect("write input.conf");
+        std::fs::write(&paths.input_lua, input_lua_with_sensitivity("0.3"))
+            .expect("write input.lua");
 
         let mut store = store_from(load_files(&paths));
         store
@@ -1225,10 +1227,18 @@ mod tests {
         // copy; a hyprlang host hides both, with nothing routed to a hyprlang writer.
         use crate::ui::category::{SidebarCategory, visible_categories};
 
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input_lua = dir.path().join("input.lua");
+        std::fs::write(&input_lua, input_lua_with_sensitivity("0.3")).expect("write input.lua");
+        let xkb = dir.path().join("no-evdev.xml");
+
         let lua = Capabilities::for_tests(&[Binary::Hyprctl, Binary::Gsettings], &[], true);
         assert_eq!(lua.hypr_config_provider(), HyprConfigProvider::Lua);
         assert!(visible_categories(&lua).contains(&SidebarCategory::Input));
-        assert!(load_input(&lua).is_some(), "the Input helper is built");
+        assert!(
+            load_input_from(&lua, input_lua.clone(), &xkb).is_some(),
+            "the Input helper is built"
+        );
         assert!(
             themes_paths(&lua).hyprland_conf.is_some(),
             "the Hyprland-side cursor copy is written on a Lua host"
@@ -1240,7 +1250,10 @@ mod tests {
             !visible_categories(&hyprlang).contains(&SidebarCategory::Input),
             "the Input page is hidden on a hyprlang host"
         );
-        assert!(load_input(&hyprlang).is_none(), "no Input helper is built");
+        assert!(
+            load_input_from(&hyprlang, input_lua, &xkb).is_none(),
+            "no Input helper is built"
+        );
         assert!(
             themes_paths(&hyprlang).hyprland_conf.is_none(),
             "the Hyprland-side cursor write is hidden on a hyprlang host"
@@ -1248,6 +1261,73 @@ mod tests {
         // The rest of the Theme page is unaffected: gsettings still gates it.
         assert!(visible_categories(&hyprlang).contains(&SidebarCategory::Theme));
         assert!(load_themes(&hyprlang).is_some());
+    }
+
+    #[test]
+    fn an_absent_or_unusable_input_lua_hides_the_input_page_and_logs_why_at_info() {
+        // Task 11.4 (architecture §10, R4.2): on a Lua host with `hyprctl`, the Input
+        // page still needs an `input.lua` the editor fully understands. A missing file
+        // and one with an opaque line inside the `input` table each build no helper —
+        // which leaves the page without rows, so the window drops the category — and
+        // the reason is logged at `info`, by line number for the opaque case and never
+        // with file contents (R7.3).
+        use crate::testing::capture_logs;
+        use crate::ui::input::page_rows;
+
+        let caps = Capabilities::for_tests(&[Binary::Hyprctl], &[], true);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let xkb = dir.path().join("no-evdev.xml");
+        let hidden_reason = |events: &[crate::testing::CapturedEvent]| {
+            events
+                .iter()
+                .find(|event| {
+                    event.level == tracing::Level::INFO
+                        && event
+                            .message
+                            .contains("input.lua cannot back the Input page")
+                })
+                .map(|event| event.fields.clone())
+        };
+
+        // No input.lua at all.
+        let missing = dir.path().join("input.lua");
+        let mut model = None;
+        let events = capture_logs(|| model = load_input_from(&caps, missing.clone(), &xkb));
+        assert!(model.is_none(), "no helper without input.lua");
+        assert!(
+            page_rows(model.as_ref(), &caps).is_empty(),
+            "the page has no rows"
+        );
+        let fields = hidden_reason(&events).expect("the hide is logged at info");
+        assert!(
+            fields.contains("unreadable"),
+            "the reason is given: {fields}"
+        );
+
+        // An input.lua with a computed value inside the `input` table (line 3).
+        std::fs::write(
+            &missing,
+            "hl.config({\n    input = {\n        sensitivity = secret_value(),\n    },\n})\n",
+        )
+        .expect("write input.lua");
+        let events = capture_logs(|| model = load_input_from(&caps, missing.clone(), &xkb));
+        assert!(model.is_none(), "no helper for an opaque input table");
+        assert!(page_rows(model.as_ref(), &caps).is_empty());
+        let fields = hidden_reason(&events).expect("the hide is logged at info");
+        assert!(
+            fields.contains("(lines 3)"),
+            "the opaque line is named: {fields}"
+        );
+        assert!(
+            !fields.contains("secret_value"),
+            "no file contents: {fields}"
+        );
+
+        // The same tree with a usable file shows the page.
+        std::fs::write(&missing, input_lua_with_sensitivity("0.3")).expect("write input.lua");
+        let model = load_input_from(&caps, missing, &xkb);
+        assert!(model.is_some());
+        assert!(!page_rows(model.as_ref(), &caps).is_empty());
     }
 
     #[test]
@@ -1374,21 +1454,6 @@ mod tests {
             kept.fit_options()[fit_index],
             "contain",
             "the kept model still carries the staged fit mode"
-        );
-    }
-
-    #[test]
-    fn hypr_bool_parses_the_accepted_spellings() {
-        for token in ["true", "yes", "on", "1", "TRUE", " True "] {
-            assert_eq!(parse_hypr_bool(token), Some(true), "`{token}` is true");
-        }
-        for token in ["false", "no", "off", "0", "OFF"] {
-            assert_eq!(parse_hypr_bool(token), Some(false), "`{token}` is false");
-        }
-        assert_eq!(
-            parse_hypr_bool("maybe"),
-            None,
-            "an unknown token is skipped"
         );
     }
 }

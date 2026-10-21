@@ -553,7 +553,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("temp dir should be creatable");
-        let path = write_file(dir.path(), "input.conf", b"kb_layout = us\n");
+        let path = write_file(dir.path(), "input.lua", b"kb_layout = \"us\",\n");
 
         let mut tracker = FreshnessTracker::new();
         tracker.record(&path).expect("record baseline");

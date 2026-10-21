@@ -14,7 +14,7 @@
 //! `hypridle.conf` write glue**. [`render_hypridle_conf`] takes the store's dirty Power &
 //! Idle settings and applies each to the file through the surgical hyprlang writer
 //! (§3.2), producing one lossless [`FileWrite`] whose diff is limited to the touched
-//! value spans (mirroring [`crate::core::input::render_input_conf`] and
+//! value spans (mirroring [`crate::core::input::render_input_lua`] and
 //! [`crate::core::notifications::render_swaync_config`]). The pipeline then restarts
 //! hypridle so it re-reads its config (task 4.4).
 //!

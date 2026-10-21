@@ -64,7 +64,7 @@ fn main() {
     );
 
     let fx = FixtureDotfiles::install();
-    let input_conf = fx.config_path("hypr/input.conf");
+    let input_lua = fx.config_path("hypr/input.lua");
 
     // --- Checklist (a): detection results ---------------------------------
     // Real detection against the fixture: the `$PATH` binary scan is a
@@ -78,7 +78,7 @@ fn main() {
         hyprland_socket: None,
         palette_config_anchor: fx.config_path("hypr/colors.conf"),
         config_paths: vec![
-            input_conf.clone(),
+            input_lua.clone(),
             fx.config_path("swaync/config.json"),
             fx.config_path("hypr/hypridle.conf"),
         ],
@@ -98,7 +98,7 @@ fn main() {
     // Load the store through the app's real startup loaders (task 5.4 wiring),
     // which log each file's parsed (setting, value) pairs at `debug`.
     let mut store = SettingsStore::new();
-    load_into_store(&mut store, &input_conf, loaders::input_conf);
+    load_into_store(&mut store, &input_lua, loaders::input_lua);
     load_into_store(
         &mut store,
         &fx.config_path("swaync/config.json"),
@@ -125,12 +125,14 @@ fn main() {
     // The plan is assembled by the app's real builder plus the Input page's
     // write glue, exactly as the window's Apply handler and the task-7.2
     // suites do. Capabilities are pinned to "hyprctl + live IPC" so the reload
-    // plan contains `hyprctl reload`; the mock runner answers it with success
-    // instead of poking the real compositor (see the module docs).
+    // plan contains `hyprctl reload config-only`; the mock runner answers it
+    // with success instead of poking the real compositor (see the module
+    // docs).
     let model = InputModel::load(
-        input_conf.clone(),
+        input_lua.clone(),
         Path::new("/nonexistent/evdev.xml"), // layout add-list is not under test
-    );
+    )
+    .expect("the fixture input.lua backs the Input page");
     let mut plan = base_apply_plan(&store);
     plan.writes.push(
         model
@@ -168,15 +170,15 @@ fn main() {
         .map(|write| (write.path.clone(), write.contents.clone()))
         .collect();
     store.commit_apply(&committed);
-    assert_eq!(written, vec![input_conf.clone()]);
+    assert_eq!(written, vec![input_lua.clone()]);
 
     // --- Checklist (c)+(d): real command exit status, error, and rollback --
-    // A second Apply whose palette generator fails: the input.conf write
+    // A second Apply whose palette generator fails: the input.lua write
     // happens for real, then the fixture's `generate-colors` stub runs as a
     // REAL subprocess through the real runner and exits 2 — so the journal
     // gets the runner's invocation + exit-status line, the write-phase error,
     // and the per-file rollback restore line, all against fixture files.
-    let before_rollback = fs::read(&input_conf).expect("read input.conf before the rollback demo");
+    let before_rollback = fs::read(&input_lua).expect("read input.lua before the rollback demo");
     store
         .stage(SettingId::MouseSensitivity, Value::Float(0.5))
         .expect("a sensitivity edit stages");
@@ -234,7 +236,7 @@ fn main() {
         other => panic!("expected WriteFailed from the stub generator, got {other:?}"),
     }
     assert_eq!(
-        fs::read(&input_conf).expect("read input.conf after the rollback"),
+        fs::read(&input_lua).expect("read input.lua after the rollback"),
         before_rollback,
         "the rollback must restore the pre-apply bytes byte-exactly (R5.4)"
     );

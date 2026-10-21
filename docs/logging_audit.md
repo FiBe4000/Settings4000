@@ -1,5 +1,11 @@
 # Structured logging audit (task 8.1)
 
+> **Captured before task 11.4 (2026-10-21).** The journal lines below still name
+> the Input file as `input.conf` with hyprlang `input.*` keys and the reload as
+> `hyprctl reload`. Since 11.4 the file is `input.lua` (same dotted paths, Lua
+> literals) and an Input write reloads with `hyprctl reload config-only`. The
+> audit's conclusions are unaffected; a re-capture is due after task 11.11.
+
 An audit of the app's `tracing` coverage against **R7.3** (what must be logged,
 at which level) and a confirmation of **R8.2** (no root, writes only under the
 user's config locations), concluded with the required checklist walkthrough

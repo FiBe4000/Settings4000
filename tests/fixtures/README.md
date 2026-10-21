@@ -52,7 +52,9 @@ files are deliberately still in their §6 shape; see "Known divergences from
     only in its laptop-panel `desc:` key. It is the realistic fixture for the
     Lua-literal editor (task 11.3): nested tables, the two cursor `hl.env`
     lines, and plenty of code the editor must treat as opaque.
-  - `hypr/input.lua` — the app-owned, schema-flat input table (verbatim).
+  - `hypr/input.lua` — the app-owned, schema-flat input table (verbatim);
+    the Input page's backing file since task 11.4, which also removed the
+    hyprlang input file it replaced.
   - `hypr/colors.lua` — the generated Lua palette partial (verbatim, header
     prefix `-- `, includes `shadow`); a read-only generated input.
   - `notifd/config` — the notifd daemon's seven-key `key=value` file with its
@@ -109,7 +111,6 @@ fixture until the tasks that retire the code and tests targeting them:
 
 | Fixture file | Removed by |
 |---|---|
-| `config/hypr/input.conf` | 11.4 (Input page moves to `input.lua`) |
 | `config/hypr/hyprland.conf` | 11.5 (cursor env write moves to `hyprland.lua`) |
 | `config/swaync/` (`config.json`, `style.css`, `colors.css`) | 11.7 (swaync replaced by notifd) |
 

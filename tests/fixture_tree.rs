@@ -93,7 +93,6 @@ fn deployed_config_paths_are_symlinks_into_the_repo() {
         "hypr/hyprland.conf",
         "hypr/hyprlock.conf",
         "hypr/hyprpaper.conf",
-        "hypr/input.conf",
         "hypr/monitors.conf",
         "gtk-3.0/settings.ini",
         "gtk-4.0/settings.ini",
@@ -156,7 +155,7 @@ fn deployed_config_paths_are_symlinks_into_the_repo() {
 fn detection_discovers_the_palette_source_behind_the_deployed_symlink() {
     let fx = FixtureDotfiles::install();
 
-    let input_conf = fx.config_path("hypr/input.conf");
+    let input_lua = fx.config_path("hypr/input.lua");
     let inputs = DetectionInputs {
         // No binaries, daemons, or compositor in a headless test — only the
         // filesystem-backed probes matter here.
@@ -164,7 +163,7 @@ fn detection_discovers_the_palette_source_behind_the_deployed_symlink() {
         running_processes: Vec::new(),
         hyprland_socket: None,
         palette_config_anchor: fx.config_path("hypr/colors.conf"),
-        config_paths: vec![input_conf.clone()],
+        config_paths: vec![input_lua.clone()],
         hyprctl_status: None,
         hyprland_lua_config: fx.config_path("hypr/hyprland.lua"),
     };
@@ -179,7 +178,7 @@ fn detection_discovers_the_palette_source_behind_the_deployed_symlink() {
         source.generate_colors(),
         fx.repo_path("scripts/generate-colors")
     );
-    assert!(caps.config_readable(&input_conf));
+    assert!(caps.config_readable(&input_lua));
     // Task 11.2: with no running session, the deployed `hyprland.lua` makes the
     // host read as a Lua-config host, so the Lua-only controls stay visible.
     assert_eq!(caps.hypr_config_provider(), HyprConfigProvider::Lua);
@@ -205,14 +204,13 @@ fn palette_schemes_parse_and_satisfy_the_schema() {
 
 /// Every hyprlang fixture parses warning-free through its deployed symlink,
 /// round-trips byte-identically, and yields the documented values at the
-/// section paths the app edits (analysis §6.3, tasks 6.5/6.6/6.8).
+/// section paths the app edits (tasks 6.5/6.8).
 #[test]
 fn hyprlang_configs_parse_losslessly_at_their_deployed_paths() {
     let fx = FixtureDotfiles::install();
 
     // Round-trip identity + warning-free parse for the whole hyprlang family.
     for relative in [
-        "hypr/input.conf",
         "hypr/hyprland.conf",
         "hypr/hypridle.conf",
         "hypr/hyprlock.conf",
@@ -223,17 +221,6 @@ fn hyprlang_configs_parse_losslessly_at_their_deployed_paths() {
         assert!(warnings.is_empty(), "{relative}: unexpected {warnings:?}");
         assert_eq!(file.emit(), input, "{relative} should round-trip");
     }
-
-    // input.conf: the Input page's section paths (task 6.6).
-    let (input_conf, _) = HyprlangFile::parse(&read(&fx.config_path("hypr/input.conf")));
-    assert_eq!(
-        input_conf.value(&KeyPath::at(&["input"], "kb_layout")),
-        Some("us,se")
-    );
-    assert_eq!(
-        input_conf.value(&KeyPath::at(&["input", "touchpad"], "natural_scroll")),
-        Some("true")
-    );
 
     // hypridle.conf: the positional listener addressing (task 6.8) — dim 150,
     // lock 300, DPMS 330, in file order.
@@ -416,18 +403,18 @@ fn active_scheme_reads_from_the_generated_header() {
 fn installs_are_isolated_and_symlinks_write_through_to_the_repo() {
     let fx_a = FixtureDotfiles::install();
     let fx_b = FixtureDotfiles::install();
-    let original = read(&fx_b.config_path("hypr/input.conf"));
+    let original = read(&fx_b.config_path("hypr/input.lua"));
 
     // A plain write through tree A's deployed symlink…
-    fs::write(fx_a.config_path("hypr/input.conf"), "input {\n}\n")
+    fs::write(fx_a.config_path("hypr/input.lua"), "hl.config({})\n")
         .expect("write through the symlink should succeed");
 
     // …lands in A's repo file and leaves tree B untouched.
     assert_eq!(
-        read(&fx_a.repo_path("config/hypr/input.conf")),
-        "input {\n}\n"
+        read(&fx_a.repo_path("config/hypr/input.lua")),
+        "hl.config({})\n"
     );
-    assert_eq!(read(&fx_b.config_path("hypr/input.conf")), original);
+    assert_eq!(read(&fx_b.config_path("hypr/input.lua")), original);
 }
 
 /// The files the `wayland-dev` dotfiles added (task 11.1, analysis §7–§8) are

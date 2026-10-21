@@ -1040,19 +1040,19 @@ mod tests {
         // conflicting file is this plan's write target, which is exactly what makes it
         // blocking (task 9.11 — see the module docs on step 2's scoping).
         let dir = tempfile::tempdir().expect("temp dir should be creatable");
-        let target = write_file(&dir, "input.conf", b"kb_layout = us\n");
+        let target = write_file(&dir, "input.lua", b"kb_layout = \"us\",\n");
         let mut tracker = FreshnessTracker::new();
         tracker.record(&target).expect("baseline the file");
         // Someone edits the file by hand after the baseline was taken.
-        fs::write(&target, b"kb_layout = se\n").expect("external edit");
+        fs::write(&target, b"kb_layout = \"se\",\n").expect("external edit");
 
         let plan = ApplyPlan {
             validations: Vec::new(),
             writes: vec![FileWrite {
                 path: target.clone(),
-                contents: b"kb_layout = us,se\n".to_vec(),
+                contents: b"kb_layout = \"us,se\",\n".to_vec(),
                 changed_keys: vec!["kb_layout".to_string()],
-                backing: BackingFile::InputConf,
+                backing: BackingFile::InputLua,
                 validation: WriteValidation::InPlan,
             }],
             palette: None,
@@ -1072,7 +1072,7 @@ mod tests {
         }
         assert_eq!(
             fs::read(&target).expect("read the file"),
-            b"kb_layout = se\n",
+            b"kb_layout = \"se\",\n",
             "the external edit stands; the staged write must not have clobbered it"
         );
         assert!(runner.recorded().is_empty(), "nothing runs on a conflict");
@@ -1080,30 +1080,30 @@ mod tests {
 
     // --- step 2's scoping: only a write target's conflict blocks (task 9.11) ------
 
-    /// Two tracked files in a fresh temp dir, returning `(dir, input_conf, hypridle_conf)`
+    /// Two tracked files in a fresh temp dir, returning `(dir, input_lua, hypridle_conf)`
     /// with both baselined in the returned tracker.
     ///
     /// The scoping tests all need the same two-file shape: the store tracks every backing
-    /// file it loaded (`input.conf`, swaync's `config.json`, `hypridle.conf`), while any
+    /// file it loaded (`input.lua`, swaync's `config.json`, `hypridle.conf`), while any
     /// single apply writes only the files whose category the user actually edited. Which of
     /// the two a given test makes its write target is the test's choice — deliberately not
     /// baked into these names, since the blocking and non-blocking tests swap the roles.
     fn two_tracked_files() -> (tempfile::TempDir, PathBuf, PathBuf, FreshnessTracker) {
         let dir = tempfile::tempdir().expect("temp dir should be creatable");
-        let input_conf = write_file(&dir, "input.conf", b"kb_layout = us\n");
+        let input_lua = write_file(&dir, "input.lua", b"kb_layout = \"us\",\n");
         let hypridle_conf = write_file(&dir, "hypridle.conf", b"listener { timeout = 300 }\n");
-        let tracker = record_baseline(&[&input_conf, &hypridle_conf]);
-        (dir, input_conf, hypridle_conf, tracker)
+        let tracker = record_baseline(&[&input_lua, &hypridle_conf]);
+        (dir, input_lua, hypridle_conf, tracker)
     }
 
-    /// The `input.conf` write the scoping tests plan, given the path from
+    /// The `input.lua` write the scoping tests plan, given the path from
     /// [`two_tracked_files`].
-    fn input_conf_write(path: &Path) -> FileWrite {
+    fn input_lua_write(path: &Path) -> FileWrite {
         FileWrite {
             path: path.to_path_buf(),
-            contents: b"kb_layout = us,se\n".to_vec(),
+            contents: b"kb_layout = \"us,se\",\n".to_vec(),
             changed_keys: vec!["kb_layout".to_string()],
-            backing: BackingFile::InputConf,
+            backing: BackingFile::InputLua,
             validation: WriteValidation::InPlan,
         }
     }
@@ -1113,7 +1113,7 @@ mod tests {
         // Task 9.11, the defect this scoping fixes: a tracked backing file that was
         // deleted can never be re-baselined by the store's refresh, so a whole-tracker
         // conflict check turned it into a permanent block on *every* category's apply
-        // until the app was restarted. The apply below writes only `input.conf`, so the
+        // until the app was restarted. The apply below writes only `input.lua`, so the
         // deleted `hypridle.conf` cannot be clobbered by it and must not stop it — but it
         // is still reported, because the app's view of that file is now wrong.
         let (_dir, written, other, tracker) = two_tracked_files();
@@ -1121,7 +1121,7 @@ mod tests {
 
         let plan = ApplyPlan {
             validations: Vec::new(),
-            writes: vec![input_conf_write(&written)],
+            writes: vec![input_lua_write(&written)],
             palette: None,
             reload_params: ReloadParams::default(),
         };
@@ -1156,7 +1156,7 @@ mod tests {
         }
         assert_eq!(
             fs::read(&written).expect("read the rewritten file"),
-            b"kb_layout = us,se\n",
+            b"kb_layout = \"us,se\",\n",
             "the unrelated file's problem must not cost the user their applied edit"
         );
         assert!(
@@ -1165,7 +1165,7 @@ mod tests {
         );
         assert_eq!(
             runner.recorded(),
-            vec![Command::new("hyprctl").arg("reload")],
+            vec![Command::new("hyprctl").arg("reload").arg("config-only")],
             "the apply completes normally, reloads included"
         );
     }
@@ -1181,7 +1181,7 @@ mod tests {
 
         let plan = ApplyPlan {
             validations: Vec::new(),
-            writes: vec![input_conf_write(&written)],
+            writes: vec![input_lua_write(&written)],
             palette: None,
             reload_params: ReloadParams::default(),
         };
@@ -1254,7 +1254,7 @@ mod tests {
         );
         assert_eq!(
             fs::read(&other).expect("read the untouched file"),
-            b"kb_layout = us\n",
+            b"kb_layout = \"us\",\n",
             "the apply aborted before any write"
         );
         assert!(runner.recorded().is_empty(), "nothing runs on a conflict");
@@ -1321,7 +1321,7 @@ mod tests {
         // Accept criterion (e): when a later write fails, earlier written files are
         // restored to their pre-apply bytes and no reload is attempted (R5.4).
         let dir = tempfile::tempdir().expect("temp dir should be creatable");
-        let first = write_file(&dir, "input.conf", b"original input\n");
+        let first = write_file(&dir, "input.lua", b"original input\n");
         // The second write targets a path that does not exist, so `write_atomic`
         // fails at canonicalization — an injected mid-sequence write failure.
         let missing = dir.path().join("monitors.conf");
@@ -1334,7 +1334,7 @@ mod tests {
                     path: first.clone(),
                     contents: b"new input\n".to_vec(),
                     changed_keys: vec!["kb_layout".to_string()],
-                    backing: BackingFile::InputConf,
+                    backing: BackingFile::InputLua,
                     validation: WriteValidation::InPlan,
                 },
                 FileWrite {
@@ -2263,7 +2263,11 @@ mod tests {
         use crate::core::store::{FileReader, FileValues, SettingsStore};
 
         let dir = tempfile::tempdir().expect("temp dir should be creatable");
-        let path = write_file(&dir, "input.conf", b"input {\n  sensitivity = 0.0\n}\n");
+        let path = write_file(
+            &dir,
+            "input.lua",
+            b"hl.config({ input = { sensitivity = 0.0 } })\n",
+        );
 
         // Load the file into a real store, establishing the freshness baseline from
         // the exact bytes read (as the startup loader does). The reader is trivial
@@ -2289,14 +2293,14 @@ mod tests {
             .stage(SettingId::MouseSensitivity, Value::Float(0.5))
             .expect("a valid edit stages");
 
-        let new_bytes = b"input {\n  sensitivity = 0.5\n}\n".to_vec();
+        let new_bytes = b"hl.config({ input = { sensitivity = 0.5 } })\n".to_vec();
         let plan = ApplyPlan {
             validations: vec![(SettingId::MouseSensitivity, Value::Float(0.5))],
             writes: vec![FileWrite {
                 path: path.clone(),
                 contents: new_bytes.clone(),
-                changed_keys: vec!["input:sensitivity".to_string()],
-                backing: BackingFile::InputConf,
+                changed_keys: vec!["input.sensitivity".to_string()],
+                backing: BackingFile::InputLua,
                 validation: WriteValidation::InPlan,
             }],
             palette: None,
@@ -2304,7 +2308,7 @@ mod tests {
         };
         let runner = MockCommandRunner::new();
         let signaller = MockProcessSignaller::new();
-        // No hyprctl/live IPC, so the InputConf reload is gated out — this test is
+        // No hyprctl/live IPC, so the InputLua reload is gated out — this test is
         // about the conflict check, not the reload set.
         let caps = Capabilities::for_tests(&[], &[], false);
 

@@ -37,7 +37,7 @@
 //! # The config provider is a guard, not a router (analysis §8.6)
 //!
 //! Hyprland ≥ 0.55 runs `hyprland.lua` through its Lua config provider, and the
-//! target dotfiles deleted their hyprlang `hyprland.conf`/`input.conf`. The app's
+//! target dotfiles deleted their hyprlang `hyprland.conf` and input file. The app's
 //! Hyprland-side input and cursor writes therefore exist only for the Lua files;
 //! there is deliberately no hyprlang code path for them (Hyprland deprecated
 //! hyprlang in 0.55). [`HyprConfigProvider`] records which provider is in use so a
@@ -1567,8 +1567,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("input.conf");
-        fs::write(&path, b"kb_layout = us\n").expect("write a config");
+        let path = dir.path().join("hypridle.conf");
+        fs::write(&path, b"general {\n}\n").expect("write a config");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o000))
             .expect("revoke read permission");
 

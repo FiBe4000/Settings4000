@@ -4,12 +4,12 @@
 //!
 //! # What this module is
 //!
-//! Three pages are file-backed in the plainest possible way: Input (`input.conf`),
+//! Three pages are file-backed in the plainest possible way: Input (`input.lua`),
 //! Notifications (swaync's `config.json`) and Power & Idle (`hypridle.conf`). Every one of
 //! their settings is an ordinary [`SettingId`] staged in the shared store, and an Apply
 //! turns that page's dirty settings into exactly one [`FileWrite`]. The interesting part of
 //! each is its **renderer** — which parser it drives and which addresses it edits — and
-//! that stays with the page ([`crate::core::input::render_input_conf`] and its two
+//! that stays with the page ([`crate::core::input::render_input_lua`] and its two
 //! siblings). What is not interesting, and was copied out once per page before this module
 //! existed, is the glue around it:
 //!
@@ -24,8 +24,9 @@
 //! [`render_write`](StoreBackedFile::render_write) is the one implementation of the steps
 //! themselves, and [`StoreWriteError`] is the one failure type — generic over the
 //! renderer's own error, which is the only genuinely page-specific piece of it (the
-//! hyprlang writer's [`EditError`](crate::parsers::hyprlang::EditError) for two of the
-//! three files, an unparseable-JSON failure for swaync's).
+//! Input renderer's [`InputRenderError`](crate::core::input::InputRenderError) for
+//! `input.lua`, the hyprlang writer's [`EditError`](crate::parsers::hyprlang::EditError)
+//! for `hypridle.conf`, an unparseable-JSON failure for swaync's).
 //!
 //! # Why a failure here must abort the whole Apply, not skip the file
 //!
@@ -87,7 +88,7 @@ pub struct StoreBackedFile {
     /// so a symlink into a dotfiles repo has its real target rewritten and the link
     /// preserved.
     pub path: PathBuf,
-    /// How the file is named in the failure message the user sees, e.g. `input.conf` or
+    /// How the file is named in the failure message the user sees, e.g. `input.lua` or
     /// `swaync config.json`.
     ///
     /// A short display name rather than [`Self::path`]: the dialog's job is to tell the
@@ -130,7 +131,7 @@ impl StoreBackedFile {
     /// [`SettingsStore::dirty_in_category`](crate::core::store::SettingsStore::dirty_in_category));
     /// that is the precondition [`Self::validation`] rests on. `render` is the page's own
     /// renderer, which applies those settings to the bytes just read through the file's
-    /// parser (e.g. [`crate::core::input::render_input_conf`]). Its error need only be
+    /// parser (e.g. [`crate::core::input::render_input_lua`]). Its error need only be
     /// [`Display`](fmt::Display), which is all the glue does with it: log the reason, and
     /// carry it for the caller to quote.
     ///
@@ -187,8 +188,9 @@ impl StoreBackedFile {
 /// Why one store-backed file's write could not be prepared, despite its page having dirty
 /// settings to apply (task 9.17).
 ///
-/// Generic over `E`, the page renderer's own failure: the hyprlang writer's
-/// [`EditError`](crate::parsers::hyprlang::EditError) for `input.conf` and
+/// Generic over `E`, the page renderer's own failure: the Input renderer's
+/// [`InputRenderError`](crate::core::input::InputRenderError) for `input.lua`, the
+/// hyprlang writer's [`EditError`](crate::parsers::hyprlang::EditError) for
 /// `hypridle.conf`, an unparseable-JSON failure for swaync's `config.json`. Both variants
 /// carry the file's display name because the [`Display`](fmt::Display) text is quoted
 /// verbatim in the dialog the user sees (`ui::chrome`'s `assembly_warning`), which has to
@@ -259,7 +261,7 @@ mod tests {
         StoreBackedFile {
             path,
             name: "test.conf",
-            backing: BackingFile::InputConf,
+            backing: BackingFile::InputLua,
             validation: WriteValidation::InPlan,
             read_failure_log: "could not read test.conf",
             render_failure_log: "could not render test.conf",
@@ -309,7 +311,7 @@ mod tests {
         assert_eq!(write.path, path);
         assert_eq!(write.contents, b"after\n");
         assert_eq!(write.changed_keys, vec!["some.key".to_string()]);
-        assert_eq!(write.backing, BackingFile::InputConf);
+        assert_eq!(write.backing, BackingFile::InputLua);
         assert_eq!(write.validation, WriteValidation::InPlan);
     }
 

@@ -46,7 +46,7 @@
 //!   populated from the runtime-loaded XKB registry. It uses the declarative row
 //!   framework (the settings are ordinary file-backed [`crate::core::model::SettingId`]s);
 //!   only the runtime candidate list and the curated keyboard-option switches need this
-//!   thin glue. The store→`input.conf` write itself lives in [`crate::core::input`].
+//!   thin glue. The store→`input.lua` write itself lives in [`crate::core::input`].
 //! - [`network`] — the Network page's bespoke glue (task 6.9): a read-only list of the
 //!   active NetworkManager connections plus the "Open Network Settings" button that
 //!   launches the management tool detached, rendered from the runtime

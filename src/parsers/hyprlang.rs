@@ -17,10 +17,12 @@
 //!   just `}`. Blocks nest (`input { touchpad { … } }`) and the same section
 //!   name may appear more than once (hypridle has three `listener { }` blocks).
 //!
-//! This module edits the app-owned hyprlang files the settings GUI manages:
-//! `config/hypr/input.conf` (the extracted `input { }` block — analysis §6.3,
-//! **not** `hyprland.conf`), `hyprland.conf` (only the two cursor `env =`
-//! lines), `hypridle.conf`, `hyprlock.conf`, and `hyprpaper.conf`.
+//! This module edits the hyprlang files the settings GUI manages:
+//! `hypridle.conf`, `hyprlock.conf`, `hyprpaper.conf`, and `hyprland.conf` (only
+//! the two cursor `env =` lines, until task 11.5 moves that write to
+//! `hyprland.lua`). Hyprland itself now runs its Lua config provider, so the
+//! Input page edits `input.lua` through
+//! [`crate::parsers::lua_literal`] instead (analysis §7.1, task 11.4).
 //!
 //! # Why a surgical, lossless parser (not a serializer)
 //!
@@ -1178,12 +1180,12 @@ mod tests {
     use super::*;
     use crate::testing::differing_lines;
 
-    /// The app-owned `input.conf` (analysis §6.3): a header comment, the
-    /// `input { }` block with flat keys, and a nested `touchpad { }` block. Uses
-    /// the real `key=value` style (no spaces around `=`).
-    const INPUT_CONF: &str = "\
-# Input configuration (keyboard layout/options, sensitivity, touchpad)
-# Sourced by hyprland.conf. App-owned: written by the settings app; keep it small.
+    /// A two-level nested block in the shape of Hyprland's former hyprlang input
+    /// configuration: a header comment, an `input { }` block with flat keys
+    /// (some with empty values), and a nested `touchpad { }` block with a hyphenated
+    /// key. Uses the compact `key=value` style (no spaces around `=`).
+    const NESTED_BLOCK: &str = "\
+# Keyboard layout/options, sensitivity, touchpad.
 input {
     kb_layout=us,se
     kb_variant=
@@ -1251,7 +1253,6 @@ splash = false
 # Hyprland main config (excerpt)
 source = ~/.config/hypr/colors.conf
 source = ~/.config/hypr/monitors.conf
-source = ~/.config/hypr/input.conf
 
 # Cursor env, kept identical to uwsm/env (canonical). No other env lines here.
 env = XCURSOR_THEME,Nordic-cursors
@@ -1335,7 +1336,7 @@ bind = $mainMod, Return, exec, $terminal
     /// All well-formed fixtures, for the round-trip identity sweep.
     fn well_formed_fixtures() -> Vec<(&'static str, &'static str)> {
         vec![
-            ("input.conf", INPUT_CONF),
+            ("nested block", NESTED_BLOCK),
             ("hypridle.conf", HYPRIDLE_CONF),
             ("hyprpaper.conf", HYPRPAPER_CONF),
             ("hyprland.conf env", HYPRLAND_ENV),
@@ -1378,15 +1379,15 @@ bind = $mainMod, Return, exec, $terminal
     fn editing_a_deeply_nested_value_changes_only_that_span() {
         // A section-path edit deep in a nested block changes exactly one value
         // span and leaves every other byte untouched.
-        let (mut file, _) = HyprlangFile::parse(INPUT_CONF);
+        let (mut file, _) = HyprlangFile::parse(NESTED_BLOCK);
         let path = KeyPath::at(&["input", "touchpad"], "natural_scroll");
         assert_eq!(file.value(&path), Some("true"));
 
         file.set_value(&path, "false").expect("editable entry");
         let edited = file.emit();
 
-        let changed = differing_lines(INPUT_CONF, &edited);
-        let target = INPUT_CONF
+        let changed = differing_lines(NESTED_BLOCK, &edited);
+        let target = NESTED_BLOCK
             .lines()
             .position(|l| l == "        natural_scroll=true")
             .expect("fixture contains the natural_scroll entry");
@@ -1395,33 +1396,6 @@ bind = $mainMod, Return, exec, $terminal
             edited.lines().nth(target),
             Some("        natural_scroll=false"),
             "only the value span changed: indentation, key, and `=` are preserved"
-        );
-    }
-
-    #[test]
-    fn input_path_addresses_input_conf_not_hyprland() {
-        // The `input.*` addressing resolves in input.conf (the extracted block,
-        // analysis §6.3) and NOT in hyprland.conf, which no longer has an input
-        // block. Same path: found in one file, absent (SectionNotFound) in the
-        // other.
-        let path = KeyPath::at(&["input", "touchpad"], "natural_scroll");
-
-        let (input_conf, _) = HyprlangFile::parse(INPUT_CONF);
-        assert_eq!(input_conf.value(&path), Some("true"));
-
-        let (mut hyprland, _) = HyprlangFile::parse(HYPRLAND_ENV);
-        assert_eq!(hyprland.value(&path), None);
-        assert_eq!(
-            hyprland.set_value(&path, "false"),
-            Err(EditError::SectionNotFound(
-                "input.touchpad.natural_scroll".to_string()
-            )),
-            "an input.* edit must not fall back to some other section"
-        );
-        assert_eq!(
-            hyprland.emit(),
-            HYPRLAND_ENV,
-            "the rejected edit changed nothing"
         );
     }
 
@@ -1585,12 +1559,12 @@ bind = $mainMod, Return, exec, $terminal
         // Appending: a new key inside `touchpad { }` lands immediately before the
         // touchpad closing brace, copying the sibling entries' indent (8 spaces)
         // and `=` separator.
-        let (mut file, _) = HyprlangFile::parse(INPUT_CONF);
+        let (mut file, _) = HyprlangFile::parse(NESTED_BLOCK);
         let path = KeyPath::at(&["input", "touchpad"], "disable_while_typing");
         assert_eq!(file.value(&path), None);
 
         file.set_value(&path, "true").expect("appends a new key");
-        let expected = INPUT_CONF.replace(
+        let expected = NESTED_BLOCK.replace(
             "        scroll_factor=1.0\n    }",
             "        scroll_factor=1.0\n        disable_while_typing=true\n    }",
         );
@@ -1671,7 +1645,7 @@ bind = $mainMod, Return, exec, $terminal
     #[test]
     fn edits_reject_values_that_would_break_hyprlang() {
         // A newline or `#` in a value is rejected before any byte changes (R8.3).
-        let (mut file, _) = HyprlangFile::parse(INPUT_CONF);
+        let (mut file, _) = HyprlangFile::parse(NESTED_BLOCK);
         let path = KeyPath::at(&["input"], "kb_layout");
         for bad in ["us\nse", "us # comment", "us\rse"] {
             assert_eq!(
@@ -1679,7 +1653,11 @@ bind = $mainMod, Return, exec, $terminal
                 Err(EditError::InvalidValue(bad.to_string()))
             );
         }
-        assert_eq!(file.emit(), INPUT_CONF, "no rejected edit changed the file");
+        assert_eq!(
+            file.emit(),
+            NESTED_BLOCK,
+            "no rejected edit changed the file"
+        );
 
         let (mut env, _) = HyprlangFile::parse(HYPRLAND_ENV);
         assert_eq!(
@@ -1802,7 +1780,7 @@ bind = $mainMod, Return, exec, $terminal
             "input {\n    k = edited\n    touchpad {\n        k = inner\n    }\n}\n"
         );
 
-        // The `input.conf`-shaped case where the two rules interact: the parent's
+        // The nested-block case where the two rules interact: the parent's
         // *last* assignment comes after the child block has closed, so descending
         // into the child and coming back out must not lose track of the parent
         // level. The old first-match walk answered `one` here.

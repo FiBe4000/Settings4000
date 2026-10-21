@@ -1,7 +1,9 @@
 //! Test support: the fixture-dotfiles installer (task 7.1, R6.1), the shared
-//! harness of the end-to-end Apply suites (task 7.2), and the small text
+//! harness of the end-to-end Apply suites (task 7.2), the small text
 //! assertions ([`replace_once`], [`differing_lines`]) that the parser and page
-//! unit tests use to state the surgical-edit contract (task 9.13).
+//! unit tests use to state the surgical-edit contract (task 9.13), and a scoped
+//! log capture ([`capture_logs`]) for asserting what a hidden feature logs
+//! (R4.2, R7.3).
 //!
 //! Integration suites need a realistic dotfiles environment: a repo tree like
 //! `~/.dotfiles` (palette sources, `scripts/generate-colors`, `theme/fonts`,
@@ -210,7 +212,7 @@ impl FixtureDotfiles {
     }
 
     /// A path under the deployed config root, e.g.
-    /// `config_path("hypr/input.conf")` — the live XDG path of a backing file.
+    /// `config_path("hypr/input.lua")` — the live XDG path of a backing file.
     pub fn config_path(&self, relative: &str) -> PathBuf {
         self.config_root.join(relative)
     }
@@ -324,9 +326,9 @@ pub mod loaders {
 
     use crate::core::store::FileValues;
 
-    /// The app's `~/.config/hypr/input.conf` loader (Input page, task 6.6).
-    pub fn input_conf(path: &Path) -> io::Result<FileValues> {
-        crate::ui::startup::load_input_conf(path)
+    /// The app's `~/.config/hypr/input.lua` loader (Input page, tasks 6.6, 11.4).
+    pub fn input_lua(path: &Path) -> io::Result<FileValues> {
+        crate::ui::startup::load_input_lua(path)
     }
 
     /// The app's `~/.config/swaync/config.json` loader (Notifications page, task 6.7).
@@ -522,4 +524,106 @@ pub fn differing_lines(before: &str, after: &str) -> Vec<usize> {
         .enumerate()
         .filter_map(|(index, (b, a))| (b != a).then_some(index))
         .collect()
+}
+
+// ===========================================================================
+// Log capture
+// ===========================================================================
+
+/// One log event captured by [`capture_logs`].
+///
+/// The message and the fields are kept apart so a test asserting on the message can
+/// never be satisfied by a field value that happens to contain the same words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedEvent {
+    /// The event's level (`info`, `warn`, …).
+    pub level: tracing::Level,
+    /// The event's message, the text after its fields in the `tracing` macro.
+    pub message: String,
+    /// The event's other fields, rendered as `name=value ` pairs in order.
+    pub fields: String,
+}
+
+/// Runs `action` under a scoped `tracing` subscriber and returns the events it
+/// logged, for tests that pin what a hidden or degraded feature logs (R4.2, R7.3).
+///
+/// The subscriber is installed only for the current thread (no global state), but
+/// `tracing` keeps a single process-wide cache of each callsite's *interest*: a
+/// parallel test that hits the same `info!` callsite first, under the no-op default
+/// subscriber, can cache it as "never enabled", which would suppress the event here.
+/// So `action` runs **twice**: once to register every callsite it reaches, then —
+/// after the interest cache is rebuilt against this subscriber and the first run's
+/// events are discarded — once more for the events that are returned. `action` must
+/// therefore be safe to repeat.
+///
+/// # Panics
+///
+/// Panics if the capture's mutex is poisoned, which only happens when `action`
+/// itself panicked — already a test failure.
+pub fn capture_logs(mut action: impl FnMut()) -> Vec<CapturedEvent> {
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Clone, Default)]
+    struct Capture {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    struct Visitor<'a> {
+        message: &'a mut String,
+        fields: &'a mut String,
+    }
+
+    impl tracing::field::Visit for Visitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            if field.name() == "message" {
+                let _ = write!(self.message, "{value:?}");
+            } else {
+                let _ = write!(self.fields, "{}={value:?} ", field.name());
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for Capture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut message = String::new();
+            let mut fields = String::new();
+            event.record(&mut Visitor {
+                message: &mut message,
+                fields: &mut fields,
+            });
+            self.events
+                .lock()
+                .expect("log capture mutex should not be poisoned")
+                .push(CapturedEvent {
+                    level: *event.metadata().level(),
+                    message,
+                    fields,
+                });
+        }
+    }
+
+    let capture = Capture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    tracing::subscriber::with_default(subscriber, || {
+        action();
+        tracing::callsite::rebuild_interest_cache();
+        capture
+            .events
+            .lock()
+            .expect("log capture mutex should not be poisoned")
+            .clear();
+        action();
+    });
+    let events = capture
+        .events
+        .lock()
+        .expect("log capture mutex should not be poisoned");
+    events.clone()
 }

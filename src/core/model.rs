@@ -85,7 +85,7 @@ pub enum Category {
     /// Palette, GTK/icon/cursor themes, wallpaper and lock background (tasks
     /// 6.3–6.5).
     Theme,
-    /// Keyboard, mouse, and touchpad settings backed by `input.conf` (task 6.6).
+    /// Keyboard, mouse, and touchpad settings backed by `input.lua` (tasks 6.6, 11.4).
     Input,
     /// swaync notification settings backed by `config.json` (task 6.7).
     Notifications,

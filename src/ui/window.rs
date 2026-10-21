@@ -119,7 +119,6 @@ use crate::ui::input;
 use crate::ui::network::{self, NetworkPage};
 use crate::ui::notifications::{self, NotificationsPage};
 use crate::ui::page::{self, PageMsg, PagePlan, SettingsPage};
-use crate::ui::row::visible_rows;
 use crate::ui::sound::{self, SoundPage};
 use crate::ui::startup::{self, LoadedFile, StartupLoad};
 use crate::ui::theme::{self, ThemePage};
@@ -179,12 +178,14 @@ struct Shell {
     /// or a committed Apply. Rebuilt by [`Shell::populate`]; `None` while the Display
     /// category shows a placeholder (no live monitor data).
     display_page: Rc<RefCell<Option<DisplayPage>>>,
-    /// The Input page's helper (task 6.6), shared with the Input glue. `None` until the
-    /// startup worker builds it, or when `hyprctl` is absent. Unlike the Display/Theme
+    /// The Input page's helper (tasks 6.6, 11.4), shared with the Input glue. `None` until
+    /// the startup worker builds it, or when the page cannot be offered (no `hyprctl`, a
+    /// hyprlang host, or an `input.lua` that is missing or not fully understood — see
+    /// `startup::load_input_from`); the Input page is then hidden. Unlike the Display/Theme
     /// models it is **not** a separate staging source — every Input setting is staged in
     /// the shared store — so it feeds neither the dirty rollup nor a bespoke commit; it
     /// only supplies the keyboard-layout candidates and renders the store's dirty Input
-    /// settings into the `input.conf` write on Apply (see [`assemble_apply_plan`]).
+    /// settings into the `input.lua` write on Apply (see [`assemble_apply_plan`]).
     input: Rc<RefCell<Option<InputModel>>>,
     /// The Notifications page's helper (task 6.7), shared with the Notifications glue.
     /// `None` until the startup worker builds it, or when swaync is absent. Like the
@@ -306,7 +307,7 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     let display: Rc<RefCell<Option<DisplayModel>>> = Rc::new(RefCell::new(None));
     let display_page: Rc<RefCell<Option<DisplayPage>>> = Rc::new(RefCell::new(None));
     // The Input page's helper (task 6.6) — the layout candidates + the Apply-time
-    // `input.conf` write. Filled by the worker; the Input page's controls are ordinary
+    // `input.lua` write. Filled by the worker; the Input page's controls are ordinary
     // store-backed rows, so no separate page handle is retained (the SettingsPage
     // controller goes in `controllers` like any framework page).
     let input: Rc<RefCell<Option<InputModel>>> = Rc::new(RefCell::new(None));
@@ -820,36 +821,31 @@ impl Shell {
         }
     }
 
-    /// Builds the Input category's page (task 6.6).
+    /// Builds the Input category's page (tasks 6.6, 11.4).
     ///
     /// The Input settings are ordinary store-backed [`SettingId`](crate::core::model::SettingId)s,
     /// so this uses the declarative row framework like the generic path — the only reason
     /// it is special-cased is that its keyboard-layout add-control is populated from the
-    /// runtime XKB candidates the [`InputModel`] holds ([`input::rows`]), which the pure
-    /// `page::plan_category` cannot supply. The built rows are gated per-row (R4.2) and, if
+    /// runtime XKB candidates the [`InputModel`] holds ([`input::page_rows`]), which the
+    /// pure `page::plan_category` cannot supply. The rows are gated per-row (R4.2) and, if
     /// any survive, a [`SettingsPage`] is launched and its controller retained in
     /// `controllers` (so a Reset/commit re-renders it via [`PageMsg::Rerender`], and its
-    /// dirty marker tracks the store's Input rollup like any framework page). If every row
-    /// is gated out the category is dropped (R4.2). The category is only reached when
-    /// `hyprctl` is present (task 5.1), so the [`InputModel`] is built too; if it were
-    /// somehow absent, the layout add-list is simply empty.
+    /// dirty marker tracks the store's Input rollup like any framework page). Without an
+    /// [`InputModel`] there are no rows and the category is dropped (R4.2): the startup
+    /// load builds none when `input.lua` is missing or holds lines the editor does not
+    /// understand, and has already logged why.
     fn populate_input(
         &self,
         category: SidebarCategory,
         controllers: &mut Vec<Controller<SettingsPage>>,
     ) {
         let caps = self.capabilities.borrow();
-        let layouts = self
-            .input
-            .borrow()
-            .as_ref()
-            .map(|model| model.layout_options().to_vec())
-            .unwrap_or_default();
-        let visible = visible_rows(&input::rows(&layouts), &caps);
+        let visible = input::page_rows(self.input.borrow().as_ref(), &caps);
         if visible.is_empty() {
             tracing::info!(
                 category = category.title(),
-                "all Input rows are gated out; hiding the whole category (R4.2)"
+                "the Input page has no rows (no usable input.lua, or every row gated out); \
+                 hiding the whole category (R4.2)"
             );
             return;
         }

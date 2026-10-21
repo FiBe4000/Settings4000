@@ -75,8 +75,8 @@ fn loaded_store(fx: &FixtureDotfiles) -> SettingsStore {
     let mut store = SettingsStore::new();
     load_into_store(
         &mut store,
-        &fx.config_path("hypr/input.conf"),
-        loaders::input_conf,
+        &fx.config_path("hypr/input.lua"),
+        loaders::input_lua,
     );
     load_into_store(
         &mut store,
@@ -95,9 +95,10 @@ fn loaded_store(fx: &FixtureDotfiles) -> SettingsStore {
 /// layout candidates play no part in assembly, and the model degrades to none (R4.4).
 fn input_model(fx: &FixtureDotfiles) -> InputModel {
     InputModel::load(
-        fx.config_path("hypr/input.conf"),
+        fx.config_path("hypr/input.lua"),
         Path::new("/nonexistent/evdev.xml"),
     )
+    .expect("the fixture input.lua backs the Input page")
 }
 
 /// The Display model, built through its production probe-and-read entry point.
@@ -254,7 +255,7 @@ fn the_three_store_backed_pages_fold_one_write_each() {
     assert_eq!(
         write_paths(&assembled.plan),
         vec![
-            fx.config_path("hypr/input.conf"),
+            fx.config_path("hypr/input.lua"),
             fx.config_path("swaync/config.json"),
             fx.config_path("hypr/hypridle.conf"),
         ],
@@ -314,7 +315,7 @@ fn the_commit_snapshot_covers_the_stores_own_files_only() {
     assert_eq!(
         write_paths(&assembled.plan),
         vec![
-            fx.config_path("hypr/input.conf"),
+            fx.config_path("hypr/input.lua"),
             fx.config_path("hypr/monitors.conf"),
         ],
         "the plan writes both files"
@@ -325,7 +326,7 @@ fn the_commit_snapshot_covers_the_stores_own_files_only() {
             .iter()
             .map(|(path, _)| path.clone())
             .collect::<Vec<_>>(),
-        vec![fx.config_path("hypr/input.conf")],
+        vec![fx.config_path("hypr/input.lua")],
         "only the store-tracked file is handed to commit_apply"
     );
     assert!(
@@ -574,14 +575,14 @@ fn a_changed_file_behind_a_clean_model_never_blocks_the_apply() {
     .expect("a clean model's stale file must not block another page's Apply");
     assert_eq!(
         write_paths(&assembled.plan),
-        vec![fx.config_path("hypr/input.conf")],
+        vec![fx.config_path("hypr/input.lua")],
         "the Input write is planned and no monitors.conf write is"
     );
 }
 
 #[test]
 fn the_conflict_guards_run_before_any_write_is_prepared() {
-    // Guard *ordering*: with a stale Display model AND an unreadable input.conf, both
+    // Guard *ordering*: with a stale Display model AND an unreadable input.lua, both
     // failure paths are live. The conflict must win, because it is the one with a
     // recovery: the window reloads the model and the user re-applies. Preparing writes
     // first would report the unreadable file and leave the stale model in place, so the
@@ -606,8 +607,8 @@ fn the_conflict_guards_run_before_any_write_is_prepared() {
     .expect("apply the external edit");
     // The write the assembler would otherwise prepare first now cannot be rendered at
     // all: the file (and the repo target behind its symlink) is gone.
-    fs::remove_file(fx.repo_path("config/hypr/input.conf")).expect("remove the repo target");
-    fs::remove_file(fx.config_path("hypr/input.conf")).expect("remove the deployed symlink");
+    fs::remove_file(fx.repo_path("config/hypr/input.lua")).expect("remove the repo target");
+    fs::remove_file(fx.config_path("hypr/input.lua")).expect("remove the deployed symlink");
 
     let failure = assemble_apply_plan(ApplySources {
         display: Some(&display),
@@ -623,7 +624,7 @@ fn the_conflict_guards_run_before_any_write_is_prepared() {
 }
 
 #[test]
-fn an_unreadable_input_conf_aborts_the_whole_apply() {
+fn an_unreadable_input_lua_aborts_the_whole_apply() {
     // The abort-not-skip contract (task 6.6): with Input edits pending but its file
     // unreadable, the assembler refuses to plan at all. Skipping the write would let the
     // Apply succeed for the *other* dirty page and then commit the Input values against
@@ -639,15 +640,15 @@ fn an_unreadable_input_conf_aborts_the_whole_apply() {
     let input = input_model(&fx);
     let power = PowerModel::load(fx.config_path("hypr/hypridle.conf"));
 
-    fs::remove_file(fx.repo_path("config/hypr/input.conf")).expect("remove the repo target");
-    fs::remove_file(fx.config_path("hypr/input.conf")).expect("remove the deployed symlink");
+    fs::remove_file(fx.repo_path("config/hypr/input.lua")).expect("remove the repo target");
+    fs::remove_file(fx.config_path("hypr/input.lua")).expect("remove the deployed symlink");
 
     let failure = assemble_apply_plan(ApplySources {
         input: Some(&input),
         power: Some(&power),
         ..ApplySources::for_store(&store)
     })
-    .expect_err("a pending Input edit with no readable input.conf must abort");
+    .expect_err("a pending Input edit with no readable input.lua must abort");
     let message = expect_write_failure(failure, FailedWrite::Input);
     assert!(
         !message.is_empty(),
@@ -702,6 +703,28 @@ fn an_unreadable_hypridle_conf_aborts_the_whole_apply() {
     .expect_err("a pending Power & Idle edit with no readable file must abort");
     expect_write_failure(failure, FailedWrite::Power);
     assert!(store.is_dirty(), "the staged edit is kept for a retry");
+}
+
+#[test]
+fn staged_power_edits_without_a_power_model_abort_the_whole_apply() {
+    // The generic orphaned-edits branch of the store-backed fold, through a page other
+    // than Input: a Refresh dropped the Power & Idle helper (hypridle uninstalled, say)
+    // while a lock-timeout edit was still staged. There is no write for it to land in,
+    // so the Apply aborts naming the page instead of committing an unwritten value.
+    let fx = FixtureDotfiles::install();
+    let mut store = loaded_store(&fx);
+    store
+        .stage(SettingId::LockTimeout, Value::Integer(600))
+        .expect("a lock-timeout change stages");
+
+    let failure = assemble_apply_plan(ApplySources::for_store(&store))
+        .expect_err("orphaned Power & Idle edits must abort");
+    let message = expect_write_failure(failure, FailedWrite::Power);
+    assert!(
+        message.contains("Reset"),
+        "the message says how to get out: {message}"
+    );
+    assert!(store.is_dirty(), "the staged edit is kept");
 }
 
 #[test]
@@ -783,7 +806,7 @@ fn an_assembled_plan_applies_and_reconciles_every_source() {
     assert_eq!(
         written,
         vec![
-            fx.config_path("hypr/input.conf"),
+            fx.config_path("hypr/input.lua"),
             fx.config_path("hypr/monitors.conf"),
         ],
         "both files were written, at their live paths"

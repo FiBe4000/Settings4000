@@ -42,7 +42,8 @@
 //! # Kept in sync with `scripts/apply-theme`
 //!
 //! For a palette (color-scheme) change the reload set mirrors the dotfiles'
-//! canonical `scripts/apply-theme` wrapper (analysis §6.1): `hyprctl reload`, then
+//! canonical `scripts/apply-theme` wrapper (analysis §6.1): `hyprctl reload` (the
+//! script's `config-only` form lands with task 11.11), then
 //! `eww reload`, then `swaync-client -rs`, then a SIGUSR1 to kitty. The app runs
 //! `generate-colors` and issues these reloads itself rather than calling the
 //! script (architecture §6), so this table and that script must be kept in step:
@@ -123,9 +124,10 @@ pub enum BackingFile {
     /// `config/hypr/monitors.conf` — a display change; Hyprland re-reads it on
     /// `hyprctl reload` (task 6.1).
     MonitorsConf,
-    /// `config/hypr/input.conf` — the `source=`d `input {}` block; `hyprctl reload`
-    /// (task 6.6).
-    InputConf,
+    /// `config/hypr/input.lua` — the app-owned `hl.config({ input = { … } })` table
+    /// that `hyprland.lua` loads with `dofile` (analysis §7.1, §8.6); re-read with
+    /// `hyprctl reload config-only` (tasks 6.6, 11.4).
+    InputLua,
     /// `config/hypr/hyprland.conf` — the cursor `env =` lines the app still owns
     /// here; `hyprctl reload` re-reads the file (task 6.4). The live cursor change
     /// itself is applied by the cursor reload emitted for the GTK/env files.
@@ -169,11 +171,19 @@ impl BackingFile {
     /// yields no action for it (with a warning) rather than an ill-formed command.
     pub fn reload_actions(self, params: &ReloadParams) -> Vec<ReloadAction> {
         match self {
-            // A plain Hyprland config re-read. hyprland.conf is here (not with the
-            // cursor reload) because architecture §6 maps the file to `hyprctl
-            // reload`; the live cursor apply rides on the GTK/env files' actions.
-            BackingFile::MonitorsConf | BackingFile::InputConf | BackingFile::HyprlandConf => {
-                vec![ReloadAction::HyprctlReload]
+            // An input change only needs Hyprland to re-run its config, not to
+            // re-apply monitor layouts, so it takes the lighter `config-only` form —
+            // the same one `scripts/apply-theme` uses (architecture §6, task 11.4).
+            BackingFile::InputLua => {
+                vec![ReloadAction::HyprctlReload(HyprlandReloadScope::ConfigOnly)]
+            }
+            // A full Hyprland re-read. `monitors.conf` needs it so the monitor rules
+            // are re-applied. hyprland.conf is here (not with the cursor reload)
+            // because architecture §6 maps the file to `hyprctl reload`; the live
+            // cursor apply rides on the GTK/env files' actions. Task 11.11 decides
+            // which of these keep the full form.
+            BackingFile::MonitorsConf | BackingFile::HyprlandConf => {
+                vec![ReloadAction::HyprctlReload(HyprlandReloadScope::Full)]
             }
             BackingFile::HypridleConf => vec![ReloadAction::HypridleRestart],
             // hyprlock intentionally has no reload (see the variant docs).
@@ -204,7 +214,7 @@ impl BackingFile {
             // (`-rs`) only: `generate-colors` rewrites `swaync/colors.css`, which
             // `style.css` imports, and never touches `config.json`.
             BackingFile::Palette => vec![
-                ReloadAction::HyprctlReload,
+                ReloadAction::HyprctlReload(HyprlandReloadScope::Full),
                 ReloadAction::EwwReload,
                 ReloadAction::SwayncReloadCss,
                 ReloadAction::KittyColors,
@@ -293,6 +303,29 @@ pub struct CursorValue {
     pub size: u32,
 }
 
+/// How much of its configuration Hyprland re-applies on a `hyprctl reload`
+/// (architecture §6; analysis §8.1).
+///
+/// Hyprland has two reload forms. `hyprctl reload config-only` re-runs the config
+/// and applies the options it sets (input, cursor, colors) without re-applying the
+/// monitor layout; the dotfiles' own `scripts/apply-theme` uses it for exactly that
+/// reason. The plain `hyprctl reload` re-applies everything, which a
+/// `monitors.conf` change needs. Both are safe while docked: the dotfiles' Lua
+/// monitor loader keeps the laptop panel off on either form (analysis §8.1).
+///
+/// Today only an `input.lua` write uses [`ConfigOnly`](Self::ConfigOnly) (task
+/// 11.4); task 11.11 moves the cursor and palette changes to it as well. When one
+/// Apply needs both forms, [`plan_reloads`] issues only the full reload, because it
+/// re-applies everything the lighter one would.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HyprlandReloadScope {
+    /// `hyprctl reload config-only`: re-run the config, leave the monitor layout as
+    /// it is.
+    ConfigOnly,
+    /// `hyprctl reload`: re-run the config and re-apply the monitor layout.
+    Full,
+}
+
 /// A single distinct live-reload the app can issue (architecture §6 /
 /// `scripts/apply-theme`, analysis §6.1).
 ///
@@ -304,9 +337,10 @@ pub struct CursorValue {
 /// [`Self::execute`] rather than a plain command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReloadAction {
-    /// `hyprctl reload` — Hyprland re-reads `hyprland.conf` and every `source=`d
-    /// file.
-    HyprctlReload,
+    /// `hyprctl reload` or `hyprctl reload config-only` — Hyprland re-runs its
+    /// config (`hyprland.lua` and every file it loads); the
+    /// [`HyprlandReloadScope`] picks the form.
+    HyprctlReload(HyprlandReloadScope),
     /// `eww reload` — recompile and reload the eww bars.
     EwwReload,
     /// `swaync-client -R` (`--reload-config`) — swaync re-reads `config.json`, so an
@@ -366,7 +400,7 @@ impl ReloadAction {
     /// [`plan_reloads`] drops the action.
     pub fn is_available(&self, capabilities: &Capabilities) -> bool {
         match self {
-            ReloadAction::HyprctlReload | ReloadAction::HyprctlSetCursor { .. } => {
+            ReloadAction::HyprctlReload(_) | ReloadAction::HyprctlSetCursor { .. } => {
                 capabilities.hyprland_reloadable()
             }
             ReloadAction::HyprpaperWallpaper { .. } => {
@@ -393,7 +427,11 @@ impl ReloadAction {
     /// reload, so the stylesheet is the last thing swaync re-reads.
     fn order_key(&self) -> (u8, u8) {
         match self {
-            ReloadAction::HyprctlReload => (0, 0),
+            // Both forms share the Hyprland slot so they stay adjacent in the sorted
+            // plan; the fold in [`plan_reloads`] that drops `config-only` beside a
+            // full reload does not depend on their relative order.
+            ReloadAction::HyprctlReload(HyprlandReloadScope::Full) => (0, 0),
+            ReloadAction::HyprctlReload(HyprlandReloadScope::ConfigOnly) => (0, 1),
             ReloadAction::GsettingsSet { key, .. } => (1, gsettings_key_rank(key)),
             ReloadAction::HyprctlSetCursor { .. } => (2, 0),
             ReloadAction::HyprpaperWallpaper { .. } => (3, 0),
@@ -419,9 +457,13 @@ impl ReloadAction {
         signaller: &dyn ProcessSignaller,
     ) -> Result<(), ReloadError> {
         match self {
-            ReloadAction::HyprctlReload => {
+            ReloadAction::HyprctlReload(HyprlandReloadScope::Full) => {
                 run_and_check(runner, Command::new("hyprctl").arg("reload"))
             }
+            ReloadAction::HyprctlReload(HyprlandReloadScope::ConfigOnly) => run_and_check(
+                runner,
+                Command::new("hyprctl").arg("reload").arg("config-only"),
+            ),
             ReloadAction::EwwReload => run_and_check(runner, Command::new("eww").arg("reload")),
             // One flag per invocation. Each change class needs only its own reload, so
             // the flags never have to be combined — and keeping them separate also works
@@ -498,8 +540,10 @@ fn gsettings_key_rank(key: &str) -> u8 {
 /// is absent or not running ([`ReloadAction::is_available`]), then sorts by
 /// [`ReloadAction::order_key`] and removes duplicates so a change touching several
 /// files that share a reload (e.g. a cursor written to `settings.ini`, `uwsm/env`,
-/// and `hyprland.conf`) issues each reload once, in a deterministic order. This is
-/// the list the Apply pipeline (task 4.5) executes after writing the files.
+/// and `hyprland.conf`) issues each reload once, in a deterministic order. When both
+/// Hyprland reload forms are planned, only the full one is kept (see
+/// [`HyprlandReloadScope`]). This is the list the Apply pipeline (task 4.5) executes
+/// after writing the files.
 pub fn plan_reloads(
     changed: &[BackingFile],
     params: &ReloadParams,
@@ -515,6 +559,13 @@ pub fn plan_reloads(
     // collapses them to one.
     actions.sort_by_key(ReloadAction::order_key);
     actions.dedup();
+    // A full `hyprctl reload` re-applies everything `config-only` would, so running
+    // both would only make Hyprland re-read its config twice.
+    if actions.contains(&ReloadAction::HyprctlReload(HyprlandReloadScope::Full)) {
+        actions.retain(|action| {
+            *action != ReloadAction::HyprctlReload(HyprlandReloadScope::ConfigOnly)
+        });
+    }
     actions
 }
 
@@ -892,20 +943,52 @@ mod tests {
 
     #[test]
     fn hypr_config_files_map_to_hyprctl_reload() {
-        // monitors.conf / input.conf / hyprland.conf all re-read via `hyprctl
-        // reload` (architecture §6). No params are needed.
+        // monitors.conf / hyprland.conf re-read via the full `hyprctl reload`
+        // (architecture §6). No params are needed.
         let params = ReloadParams::default();
-        for file in [
-            BackingFile::MonitorsConf,
-            BackingFile::InputConf,
-            BackingFile::HyprlandConf,
-        ] {
+        for file in [BackingFile::MonitorsConf, BackingFile::HyprlandConf] {
             assert_eq!(
                 file.reload_actions(&params),
-                vec![ReloadAction::HyprctlReload],
+                vec![ReloadAction::HyprctlReload(HyprlandReloadScope::Full)],
                 "{file:?} must map to exactly `hyprctl reload`"
             );
         }
+    }
+
+    #[test]
+    fn input_lua_maps_to_the_config_only_reload() {
+        // Task 11.4: an input change re-runs the config without re-applying the
+        // monitor layout, like `scripts/apply-theme` does.
+        assert_eq!(
+            BackingFile::InputLua.reload_actions(&ReloadParams::default()),
+            vec![ReloadAction::HyprctlReload(HyprlandReloadScope::ConfigOnly)]
+        );
+    }
+
+    #[test]
+    fn a_full_reload_absorbs_the_config_only_form() {
+        // An Apply that wrote both input.lua and monitors.conf reloads Hyprland once,
+        // with the full form: it re-applies everything `config-only` would.
+        let planned = plan_reloads(
+            &[BackingFile::InputLua, BackingFile::MonitorsConf],
+            &ReloadParams::default(),
+            &all_capabilities(),
+        );
+        assert_eq!(
+            planned,
+            vec![ReloadAction::HyprctlReload(HyprlandReloadScope::Full)]
+        );
+
+        // On its own, the input change keeps the lighter form.
+        let planned = plan_reloads(
+            &[BackingFile::InputLua],
+            &ReloadParams::default(),
+            &all_capabilities(),
+        );
+        assert_eq!(
+            planned,
+            vec![ReloadAction::HyprctlReload(HyprlandReloadScope::ConfigOnly)]
+        );
     }
 
     #[test]
@@ -963,7 +1046,7 @@ mod tests {
         assert_eq!(
             BackingFile::Palette.reload_actions(&ReloadParams::default()),
             vec![
-                ReloadAction::HyprctlReload,
+                ReloadAction::HyprctlReload(HyprlandReloadScope::Full),
                 ReloadAction::EwwReload,
                 ReloadAction::SwayncReloadCss,
                 ReloadAction::KittyColors,
@@ -986,7 +1069,7 @@ mod tests {
         assert_eq!(
             planned,
             vec![
-                ReloadAction::HyprctlReload,
+                ReloadAction::HyprctlReload(HyprlandReloadScope::Full),
                 ReloadAction::EwwReload,
                 ReloadAction::SwayncReloadConfig,
                 ReloadAction::SwayncReloadCss,
@@ -1105,7 +1188,7 @@ mod tests {
         assert_eq!(
             planned,
             vec![
-                ReloadAction::HyprctlReload,
+                ReloadAction::HyprctlReload(HyprlandReloadScope::Full),
                 ReloadAction::GsettingsSet {
                     key: GSETTINGS_CURSOR_THEME,
                     value: "Nordic-cursors".to_string()
@@ -1135,7 +1218,10 @@ mod tests {
         let planned = plan_reloads(&[BackingFile::Palette], &ReloadParams::default(), &caps);
         assert_eq!(
             planned,
-            vec![ReloadAction::HyprctlReload, ReloadAction::SwayncReloadCss],
+            vec![
+                ReloadAction::HyprctlReload(HyprlandReloadScope::Full),
+                ReloadAction::SwayncReloadCss
+            ],
             "eww reload and kitty SIGUSR1 are dropped when those daemons are not live"
         );
     }
@@ -1239,9 +1325,12 @@ mod tests {
         let runner = MockCommandRunner::new();
         let signaller = MockProcessSignaller::new();
 
-        ReloadAction::HyprctlReload
+        ReloadAction::HyprctlReload(HyprlandReloadScope::Full)
             .execute(&runner, &signaller)
             .expect("hyprctl reload succeeds under the default mock");
+        ReloadAction::HyprctlReload(HyprlandReloadScope::ConfigOnly)
+            .execute(&runner, &signaller)
+            .expect("hyprctl reload config-only succeeds under the default mock");
         ReloadAction::EwwReload
             .execute(&runner, &signaller)
             .expect("eww reload succeeds");
@@ -1268,6 +1357,7 @@ mod tests {
             runner.recorded(),
             vec![
                 Command::new("hyprctl").arg("reload"),
+                Command::new("hyprctl").arg("reload").arg("config-only"),
                 Command::new("eww").arg("reload"),
                 // Task 9.9: one flag per invocation — `-R` reloads swaync's config,
                 // `-rs` only its CSS.
@@ -1542,7 +1632,7 @@ mod tests {
         let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake(2))]);
         let signaller = MockProcessSignaller::new();
 
-        let error = ReloadAction::HyprctlReload
+        let error = ReloadAction::HyprctlReload(HyprlandReloadScope::Full)
             .execute(&runner, &signaller)
             .expect_err("a non-zero exit must be reported");
         match error {
