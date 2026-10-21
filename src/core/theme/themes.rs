@@ -1893,13 +1893,13 @@ export XCURSOR_SIZE=16
             "the cursor apply must succeed, got {outcome:?}"
         );
 
-        // The exact reload sequence: hyprctl reload (from hyprland.lua; task 11.11
-        // makes it `config-only`) then the cursor gsettings keys then setcursor,
+        // The exact reload sequence: `hyprctl reload config-only` (from
+        // hyprland.lua; task 11.11) then the cursor gsettings keys then setcursor,
         // deduped across the five files.
         assert_eq!(
             runner.recorded(),
             vec![
-                Command::new("hyprctl").arg("reload"),
+                Command::new("hyprctl").arg("reload").arg("config-only"),
                 Command::new("gsettings").args([
                     "set",
                     "org.gnome.desktop.interface",

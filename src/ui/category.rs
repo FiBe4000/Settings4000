@@ -146,10 +146,11 @@ impl SidebarCategory {
                     || capabilities.has_binary(Binary::Hyprpaper)
                     || capabilities.has_binary(Binary::Hyprlock)
             }
-            // Input edits Hyprland's input settings and applies via `hyprctl reload`
-            // (§6.6). Those settings exist only for the Lua config provider, so the
-            // page also requires it: on a hyprlang host it is hidden rather than
-            // writing a file the compositor ignores (task 11.2, analysis §8.6).
+            // Input edits Hyprland's input settings and applies via `hyprctl reload
+            // config-only` (§6.6, task 11.11). Those settings exist only for the Lua
+            // config provider, so the page also requires it: on a hyprlang host it is
+            // hidden rather than writing a file the compositor ignores (task 11.2,
+            // analysis §8.6).
             SidebarCategory::Input => {
                 capabilities.has_binary(Binary::Hyprctl)
                     && capabilities.hypr_config_provider() == HyprConfigProvider::Lua
@@ -270,7 +271,8 @@ mod tests {
     #[test]
     fn hyprctl_gates_the_display_and_input_categories() {
         // Present -> both shown; absent -> both hidden. Both edit Hyprland config and
-        // apply via `hyprctl reload`, so they share the gate (§6.1/§6.6).
+        // apply via a `hyprctl reload` (the full form for Display, `config-only` for
+        // Input), so they share the gate (§6.1/§6.6).
         let with_hyprctl = Capabilities::for_tests(&[Binary::Hyprctl], &[], true);
         assert!(SidebarCategory::Display.is_visible(&with_hyprctl));
         assert!(SidebarCategory::Input.is_visible(&with_hyprctl));

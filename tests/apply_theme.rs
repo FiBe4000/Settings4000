@@ -251,15 +251,16 @@ fn a_palette_switch_runs_generate_colors_then_the_reload_chain() {
 
     // The exact command sequence: the discovered generator path (inside the
     // fixture repo, no shell) with the scheme argument, then the three-step reload
-    // chain — `hyprctl reload`, `eww reload` and (below) SIGUSR1 to kitty. There is
-    // no notification-daemon step (task 11.7): notifd's popups are eww widgets,
-    // recolored by the eww reload.
+    // chain of `scripts/apply-theme` — `hyprctl reload config-only` (task 11.11),
+    // `eww reload` and (below) SIGUSR1 to kitty. There is no notification-daemon
+    // step (task 11.7): notifd's popups are eww widgets, recolored by the eww
+    // reload.
     let generate_colors = fx.repo_path("scripts/generate-colors");
     assert_eq!(
         runner.recorded(),
         vec![
             Command::new(generate_colors.to_string_lossy()).arg("nord"),
-            Command::new("hyprctl").arg("reload"),
+            Command::new("hyprctl").arg("reload").arg("config-only"),
             Command::new("eww").arg("reload"),
         ]
     );
@@ -352,9 +353,9 @@ fn a_gtk_theme_change_writes_both_settings_ini_identically() {
 /// Task 11.5 (R3.4, the duplicated-values gotcha): a cursor change writes the
 /// identical value to every copy — both `settings.ini`, `uwsm/env`, the two
 /// `hl.env` lines of `hyprland.lua` and `~/.icons/default/index.theme` — through
-/// the deployed symlinks into the repo, then reloads with `hyprctl reload` (the
-/// changed Lua config), the two `gsettings set` cursor keys and
-/// `hyprctl setcursor`.
+/// the deployed symlinks into the repo, then reloads with `hyprctl reload
+/// config-only` (the changed Lua config; task 11.11), the two `gsettings set`
+/// cursor keys and `hyprctl setcursor`.
 ///
 /// The `hyprland.lua` byte diff is also the proof of the caller contract from task
 /// 11.3: the Lua editor can address that file's top-level `hl.config` literals
@@ -492,13 +493,13 @@ fn a_cursor_change_writes_every_duplicated_copy_identically() {
         "the home-level deployment link is preserved"
     );
 
-    // (c) The exact command sequence in the canonical order: hyprctl reload (the
-    // changed hyprland.lua; task 11.11 makes it `config-only`), the two gsettings
+    // (c) The exact command sequence in the canonical order: `hyprctl reload
+    // config-only` (the changed hyprland.lua; task 11.11), the two gsettings
     // cursor keys, then hyprctl setcursor — ONCE despite five files sharing it.
     assert_eq!(
         runner.recorded(),
         vec![
-            Command::new("hyprctl").arg("reload"),
+            Command::new("hyprctl").arg("reload").arg("config-only"),
             Command::new("gsettings").args([
                 "set",
                 "org.gnome.desktop.interface",

@@ -44,7 +44,7 @@ use settings4000::core::theme::{
     PaletteModel, ThemeRoots, ThemesModel, ThemesPaths, WallpaperModel, WallpaperPaths,
 };
 use settings4000::parsers::generated::generated_files;
-use settings4000::system::command::{CommandOutput, MockCommandRunner};
+use settings4000::system::command::{Command, CommandOutput, MockCommandRunner};
 use settings4000::system::signal::MockProcessSignaller;
 use settings4000::testing::{
     FixtureDotfiles, assert_repo_untouched_except, expect_applied, load_into_store, loaders,
@@ -876,6 +876,15 @@ fn an_assembled_plan_applies_and_reconciles_every_source() {
             fx.config_path("hypr/monitors.conf"),
         ],
         "both files were written, at their live paths"
+    );
+    // Task 11.11 (architecture §6): input.lua alone would take `hyprctl reload
+    // config-only`, monitors.conf the full `hyprctl reload`. With both written in one
+    // Apply, Hyprland is reloaded exactly once, with the full form, which re-applies
+    // everything the lighter form would.
+    assert_eq!(
+        runner.recorded(),
+        vec![Command::new("hyprctl").arg("reload")],
+        "an input + monitors Apply runs the full reload once and nothing else"
     );
 
     store.commit_apply(&store_writes);

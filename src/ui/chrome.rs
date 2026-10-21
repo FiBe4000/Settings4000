@@ -653,7 +653,8 @@ mod tests {
             palette: None,
             reload_params: ReloadParams::default(),
         };
-        // `hyprctl reload` runs (hyprctl present, socket live) and exits non-zero.
+        // `hyprctl reload config-only` runs (hyprctl present, socket live) and exits
+        // non-zero.
         let caps = Capabilities::for_tests(&[Binary::Hyprctl], &[], true);
         let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake(1))]);
         let signaller = MockProcessSignaller::new();

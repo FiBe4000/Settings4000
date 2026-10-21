@@ -990,13 +990,14 @@ mod tests {
             other => panic!("expected Applied, got {other:?}"),
         }
         // generate-colors is recorded FIRST (it is the last *write* step), and the
-        // reload chain — hyprctl reload, eww reload (kitty is signalled) — follows in
-        // order; there is no notification-daemon step (task 11.7).
+        // reload chain — `hyprctl reload config-only` (task 11.11), eww reload (kitty
+        // is signalled) — follows in order; there is no notification-daemon step
+        // (task 11.7).
         assert_eq!(
             runner.recorded(),
             vec![
                 Command::new("/fake/repo/scripts/generate-colors").arg("nord"),
-                Command::new("hyprctl").arg("reload"),
+                Command::new("hyprctl").arg("reload").arg("config-only"),
                 Command::new("eww").arg("reload"),
             ]
         );
@@ -1850,7 +1851,8 @@ mod tests {
             reload_params: ReloadParams::default(),
         };
         let tracker = FreshnessTracker::new();
-        // generate-colors OK, then `hyprctl reload` FAILS; eww defaults to OK.
+        // generate-colors OK, then `hyprctl reload config-only` FAILS; eww defaults
+        // to OK.
         let runner = MockCommandRunner::with_outcomes([
             Ok(CommandOutput::fake(0)),
             Ok(CommandOutput::fake(1)),
@@ -1879,13 +1881,13 @@ mod tests {
             }
             other => panic!("expected Applied, got {other:?}"),
         }
-        // Even though `hyprctl reload` failed, eww was still attempted
+        // Even though the Hyprland reload failed, eww was still attempted
         // and kitty was still signalled — the whole plan runs.
         assert_eq!(
             runner.recorded(),
             vec![
                 Command::new("/fake/generate-colors").arg("nord"),
-                Command::new("hyprctl").arg("reload"),
+                Command::new("hyprctl").arg("reload").arg("config-only"),
                 Command::new("eww").arg("reload"),
             ]
         );
@@ -1907,7 +1909,7 @@ mod tests {
         // written first and generate-colors runs as the last write step (proven
         // strictly by the rollback test above, where a generator failure rolls the
         // file back), and the reload set is the correct deduped union of the file's
-        // reload (hyprctl reload) and the palette chain.
+        // reload (the full `hyprctl reload`) and the palette chain.
         let dir = tempfile::tempdir().expect("temp dir should be creatable");
         let monitors = write_file(&dir, "monitors.conf", b"monitor=eDP-1,preferred,auto,1\n");
         let tracker = record_baseline(&[&monitors]);
@@ -1956,8 +1958,10 @@ mod tests {
             b"monitor=eDP-1,preferred,auto,1.25\n",
         );
         // generate-colors is recorded first (the last write step, after the file
-        // write), then the DEDUPED union of the monitors reload (hyprctl reload) and
-        // the palette chain — `hyprctl reload` appears once, not twice.
+        // write), then the union of the monitors reload (the full `hyprctl reload`)
+        // and the palette chain. The chain's `config-only` step is absorbed by the
+        // full reload (task 11.11), so Hyprland is reloaded exactly once, with the
+        // full form.
         assert_eq!(
             runner.recorded(),
             vec![

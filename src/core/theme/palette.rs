@@ -773,13 +773,13 @@ shadow=0a0c0d
             other => panic!("expected Applied, got {other:?}"),
         }
         // generate-colors runs FIRST (the last write step), then the three-step
-        // apply-theme chain: hyprctl reload, eww reload, SIGUSR1 to kitty (below) — no
-        // notification-daemon step (task 11.7).
+        // apply-theme chain: `hyprctl reload config-only` (task 11.11), eww reload,
+        // SIGUSR1 to kitty (below) — no notification-daemon step (task 11.7).
         assert_eq!(
             runner.recorded(),
             vec![
                 Command::new("/repo/scripts/generate-colors").arg("everforest"),
-                Command::new("hyprctl").arg("reload"),
+                Command::new("hyprctl").arg("reload").arg("config-only"),
                 Command::new("eww").arg("reload"),
             ]
         );

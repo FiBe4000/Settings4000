@@ -35,13 +35,12 @@
 //! # Kept in sync with `scripts/apply-theme`
 //!
 //! For a palette (color-scheme) change the reload set mirrors the dotfiles'
-//! canonical `scripts/apply-theme` wrapper (analysis §6.1): `hyprctl reload` (the
-//! script's `config-only` form lands with task 11.11), then
-//! `eww reload`, then a SIGUSR1 to kitty. The app runs
-//! `generate-colors` and issues these reloads itself rather than calling the
-//! script (architecture §6), so this table and that script must be kept in step:
-//! if the script's reload chain changes, [`BackingFile::Palette`]'s mapping changes
-//! with it.
+//! canonical `scripts/apply-theme` wrapper (analysis §6.1, §8.1) exactly:
+//! `hyprctl reload config-only`, then `eww reload`, then a SIGUSR1 to kitty. The
+//! app runs `generate-colors` and issues these reloads itself rather than calling
+//! the script (architecture §6), so this table and that script must be kept in
+//! step: if the script's reload chain changes, [`BackingFile::Palette`]'s mapping
+//! changes with it.
 //!
 //! # Capability gating (R4.2/R5.5)
 //!
@@ -114,8 +113,9 @@ const HYPRIDLE_UNIT: &str = "hypridle";
 /// file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BackingFile {
-    /// `config/hypr/monitors.conf` — a display change; Hyprland re-reads it on
-    /// `hyprctl reload` (task 6.1).
+    /// `config/hypr/monitors.conf` — a display change; the only file whose change
+    /// takes the full `hyprctl reload`, because the monitor layout must be
+    /// re-applied (tasks 6.1, 11.11).
     MonitorsConf,
     /// `config/hypr/input.lua` — the app-owned `hl.config({ input = { … } })` table
     /// that `hyprland.lua` loads with `dofile` (analysis §7.1, §8.6); re-read with
@@ -123,8 +123,9 @@ pub enum BackingFile {
     InputLua,
     /// `config/hypr/hyprland.lua` — the Lua Hyprland config, of which the app edits
     /// only the two cursor `hl.env("XCURSOR_THEME", …)` / `hl.env("XCURSOR_SIZE", …)`
-    /// lines (task 11.5, R3.4); `hyprctl reload` re-runs the file. The live cursor
-    /// change itself is applied by the cursor reload emitted for the GTK/env files.
+    /// lines (task 11.5, R3.4); `hyprctl reload config-only` re-runs the file
+    /// (task 11.11). The live cursor change itself is applied by the cursor reload
+    /// emitted for the GTK/env files.
     HyprlandLua,
     /// `config/hypr/hypridle.conf` — idle timeouts / lock command; hypridle is
     /// restarted to pick them up (task 6.8).
@@ -150,11 +151,29 @@ pub enum BackingFile {
     CursorFallbackTheme,
     /// A palette (color-scheme) switch: `colors/<scheme>` is edited and
     /// `generate-colors` rewrites the color partials. Triggers the broad
-    /// apply-theme reload chain (analysis §6.1).
+    /// apply-theme reload chain, `hyprctl reload config-only` first (analysis §6.1,
+    /// §8.1).
     Palette,
 }
 
 impl BackingFile {
+    /// Every backing file, in declaration order.
+    ///
+    /// Lets a caller or test cover the whole table without keeping its own list of
+    /// variants; a new variant must be added here as well.
+    pub const ALL: &'static [BackingFile] = &[
+        BackingFile::MonitorsConf,
+        BackingFile::InputLua,
+        BackingFile::HyprlandLua,
+        BackingFile::HypridleConf,
+        BackingFile::HyprlockConf,
+        BackingFile::HyprpaperConf,
+        BackingFile::GtkSettings,
+        BackingFile::UwsmEnv,
+        BackingFile::CursorFallbackTheme,
+        BackingFile::Palette,
+    ];
+
     /// The reload actions this file's change requires, in canonical order, before
     /// capability gating.
     ///
@@ -166,18 +185,18 @@ impl BackingFile {
     /// yields no action for it (with a warning) rather than an ill-formed command.
     pub fn reload_actions(self, params: &ReloadParams) -> Vec<ReloadAction> {
         match self {
-            // An input change only needs Hyprland to re-run its config, not to
-            // re-apply monitor layouts, so it takes the lighter `config-only` form —
-            // the same one `scripts/apply-theme` uses (architecture §6, task 11.4).
-            BackingFile::InputLua => {
+            // An input or cursor change only needs Hyprland to re-run its config,
+            // not to re-apply the monitor layout, so it takes the lighter
+            // `config-only` form — the one `scripts/apply-theme` uses (architecture
+            // §6, analysis §8.1, tasks 11.4 and 11.11). hyprland.lua carries only the
+            // two cursor `hl.env` lines the app edits; the live cursor apply itself
+            // rides on the GTK/env files' actions.
+            BackingFile::InputLua | BackingFile::HyprlandLua => {
                 vec![ReloadAction::HyprctlReload(HyprlandReloadScope::ConfigOnly)]
             }
-            // A full Hyprland re-read. `monitors.conf` needs it so the monitor rules
-            // are re-applied. hyprland.lua is here (not with the cursor reload)
-            // because a changed Hyprland config is re-run with `hyprctl reload`; the
-            // live cursor apply rides on the GTK/env files' actions. Task 11.11
-            // switches hyprland.lua to the `config-only` form.
-            BackingFile::MonitorsConf | BackingFile::HyprlandLua => {
+            // The only full Hyprland reload: a monitors.conf change needs the
+            // monitor rules re-applied, which `config-only` deliberately skips.
+            BackingFile::MonitorsConf => {
                 vec![ReloadAction::HyprctlReload(HyprlandReloadScope::Full)]
             }
             BackingFile::HypridleConf => vec![ReloadAction::HypridleRestart],
@@ -203,10 +222,12 @@ impl BackingFile {
                 theme_and_cursor_actions(params, false)
             }
             // A palette switch reloads every component whose colors were regenerated,
-            // in the apply-theme order (analysis §6.1, §8.7). There is no notification
+            // with the same commands and order as `scripts/apply-theme` (analysis
+            // §6.1, §8.1, §8.7): the regenerated colors.lua is picked up by a
+            // `config-only` reload, as the script does. There is no notification
             // step: notifd's popups are eww widgets, recolored by `eww reload`.
             BackingFile::Palette => vec![
-                ReloadAction::HyprctlReload(HyprlandReloadScope::Full),
+                ReloadAction::HyprctlReload(HyprlandReloadScope::ConfigOnly),
                 ReloadAction::EwwReload,
                 ReloadAction::KittyColors,
             ],
@@ -298,22 +319,30 @@ pub struct CursorValue {
 /// (architecture §6; analysis §8.1).
 ///
 /// Hyprland has two reload forms. `hyprctl reload config-only` re-runs the config
-/// and applies the options it sets (input, cursor, colors) without re-applying the
-/// monitor layout; the dotfiles' own `scripts/apply-theme` uses it for exactly that
-/// reason. The plain `hyprctl reload` re-applies everything, which a
-/// `monitors.conf` change needs. Both are safe while docked: the dotfiles' Lua
-/// monitor loader keeps the laptop panel off on either form (analysis §8.1).
+/// and applies the options it sets (input, cursor, colors) but skips the
+/// compositor's own monitor re-apply; the `hl.monitor()` calls inside the config
+/// still execute. It is the cheaper form, and the dotfiles' own
+/// `scripts/apply-theme` uses it. The plain `hyprctl reload` additionally has the
+/// compositor re-apply the monitor rules, which a `monitors.conf` change needs.
 ///
-/// Today only an `input.lua` write uses [`ConfigOnly`](Self::ConfigOnly) (task
-/// 11.4); task 11.11 moves the cursor and palette changes to it as well. When one
-/// Apply needs both forms, [`plan_reloads`] issues only the full reload, because it
-/// re-applies everything the lighter one would.
+/// Neither form is what keeps the laptop panel off while docked: because the
+/// config's `hl.monitor()` calls run on both, the panel used to come back on even
+/// under `config-only`. The dotfiles' Lua monitor loader now emits the panel rule
+/// as disabled whenever an external output is enabled (unless the user forced the
+/// panel on), which makes both forms docked-safe (analysis §8.1).
+///
+/// Every Hyprland-side write takes [`ConfigOnly`](Self::ConfigOnly) — `input.lua`,
+/// the cursor lines of `hyprland.lua` and the palette switch — except
+/// `monitors.conf`, which takes [`Full`](Self::Full) (architecture §6, task 11.11).
+/// When one Apply needs both forms, [`plan_reloads`] issues only the full reload,
+/// because it does everything the lighter one would.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HyprlandReloadScope {
-    /// `hyprctl reload config-only`: re-run the config, leave the monitor layout as
-    /// it is.
+    /// `hyprctl reload config-only`: re-run the config (its `hl.monitor()` calls
+    /// included) without the compositor's own monitor re-apply.
     ConfigOnly,
-    /// `hyprctl reload`: re-run the config and re-apply the monitor layout.
+    /// `hyprctl reload`: re-run the config and have the compositor re-apply the
+    /// monitor rules.
     Full,
 }
 
@@ -402,9 +431,9 @@ impl ReloadAction {
     ///
     /// Used by [`plan_reloads`] to sort the merged action list so a combined change
     /// always reloads in the same sequence, and so a palette change's chain comes
-    /// out in the apply-theme order (`hyprctl reload` → `eww reload` → kitty; analysis
-    /// §6.1). The second element sub-orders the several `gsettings set` keys
-    /// deterministically.
+    /// out in the apply-theme order (`hyprctl reload config-only` → `eww reload` →
+    /// kitty; analysis §6.1). The second element sub-orders the several
+    /// `gsettings set` keys deterministically.
     fn order_key(&self) -> (u8, u8) {
         match self {
             // Both forms share the Hyprland slot so they stay adjacent in the sorted
@@ -883,29 +912,71 @@ mod tests {
 
     // --- File -> actions mapping (accept: each file maps to exactly its actions) ---
 
+    /// The Hyprland reload form a file's change plans, or `None` for a file whose
+    /// change needs no Hyprland reload at all.
+    fn hyprland_scope(file: BackingFile) -> Option<HyprlandReloadScope> {
+        let scopes: Vec<HyprlandReloadScope> = file
+            .reload_actions(&full_params())
+            .into_iter()
+            .filter_map(|action| match action {
+                ReloadAction::HyprctlReload(scope) => Some(scope),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            scopes.len() <= 1,
+            "{file:?} must plan at most one Hyprland reload, got {scopes:?}"
+        );
+        scopes.first().copied()
+    }
+
     #[test]
-    fn hypr_config_files_map_to_hyprctl_reload() {
-        // monitors.conf / hyprland.lua re-read via the full `hyprctl reload`
-        // (architecture §6; task 11.11 moves hyprland.lua to `config-only`). No
-        // params are needed.
-        let params = ReloadParams::default();
-        for file in [BackingFile::MonitorsConf, BackingFile::HyprlandLua] {
-            assert_eq!(
-                file.reload_actions(&params),
-                vec![ReloadAction::HyprctlReload(HyprlandReloadScope::Full)],
-                "{file:?} must map to exactly `hyprctl reload`"
-            );
+    fn every_backing_file_maps_to_its_expected_hyprland_reload_scope() {
+        // Task 11.11, architecture §6: only monitors.conf takes the full reload;
+        // every other Hyprland-side write takes `config-only`; the rest take none.
+        // The exhaustive match (no `_` arm) forces a decision at compile time: a new
+        // `BackingFile` variant does not build until its expected scope is written
+        // here. The residual gap is a variant added to the enum but not to
+        // `BackingFile::ALL`, which this loop would then not visit.
+        let expected = |file: BackingFile| match file {
+            BackingFile::MonitorsConf => Some(HyprlandReloadScope::Full),
+            BackingFile::InputLua | BackingFile::HyprlandLua | BackingFile::Palette => {
+                Some(HyprlandReloadScope::ConfigOnly)
+            }
+            BackingFile::HypridleConf
+            | BackingFile::HyprlockConf
+            | BackingFile::HyprpaperConf
+            | BackingFile::GtkSettings
+            | BackingFile::UwsmEnv
+            | BackingFile::CursorFallbackTheme => None,
+        };
+        for &file in BackingFile::ALL {
+            assert_eq!(hyprland_scope(file), expected(file), "{file:?}");
         }
     }
 
     #[test]
-    fn input_lua_maps_to_the_config_only_reload() {
-        // Task 11.4: an input change re-runs the config without re-applying the
-        // monitor layout, like `scripts/apply-theme` does.
+    fn monitors_conf_maps_to_exactly_the_full_reload() {
+        // The monitor layout is re-applied only by the full `hyprctl reload`
+        // (architecture §6). No params are needed.
         assert_eq!(
-            BackingFile::InputLua.reload_actions(&ReloadParams::default()),
-            vec![ReloadAction::HyprctlReload(HyprlandReloadScope::ConfigOnly)]
+            BackingFile::MonitorsConf.reload_actions(&ReloadParams::default()),
+            vec![ReloadAction::HyprctlReload(HyprlandReloadScope::Full)]
         );
+    }
+
+    #[test]
+    fn input_and_cursor_lua_files_map_to_exactly_the_config_only_reload() {
+        // Tasks 11.4 and 11.11: an input.lua or hyprland.lua (cursor `hl.env`) change
+        // re-runs the config without re-applying the monitor layout, like
+        // `scripts/apply-theme` does.
+        for file in [BackingFile::InputLua, BackingFile::HyprlandLua] {
+            assert_eq!(
+                file.reload_actions(&ReloadParams::default()),
+                vec![ReloadAction::HyprctlReload(HyprlandReloadScope::ConfigOnly)],
+                "{file:?}"
+            );
+        }
     }
 
     #[test]
@@ -920,6 +991,22 @@ mod tests {
         assert_eq!(
             planned,
             vec![ReloadAction::HyprctlReload(HyprlandReloadScope::Full)]
+        );
+
+        // The same holds when the palette chain joins a monitors change: the chain's
+        // `config-only` step is absorbed, the eww and kitty steps stay in order.
+        let planned = plan_reloads(
+            &[BackingFile::Palette, BackingFile::MonitorsConf],
+            &ReloadParams::default(),
+            &all_capabilities(),
+        );
+        assert_eq!(
+            planned,
+            vec![
+                ReloadAction::HyprctlReload(HyprlandReloadScope::Full),
+                ReloadAction::EwwReload,
+                ReloadAction::KittyColors,
+            ]
         );
 
         // On its own, the input change keeps the lighter form.
@@ -977,13 +1064,14 @@ mod tests {
     #[test]
     fn palette_change_maps_to_the_apply_theme_chain_in_order() {
         // Accept criterion: a palette change is the broad apply-theme chain, in the
-        // canonical order (analysis §6.1, §8.7) — hyprctl reload, eww reload, kitty
-        // SIGUSR1 — with no notification-daemon step (task 11.7: notifd's popups are
-        // eww widgets, recolored by the eww reload).
+        // canonical order of `scripts/apply-theme` (analysis §6.1, §8.1, §8.7) —
+        // `hyprctl reload config-only` (task 11.11), eww reload, kitty SIGUSR1 — with
+        // no notification-daemon step (task 11.7: notifd's popups are eww widgets,
+        // recolored by the eww reload).
         assert_eq!(
             BackingFile::Palette.reload_actions(&ReloadParams::default()),
             vec![
-                ReloadAction::HyprctlReload(HyprlandReloadScope::Full),
+                ReloadAction::HyprctlReload(HyprlandReloadScope::ConfigOnly),
                 ReloadAction::EwwReload,
                 ReloadAction::KittyColors,
             ]
@@ -1096,8 +1184,9 @@ mod tests {
     fn plan_dedups_and_orders_a_multi_file_cursor_change() {
         // A cursor change writes settings.ini, uwsm/env, hyprland.lua and the
         // XCursor fallback index.theme. The files' actions overlap on the cursor
-        // reload and must collapse to one of each, in canonical order: hyprctl
-        // reload (from hyprland.lua), then the cursor gsettings keys, then setcursor.
+        // reload and must collapse to one of each, in canonical order: `hyprctl
+        // reload config-only` (from hyprland.lua, task 11.11), then the cursor
+        // gsettings keys, then setcursor.
         let params = ReloadParams {
             cursor: Some(CursorValue {
                 theme: "Nordic-cursors".to_string(),
@@ -1118,7 +1207,7 @@ mod tests {
         assert_eq!(
             planned,
             vec![
-                ReloadAction::HyprctlReload(HyprlandReloadScope::Full),
+                ReloadAction::HyprctlReload(HyprlandReloadScope::ConfigOnly),
                 ReloadAction::GsettingsSet {
                     key: GSETTINGS_CURSOR_THEME,
                     value: "Nordic-cursors".to_string()
@@ -1148,7 +1237,7 @@ mod tests {
         let planned = plan_reloads(&[BackingFile::Palette], &ReloadParams::default(), &caps);
         assert_eq!(
             planned,
-            vec![ReloadAction::HyprctlReload(HyprlandReloadScope::Full)],
+            vec![ReloadAction::HyprctlReload(HyprlandReloadScope::ConfigOnly)],
             "eww reload and kitty SIGUSR1 are dropped when those daemons are not live"
         );
     }
