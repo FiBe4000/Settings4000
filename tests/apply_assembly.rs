@@ -797,6 +797,28 @@ fn staged_power_edits_without_a_power_model_abort_the_whole_apply() {
 }
 
 #[test]
+fn staged_notifd_edits_without_a_notifd_model_abort_the_whole_apply() {
+    // Task 11.15, the same branch for the Notifications page: the store tracks
+    // notifd/config and holds a staged timeout, but a Refresh found no notifd >= 1.1 (so
+    // no helper), leaving the edit with no write to land in.
+    let fx = FixtureDotfiles::install();
+    let mut store = loaded_store(&fx);
+    load_into_store(
+        &mut store,
+        &fx.config_path("notifd/config"),
+        loaders::notifd_config,
+    );
+    store
+        .stage(SettingId::NotifdTimeoutLow, Value::Integer(2500))
+        .expect("an in-range timeout stages");
+
+    let failure = assemble_apply_plan(ApplySources::for_store(&store))
+        .expect_err("orphaned Notifications edits must abort");
+    expect_write_failure(failure, FailedWrite::Notifications);
+    assert!(store.is_dirty(), "the staged edit is kept");
+}
+
+#[test]
 fn an_unrenderable_monitor_record_aborts_the_whole_apply() {
     // The Display flavour of the same contract (task 9.5): the file is perfectly
     // readable, but the staged monitor edit is one the writer refuses — a scale carrying

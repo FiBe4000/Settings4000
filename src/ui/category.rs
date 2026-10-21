@@ -38,9 +38,11 @@ use crate::core::detect::{Binary, Capabilities, HyprConfigProvider};
 ///
 /// This is the UI's notion of a sidebar page, and it is intentionally distinct from
 /// [`crate::core::model::Category`], which enumerates only the *file-backed* pages
-/// that carry staged, dirty-tracked values. Sound, Notifications and Network appear
-/// here because the sidebar still shows them, but they are runtime-only (R3.1/R5.2)
-/// and so have no counterpart in the store's dirty model.
+/// that carry staged, dirty-tracked values. Sound and Network appear here because the
+/// sidebar still shows them, but they are runtime-only (R3.1/R5.2) and so have no
+/// counterpart in the store's dirty model. Notifications has both kinds of control: its
+/// runtime-only ones stage nothing, and its notifd settings (task 11.15) roll up into
+/// [`crate::core::model::Category::Notifications`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SidebarCategory {
     /// Per-monitor resolution/scale/position and the laptop-display toggle (§6.1).
@@ -53,8 +55,9 @@ pub(crate) enum SidebarCategory {
     Theme,
     /// Keyboard layouts/options, mouse sensitivity and touchpad toggles (§6.6).
     Input,
-    /// The notifd notification daemon's runtime controls: do-not-disturb, the
-    /// notification count and inhibited state, open the center, clear all (task 11.7).
+    /// The notifd notification daemon: its runtime controls — do-not-disturb, the
+    /// notification count and inhibited state, open the center, clear all (task 11.7) —
+    /// and its staged settings from `~/.config/notifd/config` (task 11.15).
     Notifications,
     /// Idle dim/lock/DPMS timeouts and the lock command (§6.8).
     PowerAndIdle,

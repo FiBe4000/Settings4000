@@ -58,7 +58,9 @@
 //! entry and the lock grace period's spin button (task 11.13), rendered through the
 //! generic framework and driven by the store. A category
 //! with a dynamic control set (Input's XKB layouts, task 6.6) or with runtime-only
-//! controls (Sound, Notifications, Network) is built by its own glue instead, and one
+//! controls (Sound, Notifications, Network) is built by its own glue instead — the
+//! Notifications glue mounts a framework page for its staged notifd rows inside its
+//! runtime page (task 11.15) — and one
 //! with no framework rows yet keeps its task-5.1 placeholder.
 //!
 //! The store the pages render from is populated by the worker-thread startup load
@@ -580,11 +582,14 @@ fn build_control(
 }
 
 /// Builds a `GtkSpinButton` row over the whole numbers `min..=max`, stepping by `step`
-/// (task 11.13).
+/// (tasks 11.13, 11.15).
 ///
-/// The spin button is numeric-only and snaps to whole steps, so typed text that is not a
-/// number in range is corrected by GTK before any value is emitted; the setting's own
-/// validation still decides what may be staged (R8.3).
+/// The spin button is numeric-only with no decimal places, so typed text that is not a
+/// whole number in range is corrected by GTK before any value is emitted; the setting's
+/// own validation still decides what may be staged (R8.3). It deliberately does **not**
+/// snap typed values to multiples of `step`: the notifd timeouts step by 500 ms per
+/// click, but `1234` is a valid timeout the user may type. The value is rounded to a
+/// whole number on the way out ([`value_from_scale`]) in any case.
 fn build_spin(
     descriptor: &RowDescriptor,
     min: f64,
@@ -599,7 +604,7 @@ fn build_spin(
     let adjustment = Adjustment::new(min, min, max, step, step * 10.0, 0.0);
     let widget = SpinButton::new(Some(&adjustment), step, 0);
     widget.set_numeric(true);
-    widget.set_snap_to_ticks(true);
+    widget.set_snap_to_ticks(false);
     widget.set_valign(Align::Center);
 
     let handler = {
@@ -868,8 +873,9 @@ fn string_list(options: &[DropDownOption]) -> StringList {
 /// [`SettingId`](crate::core::model::SettingId) with a *static* control set are built
 /// here; the rest fall back to task 5.1's placeholder page or their own glue. The Input
 /// page is not built here — its layout list needs runtime XKB candidates, so the window
-/// builds it directly (task 6.6, see [`super::input`]), and the Notifications page is
-/// runtime-only (task 11.7, see [`super::notifications`]). Power & Idle (task 6.8) is
+/// builds it directly (task 6.6, see [`super::input`]) — and neither is the
+/// Notifications page, whose staged rows exist only with notifd's settings helper and
+/// sit inside its bespoke runtime page (tasks 11.7, 11.15, see [`super::notifications`]). Power & Idle (task 6.8) is
 /// fully static — three idle-timeout sliders, a free-text lock-command entry and the
 /// lock grace period's spin button (task 11.13) — so it lives here and is built entirely through the generic framework path with no bespoke
 /// glue.

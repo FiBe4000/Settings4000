@@ -337,6 +337,38 @@ pub mod loaders {
     pub fn hypridle_conf(path: &Path) -> io::Result<FileValues> {
         crate::ui::startup::load_hypridle_conf(path)
     }
+
+    /// The app's `~/.config/notifd/config` loader (Notifications page, task 11.15).
+    pub fn notifd_config(path: &Path) -> io::Result<FileValues> {
+        crate::ui::startup::load_notifd_config(path)
+    }
+}
+
+/// The startup load's decision whether the Notifications page gets its staged notifd
+/// rows (task 11.15), and the rows it would then show — the crate-private pieces the
+/// window uses, re-exposed so an integration suite can check the visibility rule (and
+/// its `info` log, via [`capture_logs`]) against the fixture tree rather than a copy.
+pub mod notifications {
+    use std::path::PathBuf;
+
+    use crate::core::detect::Capabilities;
+    use crate::core::model::SettingId;
+    use crate::core::notifd_config::NotifdConfigModel;
+
+    /// The startup load's helper decision for `capabilities` and the file at `path`:
+    /// `Some` exactly when the staged rows are shown.
+    pub fn offer(capabilities: &Capabilities, path: PathBuf) -> Option<NotifdConfigModel> {
+        crate::ui::startup::load_notifd_config_from(capabilities, path)
+    }
+
+    /// The settings of the staged rows the page shows for `model` — empty when there is
+    /// none, leaving only the runtime controls.
+    pub fn staged_rows(model: Option<&NotifdConfigModel>) -> Vec<SettingId> {
+        crate::ui::notifications::page_rows(model)
+            .iter()
+            .map(|row| row.setting)
+            .collect()
+    }
 }
 
 /// Loads one backing file into `store` through the given app loader, registering the

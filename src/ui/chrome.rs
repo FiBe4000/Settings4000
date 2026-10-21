@@ -69,17 +69,20 @@ pub(crate) fn actions_enabled(store: &SettingsStore) -> bool {
 ///
 /// The window sets a stack page's `needs-attention` property from
 /// `store.is_category_dirty(category)` for the returned category, so the sidebar shows
-/// a marker on a page with pending edits. [`SidebarCategory::Sound`],
-/// [`SidebarCategory::Notifications`] and [`SidebarCategory::Network`] are runtime-only
-/// (R3.1, R5.2) — their controls apply immediately and are never staged — so they have
-/// no [`Category`] and never carry a dirty marker.
+/// a marker on a page with pending edits. [`SidebarCategory::Sound`] and
+/// [`SidebarCategory::Network`] are runtime-only (R3.1, R5.2) — their controls apply
+/// immediately and are never staged — so they have no [`Category`] and never carry a
+/// dirty marker. [`SidebarCategory::Notifications`] mixes both kinds: its runtime
+/// controls stage nothing, but its notifd settings (task 11.15) are staged, so its marker
+/// follows [`Category::Notifications`].
 pub(crate) fn marker_category(category: SidebarCategory) -> Option<Category> {
     match category {
         SidebarCategory::Display => Some(Category::Display),
         SidebarCategory::Theme => Some(Category::Theme),
         SidebarCategory::Input => Some(Category::Input),
+        SidebarCategory::Notifications => Some(Category::Notifications),
         SidebarCategory::PowerAndIdle => Some(Category::PowerAndIdle),
-        SidebarCategory::Sound | SidebarCategory::Notifications | SidebarCategory::Network => None,
+        SidebarCategory::Sound | SidebarCategory::Network => None,
     }
 }
 
@@ -294,6 +297,7 @@ pub(crate) fn assembly_warning(failure: &PrepareFailure) -> ConflictWarning {
             let (file, noun) = match source {
                 FailedWrite::Display => ("monitors.conf", "display"),
                 FailedWrite::Input => ("input.lua", "input"),
+                FailedWrite::Notifications => ("notifd/config", "notification"),
                 FailedWrite::Power => ("hypridle.conf", "power and idle"),
             };
             ConflictWarning {
@@ -538,9 +542,14 @@ mod tests {
             marker_category(SidebarCategory::PowerAndIdle),
             Some(Category::PowerAndIdle)
         );
+        // The Notifications page's notifd settings are staged (task 11.15), so it
+        // carries a marker even though its other controls are runtime-only.
+        assert_eq!(
+            marker_category(SidebarCategory::Notifications),
+            Some(Category::Notifications)
+        );
         // Runtime-only pages carry no staged state, so no marker (R5.2).
         assert_eq!(marker_category(SidebarCategory::Sound), None);
-        assert_eq!(marker_category(SidebarCategory::Notifications), None);
         assert_eq!(marker_category(SidebarCategory::Network), None);
     }
 
@@ -882,12 +891,13 @@ mod tests {
 
     #[test]
     fn a_prepare_failure_warning_names_the_file_and_quotes_the_reason() {
-        // Task 9.16: the three write-preparation failures each name the file the user has
+        // Task 9.16: the write-preparation failures each name the file the user has
         // to fix, quote the underlying reason, and promise the edits were kept — the last
         // being the whole point of aborting instead of skipping the write.
         for (source, expected_file, expected_noun) in [
             (FailedWrite::Display, "monitors.conf", "display"),
             (FailedWrite::Input, "input.lua", "input"),
+            (FailedWrite::Notifications, "notifd/config", "notification"),
             (FailedWrite::Power, "hypridle.conf", "power and idle"),
         ] {
             let warning = assembly_warning(&PrepareFailure::Write {

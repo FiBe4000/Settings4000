@@ -106,6 +106,7 @@ use crate::core::detect::Capabilities;
 use crate::core::display::DisplayModel;
 use crate::core::input::InputModel;
 use crate::core::model::Category;
+use crate::core::notifd_config::NotifdConfigModel;
 use crate::core::power::PowerModel;
 use crate::core::store::SettingsStore;
 use crate::core::theme::{PaletteModel, ThemesModel, WallpaperModel};
@@ -189,10 +190,19 @@ struct Shell {
     /// The mounted Notifications page (task 11.7), retained so the window can read the
     /// notifd daemon's state when the page is shown — the first read and every later
     /// one, from the deferred page-entry hook (the task 9.26 rule). Rebuilt by
-    /// [`Shell::populate`]; `None` when the Notifications category is not visible. It is
-    /// runtime-only, so — like the Sound page — it feeds neither the Apply/Reset chrome
-    /// nor a dirty marker (R5.2).
+    /// [`Shell::populate`]; `None` when the Notifications category is not visible. Its
+    /// runtime half is runtime-only, so it feeds neither the Apply/Reset chrome nor the
+    /// dirty marker (R5.2); its staged notifd rows are a framework page whose controller
+    /// sits in `controllers` like any other.
     notifications_page: Rc<RefCell<Option<NotificationsPage>>>,
+    /// The Notifications page's helper for its staged notifd settings (task 11.15),
+    /// shared with the Apply wiring. `None` until the startup worker builds it, or when
+    /// notifd is not running at version 1.1 or later or its file is missing or not
+    /// understood (see `startup::load_notifd_config_from`); the page then shows only its
+    /// runtime controls. Like the [`InputModel`] it is **not** a separate staging source:
+    /// it only renders the store's dirty notifd settings into the file's write on Apply,
+    /// which the pipeline follows with notifd's `Reload()`.
+    notifd_config: Rc<RefCell<Option<NotifdConfigModel>>>,
     /// The Power & Idle page's helper (task 6.8), shared with the Apply wiring. `None`
     /// until the startup worker builds it, or when hypridle is absent. Like the
     /// [`InputModel`] it is **not** a separate staging source —
@@ -303,9 +313,13 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     // store-backed rows, so no separate page handle is retained (the SettingsPage
     // controller goes in `controllers` like any framework page).
     let input: Rc<RefCell<Option<InputModel>>> = Rc::new(RefCell::new(None));
-    // The Notifications page (task 11.7) — a runtime-only bespoke page rebuilt by
-    // `populate`.
+    // The Notifications page (task 11.7) — a bespoke page with runtime-only controls,
+    // rebuilt by `populate`.
     let notifications_page: Rc<RefCell<Option<NotificationsPage>>> = Rc::new(RefCell::new(None));
+    // The Notifications page's staged-settings helper (task 11.15) — the Apply-time
+    // `notifd/config` write. Filled by the worker; its rows' SettingsPage controller goes
+    // in `controllers` like any framework page.
+    let notifd_config: Rc<RefCell<Option<NotifdConfigModel>>> = Rc::new(RefCell::new(None));
     // The Power & Idle page's helper (task 6.8) — the Apply-time hypridle.conf write for the
     // store-backed timeouts + lock command. Filled by the worker; the page's controls are
     // ordinary store-backed framework rows, so no separate page handle is retained (the
@@ -439,6 +453,7 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
         display_page,
         input,
         notifications_page,
+        notifd_config,
         power,
         sound_page,
         network_page,
@@ -620,6 +635,7 @@ impl Shell {
             files,
             display,
             input,
+            notifications,
             power,
             palette,
             themes,
@@ -645,6 +661,7 @@ impl Shell {
         // pages.
         *self.display.borrow_mut() = display;
         *self.input.borrow_mut() = input;
+        *self.notifd_config.borrow_mut() = notifications;
         *self.power.borrow_mut() = power;
         *self.palette.borrow_mut() = palette;
         *self.themes.borrow_mut() = themes;
@@ -733,10 +750,11 @@ impl Shell {
                 self.populate_input(category, &mut controllers);
                 continue;
             }
-            // Notifications is bespoke too (task 11.7): every control is runtime-only
-            // notifd state (R5.2), so it does not use the declarative framework.
+            // Notifications is bespoke too (task 11.7): its runtime controls drive notifd
+            // state directly (R5.2). Its staged notifd rows (task 11.15) are a framework
+            // page mounted inside it, whose controller joins `controllers`.
             if category == SidebarCategory::Notifications {
-                self.populate_notifications(category);
+                self.populate_notifications(category, &mut controllers);
                 continue;
             }
             // Network is bespoke too (task 6.9): it is read-only, runtime-backed status
@@ -850,22 +868,45 @@ impl Shell {
         controllers.push(controller);
     }
 
-    /// Builds the Notifications category's page (task 11.7).
+    /// Builds the Notifications category's page (tasks 11.7, 11.15).
     ///
-    /// Mounts the bespoke [`notifications`] page. No dirty marker is registered: every
-    /// control is runtime-only and never feeds the Apply/Reset chrome (R5.2). The
-    /// category is only reached when detection found notifd running or installed (task
-    /// 5.1's gate). Building runs no `busctl`: the first read is the page-entry hook's
-    /// ([`Self::wire_notifications_page_entry`]), and — as on the Sound and Network
-    /// pages — the handle is stored *before* the page joins the stack, because adding the
-    /// first page fires the entry hooks synchronously and every hook is written to find
-    /// the page it is about to refresh.
-    fn populate_notifications(&self, category: SidebarCategory) {
-        let page = notifications::build();
+    /// Mounts the bespoke [`notifications`] page. When the startup load built the notifd
+    /// settings helper, the staged rows ([`notifications::page_rows`]) are launched as a
+    /// framework [`SettingsPage`] — its controller kept in `controllers` so a Reset or
+    /// commit re-renders it — and placed inside the page, and the page's dirty marker
+    /// follows [`Category::Notifications`]; the runtime controls never feed the
+    /// Apply/Reset chrome (R5.2). Without the helper the runtime controls stand alone
+    /// (the startup load logged why). The category is only reached when detection found
+    /// notifd running or installed (task 5.1's gate). Building runs no `busctl`: the
+    /// first read is the page-entry hook's ([`Self::wire_notifications_page_entry`]), and
+    /// — as on the Sound and Network pages — the handle is stored *before* the page joins
+    /// the stack, because adding the first page fires the entry hooks synchronously and
+    /// every hook is written to find the page it is about to refresh.
+    fn populate_notifications(
+        &self,
+        category: SidebarCategory,
+        controllers: &mut Vec<Controller<SettingsPage>>,
+    ) {
+        let rows = notifications::page_rows(self.notifd_config.borrow().as_ref());
+        let staged = (!rows.is_empty())
+            .then(|| page::build_page(self.store.clone(), rows, self.update_chrome.clone()));
+        let page = notifications::build(
+            staged
+                .as_ref()
+                .map(|controller| controller.widget().upcast_ref::<Widget>()),
+        );
         let root = page.root().clone();
         *self.notifications_page.borrow_mut() = Some(page);
         self.stack
             .add_titled(&root, Some(category.stack_name()), category.title());
+        if let Some(controller) = staged {
+            if let Some(model_category) = chrome::marker_category(category) {
+                self.marked
+                    .borrow_mut()
+                    .push((model_category, root.upcast()));
+            }
+            controllers.push(controller);
+        }
     }
 
     /// Builds the Sound category's page (task 6.2).
@@ -1045,6 +1086,7 @@ impl Shell {
                 let store = shell.store.borrow();
                 let display = shell.display.borrow();
                 let input = shell.input.borrow();
+                let notifd_config = shell.notifd_config.borrow();
                 let power = shell.power.borrow();
                 let palette = shell.palette.borrow();
                 let themes = shell.themes.borrow();
@@ -1053,6 +1095,7 @@ impl Shell {
                     store: &store,
                     display: display.as_ref(),
                     input: input.as_ref(),
+                    notifications: notifd_config.as_ref(),
                     power: power.as_ref(),
                     palette: palette.as_ref(),
                     themes: themes.as_ref(),
@@ -1269,7 +1312,7 @@ impl Shell {
     /// only *newly appeared* files are loaded fresh. The staging models (Display,
     /// palette, GTK/icon/cursor themes, wallpaper) go through
     /// [`startup::adopt_refreshed_model`], which keeps a model holding staged edits
-    /// rather than clobbering in-progress work. The Input/Power helpers
+    /// rather than clobbering in-progress work. The Input/Notifications/Power helpers
     /// hold no staged state (their settings stage in the shared store), so they are
     /// simply replaced.
     fn apply_refresh_load(&self, load: StartupLoad) {
@@ -1278,6 +1321,7 @@ impl Shell {
             files,
             display,
             input,
+            notifications,
             power,
             palette,
             themes,
@@ -1297,6 +1341,7 @@ impl Shell {
             DisplayModel::is_dirty,
         );
         *self.input.borrow_mut() = input;
+        *self.notifd_config.borrow_mut() = notifications;
         *self.power.borrow_mut() = power;
         startup::adopt_refreshed_model(
             &mut self.palette.borrow_mut(),

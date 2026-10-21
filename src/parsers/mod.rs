@@ -1,7 +1,8 @@
 //! Config-file parsers and surgical writers (architecture §3).
 //!
-//! One submodule per file format the app edits (palette `key=hex`, hyprlang,
-//! Lua literals, `monitors.conf`, GTK INI, `uwsm/env`). Each parser
+//! One submodule per file format the app edits (flat `key=value` files — the
+//! palette and notifd's settings —, hyprlang, Lua literals, `monitors.conf`, GTK INI,
+//! `uwsm/env`). Each parser
 //! produces a lossless line/token representation and rewrites only the value span
 //! of a targeted key, leaving comments, ordering, and commented-out lines
 //! byte-identical. Every parser carries round-trip tests (`parse → edit
@@ -11,8 +12,14 @@
 //! `relm4` — parsers are pure, display-free, and independently testable
 //! (enforced by `tests/module_boundaries.rs`).
 
-// The palette `key=hex` parser (task 3.1; R3.2). The generated-file readers
-// (`generated`) parse a scheme file through it to read the 17 schema colors
+// The shared lossless line model for flat `key=value` files (tasks 3.1, 11.15): bare
+// assignments, `#` comment lines and blank lines, no inline comments. The palette
+// parser (`palette`) and notifd's settings file (`core::notifd_config`) both build on
+// it, each adding its own key and value rules.
+pub mod kv;
+
+// The palette `key=hex` parser (task 3.1; R3.2), a layer over `kv`. The generated-file readers
+// (`generated`) parse a scheme file through it to read the 18 schema colors (`shadow` included)
 // for the Theme page's swatches, and `core::model` reuses its bare-hex
 // validator. The app never writes `colors/<scheme>` itself — a scheme switch
 // runs `generate-colors` — so the surgical `set_value` surface is exercised

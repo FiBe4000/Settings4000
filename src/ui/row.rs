@@ -144,11 +144,13 @@ pub(crate) enum WidgetKind {
     /// (task 6.8). The stored value is the entry's text verbatim; validation (if any) is
     /// the setting's concern, not the widget's.
     Entry,
-    /// A `GtkSpinButton`, editing a [`Value::Integer`] over `min..=max` in whole steps.
+    /// A `GtkSpinButton`, editing a [`Value::Integer`] over `min..=max`; each arrow click
+    /// moves by `step`, but any whole number in range may be typed.
     /// Used where the exact number matters more than dragging speed and a slider's pixel
     /// resolution would make it fiddly to hit — the hyprlock grace period, in seconds
-    /// (task 11.13). The spin button rounds to whole numbers itself, and its value is
-    /// converted like a scale's ([`value_from_scale`]).
+    /// (task 11.13), and notifd's timeouts and counts (task 11.15). The spin button
+    /// rounds to whole numbers itself, and its value is converted like a scale's
+    /// ([`value_from_scale`]).
     Spin {
         /// Inclusive lower bound.
         min: f64,

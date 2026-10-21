@@ -11,7 +11,8 @@
 //! notification. All of these are **runtime-only** (R5.2): they change live daemon
 //! state, touch no file, are applied the moment the user acts, and are never staged,
 //! dirty or part of an Apply. (notifd's file-backed settings in
-//! `~/.config/notifd/config` are a separate, staged half added by task 11.15.)
+//! `~/.config/notifd/config` are the page's separate, staged half — task 11.15,
+//! [`crate::core::notifd_config`].)
 //!
 //! [`NotificationsModel`] holds what the page last read and the one piece of
 //! interaction state the page has — a pending "clear all" awaiting confirmation —

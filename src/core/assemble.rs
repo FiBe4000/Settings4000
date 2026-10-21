@@ -56,6 +56,7 @@ use crate::core::apply::{ApplyPlan, FileWrite};
 use crate::core::display::DisplayModel;
 use crate::core::input::InputModel;
 use crate::core::model::{Category, SettingId, Value};
+use crate::core::notifd_config::NotifdConfigModel;
 use crate::core::power::PowerModel;
 use crate::core::reload::ReloadParams;
 use crate::core::store::SettingsStore;
@@ -82,6 +83,11 @@ pub struct ApplySources<'a> {
     /// The Input page's helper (tasks 6.6, 11.4): renders the store's dirty Input settings
     /// into the `input.lua` write. Not a staging source of its own.
     pub input: Option<&'a InputModel>,
+    /// The Notifications page's helper for its staged half (task 11.15): renders the
+    /// store's dirty notifd settings into the `~/.config/notifd/config` write. Not a
+    /// staging source of its own; `None` unless notifd ≥ 1.1 runs and the file is
+    /// readable. The page's runtime controls never reach an Apply (R5.2).
+    pub notifications: Option<&'a NotifdConfigModel>,
     /// The Power & Idle page's helper (task 6.8): renders the store's dirty timeouts and
     /// lock command into the `hypridle.conf` write. Not a staging source of its own.
     pub power: Option<&'a PowerModel>,
@@ -116,6 +122,7 @@ impl<'a> ApplySources<'a> {
             store,
             display: None,
             input: None,
+            notifications: None,
             power: None,
             palette: None,
             themes: None,
@@ -157,6 +164,8 @@ pub enum FailedWrite {
     Display,
     /// The Input page's `input.lua` write (tasks 6.6, 11.4).
     Input,
+    /// The Notifications page's `~/.config/notifd/config` write (task 11.15).
+    Notifications,
     /// The Power & Idle page's `hypridle.conf` write (task 6.8).
     Power,
 }
@@ -178,11 +187,11 @@ pub enum PrepareFailure {
         /// The failure, already rendered through the underlying error's
         /// [`Display`](fmt::Display) — the assembler logs it and the UI quotes it.
         ///
-        /// The message is carried as text rather than as the typed error because the three
+        /// The message is carried as text rather than as the typed error because the four
         /// sources do not share one error type — the Display model has its own, and the
-        /// two store-backed pages share a
-        /// [`StoreWriteError`](crate::core::store_write::StoreWriteError) generic over two
-        /// different renderer errors — and nothing downstream distinguishes them anyway:
+        /// three store-backed pages share a
+        /// [`StoreWriteError`](crate::core::store_write::StoreWriteError) generic over
+        /// three different renderer errors — and nothing downstream distinguishes them anyway:
         /// the log line and the dialog both only quote the reason.
         message: String,
     },
@@ -215,7 +224,7 @@ pub struct AssembledPlan {
     /// The plan to hand [`apply::run`](crate::core::apply::run).
     pub plan: ApplyPlan,
     /// The `(path, contents)` pairs of the writes whose freshness the **store** owns —
-    /// the `input.lua` and `hypridle.conf` writes — for
+    /// the `input.lua`, `notifd/config` and `hypridle.conf` writes — for
     /// [`SettingsStore::commit_apply`].
     ///
     /// Deliberately not every write in the plan. `commit_apply` re-baselines each listed
@@ -239,7 +248,7 @@ pub struct AssembledPlan {
 ///    [`PrepareFailure::Conflict`];
 /// 2. the store's dirty values as the plan's R8.3 validations
 ///    ([`base_apply_plan`]);
-/// 3. the two store-backed file writes, in category order;
+/// 3. the three store-backed file writes, in category order;
 /// 4. the store-write snapshot for the later commit;
 /// 5. the four bespoke model contributions (Display, palette, GTK/icon/cursor themes,
 ///    wallpaper).
@@ -266,6 +275,14 @@ pub fn assemble_apply_plan(sources: ApplySources<'_>) -> Result<AssembledPlan, P
         sources.input,
         InputModel::apply_contribution,
         FailedWrite::Input,
+    )?;
+    fold_store_write(
+        &mut plan,
+        sources.store,
+        Category::Notifications,
+        sources.notifications,
+        NotifdConfigModel::apply_contribution,
+        FailedWrite::Notifications,
     )?;
     fold_store_write(
         &mut plan,
@@ -404,7 +421,7 @@ fn first_conflicted_source(sources: &ApplySources<'_>) -> Option<ConflictedSourc
 /// Renders one store-backed page's dirty settings into a [`FileWrite`] and pushes it onto
 /// the plan, or aborts the Apply if the write cannot be prepared.
 ///
-/// The store-backed pages (Input, Power & Idle) share this exact shape: take that
+/// The store-backed pages (Input, Notifications, Power & Idle) share this exact shape: take that
 /// category's dirty settings from the store, hand them to the page's renderer, and treat
 /// the three possible answers as "nothing to write" (the common clean case), "one write"
 /// or "abort" — which is why they are one helper rather than one block per page.
@@ -412,8 +429,9 @@ fn first_conflicted_source(sources: &ApplySources<'_>) -> Option<ConflictedSourc
 /// names the page in the resulting failure.
 ///
 /// An absent `model` usually means the page was never offered — its app is not installed,
-/// or (for Input) `input.lua` is missing or not fully understood — so the store holds no
-/// settings for it and there is nothing to render. But a manual Refresh can drop the model
+/// or (for Input) `input.lua` is missing or not fully understood, or (for Notifications)
+/// notifd is not running at version 1.1 or later — so no edit can have been staged for it
+/// and there is nothing to render. But a manual Refresh can drop the model
 /// while the store still holds edits staged before it (the file was hand-edited into
 /// something the editor refuses, the app was uninstalled). Those edits have no write to
 /// land in, and planning the Apply anyway would let the commit promote values that never
@@ -452,7 +470,7 @@ const PAGE_GONE: &str = "the page these changes belong to is no longer available
 
 /// Logs an aborted Apply and wraps the underlying error into a [`PrepareFailure::Write`].
 ///
-/// The three log messages are spelled out per source rather than composed from one format
+/// The four log messages are spelled out per source rather than composed from one format
 /// string, so each stays a literal that can be grepped from a journal entry straight back
 /// to the write it describes (R7.3). The page model has already logged the underlying
 /// cause with its path; this line records the *consequence*, which is what the reader of
@@ -464,6 +482,9 @@ fn write_failure(source: FailedWrite, error: impl fmt::Display) -> PrepareFailur
         }
         FailedWrite::Input => {
             tracing::error!(%error, "aborting apply: could not prepare the input.lua write")
+        }
+        FailedWrite::Notifications => {
+            tracing::error!(%error, "aborting apply: could not prepare the notifd/config write")
         }
         FailedWrite::Power => {
             tracing::error!(%error, "aborting apply: could not prepare the hypridle.conf write")

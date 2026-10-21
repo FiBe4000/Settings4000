@@ -1,15 +1,25 @@
-//! The Notifications page's bespoke GTK glue (task 11.7; architecture §7; R4.2, R5.2).
+//! The Notifications page's bespoke GTK glue (tasks 11.7, 11.15; architecture §7; R4.2,
+//! R5.1, R5.2).
 //!
-//! # Why this page is bespoke, not declarative
+//! # Two halves on one page
 //!
-//! Every control on the page is **runtime-only** (R5.2): it reads or changes live
-//! state of the notifd notification daemon over D-Bus and touches no file, so nothing
-//! is staged, nothing is dirty and the Apply/Reset chrome is never involved. The
-//! declarative row framework ([`super::page`]) renders store-backed settings only, so —
-//! like the Sound and Network pages — this page renders directly from a GTK-free core
-//! model, [`NotificationsModel`], which owns every decision and every command (and is
+//! The page's upper half is **runtime-only** (R5.2): it reads or changes live state of
+//! the notifd notification daemon over D-Bus and touches no file, so nothing is staged,
+//! nothing is dirty and the Apply/Reset chrome is never involved. The declarative row
+//! framework ([`super::page`]) renders store-backed settings only, so — like the Sound
+//! and Network pages — this half renders directly from a GTK-free core model,
+//! [`NotificationsModel`], which owns every decision and every command (and is
 //! unit-tested headlessly there). This module only lays out widgets, forwards the
 //! user's actions to the model and re-renders from it.
+//!
+//! The lower half is notifd's **staged** settings from `~/.config/notifd/config` (task
+//! 11.15): popup timeouts, history size, critical-popup cap, hold time and the 2FA copy
+//! switch. Those are ordinary store-backed settings, so they *are* framework rows:
+//! [`page_rows`] describes them, the window launches a [`super::page::SettingsPage`] for
+//! them (which owns the Apply/Reset wiring and the dirty marker) and hands its widget to
+//! [`build`], which only places it under a heading. The rows exist only when the startup
+//! load built a [`NotifdConfigModel`] — notifd ≥ 1.1 runs and the file is readable —
+//! otherwise the runtime half stands alone.
 //!
 //! # What it shows
 //!
@@ -34,7 +44,8 @@
 //!
 //! # Nothing runs while the window builds the page (task 9.26 rule)
 //!
-//! [`build`] issues no command: the model starts in
+//! [`build`] issues no command (placing the already-built staged rows spawns nothing
+//! either — they render from the store): the model starts in
 //! [`DaemonView::NotQueried`] and the page shows a placeholder. The first read happens
 //! when the page becomes the visible stack child, through the window's deferred
 //! page-entry hook (which runs it from the GTK idle queue, see
@@ -63,9 +74,12 @@ use gtk4::{
     Window, gio, glib,
 };
 
+use crate::core::model::SettingId;
 use crate::core::notifd::NotifdState;
+use crate::core::notifd_config::{NotifdConfigModel, NotifdRule, NotifdSetting};
 use crate::core::notifications::{DaemonView, NotifdActionError, NotificationsModel};
 use crate::system::command::SystemCommandRunner;
+use crate::ui::row::{RowCapability, RowDescriptor, WidgetKind};
 
 /// Outer margin, in pixels, around the page content.
 const PAGE_MARGIN: i32 = 18;
@@ -222,10 +236,114 @@ impl Inner {
     }
 }
 
-/// Builds the Notifications page (task 11.7). Runs no command (see the module docs);
-/// the returned page must be kept alive by the window, which mounts
+/// The staged notifd rows (task 11.15), or **no rows** when there is no
+/// [`NotifdConfigModel`] — notifd is not running at version 1.1 or later, or its file is
+/// missing or not understood, which the startup load has logged at `info`.
+///
+/// One spin button per integer key, bounded by exactly the range notifd accepts (so the
+/// control cannot produce a value the daemon would ignore, R8.3), and a switch for
+/// `copy_codes`. Every row is [`RowCapability::Always`]: the model's existence is the
+/// whole gate, so the seven rows appear or disappear together. Kept GTK-free so the
+/// decision is testable headlessly (R6.2).
+pub(crate) fn page_rows(model: Option<&NotifdConfigModel>) -> Vec<RowDescriptor> {
+    if model.is_none() {
+        return Vec::new();
+    }
+    NOTIFD_ROWS
+        .iter()
+        .filter_map(|row| {
+            let setting = NotifdSetting::for_id(row.setting)?;
+            let widget = match (setting.rule, row.spin_step) {
+                (NotifdRule::Integer { min, max, .. }, Some(step)) => WidgetKind::Spin {
+                    min: min as f64,
+                    max: max as f64,
+                    step,
+                },
+                (NotifdRule::Bool { .. }, None) => WidgetKind::Switch,
+                // A table entry whose step does not fit its key's kind is an authoring
+                // mistake; the row is dropped and the row-count test fails.
+                (NotifdRule::Integer { .. }, None) | (NotifdRule::Bool { .. }, Some(_)) => {
+                    return None;
+                }
+            };
+            Some(RowDescriptor::new(
+                row.label,
+                widget,
+                row.setting,
+                RowCapability::Always,
+            ))
+        })
+        .collect()
+}
+
+/// One staged notifd row of the page (see [`NOTIFD_ROWS`]).
+struct NotifdRow {
+    /// The setting the row edits.
+    setting: SettingId,
+    /// The label beside the control.
+    label: &'static str,
+    /// For an integer key, the step of one spin-button arrow click (Page Up/Down moves
+    /// ten steps); `None` for the boolean key, which is a switch.
+    spin_step: Option<f64>,
+}
+
+/// The staged rows in display order. Half a second per click suits the popup timeouts,
+/// a tenth of one the hover hold time, ten entries the history size.
+const NOTIFD_ROWS: [NotifdRow; 7] = [
+    NotifdRow {
+        setting: SettingId::NotifdTimeoutLow,
+        label: "Low-urgency popups stay for (ms)",
+        spin_step: Some(500.0),
+    },
+    NotifdRow {
+        setting: SettingId::NotifdTimeoutNormal,
+        label: "Normal popups stay for (ms)",
+        spin_step: Some(500.0),
+    },
+    NotifdRow {
+        setting: SettingId::NotifdTimeoutCritical,
+        label: "Critical popups stay for (ms)",
+        spin_step: Some(500.0),
+    },
+    NotifdRow {
+        setting: SettingId::NotifdHoldMin,
+        label: "Popup stays after the pointer leaves it (ms)",
+        spin_step: Some(100.0),
+    },
+    NotifdRow {
+        setting: SettingId::NotifdHistoryMax,
+        label: "Notifications kept in the history",
+        spin_step: Some(10.0),
+    },
+    NotifdRow {
+        setting: SettingId::NotifdCriticalPerApp,
+        label: "Critical popups one app may show at once",
+        spin_step: Some(1.0),
+    },
+    NotifdRow {
+        setting: SettingId::NotifdCopyCodes,
+        label: "Offer to copy two-factor codes",
+        spin_step: None,
+    },
+];
+
+/// The explanation shown above the staged rows: the unit, what `0` means, and how a
+/// change takes effect.
+const STAGED_NOTE: &str = "Times are in milliseconds; 0 keeps a popup until it is \
+                           dismissed. An app's own timeout always wins. Changes are saved \
+                           to ~/.config/notifd/config with Apply and take effect for new \
+                           notifications without dropping the ones on screen.";
+
+/// Builds the Notifications page (tasks 11.7, 11.15). Runs no command (see the module
+/// docs); the returned page must be kept alive by the window, which mounts
 /// [`NotificationsPage::root`] and calls [`NotificationsPage::refresh`] on page entry.
-pub(crate) fn build() -> NotificationsPage {
+///
+/// `staged` is the root widget of the framework page the window launched for
+/// [`page_rows`], or `None` when there are no staged rows; it is placed under the
+/// runtime controls with a heading and [`STAGED_NOTE`]. It stays sensitive when the
+/// daemon is found not running on page entry: the edits are saved to the file and
+/// notifd reads it when it starts.
+pub(crate) fn build(staged: Option<&Widget>) -> NotificationsPage {
     let bar_json =
         NotificationsModel::bar_json_path(std::env::var_os("XDG_RUNTIME_DIR").as_deref());
 
@@ -269,6 +387,19 @@ pub(crate) fn build() -> NotificationsPage {
     content.append(&status_row);
     content.append(&error);
     content.append(&controls);
+    if let Some(staged) = staged {
+        let heading = Label::new(Some("Popups and history"));
+        heading.set_halign(Align::Start);
+        heading.set_margin_top(SECTION_SPACING);
+        content.append(&heading);
+        content.append(&note(STAGED_NOTE));
+        // The framework page brings its own page margins; this page already has them.
+        staged.set_margin_top(0);
+        staged.set_margin_bottom(0);
+        staged.set_margin_start(0);
+        staged.set_margin_end(0);
+        content.append(staged);
+    }
 
     let inner = Rc::new(Inner {
         model: RefCell::new(NotificationsModel::new(bar_json)),
@@ -457,6 +588,60 @@ mod tests {
             "Do Not Disturb was not changed: the notification daemon call exited with \
              status 1: Call failed: no such name."
         );
+    }
+
+    #[test]
+    fn the_staged_rows_exist_only_with_a_model_and_match_the_daemon_ranges() {
+        // Task 11.15: without a model (notifd < 1.1, or no readable file) the page has
+        // only its runtime controls; with one, seven well-formed rows whose spin bounds
+        // are exactly notifd's ranges.
+        use crate::core::notifd::{NotifdStatus, NotifdVersion};
+
+        assert!(page_rows(None).is_empty());
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config");
+        std::fs::write(&path, "").expect("an empty file seeds every default");
+        let model = NotifdConfigModel::offer(
+            NotifdStatus::Running {
+                version: Some(NotifdVersion::STATE_AND_RELOAD),
+            },
+            path,
+        )
+        .expect("offered");
+        let rows = page_rows(Some(&model));
+        assert_eq!(
+            rows.iter().map(|row| row.setting).collect::<Vec<_>>(),
+            vec![
+                SettingId::NotifdTimeoutLow,
+                SettingId::NotifdTimeoutNormal,
+                SettingId::NotifdTimeoutCritical,
+                SettingId::NotifdHoldMin,
+                SettingId::NotifdHistoryMax,
+                SettingId::NotifdCriticalPerApp,
+                SettingId::NotifdCopyCodes,
+            ]
+        );
+        for row in &rows {
+            assert!(row.is_well_formed(), "{:?}", row.setting);
+            let setting = NotifdSetting::for_id(row.setting).expect("a notifd key");
+            match (setting.rule, &row.widget) {
+                (
+                    NotifdRule::Integer { min, max, .. },
+                    WidgetKind::Spin {
+                        min: lo,
+                        max: hi,
+                        step,
+                    },
+                ) => {
+                    assert_eq!((*lo, *hi), (min as f64, max as f64), "{}", setting.key);
+                    assert!(*step >= 1.0, "{}", setting.key);
+                }
+                (NotifdRule::Bool { .. }, WidgetKind::Switch) => {}
+                (rule, widget) => panic!("{rule:?} rendered as {widget:?}"),
+            }
+        }
+        assert!(STAGED_NOTE.contains("0 keeps a popup until it is dismissed"));
     }
 
     #[test]

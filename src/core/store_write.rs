@@ -4,8 +4,9 @@
 //!
 //! # What this module is
 //!
-//! Two pages are file-backed in the plainest possible way: Input (`input.lua`) and
-//! Power & Idle (`hypridle.conf`). Every one of
+//! Three pages are file-backed in the plainest possible way: Input (`input.lua`), the
+//! Notifications page's staged half (`notifd/config`) and Power & Idle (`hypridle.conf`).
+//! Every one of
 //! their settings is an ordinary [`SettingId`] staged in the shared store, and an Apply
 //! turns that page's dirty settings into exactly one [`FileWrite`]. The interesting part of
 //! each is its **renderer** — which parser it drives and which addresses it edits — and
@@ -25,7 +26,9 @@
 //! themselves, and [`StoreWriteError`] is the one failure type — generic over the
 //! renderer's own error, which is the only genuinely page-specific piece of it (the
 //! Input renderer's [`InputRenderError`](crate::core::input::InputRenderError) for
-//! `input.lua`, the Power & Idle renderer's
+//! `input.lua`, the notifd renderer's
+//! [`NotifdRenderError`](crate::core::notifd_config::NotifdRenderError) for
+//! `notifd/config`, the Power & Idle renderer's
 //! [`HypridleRenderError`](crate::core::power::HypridleRenderError) for `hypridle.conf`).
 //!
 //! # Why a failure here must abort the whole Apply, not skip the file
@@ -190,9 +193,10 @@ impl StoreBackedFile {
 /// settings to apply (task 9.17).
 ///
 /// Generic over `E`, the page renderer's own failure: the Input renderer's
-/// [`InputRenderError`](crate::core::input::InputRenderError) for `input.lua`, the
-/// Power & Idle renderer's [`HypridleRenderError`](crate::core::power::HypridleRenderError)
-/// for `hypridle.conf`. Both variants carry the file's display name because the
+/// [`InputRenderError`](crate::core::input::InputRenderError) for `input.lua`, the notifd
+/// renderer's [`NotifdRenderError`](crate::core::notifd_config::NotifdRenderError) for
+/// `notifd/config`, the Power & Idle renderer's
+/// [`HypridleRenderError`](crate::core::power::HypridleRenderError) for `hypridle.conf`. Both variants carry the file's display name because the
 /// [`Display`](fmt::Display) text is quoted verbatim in the dialog the user sees
 /// (`ui::chrome`'s `assembly_warning`), which has to say which file to go and fix.
 ///

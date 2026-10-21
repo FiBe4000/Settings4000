@@ -62,6 +62,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::parsers::kv::{KvEditError, KvFile, KvLine, Occurrence, is_key_char};
+
 /// The built-in palette schema: the 18 keys `scripts/generate-colors` requires
 /// as of dotfiles commit `8a5b20b` (analysis §7.6), in the generator's order.
 ///
@@ -291,66 +293,17 @@ pub fn parse_names_line(script: &str) -> Result<Vec<String>, NamesLineError> {
 /// A parsed palette source file that can re-emit itself byte-for-byte and edit
 /// individual values in place.
 ///
-/// Built by [`PaletteFile::parse`]. Internally it is just the file's lines in
-/// order, each classified and — for a real `key=value` entry — annotated with
-/// the byte span of its value within that line's raw text. Emitting concatenates
-/// the raw line texts, so an unedited file reproduces its input exactly; editing
-/// a value splices new bytes into a single line's value span and updates that
-/// one span, leaving every other line's bytes alone.
+/// Built by [`PaletteFile::parse`]. The line model itself — every line kept verbatim,
+/// each entry annotated with its value's byte span — is the shared `key=value` model of
+/// [`crate::parsers::kv`], which notifd's settings file uses too (task 11.15). This type
+/// adds the palette's own rules on top: values are bare-hex colours, each key is meant
+/// to appear once (a duplicate is a schema error, and reads and edits address the
+/// **first** entry), and the key set is checked against a [`PaletteSchema`].
 #[derive(Clone, Debug)]
 pub struct PaletteFile {
-    /// The file's lines in original order. Concatenating every line's raw text
-    /// reproduces the original input exactly (round-trip identity).
-    lines: Vec<Line>,
-}
-
-/// One physical line of the file, kept verbatim for lossless re-emission.
-#[derive(Clone, Debug)]
-struct Line {
-    /// The exact original bytes of this line **including its terminator**
-    /// (`\n` or `\r\n`, or none for a final line with no trailing newline).
-    /// This is what [`PaletteFile::emit`] writes back, so it is never rewritten
-    /// except by [`PaletteFile::set_value`], which splices only the value span.
-    raw: String,
-    /// How this line was classified during parsing.
-    kind: LineKind,
-}
-
-/// The classification of a single line.
-///
-/// Only [`LineKind::Entry`] lines are addressable by [`PaletteFile::set_value`]
-/// and counted by [`PaletteFile::validate`]; blanks, comments, and malformed
-/// lines are preserved verbatim and never matched by an edit (so a commented-out
-/// `#bg0=…` line can never be mistaken for the real `bg0` entry).
-#[derive(Clone, Debug)]
-enum LineKind {
-    /// A line that is empty or only whitespace.
-    Blank,
-    /// A comment: the first non-whitespace character is `#`. A commented-out
-    /// entry (`# bg0=272e33`) is a comment, never an entry.
-    Comment,
-    /// A `key=value` assignment with a non-empty identifier key. The value's
-    /// byte range within [`Line::raw`] is recorded so it can be read and
-    /// rewritten in place. The value is *not* required to be valid hex to be an
-    /// entry — an out-of-format value is still an editable entry and is reported
-    /// separately as a parse warning (see [`ParseWarningKind::InvalidHexValue`]).
-    Entry {
-        /// The assignment's key, with surrounding whitespace trimmed
-        /// (e.g. `bg0`). Used to match [`PaletteFile::set_value`] targets and to
-        /// count keys for [`PaletteFile::validate`].
-        key: String,
-        /// Byte offset within [`Line::raw`] where the value begins (after the
-        /// `=` and any following whitespace).
-        value_start: usize,
-        /// Byte offset within [`Line::raw`] where the value ends (before any
-        /// trailing whitespace and the line terminator). The half-open range
-        /// `value_start..value_end` is exactly the bytes an edit replaces.
-        value_end: usize,
-    },
-    /// A non-blank, non-comment line that is not a `key=value` assignment (no
-    /// `=`, or an empty/non-identifier key). Preserved verbatim and surfaced as
-    /// a [`ParseWarningKind::MalformedLine`] warning; never editable.
-    Malformed,
+    /// The lossless line model. Emitting it reproduces the input exactly when nothing
+    /// was edited (round-trip identity).
+    file: KvFile,
 }
 
 /// A non-fatal problem noticed while parsing a palette file.
@@ -526,8 +479,8 @@ impl PaletteFile {
     /// entry, so [`emit`](Self::emit) always reproduces the input byte-for-byte.
     /// Lines that cannot be interpreted as a palette entry (and are not comments
     /// or blanks) and entries whose value is not bare hex are returned as
-    /// [`ParseWarning`]s; they are *not* errors and do not stop parsing (R6.1
-    /// acceptance).
+    /// [`ParseWarning`]s, in line order; they are *not* errors and do not stop parsing
+    /// (R6.1 acceptance).
     ///
     /// Like the sibling parsers (hyprlang, INI, env), warnings are **returned** for
     /// the caller to log or ignore — this parser does not log them itself. That
@@ -539,23 +492,24 @@ impl PaletteFile {
     /// log them. The returned warnings carry only line numbers and, for a bad value,
     /// the offending key/value — never the whole file's contents (R7.3).
     pub fn parse(input: &str) -> (Self, Vec<ParseWarning>) {
-        let mut lines = Vec::new();
-        let mut warnings = Vec::new();
-
-        // `split_inclusive` keeps each line's terminator attached and yields the
-        // final unterminated line as-is, so re-joining the pieces is exactly the
-        // input. An empty input yields no pieces, so an empty file round-trips to
-        // empty. This is what makes emission byte-for-byte lossless.
-        for (index, raw) in input.split_inclusive('\n').enumerate() {
-            let line_number = index + 1;
-            let kind = classify_line(raw, line_number, &mut warnings);
-            lines.push(Line {
-                raw: raw.to_string(),
-                kind,
-            });
-        }
-
-        (PaletteFile { lines }, warnings)
+        let file = KvFile::parse(input);
+        let warnings = file
+            .lines()
+            .filter_map(|(line, view)| {
+                let kind = match view {
+                    KvLine::Malformed => ParseWarningKind::MalformedLine,
+                    KvLine::Entry { key, value } if !is_bare_hex(value) => {
+                        ParseWarningKind::InvalidHexValue {
+                            key: key.to_string(),
+                            value: value.to_string(),
+                        }
+                    }
+                    KvLine::Blank | KvLine::Comment | KvLine::Entry { .. } => return None,
+                };
+                Some(ParseWarning { line, kind })
+            })
+            .collect();
+        (PaletteFile { file }, warnings)
     }
 
     /// Re-emits the file as text, byte-for-byte identical to the parsed input
@@ -564,11 +518,7 @@ impl PaletteFile {
     /// After [`set_value`](Self::set_value) edits, the output is identical to the
     /// input except within the edited value spans.
     pub fn emit(&self) -> String {
-        let mut out = String::new();
-        for line in &self.lines {
-            out.push_str(&line.raw);
-        }
-        out
+        self.file.emit()
     }
 
     /// Returns the current value of `key`, if the file has an entry for it.
@@ -576,19 +526,7 @@ impl PaletteFile {
     /// Reads the first entry with that key (a well-formed palette has at most
     /// one). Comment and malformed lines are never considered.
     pub fn value(&self, key: &str) -> Option<&str> {
-        for line in &self.lines {
-            if let LineKind::Entry {
-                key: entry_key,
-                value_start,
-                value_end,
-            } = &line.kind
-            {
-                if entry_key == key {
-                    return Some(&line.raw[*value_start..*value_end]);
-                }
-            }
-        }
-        None
+        self.file.value(key, Occurrence::First)
     }
 
     /// Rewrites the value of `key` to `value`, changing exactly that one value
@@ -609,30 +547,19 @@ impl PaletteFile {
         if !is_bare_hex(value) {
             return Err(SetValueError::InvalidValue(value.to_string()));
         }
-
-        // Destructure each line into its disjoint fields so the raw text can be
-        // spliced while the value span (held in `kind`) is read and updated — two
-        // borrows of different fields of the same struct.
-        for Line { raw, kind } in &mut self.lines {
-            if let LineKind::Entry {
-                key: entry_key,
-                value_start,
-                value_end,
-            } = kind
-            {
-                if entry_key.as_str() == key {
-                    // Replace only the value bytes; `replace_range` shifts the
-                    // trailing whitespace and terminator automatically, and no
-                    // other line's `String` is touched.
-                    raw.replace_range(*value_start..*value_end, value);
-                    *value_end = *value_start + value.len();
-                    tracing::debug!(key, value, "rewrote palette value");
-                    return Ok(());
-                }
+        match self.file.set_value(key, Occurrence::First, value) {
+            Ok(()) => {
+                tracing::debug!(key, value, "rewrote palette value");
+                Ok(())
+            }
+            Err(KvEditError::UnknownKey(key)) => Err(SetValueError::UnknownKey(key)),
+            // Six hex digits never contain a line break or surrounding whitespace, and
+            // no key is appended here, so the line model has nothing else to refuse;
+            // mapped rather than unwrapped so the function stays panic-free.
+            Err(KvEditError::InvalidKey(_) | KvEditError::UnsafeValue(_)) => {
+                Err(SetValueError::InvalidValue(value.to_string()))
             }
         }
-
-        Err(SetValueError::UnknownKey(key.to_string()))
     }
 
     /// Checks the file's entry keys against `schema` (R8.3).
@@ -646,12 +573,10 @@ impl PaletteFile {
         // Count each entry key's occurrences, preserving first-seen order for
         // stable, readable reports.
         let mut counts: Vec<(String, usize)> = Vec::new();
-        for line in &self.lines {
-            if let LineKind::Entry { key, .. } = &line.kind {
-                match counts.iter_mut().find(|(seen, _)| seen == key) {
-                    Some((_, count)) => *count += 1,
-                    None => counts.push((key.clone(), 1)),
-                }
+        for entry in self.file.entries() {
+            match counts.iter_mut().find(|(seen, _)| seen == entry.key) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((entry.key.to_string(), 1)),
             }
         }
 
@@ -681,95 +606,6 @@ impl PaletteFile {
             duplicate_keys,
         }
     }
-}
-
-/// Classifies one raw line (terminator included) and records a parse warning if
-/// it is malformed or carries a non-hex value.
-///
-/// The value span it computes for an entry is expressed as byte offsets into
-/// `raw`, so it can be stored directly in [`LineKind::Entry`] and later used to
-/// splice a replacement value.
-fn classify_line(raw: &str, line_number: usize, warnings: &mut Vec<ParseWarning>) -> LineKind {
-    // Work against the content without its line terminator so the terminator is
-    // never mistaken for part of a value and stays out of the value span. The raw
-    // string (with terminator) is what we re-emit; content is only for locating
-    // the `=` and the value.
-    let content = strip_terminator(raw);
-
-    let trimmed = content.trim_start();
-    if trimmed.is_empty() {
-        return LineKind::Blank;
-    }
-    if trimmed.starts_with('#') {
-        // A comment — including a commented-out entry like `# bg0=272e33`. The `#`
-        // check comes before the `=` check so such a line is never treated as an
-        // editable entry.
-        return LineKind::Comment;
-    }
-
-    // Try to read the line as `key=value`.
-    let Some(eq) = content.find('=') else {
-        warnings.push(ParseWarning {
-            line: line_number,
-            kind: ParseWarningKind::MalformedLine,
-        });
-        return LineKind::Malformed;
-    };
-
-    let key = content[..eq].trim();
-    if key.is_empty() || !key.chars().all(is_key_char) {
-        // No usable key (empty, or containing characters a palette key never has),
-        // so this is not an assignment we can address.
-        warnings.push(ParseWarning {
-            line: line_number,
-            kind: ParseWarningKind::MalformedLine,
-        });
-        return LineKind::Malformed;
-    }
-
-    // The value is the content after `=` with surrounding whitespace trimmed. The
-    // offsets are relative to `content`, which shares the same origin as `raw`
-    // (content is a prefix of raw), so they index into `raw` directly.
-    let after_eq = &content[eq + 1..];
-    let leading_ws = after_eq.len() - after_eq.trim_start().len();
-    let value = after_eq.trim();
-    let value_start = eq + 1 + leading_ws;
-    let value_end = value_start + value.len();
-
-    if !is_bare_hex(value) {
-        warnings.push(ParseWarning {
-            line: line_number,
-            kind: ParseWarningKind::InvalidHexValue {
-                key: key.to_string(),
-                value: value.to_string(),
-            },
-        });
-    }
-
-    LineKind::Entry {
-        key: key.to_string(),
-        value_start,
-        value_end,
-    }
-}
-
-/// Returns `content` with a trailing `\n` or `\r\n` removed, so value-span
-/// computation never runs into the line terminator.
-///
-/// The terminator is only stripped for locating the value; the caller keeps the
-/// full `raw` (terminator included) for lossless emission.
-fn strip_terminator(raw: &str) -> &str {
-    let without_lf = raw.strip_suffix('\n').unwrap_or(raw);
-    without_lf.strip_suffix('\r').unwrap_or(without_lf)
-}
-
-/// Whether `c` may appear in a palette key.
-///
-/// Palette keys are simple identifiers (`bg0`, `accent0`, `red`, …): ASCII
-/// letters, digits, and underscore. A character outside this set makes the line
-/// malformed rather than an entry.
-fn is_key_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
 }
 
 /// Whether `value` is a bare-hex color: exactly six ASCII hexadecimal digits and

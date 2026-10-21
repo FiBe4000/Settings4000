@@ -65,7 +65,7 @@ pub mod reload;
 pub mod apply;
 
 // The write glue shared by the store-backed pages (task 9.17; architecture §6; R5.3, R8.3).
-// `input` and `power` each stage every one of their settings in the shared
+// `input`, `notifd_config` and `power` each stage every one of their settings in the shared
 // `store` and write exactly one backing file, so the steps around their per-page renderer —
 // no write when nothing is dirty, read the current bytes, render, wrap the result in an
 // `apply::FileWrite` — are one implementation here rather than one copy per page. It also
@@ -108,13 +108,23 @@ pub mod network;
 // drives the daemon through it.
 pub mod notifd;
 
-// The Notifications-page model (task 11.7; R4.2, R5.2). Every control on the page is
+// The Notifications-page runtime model (task 11.7; R4.2, R5.2). These controls are
 // runtime-only: it reads notifd's state (`GetState`, or `bar.json` on a daemon older than
 // 1.1) on page entry and applies do-not-disturb, "open the notification center" and the
 // confirmation-guarded "clear all" immediately through the `CommandRunner`, bypassing
 // staging. It is consumed by the Notifications page UI glue (`ui::notifications`), so its
 // public surface is exercised in a non-test build too.
 pub mod notifications;
+
+// The Notifications page's file-backed half (task 11.15; R5.1, R8.3): notifd's seven
+// settings in `~/.config/notifd/config`, with the daemon's own ranges and defaults, read
+// with its "last valid assignment wins" rule and written surgically through the shared
+// `parsers::kv` line model. The settings are staged in `store`; this module's
+// `NotifdConfigModel` renders the one write, which the pipeline follows with notifd's
+// `Reload()` (`reload::BackingFile::NotifdConfig`). `model` calls its range check at
+// stage time, the startup load (`ui::startup`) its reader, and the plan assembler
+// (`assemble`) its write glue.
+pub mod notifd_config;
 
 // The Power & Idle-page domain logic (tasks 6.8, 11.13; R4.2, R4.4, R5.6, R8.3). It
 // provides the store-`SettingId` -> `hypridle.conf` write glue: it renders the store's dirty

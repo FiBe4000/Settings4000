@@ -44,7 +44,7 @@ build dependencies:
 |---|---|
 | `hyprctl` | Hyprland reloads, monitor info, `setcursor`, hyprpaper control |
 | `wpctl` / `pactl` | Sound page (volume, mute, devices) |
-| `notifd` (+ `busctl`) | Notifications page: do-not-disturb, notification count, clear all, open the center — detected by its D-Bus name `se.dotfiles.Notifd` (running) or its `~/.config/systemd/user/notifd.service` unit (installed); its `Reload()` method after an icon-theme change (notifd ≥ 1.1); every call goes through `busctl` with auto-start disabled |
+| `notifd` (+ `busctl`) | Notifications page: do-not-disturb, notification count, clear all, open the center — detected by its D-Bus name `se.dotfiles.Notifd` (running) or its `~/.config/systemd/user/notifd.service` unit (installed); with notifd ≥ 1.1 the page also edits the seven settings of `~/.config/notifd/config` (popup timeouts, history size, critical popups per app, hold time, 2FA copy), and its `Reload()` method follows a write of that file as well as an icon-theme change; every call goes through `busctl` with auto-start disabled |
 | `hypridle`, `hyprlock`, `hyprpaper` | Power & Idle, lock background, wallpaper |
 | `nmcli`, `nm-connection-editor` | Network status page + settings launcher |
 | `gsettings`, `dconf` | GTK theme/cursor propagation, live-restyle detection |
@@ -141,8 +141,8 @@ that has its own small config file. The new layout is analysed in
 `docs/dotfiles_analysis.md` §7–§8 and the re-alignment work is the §11 backlog
 in `docs/tasks.md`. The Input page, the cursor copies, the palette schema and
 the Notifications page's runtime controls already follow it; the remaining
-§11 items (among them the laptop-display toggle running the dotfiles script
-and notifd's file-backed settings) are still open, and
+§11 items (among them the laptop-display toggle running the dotfiles script)
+are still open, and
 until they land those parts of the app keep their earlier behaviour.
 
 ## Documentation

@@ -53,11 +53,12 @@
 //!   [`crate::core::network`] status. It is bespoke rather than declarative because the
 //!   page is read-only and runtime-backed (R3.1) — it has no store-backed settings at
 //!   all.
-//! - [`notifications`] — the Notifications page's bespoke glue (task 11.7): the
+//! - [`notifications`] — the Notifications page's bespoke glue (tasks 11.7, 11.15): the
 //!   runtime-only notifd controls (do-not-disturb, the notification count and inhibited
 //!   state, open the center, clear all behind a confirmation), rendered from the
-//!   GTK-free [`crate::core::notifications`] model. Bespoke because nothing on it is
-//!   staged (R5.2).
+//!   GTK-free [`crate::core::notifications`] model, plus the row list of notifd's staged
+//!   settings, which the window renders through the declarative framework and mounts
+//!   inside the page. Bespoke because its runtime half is not staged (R5.2).
 //!
 //! The real per-category page content (§6) plugs into this shell in later tasks.
 
@@ -67,7 +68,10 @@ mod chrome;
 mod display;
 mod input;
 mod network;
-mod notifications;
+// Crate-visible for the same reason as `startup` below: `crate::testing` re-exposes its
+// GTK-free staged-row list so the Notifications integration suite can check which rows
+// the page shows (task 11.15).
+pub(crate) mod notifications;
 mod page;
 mod row;
 mod sound;

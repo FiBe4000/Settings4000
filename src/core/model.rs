@@ -61,6 +61,7 @@ use std::path::{Path, PathBuf};
 
 use crate::core::home_path::{self, expand_home, is_home_relative};
 use crate::core::lock_grace::GraceError;
+use crate::core::notifd_config;
 use crate::parsers::palette::is_bare_hex;
 
 /// A top-level settings category — one entry per sidebar page (R2.4, requirements
@@ -89,6 +90,11 @@ pub enum Category {
     Theme,
     /// Keyboard, mouse, and touchpad settings backed by `input.lua` (tasks 6.6, 11.4).
     Input,
+    /// notifd's popup timeouts, history size, critical-popup cap, hold time and 2FA
+    /// copy switch, backed by `~/.config/notifd/config` (task 11.15). The page's
+    /// do-not-disturb, count and clear controls are runtime-only and are not part of
+    /// this category's staged state (R5.2).
+    Notifications,
     /// Idle timeouts, the lock command and its grace period, backed by `hypridle.conf`
     /// (tasks 6.8, 11.13).
     PowerAndIdle,
@@ -192,6 +198,32 @@ pub enum SettingId {
     /// Touchpad tap-to-click.
     TouchpadTapToClick,
 
+    // --- Notifications (task 11.15) ---
+    //
+    // The seven keys of `~/.config/notifd/config`. Their key names, ranges and defaults
+    // are notifd's own and live in one table, `core::notifd_config::NOTIFD_SETTINGS`.
+    /// How long a low-urgency popup stays, in milliseconds; `0` keeps it until it is
+    /// dismissed (`timeout_low_ms`). An application's own expiry always wins.
+    NotifdTimeoutLow,
+    /// How long a normal-urgency popup stays, in milliseconds; `0` = until dismissed
+    /// (`timeout_normal_ms`).
+    NotifdTimeoutNormal,
+    /// How long a critical popup stays, in milliseconds; `0` = until dismissed
+    /// (`timeout_critical_ms`, `0` by default).
+    NotifdTimeoutCritical,
+    /// How many notifications the history (the notification center) keeps; at least 1
+    /// (`history_max`).
+    NotifdHistoryMax,
+    /// How many critical popups one application may hold on screen at once, `1..=5` —
+    /// the number of popup slots (`critical_per_app`).
+    NotifdCriticalPerApp,
+    /// How long a popup stays at least after the pointer leaves it, in milliseconds
+    /// (`hold_min_ms`).
+    NotifdHoldMin,
+    /// Whether a notification carrying a two-factor code offers a "Copy" action
+    /// (`copy_codes`).
+    NotifdCopyCodes,
+
     // --- Power & Idle (task 6.8) ---
     /// Idle seconds before the screen dims (`hypridle.conf` listener).
     DimTimeout,
@@ -232,10 +264,17 @@ impl SettingId {
             SettingId::DimTimeout
             | SettingId::LockTimeout
             | SettingId::DpmsTimeout
-            | SettingId::LockGracePeriod => ValueKind::Integer,
+            | SettingId::LockGracePeriod
+            | SettingId::NotifdTimeoutLow
+            | SettingId::NotifdTimeoutNormal
+            | SettingId::NotifdTimeoutCritical
+            | SettingId::NotifdHistoryMax
+            | SettingId::NotifdCriticalPerApp
+            | SettingId::NotifdHoldMin => ValueKind::Integer,
             SettingId::TouchpadNaturalScroll
             | SettingId::TouchpadTapToClick
-            | SettingId::LaptopDisplayEnabled => ValueKind::Bool,
+            | SettingId::LaptopDisplayEnabled
+            | SettingId::NotifdCopyCodes => ValueKind::Bool,
             SettingId::PaletteColor
             | SettingId::WallpaperPath
             | SettingId::LockBackgroundPath
@@ -263,6 +302,13 @@ impl SettingId {
             | SettingId::MouseSensitivity
             | SettingId::TouchpadNaturalScroll
             | SettingId::TouchpadTapToClick => Category::Input,
+            SettingId::NotifdTimeoutLow
+            | SettingId::NotifdTimeoutNormal
+            | SettingId::NotifdTimeoutCritical
+            | SettingId::NotifdHistoryMax
+            | SettingId::NotifdCriticalPerApp
+            | SettingId::NotifdHoldMin
+            | SettingId::NotifdCopyCodes => Category::Notifications,
             SettingId::DimTimeout
             | SettingId::LockTimeout
             | SettingId::DpmsTimeout
@@ -297,6 +343,13 @@ impl SettingId {
             | SettingId::MouseSensitivity
             | SettingId::TouchpadNaturalScroll
             | SettingId::TouchpadTapToClick
+            | SettingId::NotifdTimeoutLow
+            | SettingId::NotifdTimeoutNormal
+            | SettingId::NotifdTimeoutCritical
+            | SettingId::NotifdHistoryMax
+            | SettingId::NotifdCriticalPerApp
+            | SettingId::NotifdHoldMin
+            | SettingId::NotifdCopyCodes
             | SettingId::DimTimeout
             | SettingId::LockTimeout
             | SettingId::DpmsTimeout
@@ -346,6 +399,17 @@ impl SettingId {
             (SettingId::LockGracePeriod, Value::Integer(seconds)) => {
                 validate_int_range(*seconds, &LOCK_GRACE_SECONDS_RANGE)
             }
+            // notifd ignores a value outside its range and silently uses the default, so
+            // the daemon's own range is enforced here, at stage time (task 11.15, R8.3).
+            (
+                SettingId::NotifdTimeoutLow
+                | SettingId::NotifdTimeoutNormal
+                | SettingId::NotifdTimeoutCritical
+                | SettingId::NotifdHistoryMax
+                | SettingId::NotifdCriticalPerApp
+                | SettingId::NotifdHoldMin,
+                Value::Integer(number),
+            ) => notifd_config::validate_integer(*self, *number),
             // No value-format rule: a boolean switch, a free-text command, or a
             // drop-down whose every option is valid. The kind match above is the
             // only constraint. `LaptopDisplayEnabled` is runtime-only (R5.2) and
@@ -354,7 +418,8 @@ impl SettingId {
             (
                 SettingId::TouchpadNaturalScroll
                 | SettingId::TouchpadTapToClick
-                | SettingId::LaptopDisplayEnabled,
+                | SettingId::LaptopDisplayEnabled
+                | SettingId::NotifdCopyCodes,
                 Value::Bool(_),
             ) => Ok(()),
             // The keyboard-layout list must have at least one entry (R8.3): writing an
@@ -568,6 +633,20 @@ pub enum ValidationError {
         /// The inclusive upper bound, formatted.
         max: String,
     },
+    /// A notifd setting is outside the range notifd accepts for its key, so the daemon
+    /// would ignore the line and silently use its default (task 11.15, R8.3). Names the
+    /// key and the rule, because the reason (e.g. `critical_per_app` is capped by the
+    /// number of popup slots) is the daemon's, not an app preference.
+    NotifdOutOfRange {
+        /// The key in `~/.config/notifd/config`.
+        key: &'static str,
+        /// The refused value.
+        value: i64,
+        /// The smallest value notifd accepts for the key.
+        min: i64,
+        /// The largest value notifd accepts for the key.
+        max: i64,
+    },
     /// A wallpaper/lock-background path is not a readable image file.
     ImagePath {
         /// The path that was checked.
@@ -631,6 +710,16 @@ impl fmt::Display for ValidationError {
             ValidationError::OutOfRange { value, min, max } => {
                 write!(f, "{value} is outside the allowed range {min} to {max}")
             }
+            ValidationError::NotifdOutOfRange {
+                key,
+                value,
+                min,
+                max,
+            } => write!(
+                f,
+                "{key}={value} would be ignored by notifd, which then uses its default: it \
+                 must be a whole number from {min} to {max}"
+            ),
             ValidationError::ImagePath { path, problem } => {
                 let path = path.display();
                 match problem {
@@ -1104,6 +1193,13 @@ mod tests {
         SettingId::MouseSensitivity,
         SettingId::TouchpadNaturalScroll,
         SettingId::TouchpadTapToClick,
+        SettingId::NotifdTimeoutLow,
+        SettingId::NotifdTimeoutNormal,
+        SettingId::NotifdTimeoutCritical,
+        SettingId::NotifdHistoryMax,
+        SettingId::NotifdCriticalPerApp,
+        SettingId::NotifdHoldMin,
+        SettingId::NotifdCopyCodes,
         SettingId::DimTimeout,
         SettingId::LockTimeout,
         SettingId::DpmsTimeout,
@@ -1128,6 +1224,13 @@ mod tests {
             | SettingId::MouseSensitivity
             | SettingId::TouchpadNaturalScroll
             | SettingId::TouchpadTapToClick
+            | SettingId::NotifdTimeoutLow
+            | SettingId::NotifdTimeoutNormal
+            | SettingId::NotifdTimeoutCritical
+            | SettingId::NotifdHistoryMax
+            | SettingId::NotifdCriticalPerApp
+            | SettingId::NotifdHoldMin
+            | SettingId::NotifdCopyCodes
             | SettingId::DimTimeout
             | SettingId::LockTimeout
             | SettingId::DpmsTimeout
@@ -1162,6 +1265,13 @@ mod tests {
             }
             SettingId::LockCommand => Value::String("hyprlock".to_string()),
             SettingId::LockGracePeriod => Value::Integer(10),
+            SettingId::NotifdTimeoutLow
+            | SettingId::NotifdTimeoutNormal
+            | SettingId::NotifdTimeoutCritical
+            | SettingId::NotifdHoldMin => Value::Integer(5000),
+            SettingId::NotifdHistoryMax => Value::Integer(100),
+            SettingId::NotifdCriticalPerApp => Value::Integer(3),
+            SettingId::NotifdCopyCodes => Value::Bool(true),
         }
     }
 
@@ -1235,6 +1345,14 @@ mod tests {
         assert_eq!(SettingId::MouseSensitivity.category(), Category::Input);
         assert_eq!(SettingId::DimTimeout.category(), Category::PowerAndIdle);
         assert_eq!(SettingId::LockCommand.category(), Category::PowerAndIdle);
+        assert_eq!(
+            SettingId::NotifdTimeoutLow.category(),
+            Category::Notifications
+        );
+        assert_eq!(
+            SettingId::NotifdCopyCodes.category(),
+            Category::Notifications
+        );
     }
 
     #[test]

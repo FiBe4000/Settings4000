@@ -31,7 +31,7 @@
 //! (from `gtk-3.0/settings.ini`) without dropping popups, timers, inhibitors or
 //! history (analysis §8.2), so it is the [`ReloadAction::NotifdReload`] step: a
 //! `settings.ini` write that changed the icon theme asks for it (task 11.14), and
-//! the notifd config file (task 11.15) will ask for it too. [`plan_reloads`]
+//! so does a write of the notifd config file (task 11.15). [`plan_reloads`]
 //! deduplicates, so one Apply calls it once however many writes asked. It needs a
 //! running daemon of version 1.1 or later, the first with `Reload()`; an older one
 //! is skipped and the Theme page says that notification icons follow at the next
@@ -198,6 +198,10 @@ pub enum BackingFile {
     /// (libXcursor reads it when a program loads its cursors), so like `uwsm/env` it
     /// carries only the shared live cursor reload.
     CursorFallbackTheme,
+    /// `~/.config/notifd/config` — notifd's seven tunables (task 11.15); re-read
+    /// with notifd's `Reload()` D-Bus method, which keeps on-screen popups, timers and
+    /// the history (analysis §8.2). Never a unit restart.
+    NotifdConfig,
     /// A palette (color-scheme) switch: `colors/<scheme>` is edited and
     /// `generate-colors` rewrites the color partials. Triggers the broad
     /// apply-theme reload chain, `hyprctl reload config-only` first (analysis §6.1,
@@ -220,6 +224,7 @@ impl BackingFile {
         BackingFile::GtkSettings,
         BackingFile::UwsmEnv,
         BackingFile::CursorFallbackTheme,
+        BackingFile::NotifdConfig,
         BackingFile::Palette,
     ];
 
@@ -259,6 +264,9 @@ impl BackingFile {
                 vec![ReloadAction::HyprctlReload(HyprlandReloadScope::Full)]
             }
             BackingFile::HypridleConf => vec![ReloadAction::HypridleRestart],
+            // notifd re-reads its file in place on `Reload()`; an icon-theme change in
+            // the same Apply asks for the same call, and `plan_reloads` issues it once.
+            BackingFile::NotifdConfig => vec![ReloadAction::NotifdReload],
             // hyprlock intentionally has no reload (see the variant docs).
             BackingFile::HyprlockConf => Vec::new(),
             BackingFile::HyprpaperConf => match &params.wallpaper {
@@ -523,7 +531,7 @@ pub enum ReloadAction {
     /// running daemon of version 1.1 or later has the method; never replaced by a
     /// unit restart (which drops the popups on screen) or SIGHUP (which stops it).
     /// One variant serves every write that needs it — the icon theme in
-    /// `settings.ini` now, the notifd config file later (task 11.15) — so
+    /// `settings.ini` and the notifd config file (task 11.15) — so
     /// [`plan_reloads`]' deduplication issues it once per Apply.
     NotifdReload,
 }
@@ -1201,7 +1209,8 @@ mod tests {
             | BackingFile::HyprpaperConf
             | BackingFile::GtkSettings
             | BackingFile::UwsmEnv
-            | BackingFile::CursorFallbackTheme => None,
+            | BackingFile::CursorFallbackTheme
+            | BackingFile::NotifdConfig => None,
         };
         for &file in BackingFile::ALL {
             assert_eq!(hyprland_scope(file), expected(file), "{file:?}");
@@ -1211,8 +1220,8 @@ mod tests {
         // each file, with every component running and every value changed: the
         // wallpaper gains the bar text tone after the single hyprpaper request, and
         // only the settings.ini files ask for notifd's `Reload()` (the icon theme
-        // lives there) — never the cursor-only copies. A future notifd config file
-        // (task 11.15) adds one arm here mapping to `["notifd Reload"]`.
+        // lives there) — never the cursor-only copies — and the notifd config file
+        // (task 11.15) asks for nothing but notifd's `Reload()`.
         let expected_plan = |file: BackingFile| -> Vec<&'static str> {
             match file {
                 BackingFile::MonitorsConf => vec!["hyprctl reload"],
@@ -1235,6 +1244,7 @@ mod tests {
                     "gsettings cursor-size",
                     "hyprctl setcursor",
                 ],
+                BackingFile::NotifdConfig => vec!["notifd Reload"],
                 BackingFile::Palette => {
                     vec!["hyprctl reload config-only", "eww reload", "kitty SIGUSR1"]
                 }
@@ -1624,9 +1634,59 @@ mod tests {
     }
 
     #[test]
+    fn an_icon_theme_and_a_notifd_config_write_plan_one_reload() {
+        // Task 11.15 on top of 11.14: a settings.ini write that changed the icon theme
+        // and a notifd config write each ask for `Reload()`; one Apply issues it once,
+        // last. The config file alone asks for exactly that call.
+        let icon_only = ReloadParams {
+            icon_theme: Some("Papirus".to_string()),
+            ..ReloadParams::default()
+        };
+        let planned = plan_reloads(
+            &[BackingFile::GtkSettings, BackingFile::NotifdConfig],
+            &icon_only,
+            &all_capabilities(),
+        );
+        assert_eq!(
+            kinds(&planned),
+            vec!["gsettings icon-theme", "notifd Reload"]
+        );
+        assert_eq!(
+            plan_reloads(
+                &[BackingFile::NotifdConfig],
+                &ReloadParams::default(),
+                &all_capabilities()
+            ),
+            vec![ReloadAction::NotifdReload]
+        );
+    }
+
+    #[test]
+    fn a_notifd_config_write_plans_nothing_without_a_reloadable_daemon() {
+        // The file-backed rows are hidden for these daemons, so the case is a guard: the
+        // gate drops the call rather than restart anything.
+        for notifd in [
+            notifd_running("1.0"),
+            NotifdStatus::Installed,
+            NotifdStatus::Absent,
+        ] {
+            let caps = Capabilities::for_tests(&[], &[], false).with_notifd_for_tests(notifd);
+            assert!(
+                plan_reloads(
+                    &[BackingFile::NotifdConfig],
+                    &ReloadParams::default(),
+                    &caps
+                )
+                .is_empty(),
+                "{notifd}"
+            );
+        }
+    }
+
+    #[test]
     fn notifd_reload_is_issued_once_however_many_writes_ask_for_it() {
-        // Task 11.14: the icon theme and the notifd config file (task 11.15) will both
-        // ask for `Reload()` in one Apply; the planner issues it once, last.
+        // Task 11.14: the icon theme and the notifd config file (task 11.15) both ask
+        // for `Reload()` in one Apply; the planner issues it once, last.
         let requested = vec![
             ReloadAction::NotifdReload,
             ReloadAction::GsettingsSet {

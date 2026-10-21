@@ -42,7 +42,7 @@
 //! # Scope: the settings defined so far (§6 extends this)
 //!
 //! The full `SettingId` ↔ file ↔ parser ↔ key mapping grows with the §6 category
-//! pages; today the store-backed pages exercise two files, so those are what this
+//! pages; today the store-backed pages exercise three files, so those are what this
 //! loads:
 //!
 //! - `~/.config/hypr/input.lua` (the app-owned `hl.config({ input = { … } })` table,
@@ -50,7 +50,10 @@
 //!   keyboard options, mouse sensitivity, and touchpad toggles (tasks 6.6, 11.4);
 //! - `~/.config/hypr/hypridle.conf` via the hyprlang parser → the Power & Idle page's
 //!   dim/lock/DPMS timeouts (by positional `listener` matching, §3.2) and lock command
-//!   (task 6.8).
+//!   (task 6.8);
+//! - `~/.config/notifd/config` via the shared `key=value` line model → the
+//!   Notifications page's seven notifd settings, read with the daemon's own rules
+//!   (task 11.15, [`crate::core::notifd_config`]).
 //!
 //! Each §6 page extends [`load_files`] with its own file loader in the same shape
 //! (read → parse → map keys to `(SettingId, Value)` → build a re-reader). Where a
@@ -58,9 +61,11 @@
 //! reading; the reverse split for *writing* is the owning page's job, since startup
 //! produces no writes.
 //!
-//! The Notifications page has no startup model: every control on it is runtime-only
-//! (task 11.7), so the window builds its model when it builds the page and the first
-//! daemon query happens on page entry.
+//! The Notifications page has two halves. Its runtime controls have no startup model
+//! (task 11.7): the window builds that model when it builds the page and the first
+//! daemon query happens on page entry. Its staged notifd settings (task 11.15) get a
+//! write helper here, like Input and Power & Idle, built only when notifd ≥ 1.1 runs and
+//! its file is readable ([`load_notifd_config_from`]).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -71,6 +76,7 @@ use crate::core::home_path::home_dir;
 use crate::core::input::{InputModel, default_xkb_registry, input_values, read_input_lua};
 use crate::core::lock_grace::parse_grace;
 use crate::core::model::{SettingId, Value};
+use crate::core::notifd_config::{NotifdConfigModel, NotifdConfigUnavailable, read_values};
 use crate::core::power::{PowerModel, power_key_path};
 use crate::core::store::{FileReader, FileValues, RefreshReport, SettingsStore};
 use crate::core::theme::{
@@ -119,6 +125,13 @@ pub(crate) struct StartupLoad {
     /// R4.2). It supplies the layout add-list and renders the store's dirty Input
     /// settings into the `input.lua` write on Apply.
     pub(crate) input: Option<InputModel>,
+    /// The Notifications page's helper for its staged notifd settings (task 11.15): the
+    /// `~/.config/notifd/config` path, or `None` when those rows cannot be offered —
+    /// notifd is not running at version 1.1 or later, or the file is missing or not
+    /// understood. The page then shows only its runtime controls. It renders the store's
+    /// dirty notifd settings into the file's write on Apply, which the pipeline follows
+    /// with notifd's `Reload()`.
+    pub(crate) notifications: Option<NotifdConfigModel>,
     /// The Power & Idle page's helper (task 6.8): the `hypridle.conf` path, or `None` when
     /// hypridle is absent (the Power & Idle category is then hidden entirely, R4.2). It
     /// renders the store's dirty dim/lock/DPMS timeouts and lock command into the
@@ -151,6 +164,8 @@ struct BackingPaths {
     input_lua: PathBuf,
     /// `~/.config/hypr/hypridle.conf` — the idle timeouts + lock command (hyprlang).
     hypridle_conf: PathBuf,
+    /// `~/.config/notifd/config` — notifd's seven settings (`key=value`).
+    notifd_config: PathBuf,
 }
 
 impl BackingPaths {
@@ -164,8 +179,17 @@ impl BackingPaths {
         BackingPaths {
             input_lua: input_lua_path(&config_home),
             hypridle_conf: config_home.join("hypr").join("hypridle.conf"),
+            notifd_config: notifd_config_path(&config_home),
         }
     }
+}
+
+/// The live path of notifd's settings file under the XDG config base directory
+/// `config_home` (R8.5) — one definition for the store loader and the Notifications page
+/// helper, which must agree on the file. notifd itself reads
+/// `$XDG_CONFIG_HOME/notifd/config` (falling back to `~/.config`), the same rule.
+fn notifd_config_path(config_home: &Path) -> PathBuf {
+    config_home.join("notifd").join("config")
 }
 
 /// The live path of `input.lua` under the XDG config base directory `config_home`
@@ -207,6 +231,9 @@ pub(crate) fn load() -> StartupLoad {
     let files = load_files(&BackingPaths::from_system());
     let display = load_display(&capabilities);
     let input = load_input(&capabilities);
+    // Reads notifd's file for the visibility gate; `load_files` above read it for the
+    // store through the same `read_notifd_config` (see the note there), so both agree.
+    let notifications = load_notifd_config_from(&capabilities, notifd_config_path(&config_home()));
     let power = load_power(&capabilities);
     let palette = load_palette(&capabilities);
     let themes = load_themes(&capabilities);
@@ -216,6 +243,7 @@ pub(crate) fn load() -> StartupLoad {
         files,
         display,
         input,
+        notifications,
         power,
         palette,
         themes,
@@ -320,6 +348,38 @@ fn load_power(capabilities: &Capabilities) -> Option<PowerModel> {
     }
     let hypridle_conf = config_home().join("hypr").join("hypridle.conf");
     Some(PowerModel::load(hypridle_conf))
+}
+
+/// Builds the Notifications page's helper for its staged notifd settings, or decides
+/// that only the runtime controls are shown (task 11.15; R4.2, R4.4).
+///
+/// Both conditions are required, and a failing one is logged at `info` with its reason
+/// (never the file's contents, R7.3):
+///
+/// - notifd runs at version 1.1 or later — older daemons have neither the file nor
+///   `Reload()`, and a stopped one could not apply a change (analysis §8.2);
+/// - the file at `notifd_config` is readable, UTF-8, and free of characters notifd
+///   would split or strip differently from the app (see [`crate::core::notifd_config`]).
+///
+/// The Notifications page itself is gated separately (notifd installed or running,
+/// task 11.7), so `None` here leaves the runtime controls alone on the page. Split from
+/// [`load`] so the decision is testable against a fixture file.
+pub(crate) fn load_notifd_config_from(
+    capabilities: &Capabilities,
+    notifd_config: PathBuf,
+) -> Option<NotifdConfigModel> {
+    match NotifdConfigModel::offer(capabilities.notifd(), notifd_config.clone()) {
+        Ok(model) => Some(model),
+        Err(reason) => {
+            tracing::info!(
+                path = %notifd_config.display(),
+                %reason,
+                "notifd's settings file cannot back the Notifications page's staged rows; \
+                 only the runtime controls are shown (R4.2)"
+            );
+            None
+        }
+    }
 }
 
 /// Builds the Input page's helper on the worker thread for the real system (tasks
@@ -604,6 +664,16 @@ fn load_files(paths: &BackingPaths) -> Vec<LoadedFile> {
         load_hypridle_conf,
         "hypridle.conf",
     );
+    // notifd's file is read a second time here on purpose: `load_notifd_config_from`
+    // already read it once through `NotifdConfigModel::offer` for the visibility gate.
+    // Both go through the same `read_notifd_config`, so the rows are shown exactly when
+    // the store tracks the file; keep both reads rather than removing one.
+    push_loaded(
+        &mut files,
+        &paths.notifd_config,
+        load_notifd_config,
+        "notifd/config",
+    );
     files
 }
 
@@ -664,6 +734,49 @@ pub(crate) fn load_input_lua(path: &Path) -> io::Result<FileValues> {
     let (bytes, file) = read_input_lua(path)?;
     let values = input_values(&file);
     Ok(FileValues { bytes, values })
+}
+
+/// Reads `~/.config/notifd/config` into the seven Notifications-page settings it backs
+/// (task 11.15; analysis §8.2).
+///
+/// Every setting gets a value — the one notifd uses: its last valid assignment in the
+/// file, else the daemon's default ([`read_values`]) — so a hand-trimmed file still
+/// offers every control, and a changed missing key is appended on Apply. Assignments
+/// notifd ignores are logged at `warn` with line number and key only, keys the file lacks
+/// at `info` (R7.3). A file that cannot be read, is not UTF-8, or holds characters notifd
+/// reads differently propagates as an error (the latter two as
+/// [`io::ErrorKind::InvalidData`]), so the store does not track it — the same rule that
+/// keeps the staged rows hidden for it.
+///
+/// Crate-visible for the same reason as [`load_input_lua`] (task 7.2).
+pub(crate) fn load_notifd_config(path: &Path) -> io::Result<FileValues> {
+    let (bytes, file) =
+        crate::core::notifd_config::read_notifd_config(path).map_err(|error| match error {
+            NotifdConfigUnavailable::Unreadable(error) => error,
+            other => io::Error::new(io::ErrorKind::InvalidData, other.to_string()),
+        })?;
+    let read = read_values(&file);
+    for ignored in &read.ignored {
+        tracing::warn!(
+            file = "notifd/config",
+            line = ignored.line,
+            key = ignored.key,
+            "notifd ignores this value (it fails the key's rule); the key keeps the \
+             daemon's default or an earlier valid line"
+        );
+    }
+    if !read.missing.is_empty() {
+        tracing::info!(
+            file = "notifd/config",
+            missing = ?read.missing,
+            "keys not set in notifd's settings file show notifd's defaults and are added \
+             when changed"
+        );
+    }
+    Ok(FileValues {
+        bytes,
+        values: read.values,
+    })
 }
 
 /// Reads and parses `hypridle.conf` (hyprlang) into the Power & Idle-page settings it
@@ -839,6 +952,7 @@ mod tests {
         let paths = BackingPaths {
             input_lua: dir.path().join("no-input.lua"),
             hypridle_conf: dir.path().join("no-hypridle.conf"),
+            notifd_config: dir.path().join("no-notifd-config"),
         };
         assert!(
             load_files(&paths).is_empty(),
@@ -865,6 +979,7 @@ mod tests {
         let paths = BackingPaths {
             input_lua: dir.path().join("input.lua"),
             hypridle_conf: dir.path().join("hypridle.conf"),
+            notifd_config: dir.path().join("no-notifd-config"),
         };
         let loaded = load_files(&paths);
         assert_eq!(loaded.len(), 1, "only the usable file loads");
@@ -894,6 +1009,7 @@ mod tests {
         let paths = BackingPaths {
             input_lua: dir.path().join("input.lua"),
             hypridle_conf: dir.path().join("hypridle.conf"),
+            notifd_config: dir.path().join("no-notifd-config"),
         };
 
         let mut store = store_from(load_files(&paths));
@@ -1055,6 +1171,7 @@ mod tests {
         let paths = BackingPaths {
             input_lua: dir.path().join("input.lua"),
             hypridle_conf: dir.path().join("hypridle.conf"),
+            notifd_config: dir.path().join("no-notifd-config"),
         };
         std::fs::write(&paths.input_lua, input_lua_with_sensitivity("0.3"))
             .expect("write input.lua");
@@ -1109,6 +1226,7 @@ mod tests {
         let paths = BackingPaths {
             input_lua: dir.path().join("input.lua"),
             hypridle_conf: dir.path().join("no-hypridle.conf"),
+            notifd_config: dir.path().join("no-notifd-config"),
         };
         std::fs::write(&paths.input_lua, input_lua_with_sensitivity("0.3"))
             .expect("write input.lua");
@@ -1237,6 +1355,83 @@ mod tests {
         let model = load_input_from(&caps, missing, &xkb);
         assert!(model.is_some());
         assert!(!page_rows(model.as_ref(), &caps).is_empty());
+    }
+
+    #[test]
+    fn the_notifd_rows_need_a_reloadable_daemon_and_a_readable_file() {
+        // Task 11.15 (R4.2): the staged notifd rows are offered only for notifd >= 1.1
+        // and a readable file; otherwise the page keeps its runtime controls alone and
+        // the reason is logged at `info`.
+        use crate::core::notifd::{NotifdStatus, NotifdVersion};
+        use crate::testing::{CapturedEvent, capture_logs};
+        use crate::ui::notifications::page_rows;
+
+        let with_notifd = |version: &str| {
+            Capabilities::for_tests(&[], &[], false).with_notifd_for_tests(NotifdStatus::Running {
+                version: NotifdVersion::parse(version),
+            })
+        };
+        let hidden_reason = |events: &[CapturedEvent]| {
+            events
+                .iter()
+                .find(|event| {
+                    event.level == tracing::Level::INFO
+                        && event
+                            .message
+                            .contains("only the runtime controls are shown")
+                })
+                .map(|event| event.fields.clone())
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config");
+
+        // notifd 1.1 but no file.
+        let mut model = None;
+        let events =
+            capture_logs(|| model = load_notifd_config_from(&with_notifd("1.1"), path.clone()));
+        assert!(model.is_none());
+        assert!(page_rows(model.as_ref()).is_empty());
+        let fields = hidden_reason(&events).expect("the hide is logged at info");
+        assert!(fields.contains("cannot be read"), "{fields}");
+
+        // The file exists, but the daemon is 1.0.
+        std::fs::write(&path, "timeout_low_ms=5000\n").expect("write the file");
+        let events =
+            capture_logs(|| model = load_notifd_config_from(&with_notifd("1.0"), path.clone()));
+        assert!(model.is_none());
+        let fields = hidden_reason(&events).expect("the hide is logged at info");
+        assert!(fields.contains("1.1 or later"), "{fields}");
+
+        // Both conditions hold: the seven rows.
+        let model = load_notifd_config_from(&with_notifd("1.1"), path);
+        assert_eq!(page_rows(model.as_ref()).len(), 7);
+    }
+
+    #[test]
+    fn the_notifd_loader_seeds_every_setting_and_skips_a_file_it_cannot_read_alike() {
+        // Task 11.15: a trimmed file still seeds all seven settings (missing ones at the
+        // daemon default); a file with a character notifd splits differently is not
+        // tracked at all.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config");
+        std::fs::write(&path, "# trimmed\ncritical_per_app = 2\n").expect("write the file");
+        let loaded = load_notifd_config(&path).expect("a readable file loads");
+        assert_eq!(loaded.values.len(), 7);
+        assert!(
+            loaded
+                .values
+                .contains(&(SettingId::NotifdCriticalPerApp, Value::Integer(2)))
+        );
+        assert!(
+            loaded
+                .values
+                .contains(&(SettingId::NotifdTimeoutLow, Value::Integer(5000)))
+        );
+
+        std::fs::write(&path, "timeout_low_ms=1\x0c\n").expect("write the file");
+        let error = load_notifd_config(&path).expect_err("refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("line 1"), "{error}");
     }
 
     #[test]
