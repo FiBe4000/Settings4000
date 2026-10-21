@@ -46,26 +46,15 @@ use crate::core::apply::{ApplyOutcome, ApplyPlan};
 use crate::core::reload::ReloadError;
 use crate::core::store::{FileValues, SettingsStore};
 
-/// The placeholder home-directory prefix used inside fixture files.
-///
-/// The real dotfiles contain absolute paths under the user's home (the
-/// wallpaper/lock-background paths in `hyprpaper.conf`/`hyprlock.conf`); the
-/// checked-in fixture anonymizes them to this prefix, and the installer
-/// rewrites it to the temp tree's home at install time so the installed paths
-/// point at real, readable files (the R8.3 image validator checks existence).
-///
-/// Public so the smoke suite (`tests/fixture_tree.rs`) can assert that no
-/// installed file still contains it — the guard that catches a future fixture
-/// file whose placeholder lands somewhere no parser test happens to read.
-pub const HOME_PLACEHOLDER: &str = "/home/user";
-
 /// The wallpaper path, relative to the fixture home, that the installed
-/// `hyprpaper.conf`/`hyprlock.conf` reference after placeholder substitution.
+/// `hyprpaper.conf`/`hyprlock.conf` reference as `~/Pictures/wallpaper/18.jpg`
+/// (verbatim from the real dotfiles, analysis §7.4).
 ///
-/// The installer creates a small stub file here so the configured wallpaper
-/// exists and is readable (decodability is not a concern: the R8.3 validator
-/// checks existence, readability, and extension only).
-const WALLPAPER_RELATIVE: &str = "Pictures/wallpaper/wallpaper.jpg";
+/// The installer creates a small stub file here so the configured wallpaper,
+/// expanded against the fixture home (task 11.10), exists and is readable
+/// (decodability is not a concern: the R8.3 validator checks existence,
+/// readability, and extension only).
+const WALLPAPER_RELATIVE: &str = "Pictures/wallpaper/18.jpg";
 
 /// The deployment links that live under `$HOME` itself rather than under
 /// `$XDG_CONFIG_HOME`, as `(link relative to home, target relative to the repo)`.
@@ -102,7 +91,7 @@ const HOME_LINKS: &[(&str, &str)] = &[
 /// │   └── hypr/colors.conf -> …/.dotfiles/config/hypr/colors.conf   (etc.)
 /// ├── .icons/default/index.theme -> …/.dotfiles/icons/default/index.theme
 /// ├── .zsh_colors -> .dotfiles/zsh/colors.zsh
-/// └── Pictures/wallpaper/wallpaper.jpg   — stub the configs point at
+/// └── Pictures/wallpaper/18.jpg          — stub the configs' `~/…` paths name
 /// ```
 #[derive(Debug)]
 pub struct FixtureDotfiles {
@@ -121,8 +110,7 @@ impl FixtureDotfiles {
     ///
     /// Installation performs, in order:
     ///
-    /// 1. copy `tests/fixtures/dotfiles/` to `<home>/.dotfiles`, substituting the
-    ///    [`HOME_PLACEHOLDER`] prefix in every file for the temp home and
+    /// 1. copy `tests/fixtures/dotfiles/` to `<home>/.dotfiles` byte for byte,
     ///    preserving each file's permissions (the `scripts/` stubs stay executable);
     /// 2. symlink every file under the repo's `config/` from `<home>/.config`,
     ///    per file, exactly like the real `setup.sh` deployment (analysis §1) —
@@ -131,7 +119,7 @@ impl FixtureDotfiles {
     /// 3. create the home-level deployment links in [`HOME_LINKS`]
     ///    (`<home>/.zsh_colors`, `<home>/.icons/default/index.theme`), which
     ///    live outside `$XDG_CONFIG_HOME`;
-    /// 4. create the stub wallpaper file the substituted configs point at.
+    /// 4. create the stub wallpaper file the configs' home-relative paths name.
     ///
     /// Each call builds a completely independent tree, so parallel tests never
     /// share state. Panics on any I/O failure (see the module docs).
@@ -158,11 +146,7 @@ impl FixtureDotfiles {
         let repo_root = home.join(".dotfiles");
         let config_root = home.join(".config");
 
-        let home_str = home
-            .to_str()
-            .unwrap_or_else(|| panic!("temp home path is not UTF-8: {}", home.display()));
-
-        copy_tree_substituting(&fixture_root, &repo_root, home_str);
+        copy_tree(&fixture_root, &repo_root);
         deploy_config_symlinks(&repo_root.join("config"), &config_root);
 
         for (link_relative, target_relative) in HOME_LINKS {
@@ -178,7 +162,7 @@ impl FixtureDotfiles {
             });
         }
 
-        // The wallpaper the substituted hyprpaper/hyprlock configs reference.
+        // The wallpaper the hyprpaper/hyprlock configs name as `~/Pictures/…`.
         let wallpaper = home.join(WALLPAPER_RELATIVE);
         create_parent_dirs(&wallpaper);
         // Not a decodable image — the R8.3 validator checks existence,
@@ -224,19 +208,18 @@ impl FixtureDotfiles {
     }
 
     /// The stub wallpaper file the installed `hyprpaper.conf`/`hyprlock.conf`
-    /// point at (exists and is readable, so R8.3 path validation passes).
+    /// name as `~/Pictures/wallpaper/18.jpg`, as an absolute path (exists and is
+    /// readable, so R8.3 path validation of the expanded value passes).
     pub fn wallpaper_path(&self) -> PathBuf {
         self.home.join(WALLPAPER_RELATIVE)
     }
 }
 
-/// Recursively copies the fixture tree at `from` to `to`, replacing every
-/// occurrence of [`HOME_PLACEHOLDER`] in file contents with `home` and
-/// preserving each file's permissions.
+/// Recursively copies the fixture tree at `from` to `to` byte for byte.
 ///
-/// All fixture files are UTF-8 text, so the substitution runs on every file;
-/// a file the substitution does not apply to is copied byte-identical.
-fn copy_tree_substituting(from: &Path, to: &Path, home: &str) {
+/// [`fs::copy`] carries each file's permission bits over, so the `scripts/`
+/// stubs stay executable.
+fn copy_tree(from: &Path, to: &Path) {
     fs::create_dir_all(to).unwrap_or_else(|e| panic!("failed to create {}: {e}", to.display()));
 
     let entries =
@@ -248,23 +231,17 @@ fn copy_tree_substituting(from: &Path, to: &Path, home: &str) {
         let target = to.join(entry.file_name());
 
         if source.is_dir() {
-            copy_tree_substituting(&source, &target, home);
+            copy_tree(&source, &target);
             continue;
         }
 
-        let contents = fs::read_to_string(&source)
-            .unwrap_or_else(|e| panic!("failed to read fixture file {}: {e}", source.display()));
-        let substituted = contents.replace(HOME_PLACEHOLDER, home);
-        fs::write(&target, substituted)
-            .unwrap_or_else(|e| panic!("failed to write {}: {e}", target.display()));
-
-        // Substitution went through read/write, which does not carry the mode
-        // over — restore it so the `scripts/` stubs stay executable.
-        let permissions = fs::metadata(&source)
-            .unwrap_or_else(|e| panic!("failed to stat {}: {e}", source.display()))
-            .permissions();
-        fs::set_permissions(&target, permissions)
-            .unwrap_or_else(|e| panic!("failed to set permissions on {}: {e}", target.display()));
+        fs::copy(&source, &target).unwrap_or_else(|e| {
+            panic!(
+                "failed to copy {} to {}: {e}",
+                source.display(),
+                target.display()
+            )
+        });
     }
 }
 

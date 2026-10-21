@@ -10,12 +10,15 @@
 //! preload`/`wallpaper`, while a hyprlock-only change issues **no** reload (hyprlock
 //! reads its config only at the next lock — intentional, architecture §6). Chosen image
 //! paths are validated (exists + readable + image extension, R8.3) before staging.
-//! [`WallpaperModel`]'s own docs carry the rest.
+//! Both files may store their path home-relative (`~/Pictures/…`, analysis §7.4); how
+//! the model validates, previews, writes and reloads such a value is described under
+//! "Home-relative paths" on [`WallpaperModel`], whose docs carry the rest.
 
 use std::path::{Path, PathBuf};
 
 use crate::core::apply::{FileWrite, WriteMode, WriteValidation};
-use crate::core::model::{SettingId, ValidationError, Value, validate_image_path};
+use crate::core::home_path::{expand_home, expand_home_to_string, path_in_form_of};
+use crate::core::model::{SettingId, ValidationError, Value, validate_image_value};
 use crate::core::reload::{BackingFile, ReloadParams};
 use crate::parsers::hyprlang::{HyprlangFile, KeyPath};
 
@@ -45,7 +48,7 @@ const LOCK_PATH_KEY: &str = "path";
 const CURATED_FIT_MODES: &[&str] = &["cover", "contain", "fill", "tile"];
 
 /// The live XDG paths of the two config files a wallpaper / lock-background change
-/// writes (R8.5).
+/// writes (R8.5), plus the home directory their `~/…` image paths are relative to.
 ///
 /// Injected (like [`ThemesPaths`](super::ThemesPaths)) so the model is exercised against
 /// a fixture tree in tests; the writer follows symlinks, so a dotfiles-deployed file is
@@ -56,6 +59,11 @@ pub struct WallpaperPaths {
     pub hyprpaper_conf: PathBuf,
     /// `~/.config/hypr/hyprlock.conf` (the lock-screen background `path`).
     pub hyprlock_conf: PathBuf,
+    /// The home directory a `~/…` image path in either file expands against
+    /// ([`crate::core::home_path::home_dir`] in production, the fixture's fake home in
+    /// tests), or `None` when it is unknown — a home-relative path then fails
+    /// validation instead of being guessed (task 11.10).
+    pub home: Option<PathBuf>,
 }
 
 /// Which of the wallpaper page's staged values a render actually managed to write into a
@@ -125,6 +133,27 @@ impl WrittenWallpaperValues {
 /// [`Self::reload_params`] setting the wallpaper reload parameter only when
 /// `hyprpaper.conf` is written.
 ///
+/// # Home-relative paths (task 11.10)
+///
+/// The dotfiles store both paths as `~/Pictures/wallpaper/18.jpg` (analysis §7.4) so the
+/// repo stays portable. The model keeps every path **in the form its file uses** — the
+/// staged and baseline values are exactly the text that is (or will be) in the file, so
+/// the dirty comparison stays a plain string comparison and re-choosing the configured
+/// image leaves the page clean. The rules (all in [`crate::core::home_path`]):
+///
+/// - a chosen image below the home directory is staged as `~/…` when the target file's
+///   current value is home-relative, and absolute otherwise; an image outside the home
+///   directory is always absolute. `hyprpaper.conf` and `hyprlock.conf` decide
+///   independently from their own current value;
+/// - validation (R8.3) and the file chooser's starting point ([`Self::wallpaper_file`],
+///   [`Self::lock_file`]) use the path expanded against [`WallpaperPaths::home`];
+/// - the hyprpaper reload is given the expanded absolute path: hyprpaper's IPC server
+///   rejects any path not starting with `/` (hyprpaper 0.8.4, `CWallpaperObject::apply`
+///   in `src/ipc/IPC.cpp`). The `hyprctl hyprpaper` client at Hyprland tag v0.56.2
+///   (`getFullPath` in `hyprctl/src/hyprpaper/Hyprpaper.cpp`) happens to
+///   expand a leading `~` before sending, but relying on that client-side detail is
+///   unnecessary when the app knows the absolute path.
+///
 /// It stays GTK-free so the read, staging, the surgical writes, and the reload decision
 /// are unit-tested headlessly (R6.2); the layering guard in
 /// `tests/module_boundaries.rs` forbids any `gtk`/`relm4` import.
@@ -180,14 +209,22 @@ pub struct WallpaperApply {
 /// wallpaper (analysis §6.2 — the dotfiles unify the two, so "the same image" means no
 /// override).
 ///
+/// "The same image" is decided on the paths expanded against `home` (task 11.10): each
+/// file keeps its own form, so `~/Pictures/a.jpg` in one and `/home/me/Pictures/a.jpg`
+/// in the other still name one image and must not switch the override on.
+///
 /// The single definition of that rule, shared by [`WallpaperModel::load`] (which applies
 /// it to the paths read from disk) and [`WallpaperModel::commit`] (which re-applies it to
 /// the promoted baselines, i.e. to the paths now on disk). Keeping one copy is what stops
 /// the toggle's baseline from disagreeing with the files: a divergence would make
 /// [`WallpaperModel::reset`] restore a toggle state the config does not have, turning a
 /// clean page into a pending change the user never made (R5.1).
-fn override_from_paths(wallpaper: Option<&str>, lock: Option<&str>) -> bool {
-    lock.is_some() && lock != wallpaper
+fn override_from_paths(wallpaper: Option<&str>, lock: Option<&str>, home: Option<&Path>) -> bool {
+    match (wallpaper, lock) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(wallpaper), Some(lock)) => expand_home(wallpaper, home) != expand_home(lock, home),
+    }
 }
 
 impl WallpaperModel {
@@ -225,7 +262,11 @@ impl WallpaperModel {
             .and_then(|file| file.value(&KeyPath::at(&[LOCK_SECTION], LOCK_PATH_KEY)))
             .map(str::to_string);
 
-        let override_initial = override_from_paths(wallpaper_path.as_deref(), lock_path.as_deref());
+        let override_initial = override_from_paths(
+            wallpaper_path.as_deref(),
+            lock_path.as_deref(),
+            paths.home.as_deref(),
+        );
 
         let fit_options: Vec<String> = CURATED_FIT_MODES.iter().map(|s| (*s).to_string()).collect();
 
@@ -273,9 +314,17 @@ impl WallpaperModel {
         self.lock_available && self.hyprlock().is_some()
     }
 
-    /// The effective wallpaper image path (staged or current), or `None` when unset.
+    /// The effective wallpaper image path (staged or current) as written in
+    /// `hyprpaper.conf` — possibly home-relative (`~/…`) — or `None` when unset. For
+    /// display; use [`Self::wallpaper_file`] to reach the file itself.
     pub fn wallpaper_path(&self) -> Option<&str> {
         self.wallpaper.effective()
+    }
+
+    /// The effective wallpaper image as a filesystem path, with a home-relative value
+    /// expanded (task 11.10) — what the UI's file chooser starts from.
+    pub fn wallpaper_file(&self) -> Option<PathBuf> {
+        self.wallpaper.effective().map(|path| self.expand(path))
     }
 
     /// The fit-mode drop-down options (the curated modes plus the current value).
@@ -293,29 +342,46 @@ impl WallpaperModel {
         self.override_on
     }
 
-    /// The effective lock-screen override image path (staged or current), or `None`.
-    /// Only meaningful while [`Self::override_on`] is set; the UI shows it in the
-    /// override chooser.
+    /// The effective lock-screen override image path (staged or current) as written in
+    /// `hyprlock.conf`, or `None`. Only meaningful while [`Self::override_on`] is set;
+    /// the UI shows it in the override chooser.
     pub fn lock_path(&self) -> Option<&str> {
         self.lock.effective()
+    }
+
+    /// The effective lock-screen override image as a filesystem path, with a
+    /// home-relative value expanded (task 11.10), like [`Self::wallpaper_file`].
+    pub fn lock_file(&self) -> Option<PathBuf> {
+        self.lock.effective().map(|path| self.expand(path))
+    }
+
+    /// Expands a home-relative config value against the injected home directory.
+    fn expand(&self, path: &str) -> PathBuf {
+        expand_home(path, self.paths.home.as_deref())
     }
 
     /// Stages a wallpaper image path after validating it (R8.3).
     ///
     /// The path must exist, be readable, and have an image extension; an invalid path is
     /// rejected (returned as an [`Err`] the UI surfaces) and nothing is staged, so a
-    /// broken wallpaper can never be written.
+    /// broken wallpaper can never be written. `path` is usually the absolute path the
+    /// file chooser returned; it is staged in `hyprpaper.conf`'s own form (see
+    /// "Home-relative paths" on [`WallpaperModel`]).
     pub fn stage_wallpaper(&mut self, path: &str) -> Result<(), ValidationError> {
-        validate_image_path(Path::new(path))?;
-        self.wallpaper.stage(path);
+        let home = self.paths.home.as_deref();
+        validate_image_value(path, home)?;
+        let in_form = path_in_form_of(path, self.wallpaper.original.as_deref(), home);
+        self.wallpaper.stage(&in_form);
         Ok(())
     }
 
     /// Stages a lock-screen override image path after validating it (R8.3), like
-    /// [`Self::stage_wallpaper`].
+    /// [`Self::stage_wallpaper`], in `hyprlock.conf`'s own form.
     pub fn stage_lock(&mut self, path: &str) -> Result<(), ValidationError> {
-        validate_image_path(Path::new(path))?;
-        self.lock.stage(path);
+        let home = self.paths.home.as_deref();
+        validate_image_value(path, home)?;
+        let in_form = path_in_form_of(path, self.lock.original.as_deref(), home);
+        self.lock.stage(&in_form);
         Ok(())
     }
 
@@ -339,11 +405,22 @@ impl WallpaperModel {
 
     /// The image path that should be written to `hyprlock.conf`: the override path when
     /// the override is on, otherwise the wallpaper path (so the two stay in sync).
-    fn effective_lock(&self) -> Option<&str> {
+    ///
+    /// The wallpaper path is in `hyprpaper.conf`'s form, so following it re-expresses it
+    /// in `hyprlock.conf`'s own form (task 11.10): the two files may legitimately differ
+    /// in form while naming the same image, and that must neither trigger a write nor
+    /// change the lock file's form.
+    fn effective_lock(&self) -> Option<String> {
         if self.override_on {
-            self.lock.effective()
+            self.lock.effective().map(str::to_string)
         } else {
-            self.wallpaper.effective()
+            self.wallpaper.effective().map(|path| {
+                path_in_form_of(
+                    path,
+                    self.lock.original.as_deref(),
+                    self.paths.home.as_deref(),
+                )
+            })
         }
     }
 
@@ -354,7 +431,7 @@ impl WallpaperModel {
             return false;
         }
         match self.effective_lock() {
-            Some(path) => Some(path) != self.lock.original.as_deref(),
+            Some(path) => Some(path.as_str()) != self.lock.original.as_deref(),
             None => false,
         }
     }
@@ -424,7 +501,7 @@ impl WallpaperModel {
         self.backing.absorb_writes(&writes);
         // Capture the effective lock path (which depends on the still-staged wallpaper
         // value when the override is off) before promoting the wallpaper edit.
-        let new_lock = self.effective_lock().map(str::to_string);
+        let new_lock = self.effective_lock();
         if written.wallpaper {
             self.wallpaper.commit();
         }
@@ -447,6 +524,7 @@ impl WallpaperModel {
         self.override_initial = override_from_paths(
             self.wallpaper.original.as_deref(),
             self.lock.original.as_deref(),
+            self.paths.home.as_deref(),
         );
     }
 
@@ -548,7 +626,7 @@ impl WallpaperModel {
     fn render_hyprlock(&self, backing: &BackingText) -> Option<FileWrite> {
         let path = self.effective_lock()?;
         let (mut file, _) = HyprlangFile::parse(&backing.text);
-        match file.set_value(&KeyPath::at(&[LOCK_SECTION], LOCK_PATH_KEY), path) {
+        match file.set_value(&KeyPath::at(&[LOCK_SECTION], LOCK_PATH_KEY), &path) {
             Ok(()) => Some(FileWrite {
                 path: backing.path.clone(),
                 contents: file.emit().into_bytes(),
@@ -575,10 +653,19 @@ impl WallpaperModel {
     /// hyprlock-only change carries no wallpaper parameter — and, combined with
     /// [`BackingFile::HyprlockConf`] mapping to no action, issues no reload command at
     /// all (the intentional hyprlock behaviour, architecture §6).
+    ///
+    /// The path is expanded to its absolute form even when the file stores `~/…`,
+    /// because hyprpaper's IPC accepts only absolute paths (see "Home-relative paths" on
+    /// [`WallpaperModel`]). Only with an unknown home does a `~/…` value pass through
+    /// unexpanded; it can then never have been validated, so it only reaches the
+    /// reload on a fit-only change, where `hyprctl` expands it from its own `$HOME`.
     fn reload_params(&self) -> ReloadParams {
+        let home = self.paths.home.as_deref();
         let (wallpaper, fit) = if self.hyprpaper_write_needed() {
             (
-                self.wallpaper.effective().map(str::to_string),
+                self.wallpaper
+                    .effective()
+                    .map(|path| expand_home_to_string(path, home)),
                 self.fit.effective().map(str::to_string),
             )
         } else {
@@ -597,18 +684,26 @@ impl WallpaperModel {
     /// when it is actually being (re)written (a fit-only change never rewrites — nor
     /// should it re-validate — the unchanged wallpaper path), and the effective lock
     /// path when `hyprlock.conf` is written.
+    ///
+    /// Each path is handed over expanded against the injected home (task 11.10), so the
+    /// Apply-time re-check examines the same file staging did; a `~/…` value is left as
+    /// is only when the home is unknown, and [`SettingId::validate`] then rejects it.
     fn validations(&self) -> Vec<(SettingId, Value)> {
+        let home = self.paths.home.as_deref();
         let mut validations = Vec::new();
         if self.wallpaper.is_changed() {
             if let Some(path) = self.wallpaper.effective() {
-                validations.push((SettingId::WallpaperPath, Value::String(path.to_string())));
+                validations.push((
+                    SettingId::WallpaperPath,
+                    Value::String(expand_home_to_string(path, home)),
+                ));
             }
         }
         if self.hyprlock_write_needed() {
             if let Some(path) = self.effective_lock() {
                 validations.push((
                     SettingId::LockBackgroundPath,
-                    Value::String(path.to_string()),
+                    Value::String(expand_home_to_string(&path, home)),
                 ));
             }
         }
@@ -658,7 +753,13 @@ label {
 ";
 
     /// Writes the two backing files into `dir/hypr` and returns their
-    /// [`WallpaperPaths`].
+    /// [`WallpaperPaths`], with `dir/home` as the home directory the configs' `~/…`
+    /// paths expand against.
+    ///
+    /// The tests write their images with [`write_image`] *beside* `dir`, i.e. outside
+    /// that home, so a chosen image is written absolute even into these tilde-shaped
+    /// configs; the home-relative write is covered by the tests that place an image
+    /// under [`home_of`] explicitly.
     fn write_wallpaper_fixture(dir: &Path) -> WallpaperPaths {
         let hypr = dir.join("hypr");
         fs::create_dir_all(&hypr).expect("create hypr config subdir");
@@ -669,7 +770,16 @@ label {
         WallpaperPaths {
             hyprpaper_conf,
             hyprlock_conf,
+            home: Some(dir.join("home")),
         }
+    }
+
+    /// The home directory of a [`WallpaperPaths`] built by these helpers.
+    fn home_of(paths: &WallpaperPaths) -> &Path {
+        paths
+            .home
+            .as_deref()
+            .expect("the test fixtures always set a home")
     }
 
     /// Writes a real (present, readable) file with an image extension at `dir/name` and
@@ -782,6 +892,12 @@ label {
         let config = tmp.path().join("config");
         let paths = write_wallpaper_fixture(&config);
 
+        // The reload must name the configured `~/…` image by its absolute path (task
+        // 11.10): hyprpaper's IPC rejects anything that does not start with `/`.
+        let absolute = home_of(&paths)
+            .join("Pictures/wallpaper/18.jpg")
+            .to_string_lossy()
+            .into_owned();
         let mut model = WallpaperModel::load(paths, true);
         // Change ONLY the fit; the wallpaper path stays the on-disk value.
         model.stage_fit("tile");
@@ -814,7 +930,7 @@ label {
         );
         assert_eq!(
             contribution.reload_params.wallpaper.as_deref(),
-            Some("~/Pictures/wallpaper/18.jpg")
+            Some(absolute.as_str())
         );
         assert_eq!(contribution.reload_params.fit.as_deref(), Some("tile"));
 
@@ -837,19 +953,12 @@ label {
             matches!(outcome, ApplyOutcome::Applied { .. }),
             "the fit-only apply must succeed, got {outcome:?}"
         );
+        let set_arg = format!(",{absolute},tile");
         assert_eq!(
             runner.recorded(),
             vec![
-                Command::new("hyprctl").args([
-                    "hyprpaper",
-                    "preload",
-                    "~/Pictures/wallpaper/18.jpg"
-                ]),
-                Command::new("hyprctl").args([
-                    "hyprpaper",
-                    "wallpaper",
-                    ",~/Pictures/wallpaper/18.jpg,tile"
-                ]),
+                Command::new("hyprctl").args(["hyprpaper", "preload", absolute.as_str()]),
+                Command::new("hyprctl").args(["hyprpaper", "wallpaper", set_arg.as_str()]),
             ]
         );
     }
@@ -1027,6 +1136,7 @@ label {
             WallpaperPaths {
                 hyprpaper_conf: config.join("hypr").join("does-not-exist.conf"),
                 hyprlock_conf: paths.hyprlock_conf.clone(),
+                home: paths.home.clone(),
             },
             true,
         );
@@ -1118,6 +1228,7 @@ label {
             WallpaperPaths {
                 hyprpaper_conf,
                 hyprlock_conf,
+                home: Some(config.join("home")),
             },
             wallpaper_a,
             lock_b,
@@ -1486,5 +1597,263 @@ label {
             Some("~/Pictures/wallpaper/18.jpg"),
             "the lock background on disk is untouched, which is why the two now differ"
         );
+    }
+
+    /// Creates `relative` (with parents) below `home` as a stub image file and returns
+    /// its absolute path string — the shape a file chooser hands back.
+    fn write_home_image(home: &Path, relative: &str) -> String {
+        let path = home.join(relative);
+        fs::create_dir_all(path.parent().expect("an image path has a parent"))
+            .expect("create the image's directory");
+        fs::write(&path, b"img").expect("write image file");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Runs a contribution through the real Apply pipeline with a mock runner and
+    /// returns the commands it recorded.
+    fn apply_and_record(contribution: WallpaperApply) -> Vec<Command> {
+        let plan = ApplyPlan {
+            validations: contribution.validations,
+            writes: contribution.writes,
+            palette: None,
+            reload_params: contribution.reload_params,
+        };
+        let runner = MockCommandRunner::new();
+        let caps = Capabilities::for_tests(&[Binary::Hyprctl], &[Daemon::Hyprpaper], true);
+        let outcome = apply::run(
+            &plan,
+            &FreshnessTracker::new(),
+            &caps,
+            &runner,
+            &MockProcessSignaller::new(),
+        );
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied { .. }),
+            "the wallpaper apply must succeed, got {outcome:?}"
+        );
+        runner.recorded()
+    }
+
+    #[test]
+    fn an_image_under_home_is_written_home_relative_into_tilde_shaped_configs() {
+        // Task 11.10: both fixture files store `~/…`, so a chosen image below the home
+        // directory is written as `~/…` into each, while validation and the hyprpaper
+        // reload work on the absolute path.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_wallpaper_fixture(&config);
+        let chosen = write_home_image(home_of(&paths), "Pictures/next.png");
+
+        let mut model = WallpaperModel::load(paths.clone(), true);
+        model
+            .stage_wallpaper(&chosen)
+            .expect("an image under home validates");
+        assert_eq!(model.wallpaper_path(), Some("~/Pictures/next.png"));
+        assert_eq!(model.wallpaper_file(), Some(PathBuf::from(&chosen)));
+
+        let contribution = model.apply_contribution().expect("a change contributes");
+        assert_eq!(
+            contribution.validations,
+            vec![
+                (SettingId::WallpaperPath, Value::String(chosen.clone())),
+                (SettingId::LockBackgroundPath, Value::String(chosen.clone())),
+            ],
+            "the Apply-time re-check examines the expanded paths"
+        );
+        let recorded = apply_and_record(contribution);
+
+        assert_eq!(
+            fs::read_to_string(&paths.hyprpaper_conf).unwrap(),
+            HYPRPAPER_CONF.replace("~/Pictures/wallpaper/18.jpg", "~/Pictures/next.png")
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.hyprlock_conf).unwrap(),
+            HYPRLOCK_CONF.replace("~/Pictures/wallpaper/18.jpg", "~/Pictures/next.png")
+        );
+        let set_arg = format!(",{chosen},cover");
+        assert_eq!(
+            recorded,
+            vec![
+                Command::new("hyprctl").args(["hyprpaper", "preload", chosen.as_str()]),
+                Command::new("hyprctl").args(["hyprpaper", "wallpaper", set_arg.as_str()]),
+            ],
+            "hyprpaper's IPC receives the absolute path, never `~/…`"
+        );
+    }
+
+    #[test]
+    fn an_absolute_config_keeps_writing_absolute_paths() {
+        // Task 11.10: a file whose current value is absolute keeps the absolute form even
+        // for an image below the home directory.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_wallpaper_fixture(&config);
+        let current = write_home_image(home_of(&paths), "Pictures/wallpaper/18.jpg");
+        fs::write(
+            &paths.hyprpaper_conf,
+            HYPRPAPER_CONF.replace("~/Pictures/wallpaper/18.jpg", &current),
+        )
+        .expect("write an absolute hyprpaper.conf");
+        fs::write(
+            &paths.hyprlock_conf,
+            HYPRLOCK_CONF.replace("~/Pictures/wallpaper/18.jpg", &current),
+        )
+        .expect("write an absolute hyprlock.conf");
+        let chosen = write_home_image(home_of(&paths), "Pictures/next.png");
+
+        let mut model = WallpaperModel::load(paths.clone(), true);
+        model
+            .stage_wallpaper(&chosen)
+            .expect("an image under home validates");
+        apply_and_record(model.apply_contribution().expect("a change contributes"));
+
+        assert_eq!(
+            fs::read_to_string(&paths.hyprpaper_conf).unwrap(),
+            HYPRPAPER_CONF.replace("~/Pictures/wallpaper/18.jpg", &chosen)
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.hyprlock_conf).unwrap(),
+            HYPRLOCK_CONF.replace("~/Pictures/wallpaper/18.jpg", &chosen)
+        );
+    }
+
+    #[test]
+    fn each_file_keeps_its_own_form_for_the_same_image() {
+        // Task 11.10: the two files decide independently. `~/…` in hyprpaper.conf and the
+        // absolute spelling of the same image in hyprlock.conf are one image (no
+        // override, nothing dirty), and a new image is written in each file's own form.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_wallpaper_fixture(&config);
+        let current = write_home_image(home_of(&paths), "Pictures/wallpaper/18.jpg");
+        fs::write(
+            &paths.hyprlock_conf,
+            HYPRLOCK_CONF.replace("~/Pictures/wallpaper/18.jpg", &current),
+        )
+        .expect("write an absolute hyprlock.conf");
+        let chosen = write_home_image(home_of(&paths), "Pictures/next.png");
+
+        let mut model = WallpaperModel::load(paths.clone(), true);
+        assert!(
+            !model.override_on(),
+            "two spellings of one image are the unified default"
+        );
+        assert!(
+            !model.is_dirty(),
+            "a differing form alone is no pending change"
+        );
+
+        model
+            .stage_wallpaper(&chosen)
+            .expect("an image under home validates");
+        apply_and_record(model.apply_contribution().expect("a change contributes"));
+
+        assert_eq!(
+            fs::read_to_string(&paths.hyprpaper_conf).unwrap(),
+            HYPRPAPER_CONF.replace("~/Pictures/wallpaper/18.jpg", "~/Pictures/next.png")
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.hyprlock_conf).unwrap(),
+            HYPRLOCK_CONF.replace("~/Pictures/wallpaper/18.jpg", &chosen)
+        );
+        model.commit();
+        assert!(!model.is_dirty(), "the committed page is clean");
+        assert!(
+            !model.override_on(),
+            "the two files still name one image after the write"
+        );
+    }
+
+    #[test]
+    fn each_file_keeps_its_own_form_in_the_reverse_pairing() {
+        // The mirror of the test above: an absolute wallpaper next to a `~/…` lock
+        // background. Following the absolute wallpaper must contract it back to `~/…`
+        // for hyprlock.conf (the contraction branch of the lock path), and the two
+        // spellings must still read as one image.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_wallpaper_fixture(&config);
+        let current = write_home_image(home_of(&paths), "Pictures/wallpaper/18.jpg");
+        fs::write(
+            &paths.hyprpaper_conf,
+            HYPRPAPER_CONF.replace("~/Pictures/wallpaper/18.jpg", &current),
+        )
+        .expect("write an absolute hyprpaper.conf");
+        let chosen = write_home_image(home_of(&paths), "Pictures/next.png");
+
+        let mut model = WallpaperModel::load(paths.clone(), true);
+        assert!(
+            !model.override_on(),
+            "two spellings of one image are the unified default"
+        );
+        assert!(
+            !model.is_dirty(),
+            "a differing form alone is no pending change"
+        );
+
+        model
+            .stage_wallpaper(&chosen)
+            .expect("an image under home validates");
+        assert_eq!(model.wallpaper_path(), Some(chosen.as_str()));
+        apply_and_record(model.apply_contribution().expect("a change contributes"));
+
+        assert_eq!(
+            fs::read_to_string(&paths.hyprpaper_conf).unwrap(),
+            HYPRPAPER_CONF.replace("~/Pictures/wallpaper/18.jpg", &chosen)
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.hyprlock_conf).unwrap(),
+            HYPRLOCK_CONF.replace("~/Pictures/wallpaper/18.jpg", "~/Pictures/next.png")
+        );
+        model.commit();
+        assert!(!model.is_dirty(), "the committed page is clean");
+        assert!(
+            !model.override_on(),
+            "the two files still name one image after the write"
+        );
+    }
+
+    #[test]
+    fn re_choosing_the_configured_tilde_image_by_its_absolute_path_is_clean() {
+        // The chooser returns absolute paths; picking the image the config names as
+        // `~/…` again must not light up Apply (R5.1).
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_wallpaper_fixture(&config);
+        let current = write_home_image(home_of(&paths), "Pictures/wallpaper/18.jpg");
+
+        let mut model = WallpaperModel::load(paths, true);
+        assert_eq!(model.wallpaper_file(), Some(PathBuf::from(&current)));
+        model
+            .stage_wallpaper(&current)
+            .expect("the configured image validates");
+        assert!(!model.is_dirty());
+        assert_eq!(model.wallpaper_path(), Some("~/Pictures/wallpaper/18.jpg"));
+    }
+
+    #[test]
+    fn without_a_home_a_tilde_choice_is_rejected_and_absolute_ones_still_work() {
+        // An unknown home directory: a home-relative value names no checkable file, so
+        // it is rejected (R8.3), while an absolute image is staged and written as is.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = WallpaperPaths {
+            home: None,
+            ..write_wallpaper_fixture(&config)
+        };
+        let wall = write_image(tmp.path(), "wall.png");
+
+        let mut model = WallpaperModel::load(paths, true);
+        assert!(matches!(
+            model.stage_wallpaper("~/Pictures/wallpaper/18.jpg"),
+            Err(ValidationError::ImagePath {
+                problem: crate::core::model::ImagePathProblem::HomeUnknown,
+                ..
+            })
+        ));
+        model
+            .stage_wallpaper(&wall)
+            .expect("an absolute image needs no home");
+        assert_eq!(model.wallpaper_path(), Some(wall.as_str()));
     }
 }

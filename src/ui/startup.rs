@@ -67,6 +67,7 @@ use std::path::{Path, PathBuf};
 
 use crate::core::detect::{Binary, Capabilities, DetectionInputs, HyprConfigProvider};
 use crate::core::display::DisplayModel;
+use crate::core::home_path::home_dir;
 use crate::core::input::{InputModel, default_xkb_registry, input_values, read_input_lua};
 use crate::core::model::{SettingId, Value};
 use crate::core::power::{PowerModel, power_key_path};
@@ -410,12 +411,14 @@ fn load_wallpaper(capabilities: &Capabilities) -> Option<WallpaperModel> {
 }
 
 /// The live XDG paths of the two config files a wallpaper / lock-background change
-/// writes (R8.5).
+/// writes (R8.5), and the home directory their `~/…` image paths expand against (task
+/// 11.10).
 fn wallpaper_paths() -> WallpaperPaths {
     let config = config_home();
     WallpaperPaths {
         hyprpaper_conf: config.join("hypr").join("hyprpaper.conf"),
         hyprlock_conf: config.join("hypr").join("hyprlock.conf"),
+        home: home_dir(),
     }
 }
 
@@ -545,13 +548,6 @@ fn data_home() -> PathBuf {
         Some(home) => home.join(".local").join("share"),
         None => PathBuf::from(".local").join("share"),
     }
-}
-
-/// The user's home directory from `$HOME`, or `None` when it is unset.
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
 }
 
 /// Builds the Display page's model on the worker thread (task 6.1).
@@ -1287,6 +1283,7 @@ mod tests {
         let paths = || WallpaperPaths {
             hyprpaper_conf: hyprpaper_conf.clone(),
             hyprlock_conf: dir.path().join("hyprlock.conf"),
+            home: None,
         };
 
         let mut model = WallpaperModel::load(paths(), false);

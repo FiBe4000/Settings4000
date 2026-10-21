@@ -59,6 +59,7 @@ use std::io;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
+use crate::core::home_path::{self, expand_home, is_home_relative};
 use crate::parsers::palette::is_bare_hex;
 
 /// A top-level settings category — one entry per sidebar page (R2.4, requirements
@@ -304,8 +305,11 @@ impl SettingId {
         // WrongKind error — so the kind check and the dispatch cannot drift apart.
         match (self, value) {
             (SettingId::PaletteColor, Value::String(text)) => validate_hex_color(text),
+            // The value may be the config's own `~/…` form (task 11.10). The wallpaper
+            // model already hands over expanded paths against its injected home; reading
+            // `$HOME` here covers any other caller with the same rule.
             (SettingId::WallpaperPath | SettingId::LockBackgroundPath, Value::String(text)) => {
-                validate_image_path(Path::new(text))
+                validate_image_value(text, home_path::home_dir().as_deref())
             }
             (SettingId::MonitorMode, Value::Enum(token)) => validate_monitor_mode(token),
             (SettingId::MonitorPosition, Value::Enum(token)) => validate_monitor_position(token),
@@ -563,6 +567,10 @@ pub enum ImagePathProblem {
     /// The file exists but could not be opened for reading (e.g. permission
     /// denied). Carries the underlying OS error.
     Unreadable(io::Error),
+    /// The path is home-relative (`~/…`) but the home directory is unknown (`$HOME`
+    /// unset), so there is no file to check. Reported instead of probing the literal
+    /// `~/…` as a path relative to the working directory (task 11.10).
+    HomeUnknown,
 }
 
 impl fmt::Display for ValidationError {
@@ -612,6 +620,11 @@ impl fmt::Display for ValidationError {
                     ImagePathProblem::Unreadable(error) => {
                         write!(f, "{path} cannot be read: {error}")
                     }
+                    ImagePathProblem::HomeUnknown => write!(
+                        f,
+                        "{path} is relative to the home directory, but the home directory \
+                         is unknown ($HOME is not set)"
+                    ),
                 }
             }
         }
@@ -999,6 +1012,34 @@ pub fn validate_image_path(path: &Path) -> Result<(), ValidationError> {
     }
 
     Ok(())
+}
+
+/// Validates a wallpaper/lock-background **config value** as an image path (R8.3,
+/// task 11.10): like [`validate_image_path`], after expanding a home-relative value
+/// (`~` or `~/…`) against `home`.
+///
+/// The dotfiles store these paths as `~/Pictures/wallpaper/18.jpg` (analysis §7.4),
+/// which names no file until the `~` is expanded — hyprpaper and hyprlock expand it
+/// themselves when they read their configs, so the app must check the same file they
+/// will load. Which forms count as home-relative, and why `~user/…` does not, is
+/// documented in [`crate::core::home_path`]. A home-relative value with no known
+/// `home` is rejected as [`ImagePathProblem::HomeUnknown`] rather than probed as a
+/// relative path. Errors report the original value, so the user sees the path as
+/// written in the config.
+pub fn validate_image_value(value: &str, home: Option<&Path>) -> Result<(), ValidationError> {
+    if is_home_relative(value) && home.is_none() {
+        return Err(ValidationError::ImagePath {
+            path: PathBuf::from(value),
+            problem: ImagePathProblem::HomeUnknown,
+        });
+    }
+    validate_image_path(&expand_home(value, home)).map_err(|error| match error {
+        ValidationError::ImagePath { problem, .. } => ValidationError::ImagePath {
+            path: PathBuf::from(value),
+            problem,
+        },
+        other => other,
+    })
 }
 
 #[cfg(test)]
@@ -1647,6 +1688,72 @@ mod tests {
     }
 
     #[test]
+    fn a_home_relative_image_value_is_validated_on_its_expanded_path() {
+        // Task 11.10: the dotfiles store `~/Pictures/…`; validation must check the file
+        // hyprpaper/hyprlock will load, i.e. the path below the home directory.
+        let home = tempfile::tempdir().expect("temp dir should be creatable");
+        fs::create_dir_all(home.path().join("Pictures")).expect("create Pictures");
+        fs::write(home.path().join("Pictures/wall.jpg"), b"img").expect("write image");
+        fs::write(home.path().join("Pictures/notes.txt"), b"hi").expect("write text");
+
+        assert!(validate_image_value("~/Pictures/wall.jpg", Some(home.path())).is_ok());
+        // An absolute value is unaffected by the home directory.
+        let absolute = home.path().join("Pictures/wall.jpg");
+        assert!(validate_image_value(&absolute.to_string_lossy(), Some(home.path())).is_ok());
+
+        // A missing file and a non-image are still rejected, reported with the value as
+        // written in the config.
+        match validate_image_value("~/Pictures/gone.jpg", Some(home.path())) {
+            Err(ValidationError::ImagePath {
+                path,
+                problem: ImagePathProblem::DoesNotExist,
+            }) => assert_eq!(path, PathBuf::from("~/Pictures/gone.jpg")),
+            other => panic!("expected DoesNotExist, got {other:?}"),
+        }
+        assert!(matches!(
+            validate_image_value("~/Pictures/notes.txt", Some(home.path())),
+            Err(ValidationError::ImagePath {
+                problem: ImagePathProblem::UnsupportedExtension { .. },
+                ..
+            })
+        ));
+        // A bare `~` expands to the home directory, which is not a regular file.
+        assert!(matches!(
+            validate_image_value("~", Some(home.path())),
+            Err(ValidationError::ImagePath {
+                problem: ImagePathProblem::NotAFile,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_home_relative_image_value_without_a_home_fails_cleanly() {
+        // No `$HOME`: nothing to expand against, so the value is rejected with its own
+        // reason instead of being probed relative to the working directory.
+        for value in ["~/Pictures/wall.jpg", "~"] {
+            assert!(
+                matches!(
+                    validate_image_value(value, None),
+                    Err(ValidationError::ImagePath {
+                        problem: ImagePathProblem::HomeUnknown,
+                        ..
+                    })
+                ),
+                "{value} must be rejected without a home directory"
+            );
+        }
+        // `~user/…` is not home-relative: it is checked literally and simply missing.
+        assert!(matches!(
+            validate_image_value("~nobody/wall.jpg", None),
+            Err(ValidationError::ImagePath {
+                problem: ImagePathProblem::DoesNotExist,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn validation_error_messages_are_human_readable() {
         // The UI shows these verbatim, so exercise every Display arm and confirm it
         // produces a non-empty, contextual message (also covers each error variant).
@@ -1698,6 +1805,10 @@ mod tests {
                 problem: ImagePathProblem::Unreadable(io::Error::from(
                     io::ErrorKind::PermissionDenied,
                 )),
+            },
+            ValidationError::ImagePath {
+                path: PathBuf::from("~/x.png"),
+                problem: ImagePathProblem::HomeUnknown,
             },
         ];
         for error in cases {

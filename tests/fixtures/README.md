@@ -80,12 +80,11 @@ parent directories are plain, as `setup.sh` creates them.
   `bitdepth,10` on the eDP record, the laptop-B rule at scale `1`, and the
   four external rules active with pinned `@60`/`@120` modes (anonymized, see
   below).
-- `config/hypr/hyprlock.conf` — the current file (grace-period comment,
+- `config/hypr/hyprlock.conf` — verbatim `8a5b20b` (grace-period comment,
   `dots_rounding`, lock-indicator colours, greeting and keyboard-layout
-  labels), **except** `background.path`, which keeps the absolute
-  placeholder (see "Known divergences").
-- `config/hypr/hyprpaper.conf` — unchanged: it already matched `8a5b20b` in
-  everything but the same `path` value.
+  labels, `background.path = ~/Pictures/wallpaper/18.jpg`); its `path` line
+  was completed in task 11.10, see below.
+- `config/hypr/hyprpaper.conf` — verbatim `8a5b20b`; see task 11.10 below.
 - `scripts/generate-colors` — see above.
 
 ### Refreshed to `8a5b20b` in task 11.5
@@ -113,6 +112,18 @@ lines of `hyprland.lua`, and `icons/default/index.theme`.
   `shadow` line, the rest were already current). `colors/README.md` stays a
   stand-in; its key list now names all 18 keys.
 
+### Refreshed to `8a5b20b` in task 11.10
+
+- `config/hypr/hyprlock.conf`, `config/hypr/hyprpaper.conf` — now verbatim:
+  both store the wallpaper home-relative, `path = ~/Pictures/wallpaper/18.jpg`.
+  The app expands a leading `~/` against the home directory for validation and
+  the file chooser and writes a chosen image back in each file's own form, so
+  the real value resolves inside each test's temp home: the installer creates a
+  stub image at `<home>/Pictures/wallpaper/18.jpg`
+  (`FixtureDotfiles::wallpaper_path`). The install-time `/home/user`
+  placeholder substitution these two files used to need is gone; the installer
+  now copies the tree byte for byte.
+
 ### Known divergences from `8a5b20b`
 
 Each of these files is kept in its §6 shape because the `8a5b20b` version
@@ -123,7 +134,6 @@ was verified by refreshing each file in turn and running the suite.
 | Fixture file | `8a5b20b` has | Existing tests it breaks | Refresh with |
 |---|---|---|---|
 | `config/hypr/hypridle.conf` | `--grace 10` in `lock_cmd`, dual-form dpms commands, `idle-dim` dim/restore, explanatory comments | `apply_power::a_lock_command_edit_restarts_via_the_kill_and_respawn_fallback` (expects the old `lock_cmd` text) | 11.13 |
-| `config/hypr/hyprlock.conf`, `config/hypr/hyprpaper.conf` | `path = ~/Pictures/wallpaper/18.jpg` | `fixture_tree::hyprlang_configs_parse_losslessly_at_their_deployed_paths`, `apply_theme::a_wallpaper_change_dual_writes_hyprpaper_and_hyprlock_and_reloads`, `apply_theme::a_tilde_shaped_wallpaper_original_is_replaced_surgically` (all expect the substituted absolute path of an existing file) | 11.10 |
 
 ### Removed
 
@@ -141,17 +151,14 @@ The content mirrors the real files' formats byte-for-byte where they carry no
 personal data (palette hex values, section structure, comments that document
 sync invariants). Everything identifying is replaced:
 
-- **No usernames/home paths.** Absolute paths under the user's home use the
-  placeholder prefix `/home/user`, which the installer rewrites to the
-  temp-dir home at install time (so e.g. the wallpaper path points at a real,
-  readable file inside the tree and passes the R8.3 image-path validator).
-  This is a deliberate divergence from the real machine, where the
-  wallpaper/lock-background values are tilde-shaped (`~/Pictures/wallpaper/…`,
-  analysis §4/§6.2): substitution needs a rewritable absolute placeholder,
-  since a literal `~` has no install-time home to rewrite to and would not
-  resolve to a readable file for validation. A tilde-shaped-original test case
-  is a task-7.2 concern; once the app expands `~` itself (task 11.10), the
-  fixture can carry the real `~/…` form (see "Known divergences").
+- **No usernames/home paths.** No fixture file names an absolute path under
+  `/home/` (`fixture_tree::no_fixture_file_names_an_absolute_home_path`
+  enforces it). Home paths are spelled the way the real dotfiles spell them —
+  home-relative (`~/Pictures/wallpaper/18.jpg` in `hyprpaper.conf` and
+  `hyprlock.conf`) or built from `$HOME` at run time (`hyprland.lua`) — so they
+  resolve inside each test's temp home without rewriting. (Until task 11.10 the
+  two wallpaper values were an absolute `/home/user/…` placeholder that the
+  installer substituted, because the app could not yet expand `~`.)
 - **No hardware serials or locations.** Monitor EDID `desc:` strings and the
   location/model mentions in `monitors.conf` comments are neutral
   placeholders — still awk-parseable in the exact record shape

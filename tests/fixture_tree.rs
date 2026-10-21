@@ -21,7 +21,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 use settings4000::core::detect::{Capabilities, DetectionInputs, HyprConfigProvider};
-use settings4000::core::model::validate_image_path;
+use settings4000::core::model::validate_image_value;
 use settings4000::core::notifd::NotifdReplies;
 use settings4000::core::theme::load_palette_schema;
 use settings4000::parsers::env::{EnvFile, GtkThemeOverride};
@@ -34,24 +34,24 @@ use settings4000::parsers::ini::IniFile;
 use settings4000::parsers::lua_literal::{LuaConfigFile, LuaValue, TableStatus};
 use settings4000::parsers::monitors::{MonitorField, MonitorsFile};
 use settings4000::parsers::palette::{PaletteFile, PaletteSchema, SchemaSource};
-use settings4000::testing::{
-    FixtureDotfiles, HOME_PLACEHOLDER, assert_repo_untouched_except, repo_snapshot,
-};
+use settings4000::testing::{FixtureDotfiles, assert_repo_untouched_except, repo_snapshot};
 
 /// Reads a file, panicking with the path on failure (test-only convenience).
 fn read(path: &std::path::Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
 
-/// Placeholder substitution must be complete: no installed file may still
-/// contain the anonymization prefix the fixture uses for home paths.
+/// The anonymization rule "no usernames/home paths" (`tests/fixtures/README.md`)
+/// holds for every file: none names an absolute path under `/home/`.
 ///
-/// The parser tests below only read the files they parse, so without this
-/// walk a future fixture file whose `/home/user` placeholder lands somewhere
-/// unparsed would install with a dangling, never-substituted path and no test
-/// would notice.
+/// The fixture spells home paths the way the real dotfiles do, home-relative
+/// (`~/…`) or built from `$HOME`, so they resolve inside each test's temp home
+/// without any install-time rewriting (task 11.10). The parser tests below only
+/// read the files they parse, so without this walk a future fixture file copied
+/// with a real user's absolute path would go unnoticed — and would point every
+/// test at a path outside the isolated tree.
 #[test]
-fn no_installed_file_retains_the_home_placeholder() {
+fn no_fixture_file_names_an_absolute_home_path() {
     let fx = FixtureDotfiles::install();
 
     let mut pending = vec![fx.repo_root().to_path_buf()];
@@ -67,9 +67,9 @@ fn no_installed_file_retains_the_home_placeholder() {
                 pending.push(path);
             } else {
                 assert!(
-                    !read(&path).contains(HOME_PLACEHOLDER),
-                    "{} still contains the {HOME_PLACEHOLDER} placeholder — \
-                     installation should have substituted it",
+                    !read(&path).contains("/home/"),
+                    "{} names an absolute /home/ path — write it home-relative \
+                     (`~/…`) as the real dotfiles do",
                     path.display()
                 );
                 files_checked += 1;
@@ -279,10 +279,11 @@ fn hyprlang_configs_parse_losslessly_at_their_deployed_paths() {
         );
     }
 
-    // hyprpaper/hyprlock: the unified wallpaper path (analysis §6.2) points at
-    // the substituted, existing stub in both files and passes R8.3 validation.
-    let wallpaper = fx.wallpaper_path();
-    let expected = wallpaper.to_str().expect("wallpaper path is UTF-8");
+    // hyprpaper/hyprlock: the unified wallpaper path (analysis §6.2) is the
+    // real dotfiles' home-relative value in both files (analysis §7.4); expanded
+    // against the fixture home it names the installed stub and passes R8.3
+    // validation (task 11.10).
+    let expected = "~/Pictures/wallpaper/18.jpg";
     let (hyprpaper, _) = HyprlangFile::parse(&read(&fx.config_path("hypr/hyprpaper.conf")));
     assert_eq!(
         hyprpaper.value(&KeyPath::at(&["wallpaper"], "path")),
@@ -293,7 +294,11 @@ fn hyprlang_configs_parse_losslessly_at_their_deployed_paths() {
         hyprlock.value(&KeyPath::at(&["background"], "path")),
         Some(expected)
     );
-    assert!(validate_image_path(&wallpaper).is_ok());
+    assert_eq!(
+        fx.wallpaper_path(),
+        fx.home().join("Pictures/wallpaper/18.jpg")
+    );
+    assert!(validate_image_value(expected, Some(fx.home())).is_ok());
 }
 
 /// Both Lua configs parse structurally sound through their deployed symlinks,

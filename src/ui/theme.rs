@@ -19,7 +19,10 @@
 //! extension, R8.3) before staging; an invalid choice is rejected with a plain
 //! `gtk::AlertDialog` message and nothing is staged. The lock-override toggle is shown
 //! only when hyprlock is present, and the whole section only when hyprpaper is (the
-//! window gates it, R4.2/R4.4).
+//! window gates it, R4.2/R4.4). The configs may store the image home-relative
+//! (`~/Pictures/…`); the model expands it for the chooser's starting file and writes a
+//! chosen image back in each file's own form (task 11.10), so this glue only ever hands
+//! the model the absolute path the chooser returned.
 //!
 //! # The GTK_THEME override and live restyle (task 6.4; R3.3/R2.2)
 //!
@@ -68,7 +71,7 @@
 //! Cairo draw function paints the rectangles directly.
 
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gtk4::gio;
@@ -441,7 +444,11 @@ impl Inner {
         }
 
         // The wallpaper image picker.
-        let button = self.image_chooser_button(model.wallpaper_path(), WallpaperTarget::Wallpaper);
+        let button = self.image_chooser_button(
+            model.wallpaper_path(),
+            model.wallpaper_file(),
+            WallpaperTarget::Wallpaper,
+        );
         section.append(&labelled_row("Image", &button));
 
         // The fit-mode drop-down.
@@ -474,8 +481,11 @@ impl Inner {
             section.append(&labelled_row("Use a different lock-screen image", &switch));
 
             if model.override_on() {
-                let lock_button =
-                    self.image_chooser_button(model.lock_path(), WallpaperTarget::Lock);
+                let lock_button = self.image_chooser_button(
+                    model.lock_path(),
+                    model.lock_file(),
+                    WallpaperTarget::Lock,
+                );
                 section.append(&labelled_row("Lock-screen image", &lock_button));
             }
         }
@@ -485,10 +495,16 @@ impl Inner {
     }
 
     /// Builds a button showing the current image's file name (or "Choose…") that opens a
-    /// file chooser for `target` on click; the full path is the tooltip (task 6.5).
+    /// file chooser for `target` on click (task 6.5).
+    ///
+    /// `current` is the path as written in the config — possibly `~/…` — and is what the
+    /// tooltip shows, so the user sees the file's own spelling. `current_file` is the
+    /// same path expanded against the home directory (task 11.10); the chooser must
+    /// start from that, because a `~/…` literal names no file to GIO.
     fn image_chooser_button(
         self: &Rc<Self>,
         current: Option<&str>,
+        current_file: Option<PathBuf>,
         target: WallpaperTarget,
     ) -> Button {
         let label = current
@@ -500,10 +516,9 @@ impl Inner {
             button.set_tooltip_text(Some(path));
         }
         let weak = Rc::downgrade(self);
-        let initial = current.map(str::to_string);
         button.connect_clicked(move |button| {
             if let Some(inner) = weak.upgrade() {
-                inner.choose_image(button, target, initial.clone());
+                inner.choose_image(button, target, current_file.clone());
             }
         });
         button
@@ -519,7 +534,7 @@ impl Inner {
         self: &Rc<Self>,
         button: &Button,
         target: WallpaperTarget,
-        initial: Option<String>,
+        initial: Option<PathBuf>,
     ) {
         let dialog = FileDialog::builder()
             .title("Choose an image")

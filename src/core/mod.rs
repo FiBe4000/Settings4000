@@ -26,6 +26,13 @@ pub mod freshness;
 // stopped, and the Apply pipeline takes the palette source's repo root from it.
 pub mod detect;
 
+// Home-relative (`~/…`) config values (task 11.10, R8.3): the one definition of
+// which `~` form is expanded for validation and the file chooser, and of how a
+// chosen image path is written back in the form the file already uses. Used by
+// `model`'s image-path validator and `theme`'s wallpaper model; `ui::startup`
+// takes the home directory from it.
+pub mod home_path;
+
 // The typed settings model + validators (R8.3). The SettingsStore (`store`)
 // keeps an `original`/`staged` `Value` per `SettingId`, and the Apply pipeline
 // (`apply`) validates every staged value against these validators before

@@ -156,6 +156,7 @@ fn wallpaper_model(fx: &FixtureDotfiles) -> WallpaperModel {
         WallpaperPaths {
             hyprpaper_conf: fx.config_path("hypr/hyprpaper.conf"),
             hyprlock_conf: fx.config_path("hypr/hyprlock.conf"),
+            home: Some(fx.home().to_path_buf()),
         },
         true,
     )

@@ -16,9 +16,12 @@
 //!   `~/.icons/default/index.theme`) must all receive the identical value
 //!   (R3.4, analysis §7.7, §8.4);
 //! - the **wallpaper / lock background** dual write (`hyprpaper.conf` +
-//!   `hyprlock.conf`, same image), including the real machine's tilde-shaped
-//!   original path (`~/Pictures/…`), which the fixture's anonymized absolute
-//!   paths would otherwise never exercise.
+//!   `hyprlock.conf`, same image). The fixture carries the real dotfiles'
+//!   home-relative value (`~/Pictures/wallpaper/18.jpg`, analysis §7.4), so the
+//!   suite proves the form-preserving write (task 11.10): an image under the
+//!   home directory is written `~/…`, one outside it absolute, a file that uses
+//!   absolute paths keeps them, and hyprpaper's IPC always gets the absolute
+//!   path.
 //!
 //! Like Display, these models own their files' freshness (R5.6): the window
 //! checks `check_conflict()` and aborts before building the plan, so the
@@ -32,6 +35,7 @@ use settings4000::core::apply::WriteMode;
 use settings4000::core::apply::{self, ApplyOutcome, ApplyPlan, WriteFailureCause};
 use settings4000::core::detect::{Binary, Capabilities, Daemon, DetectionInputs};
 use settings4000::core::freshness::FreshnessTracker;
+use settings4000::core::model::validate_image_value;
 use settings4000::core::notifd::NotifdReplies;
 use settings4000::core::reload::BackingFile;
 use settings4000::core::reload::ReloadParams;
@@ -112,15 +116,92 @@ fn themes_paths(fx: &FixtureDotfiles) -> ThemesPaths {
 }
 
 /// Builds the wallpaper model exactly as the startup worker does (task 6.5), with
-/// hyprlock present so the lock-background dual write is in play.
+/// hyprlock present so the lock-background dual write is in play, and the fixture
+/// home as the directory `~/…` paths expand against (task 11.10).
 fn load_wallpaper(fx: &FixtureDotfiles) -> WallpaperModel {
     WallpaperModel::load(
         WallpaperPaths {
             hyprpaper_conf: fx.config_path("hypr/hyprpaper.conf"),
             hyprlock_conf: fx.config_path("hypr/hyprlock.conf"),
+            home: Some(fx.home().to_path_buf()),
         },
         true,
     )
+}
+
+/// The configured wallpaper value of the fixture's `hyprpaper.conf` and
+/// `hyprlock.conf` (verbatim from the real dotfiles, analysis §7.4).
+const FIXTURE_WALLPAPER: &str = "~/Pictures/wallpaper/18.jpg";
+
+/// Stages `chosen` as the wallpaper of a freshly loaded fixture model, applies it
+/// through the real pipeline with a mock runner, and returns the recorded commands.
+fn apply_wallpaper(fx: &FixtureDotfiles, chosen: &str) -> Vec<Command> {
+    let mut wallpaper = load_wallpaper(fx);
+    assert!(!wallpaper.override_on(), "the fixture unifies both paths");
+    wallpaper
+        .stage_wallpaper(chosen)
+        .expect("an existing image stages");
+
+    let mut plan = empty_plan();
+    let contribution = wallpaper
+        .apply_contribution()
+        .expect("a dirty wallpaper contributes");
+    plan.writes.extend(contribution.writes);
+    plan.validations.extend(contribution.validations);
+    plan.reload_params = contribution.reload_params;
+
+    let caps = Capabilities::for_tests(&[Binary::Hyprctl], &[Daemon::Hyprpaper], true);
+    let runner = MockCommandRunner::new();
+    let outcome = apply::run(
+        &plan,
+        &FreshnessTracker::new(),
+        &caps,
+        &runner,
+        &MockProcessSignaller::new(),
+    );
+    let (reload_failures, written) = expect_applied(outcome);
+    assert!(reload_failures.is_empty());
+    assert_eq!(
+        written.len(),
+        2,
+        "hyprpaper.conf AND hyprlock.conf are written"
+    );
+    runner.recorded()
+}
+
+/// Asserts that `relative` (a deployed hypr config) now equals its pre-apply
+/// bytes in `before` with exactly the one `old` path value replaced by `new` —
+/// and that this is a single-line change.
+fn assert_only_the_path_changed(
+    fx: &FixtureDotfiles,
+    before: &std::collections::BTreeMap<String, Vec<u8>>,
+    relative: &str,
+    old: &str,
+    new: &str,
+) {
+    let repo_relative = format!("config/{relative}");
+    let original =
+        String::from_utf8(before[repo_relative.as_str()].clone()).expect("hypr configs are UTF-8");
+    let applied = fs::read_to_string(fx.config_path(relative)).expect("read the applied file");
+    assert_eq!(
+        applied,
+        replace_once(&original, old, new),
+        "{relative}: only the image path value may change"
+    );
+    assert_eq!(
+        differing_lines(&original, &applied).len(),
+        1,
+        "{relative}: exactly one line (the path) differs"
+    );
+}
+
+/// The two hyprpaper reload commands for `absolute` with the fixture's `cover` fit.
+fn hyprpaper_reload(absolute: &str) -> Vec<Command> {
+    let wallpaper_arg = format!(",{absolute},cover");
+    vec![
+        Command::new("hyprctl").args(["hyprpaper", "preload", absolute]),
+        Command::new("hyprctl").args(["hyprpaper", "wallpaper", wallpaper_arg.as_str()]),
+    ]
 }
 
 /// An empty plan to fold a Theme contribution into; the Theme models carry their
@@ -524,71 +605,58 @@ fn a_cursor_change_creates_a_missing_xcursor_fallback_theme() {
 }
 
 #[test]
+fn the_fixture_wallpaper_value_loads_as_an_existing_image() {
+    // Task 11.10: the configured `~/…` value is read verbatim, and its expanded
+    // form is the installed stub — which is what validation and the file
+    // chooser use.
+    let fx = FixtureDotfiles::install();
+    let wallpaper = load_wallpaper(&fx);
+    assert_eq!(wallpaper.wallpaper_path(), Some(FIXTURE_WALLPAPER));
+    assert_eq!(wallpaper.wallpaper_file(), Some(fx.wallpaper_path()));
+    assert!(fx.wallpaper_path().is_file(), "the installed stub exists");
+    assert!(!wallpaper.is_dirty(), "a freshly loaded page is clean");
+    assert!(
+        validate_image_value(FIXTURE_WALLPAPER, Some(fx.home())).is_ok(),
+        "the configured value passes R8.3 validation"
+    );
+}
+
+#[test]
 fn a_wallpaper_change_dual_writes_hyprpaper_and_hyprlock_and_reloads() {
     // Task 6.5 (the unified-wallpaper gotcha): with the lock override off, one
     // wallpaper change writes the SAME new path to hyprpaper.conf and
     // hyprlock.conf, then reloads hyprpaper live (preload + wallpaper with the
     // fit as the third comma-field). hyprlock gets no reload — it reads its
     // config at launch (intentional).
+    //
+    // Task 11.10: the image lies under the home directory and both files store
+    // `~/…`, so both receive `~/…`, while the reload names the absolute path
+    // (hyprpaper's IPC rejects anything not starting with `/`).
     let fx = FixtureDotfiles::install();
-    // The new image the user picks; must exist and be readable for R8.3.
+    // The new image the user picks; must exist and be readable for R8.3. The file
+    // chooser hands back an absolute path.
     let new_wallpaper = fx.home().join("Pictures/wallpaper/next.png");
     fs::write(&new_wallpaper, b"fixture next wallpaper").expect("create the new image");
     let new_wallpaper_str = new_wallpaper.to_str().expect("UTF-8 path").to_string();
     let before = repo_snapshot(&fx);
 
-    let mut wallpaper = load_wallpaper(&fx);
-    assert!(!wallpaper.override_on(), "the fixture unifies both paths");
-    wallpaper
-        .stage_wallpaper(&new_wallpaper_str)
-        .expect("an existing image stages");
+    let recorded = apply_wallpaper(&fx, &new_wallpaper_str);
 
-    let mut plan = empty_plan();
-    let contribution = wallpaper
-        .apply_contribution()
-        .expect("a dirty wallpaper contributes");
-    plan.writes.extend(contribution.writes);
-    plan.validations.extend(contribution.validations);
-    plan.reload_params = contribution.reload_params;
-
-    let caps = Capabilities::for_tests(&[Binary::Hyprctl], &[Daemon::Hyprpaper], true);
-    let freshness = FreshnessTracker::new();
-    let runner = MockCommandRunner::new();
-    let signaller = MockProcessSignaller::new();
-    let outcome = apply::run(&plan, &freshness, &caps, &runner, &signaller);
-    let (reload_failures, written) = expect_applied(outcome);
-    assert!(reload_failures.is_empty());
-    assert_eq!(
-        written.len(),
-        2,
-        "hyprpaper.conf AND hyprlock.conf are written"
-    );
-
-    // (a) Exact bytes: both files get the identical new path; every other byte —
-    // including the fit mode and hyprlock's many other sections — is untouched.
-    let old_path = fx.wallpaper_path();
-    let old_path_str = old_path.to_str().expect("UTF-8 path");
+    // (a) Exact bytes: both files get the identical new home-relative path; every
+    // other byte — including the fit mode and hyprlock's many other sections — is
+    // untouched.
     for relative in ["hypr/hyprpaper.conf", "hypr/hyprlock.conf"] {
-        let repo_relative = format!("config/{relative}");
-        let original = String::from_utf8(before[repo_relative.as_str()].clone())
-            .expect("hypr configs are UTF-8");
-        assert_eq!(
-            fs::read_to_string(fx.config_path(relative)).expect("read the applied file"),
-            replace_once(&original, old_path_str, &new_wallpaper_str),
-            "{relative}: only the image path value may change"
+        assert_only_the_path_changed(
+            &fx,
+            &before,
+            relative,
+            FIXTURE_WALLPAPER,
+            "~/Pictures/wallpaper/next.png",
         );
     }
 
-    // (b) The exact reload: preload then set-on-all-outputs with the current fit
-    // as the third comma-field; nothing for hyprlock.
-    let wallpaper_arg = format!(",{new_wallpaper_str},cover");
-    assert_eq!(
-        runner.recorded(),
-        vec![
-            Command::new("hyprctl").args(["hyprpaper", "preload", new_wallpaper_str.as_str()]),
-            Command::new("hyprctl").args(["hyprpaper", "wallpaper", wallpaper_arg.as_str()]),
-        ]
-    );
+    // (b) The exact reload, with the absolute path; nothing for hyprlock.
+    assert_eq!(recorded, hyprpaper_reload(&new_wallpaper_str));
 
     // (c) Everything else untouched.
     assert_repo_untouched_except(
@@ -599,71 +667,94 @@ fn a_wallpaper_change_dual_writes_hyprpaper_and_hyprlock_and_reloads() {
 }
 
 #[test]
-fn a_tilde_shaped_wallpaper_original_is_replaced_surgically() {
-    // The real machine's configs use a tilde path (`~/Pictures/…`), not the
-    // fixture's anonymized absolute one: rewrite the
-    // installed originals to the tilde form, then prove a staged absolute path
-    // still applies as a surgical value-span edit in both files. Only the staged
-    // (new) path is validated (R8.3) — the tilde original never has to resolve.
+fn a_wallpaper_outside_home_is_written_absolute() {
+    // Task 11.10: an image outside the home directory has no `~/…` spelling, so
+    // it is written absolute into both files even though they store `~/…`.
     let fx = FixtureDotfiles::install();
-    let tilde_path = "~/Pictures/wallpaper/wallpaper.jpg";
+    let outside_dir = fx
+        .home()
+        .parent()
+        .expect("the fixture home has a parent")
+        .join("shared-backgrounds");
+    fs::create_dir_all(&outside_dir).expect("create a directory outside the home");
+    let outside = outside_dir.join("dunes.jpg");
+    fs::write(&outside, b"fixture outside wallpaper").expect("create the image");
+    let outside_str = outside.to_str().expect("UTF-8 path").to_string();
+    assert!(
+        !outside.starts_with(fx.home()),
+        "the image is outside the home"
+    );
+    let before = repo_snapshot(&fx);
+
+    let recorded = apply_wallpaper(&fx, &outside_str);
+
+    for relative in ["hypr/hyprpaper.conf", "hypr/hyprlock.conf"] {
+        assert_only_the_path_changed(&fx, &before, relative, FIXTURE_WALLPAPER, &outside_str);
+    }
+    assert_eq!(recorded, hyprpaper_reload(&outside_str));
+}
+
+#[test]
+fn an_absolute_wallpaper_original_keeps_its_absolute_form() {
+    // Task 11.10, the other form: a host whose configs store absolute paths keeps
+    // them, even for an image under the home directory. The originals are
+    // rewritten to the absolute spelling of the same stub (fixture setup, not the
+    // code under test), and the change is a surgical value-span edit in both.
+    let fx = FixtureDotfiles::install();
     let absolute = fx.wallpaper_path();
     let absolute_str = absolute.to_str().expect("UTF-8 path");
     for relative in ["hypr/hyprpaper.conf", "hypr/hyprlock.conf"] {
         let live = fx.config_path(relative);
         let text = fs::read_to_string(&live).expect("read the installed file");
-        // A plain write-through here is fixture setup, not the code under test.
-        fs::write(&live, replace_once(&text, absolute_str, tilde_path))
-            .expect("rewrite the original to the tilde form");
+        fs::write(&live, replace_once(&text, FIXTURE_WALLPAPER, absolute_str))
+            .expect("rewrite the original to the absolute form");
     }
     let before = repo_snapshot(&fx);
-
-    let mut wallpaper = load_wallpaper(&fx);
     assert_eq!(
-        wallpaper.wallpaper_path(),
-        Some(tilde_path),
-        "the tilde original is read verbatim"
-    );
-    assert!(
-        !wallpaper.override_on(),
-        "identical tilde paths still read as the unified default"
+        load_wallpaper(&fx).wallpaper_path(),
+        Some(absolute_str),
+        "the absolute original is read verbatim"
     );
 
     let new_wallpaper = fx.home().join("Pictures/wallpaper/next.png");
     fs::write(&new_wallpaper, b"fixture next wallpaper").expect("create the new image");
     let new_wallpaper_str = new_wallpaper.to_str().expect("UTF-8 path").to_string();
-    wallpaper
-        .stage_wallpaper(&new_wallpaper_str)
-        .expect("an existing image stages over a tilde original");
 
-    let mut plan = empty_plan();
-    let contribution = wallpaper
-        .apply_contribution()
-        .expect("a dirty wallpaper contributes");
-    plan.writes.extend(contribution.writes);
-    plan.validations.extend(contribution.validations);
-    plan.reload_params = contribution.reload_params;
+    let recorded = apply_wallpaper(&fx, &new_wallpaper_str);
 
-    let caps = Capabilities::for_tests(&[Binary::Hyprctl], &[Daemon::Hyprpaper], true);
-    let freshness = FreshnessTracker::new();
-    let runner = MockCommandRunner::new();
-    let signaller = MockProcessSignaller::new();
-    let outcome = apply::run(&plan, &freshness, &caps, &runner, &signaller);
-    let (reload_failures, _) = expect_applied(outcome);
-    assert!(reload_failures.is_empty());
-
-    // Exact bytes: the tilde-shaped original with ONLY the tilde span replaced by
-    // the new absolute path, in both files.
     for relative in ["hypr/hyprpaper.conf", "hypr/hyprlock.conf"] {
-        let repo_relative = format!("config/{relative}");
-        let original = String::from_utf8(before[repo_relative.as_str()].clone())
-            .expect("hypr configs are UTF-8");
-        assert_eq!(
-            fs::read_to_string(fx.config_path(relative)).expect("read the applied file"),
-            replace_once(&original, tilde_path, &new_wallpaper_str),
-            "{relative}: the tilde original must be replaced surgically"
+        assert_only_the_path_changed(&fx, &before, relative, absolute_str, &new_wallpaper_str);
+    }
+    assert_eq!(recorded, hyprpaper_reload(&new_wallpaper_str));
+}
+
+#[test]
+fn a_missing_or_non_image_wallpaper_is_rejected_before_staging() {
+    // R8.3 still holds with home-relative values: a missing file and a non-image
+    // are rejected whether chosen absolute or spelled `~/…`, and nothing stages.
+    let fx = FixtureDotfiles::install();
+    let notes = fx.home().join("Pictures/wallpaper/notes.txt");
+    fs::write(&notes, b"not an image").expect("create a non-image file");
+    let missing = fx.home().join("Pictures/wallpaper/missing.jpg");
+
+    let mut wallpaper = load_wallpaper(&fx);
+    for rejected in [
+        missing.to_str().expect("UTF-8 path"),
+        "~/Pictures/wallpaper/missing.jpg",
+        notes.to_str().expect("UTF-8 path"),
+        "~/Pictures/wallpaper/notes.txt",
+    ] {
+        assert!(
+            wallpaper.stage_wallpaper(rejected).is_err(),
+            "{rejected} must be rejected"
+        );
+        assert!(
+            wallpaper.stage_lock(rejected).is_err(),
+            "{rejected} must be rejected as a lock image too"
         );
     }
+    assert!(!wallpaper.is_dirty(), "a rejected path is never staged");
+    assert_eq!(wallpaper.wallpaper_path(), Some(FIXTURE_WALLPAPER));
 }
 
 #[test]
