@@ -684,7 +684,7 @@ shadow=0a0c0d
     }
 
     #[test]
-    fn round_trips_empty_input_and_a_final_line_without_a_newline() {
+    fn edge_case_inputs_round_trip() {
         // Edge cases for the split/emit contract: emptiness and a missing trailing
         // newline must both survive round-trip.
         for input in [
@@ -759,7 +759,7 @@ shadow=0a0c0d
     }
 
     #[test]
-    fn set_value_rejects_unknown_key_and_invalid_hex_without_changing_the_file() {
+    fn set_value_rejects_an_unknown_key() {
         let (mut palette, _) = PaletteFile::parse(EVERFOREST_FIXTURE);
 
         // A key that does not exist as an entry is rejected...
@@ -772,6 +772,15 @@ shadow=0a0c0d
             palette.set_value("highlight", "abcdef"),
             Err(SetValueError::UnknownKey("highlight".to_string()))
         );
+
+        // None of the rejected edits changed the file.
+        assert_eq!(palette.emit(), EVERFOREST_FIXTURE);
+    }
+
+    #[test]
+    fn set_value_rejects_a_non_hex_value() {
+        let (mut palette, _) = PaletteFile::parse(EVERFOREST_FIXTURE);
+
         // A non-hex value is rejected before any byte is written (R8.3).
         assert_eq!(
             palette.set_value("bg0", "#abcdef"),
@@ -838,7 +847,7 @@ magenta=d699b6
     }
 
     #[test]
-    fn a_malformed_line_is_preserved_and_warned_without_panicking() {
+    fn a_malformed_line_is_kept_with_a_warning() {
         // Accept criterion: a malformed line surfaces as a parse warning, not a
         // panic, and is preserved losslessly.
         let input = "\
@@ -886,7 +895,7 @@ bg1=2e383c
     }
 
     #[test]
-    fn crlf_line_endings_round_trip_and_an_edit_never_pulls_in_the_carriage_return() {
+    fn crlf_line_endings_survive_an_edit() {
         // A file with Windows `\r\n` endings must round-trip byte-for-byte (the
         // `\r` is part of the terminator, not the value), and an edit must change
         // only the six value bytes — never dragging the `\r` into the value span.
@@ -913,7 +922,7 @@ bg1=2e383c
     }
 
     #[test]
-    fn an_empty_value_parses_as_an_editable_entry_and_warns() {
+    fn an_empty_value_is_an_editable_entry_with_a_warning() {
         // `bg0=` (nothing after the `=`) is a well-formed assignment with an empty
         // value: it must parse as an addressable Entry (not a malformed line),
         // warn as InvalidHexValue, round-trip losslessly, and never panic. The
@@ -961,7 +970,8 @@ bg1=2e383c
     }
 
     #[test]
-    fn is_bare_hex_accepts_six_digits_of_either_case_and_rejects_the_rest() {
+    fn is_bare_hex_accepts_exactly_six_hex_digits() {
+        // Of either case, with no leading `#`; anything shorter or longer is rejected.
         assert!(is_bare_hex("272e33"));
         assert!(is_bare_hex("ABCDEF"));
         assert!(!is_bare_hex("#272e33"), "a leading # is not bare hex");
@@ -993,7 +1003,7 @@ done
     }
 
     #[test]
-    fn the_names_line_of_the_real_generator_yields_the_18_key_schema() {
+    fn the_real_generator_names_line_yields_18_keys() {
         let keys = parse_names_line(GENERATOR_EXCERPT).expect("the real line parses");
         assert_eq!(
             keys, BUILT_IN_PALETTE_KEYS,
@@ -1011,7 +1021,7 @@ done
     }
 
     #[test]
-    fn a_names_mention_that_does_not_start_the_line_is_never_matched() {
+    fn only_a_line_starting_with_names_is_matched() {
         // Comments, indented assignments and the `"${NAMES[@]}"` loop all
         // contain `NAMES`, some even `NAMES=(`; none is the top-level schema.
         let only_mentions = "\
@@ -1032,7 +1042,7 @@ for name in \"${NAMES[@]}\"; do :; done
     }
 
     #[test]
-    fn the_names_line_tolerates_spacing_a_trailing_comment_crlf_and_repeats() {
+    fn the_names_line_tolerates_harmless_variations() {
         assert_eq!(
             parse_names_line("NAMES=(  bg0\tbg1  bg0 )  # the schema\r\n"),
             Ok(vec!["bg0".to_string(), "bg1".to_string()]),
@@ -1041,7 +1051,8 @@ for name in \"${NAMES[@]}\"; do :; done
     }
 
     #[test]
-    fn a_names_line_the_parser_cannot_understand_is_an_error_not_a_guess() {
+    fn an_unparseable_names_line_is_an_error() {
+        // The parser reports the problem rather than guessing at a schema.
         // Each of these makes the caller fall back to the built-in list.
         let cases = [
             ("x=1\n", NamesLineError::Absent),

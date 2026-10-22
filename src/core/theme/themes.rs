@@ -2249,11 +2249,9 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn scan_finds_gtk_icon_and_cursor_themes_from_fixture_roots() {
-        // Accept criterion (R3.3/R3.4): the theme scan unit-tested against a fixture tree
-        // with injectable roots. A GTK theme is a dir with gtk-3.0/ or gtk-4.0/; a
-        // cursor theme has a cursors/ subdir; an icon theme has index.theme and no
-        // cursors/.
+    fn scan_finds_gtk_themes_in_fixture_roots() {
+        // Accept criterion (R3.3): the theme scan unit-tested against a fixture tree
+        // with injectable roots. A GTK theme is a dir with gtk-3.0/ or gtk-4.0/.
         let tmp = tempfile::tempdir().expect("temp dir");
         let themes = tmp.path().join("themes");
         fs::create_dir_all(themes.join("Everforest-Green-Dark").join("gtk-4.0")).unwrap();
@@ -2275,7 +2273,14 @@ export XCURSOR_SIZE=16
             "GTK themes are the dirs with a gtk-3.0/ or gtk-4.0/ plus the built-ins, sorted; \
              dotfiles/non-themes skipped"
         );
+    }
 
+    #[test]
+    fn scan_classifies_icon_and_cursor_themes_in_fixture_roots() {
+        // Accept criterion (R3.3/R3.4): the icon/cursor scan unit-tested against a
+        // fixture tree with injectable roots. A cursor theme has a cursors/ subdir; an
+        // icon theme has index.theme and real icon content.
+        let tmp = tempfile::tempdir().expect("temp dir");
         let icons = write_icon_root(tmp.path());
         let (icon_themes, cursor_themes) =
             scan_icon_and_cursor_themes(std::slice::from_ref(&icons));
@@ -2323,7 +2328,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn builtin_gtk_themes_are_offered_without_a_theme_dir_and_are_never_duplicated() {
+    fn builtin_gtk_themes_are_offered_without_a_theme_dir() {
         // R3.3 requires the built-in Adwaita variants alongside the installed theme
         // dirs. GTK carries their stylesheets in the library, so a system can offer
         // Adwaita with no /usr/share/themes/Adwaita directory at all — a directory scan
@@ -2343,9 +2348,16 @@ export XCURSOR_SIZE=16
             "the built-in variants are offered even though no Adwaita dir exists, merged \
              into the scan's single sort order"
         );
+    }
 
-        // The same roots plus an on-disk Adwaita (e.g. gnome-themes-extra installing
-        // both variants): the names must appear once each, not twice.
+    #[test]
+    fn a_scanned_adwaita_dir_does_not_duplicate_the_builtin() {
+        // The built-in Adwaita variants are merged into the scan (task 9.7), so a root
+        // that also has them on disk (e.g. gnome-themes-extra installing both variants)
+        // must still yield each name once, not twice.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let without = tmp.path().join("without-adwaita");
+        fs::create_dir_all(without.join("Nordic").join("gtk-3.0")).unwrap();
         let with = tmp.path().join("with-adwaita");
         fs::create_dir_all(with.join("Adwaita").join("gtk-3.0")).unwrap();
         fs::create_dir_all(with.join("Adwaita-dark").join("gtk-3.0")).unwrap();
@@ -2417,7 +2429,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn a_cursor_change_writes_all_five_copies_to_the_same_value_and_reloads() {
+    fn a_cursor_apply_writes_five_identical_copies() {
         // Accept criterion: a cursor apply writes BOTH settings.ini files, both env
         // copies (uwsm/env and hyprland.lua's hl.env lines) AND the XCursor fallback
         // theme to the SAME value, and drives the exact gsettings/hyprctl setcursor
@@ -2557,7 +2569,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn a_gtk_theme_change_writes_only_settings_ini_and_sets_gsettings() {
+    fn a_gtk_theme_apply_writes_only_the_settings_ini_pair() {
         // A GTK theme change touches only the two settings.ini files (not the env
         // files) and reloads with just `gsettings set … gtk-theme`.
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -2638,7 +2650,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn an_icon_theme_change_writes_both_settings_ini_copies_and_sets_gsettings() {
+    fn an_icon_theme_apply_writes_both_settings_ini() {
         // The icon theme's sibling of the GTK-theme test above (task 9.12). Like the GTK
         // theme, the icon theme is declared only in the two settings.ini files — the env
         // files carry cursor copies only — so an icon change must leave both settings.ini
@@ -2941,7 +2953,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn an_app_env_override_disables_the_gtk_dropdown_and_ignores_edits() {
+    fn an_app_env_override_locks_the_gtk_theme() {
         // Accept criterion (R3.3): a GTK_THEME set in the app's own environment shows a
         // banner and disables the GTK-theme drop-down; the app must not fight it.
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -3028,33 +3040,48 @@ export XCURSOR_SIZE=16
         assert!(model.apply_contribution().is_none());
     }
 
-    #[test]
-    fn reselecting_the_current_value_is_not_dirty_and_reset_commit_work() {
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let config = tmp.path().join("config");
+    /// Loads a [`ThemesModel`] whose settings.ini selects Everforest-Green-Dark and whose
+    /// theme root also offers Adwaita, for the staging-lifecycle tests below.
+    fn two_gtk_themes_model(tmp: &Path) -> ThemesModel {
+        let config = tmp.join("config");
         fs::create_dir_all(&config).unwrap();
         let paths = write_backing_fixture(&config, UWSM_ENV);
-        let themes = tmp.path().join("themes");
+        let themes = tmp.join("themes");
         fs::create_dir_all(themes.join("Adwaita").join("gtk-4.0")).unwrap();
         fs::create_dir_all(themes.join("Everforest-Green-Dark").join("gtk-4.0")).unwrap();
         let roots = ThemeRoots {
             gtk_theme_dirs: vec![themes],
             icon_dirs: Vec::new(),
         };
+        ThemesModel::load(&roots, paths, false, None)
+    }
 
-        let mut model = ThemesModel::load(&roots, paths, false, None);
+    #[test]
+    fn reselecting_the_current_gtk_theme_is_not_dirty() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut model = two_gtk_themes_model(tmp.path());
         // The current GTK theme is Everforest-Green-Dark (from settings.ini).
         model.stage_gtk_theme("Everforest-Green-Dark");
         assert!(
             !model.is_dirty(),
             "re-selecting the current value is not dirty"
         );
+    }
 
+    #[test]
+    fn reset_discards_a_staged_gtk_theme() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut model = two_gtk_themes_model(tmp.path());
         model.stage_gtk_theme("Adwaita");
         assert!(model.is_dirty());
         model.reset();
         assert!(!model.is_dirty(), "reset discards the pending change");
+    }
 
+    #[test]
+    fn commit_promotes_a_staged_gtk_theme() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut model = two_gtk_themes_model(tmp.path());
         model.stage_gtk_theme("Adwaita");
         model.commit();
         assert!(!model.is_dirty(), "commit clears the dirty state");
@@ -3070,7 +3097,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn an_external_edit_is_a_conflict_and_reload_rebaselines() {
+    fn an_external_edit_conflicts_until_a_reload() {
         // R5.6: an external edit to a backing file is detected as a conflict, and
         // reload re-baselines against the current bytes.
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -3103,7 +3130,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn cursor_preselect_falls_back_to_uwsm_env_when_settings_ini_lacks_it() {
+    fn cursor_preselect_falls_back_to_uwsm_env() {
         // N2(a): when settings.ini does not carry the cursor keys, the cursor theme and
         // size are preselected from uwsm/env's XCURSOR_* instead.
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -3202,7 +3229,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn a_non_numeric_cursor_size_writes_files_but_skips_the_live_cursor_reload() {
+    fn a_non_numeric_cursor_size_skips_the_live_reload() {
         // N2(c): an unparseable on-disk cursor size degrades gracefully — a cursor
         // theme change is still written to the files, but the live cursor reload
         // (`gsettings set cursor-*` + `hyprctl setcursor`) is skipped because
@@ -3416,7 +3443,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn a_cursor_change_is_still_promoted_when_hyprland_lua_has_no_env_line() {
+    fn a_missing_lua_cursor_line_does_not_block_promotion() {
         // Task 9.6, the other side of the divergence rule: an ABSENT copy must not block
         // promotion. Here hyprland.lua carries only the XCURSOR_THEME line, and the Lua
         // editor rewrites hl.env calls but never adds one, so a cursor *size* change can
@@ -3468,7 +3495,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn an_unsafe_hyprland_lua_is_read_as_absent_and_refuses_the_write() {
+    fn an_unsafe_hyprland_lua_is_left_untouched() {
         // A hyprland.lua whose bracket structure the Lua editor cannot follow (here an
         // unclosed table) has no locatable lines: its cursor values read as absent — the
         // page still loads and shows the other copies' value, and no disagreement is
@@ -3510,7 +3537,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn the_consistency_check_names_only_the_lua_copy_when_it_alone_disagrees() {
+    fn the_mismatch_note_names_a_disagreeing_lua_copy() {
         // R3.4: the Theme page reports which cursor copies differ from the value it
         // shows. With every copy at Nordic-cursors/16 except hyprland.lua's size line,
         // exactly the Lua copy is named.
@@ -3545,7 +3572,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn the_consistency_check_names_only_index_theme_when_it_alone_disagrees() {
+    fn the_mismatch_note_names_a_disagreeing_index_theme() {
         // The XCursor fallback theme's Inherits= is a cursor copy too (analysis §8.4).
         let tmp = tempfile::tempdir().expect("temp dir");
         let config = tmp.path().join("config");
@@ -3574,7 +3601,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn the_cursor_falls_back_to_the_lua_and_index_theme_copies_when_the_others_lack_it() {
+    fn the_cursor_preselect_falls_back_to_lua_then_index_theme() {
         // The value the page shows comes from settings.ini, then uwsm/env, then
         // hyprland.lua, then (the theme only) index.theme — so a host whose only cursor
         // copies are the Lua lines and the fallback theme still preselects them.
@@ -3806,7 +3833,7 @@ export XCURSOR_SIZE=16
 
     #[cfg(unix)]
     #[test]
-    fn a_plain_settings_ini_beside_its_repo_copy_is_reported_and_a_linked_one_is_not() {
+    fn a_plain_settings_ini_beside_its_repo_copy_is_reported() {
         // Task 11.12 (analysis §7.7): the nwg-look shape — gtk-4.0/settings.ini
         // replaced by a plain copy while the repo still has its own, gtk-3.0 still
         // linked. Only the plain one is reported, with a note naming both paths.
@@ -3856,7 +3883,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn a_plain_settings_ini_without_a_repo_or_repo_copy_is_not_reported() {
+    fn a_plain_settings_ini_without_a_repo_copy_is_not_reported() {
         // Task 11.12: plain files are the normal, non-dotfiles setup, so without a
         // repo — or with a repo that has no copy of the file — nothing is reported.
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -3875,7 +3902,7 @@ export XCURSOR_SIZE=16
 
     #[cfg(unix)]
     #[test]
-    fn a_settings_ini_reached_through_a_symlinked_directory_is_still_linked() {
+    fn a_settings_ini_in_a_linked_directory_counts_as_linked() {
         // Task 11.12: a setup that links the whole gtk-4.0 directory into the repo
         // makes the live file a regular file that *is* the repo copy — not a
         // divergence. A dangling or missing live file is not one either.
@@ -3905,7 +3932,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn the_xsettingsd_note_follows_detection_and_survives_a_reload() {
+    fn the_xsettingsd_note_follows_detection() {
         // Task 11.12 (analysis §7.7): a running xsettingsd turns on the
         // external-writer note; it gates nothing and a conflict reload keeps it.
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -3924,7 +3951,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn the_notification_icons_note_appears_only_for_a_running_notifd_without_reload() {
+    fn the_icons_note_appears_only_for_a_pre_reload_notifd() {
         // Task 11.14 (analysis §8.2): only a running notifd older than 1.1 (or one that
         // reported no version) cannot pick up an icon-theme change live; a 1.1 daemon
         // is reloaded by the Apply, and a stopped or absent one reads the theme when it
@@ -3981,7 +4008,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn the_first_theme_root_with_a_gtk4_dir_provides_the_link_targets() {
+    fn the_first_root_with_a_gtk4_dir_provides_link_targets() {
         // GTK's own lookup order: the first root holding `<theme>/gtk-4.0` wins, a root
         // with only `gtk-3.0` for that name does not shadow it, and the targets are
         // built from the resolved root. An entry the theme does not ship gets none.
@@ -4007,7 +4034,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn theme_names_that_are_not_one_directory_name_never_reach_outside_a_root() {
+    fn a_path_shaped_theme_name_never_escapes_a_root() {
         // A name read from the user's settings.ini could hold a path; it must never be
         // joined onto a root to escape it.
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -4030,7 +4057,7 @@ export XCURSOR_SIZE=16
 
     #[cfg(unix)]
     #[test]
-    fn a_theme_whose_gtk4_files_resolve_outside_the_roots_is_not_linked() {
+    fn gtk4_files_resolving_outside_the_roots_are_not_linked() {
         // "Never follow a link outside the theme roots": a theme directory, or one of
         // its entries, that is a symlink to somewhere else is refused.
         use std::os::unix::fs::symlink;
@@ -4089,9 +4116,9 @@ export XCURSOR_SIZE=16
 
     #[cfg(unix)]
     #[test]
-    fn a_gtk_theme_change_plans_one_point_step_per_link_and_other_changes_none() {
+    fn icon_or_cursor_changes_plan_no_gtk4_link_steps() {
         let tmp = tempfile::tempdir().expect("temp dir");
-        let (mut model, links_dir, new) = linked_model(tmp.path());
+        let (mut model, _, _) = linked_model(tmp.path());
 
         model.stage_icon_theme("Papirus");
         model.stage_cursor_theme("Bibata");
@@ -4100,6 +4127,13 @@ export XCURSOR_SIZE=16
             contribution.links.is_empty(),
             "icon/cursor changes never touch the GTK 4 links"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_gtk_theme_change_plans_one_point_step_per_link() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let (mut model, links_dir, new) = linked_model(tmp.path());
 
         model.stage_gtk_theme("New");
         let links = model.apply_contribution().expect("dirty").links;
@@ -4117,7 +4151,7 @@ export XCURSOR_SIZE=16
 
     #[cfg(unix)]
     #[test]
-    fn a_gtk3_only_theme_plans_removals_and_a_builtin_gets_no_note() {
+    fn a_gtk3_only_theme_plans_link_removals_with_a_note() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let (mut model, links_dir, _) = linked_model(tmp.path());
 
@@ -4135,26 +4169,39 @@ export XCURSOR_SIZE=16
                  fall back to the default Adwaita look."
             )
         );
+    }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_builtin_theme_plans_link_removals_without_a_note() {
         // A built-in theme has no directory either, so the links go too — but the
         // default look is then what was asked for, so there is nothing to explain.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let (mut model, _, _) = linked_model(tmp.path());
         model.stage_gtk_theme("Adwaita");
         assert_eq!(model.apply_contribution().expect("dirty").links.len(), 3);
         assert_eq!(model.gtk4_links_note(), None);
     }
 
+    /// [`linked_model`] with only one GTK 4 link deployed: `gtk.css`, already pointing
+    /// at the `New` theme; `gtk-dark.css` and `assets` are missing.
     #[cfg(unix)]
-    #[test]
-    fn links_already_on_the_chosen_theme_and_absent_removals_plan_nothing() {
-        // Re-applying the theme the links already point at is a no-op for them, and a
-        // missing link needs no removal.
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let (mut model, links_dir, new) = linked_model(tmp.path());
+    fn partly_linked_model(tmp: &Path) -> (ThemesModel, PathBuf) {
+        let (model, links_dir, new) = linked_model(tmp);
         for name in GTK4_THEME_LINKS {
             fs::remove_file(links_dir.join(name)).expect("remove the old link");
         }
         std::os::unix::fs::symlink(new.join("gtk.css"), links_dir.join("gtk.css"))
             .expect("one link already on New");
+        (model, links_dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_already_on_the_chosen_theme_plan_nothing() {
+        // Re-applying the theme a link already points at is a no-op for that link.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let (mut model, links_dir) = partly_linked_model(tmp.path());
 
         model.stage_gtk_theme("New");
         let links = model.apply_contribution().expect("dirty").links;
@@ -4166,6 +4213,14 @@ export XCURSOR_SIZE=16
             vec![links_dir.join("gtk-dark.css"), links_dir.join("assets")],
             "only the two links that are not on New yet are planned"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_link_plans_no_removal() {
+        // Switching to a theme without a GTK 4 version removes only the links that exist.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let (mut model, links_dir) = partly_linked_model(tmp.path());
 
         model.stage_gtk_theme("Plain");
         let links = model.apply_contribution().expect("dirty").links;
@@ -4182,7 +4237,8 @@ export XCURSOR_SIZE=16
 
     #[cfg(unix)]
     #[test]
-    fn a_real_file_or_directory_at_a_link_path_blocks_all_three_and_is_noted() {
+    fn a_real_directory_at_a_link_path_blocks_all_link_steps() {
+        // All three links are left alone, and the GTK 4 links note names the blocking path.
         let tmp = tempfile::tempdir().expect("temp dir");
         let (mut model, links_dir, _) = linked_model(tmp.path());
         fs::remove_file(links_dir.join("assets")).expect("remove the link");
@@ -4203,19 +4259,30 @@ export XCURSOR_SIZE=16
         );
     }
 
+    /// [`linked_model`] with `gtk-dark.css` re-pointed at a file of the user's own
+    /// outside every theme root. Returns the model, the resolved `New` theme directory,
+    /// and the user's folder holding the link target.
     #[cfg(unix)]
-    #[test]
-    fn a_link_outside_the_theme_roots_blocks_all_three_but_a_dangling_one_is_repaired() {
+    fn foreign_linked_model(tmp: &Path) -> (ThemesModel, PathBuf, PathBuf) {
         use std::os::unix::fs::symlink;
 
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let (mut model, links_dir, new) = linked_model(tmp.path());
-        let custom = tmp.path().join("custom");
+        let (model, links_dir, new) = linked_model(tmp);
+        let custom = tmp.join("custom");
         fs::create_dir_all(&custom).expect("create the user's folder");
         fs::write(custom.join("gtk-dark.css"), b"/* mine */\n").expect("write css");
         fs::remove_file(links_dir.join("gtk-dark.css")).expect("remove the link");
         symlink(custom.join("gtk-dark.css"), links_dir.join("gtk-dark.css"))
             .expect("a link of the user's own");
+        (model, new, custom)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_outside_the_theme_roots_blocks_all_link_steps() {
+        // A link of the user's own is an override: all three links are left alone and
+        // the note says why, while the settings.ini writes still land.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let (mut model, _, _) = foreign_linked_model(tmp.path());
 
         model.stage_gtk_theme("New");
         let contribution = model.apply_contribution().expect("dirty");
@@ -4230,8 +4297,15 @@ export XCURSOR_SIZE=16
             note.contains("/gtk-4.0/gtk-dark.css links to a place outside the theme folders"),
             "{note}"
         );
+    }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_foreign_link_is_repaired() {
         // The same link dangling (its target gone) is a stale link, not an override.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let (mut model, new, custom) = foreign_linked_model(tmp.path());
+        model.stage_gtk_theme("New");
         fs::remove_file(custom.join("gtk-dark.css")).expect("delete the target");
         assert_eq!(model.gtk4_links_note(), None);
         let links = model.apply_contribution().expect("dirty").links;
@@ -4248,7 +4322,7 @@ export XCURSOR_SIZE=16
 
     #[cfg(unix)]
     #[test]
-    fn a_gtk_theme_name_that_is_not_a_directory_name_gets_no_note_and_no_link_step() {
+    fn a_path_shaped_gtk_theme_name_plans_no_link_step() {
         // Only a hand-edited settings.ini can hold such a name; it is neither joined
         // onto a root nor described as a theme "without a GTK 4 version".
         let tmp = tempfile::tempdir().expect("temp dir");

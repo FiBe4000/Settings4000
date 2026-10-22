@@ -374,7 +374,7 @@ fn a_glob_string_does_not_open_a_phantom_block_comment() {
 }
 
 #[test]
-fn raw_strings_are_blanked_without_swallowing_the_code_after_them() {
+fn raw_strings_are_blanked_up_to_their_real_end() {
     // Raw strings escape nothing, so they end only at a quote followed by as many
     // hashes as they opened with — the embedded `"# ` and quotes below do not end
     // these literals early.
@@ -479,7 +479,7 @@ fn non_ascii_source_keeps_its_ascii_tokens() {
 }
 
 #[test]
-fn rust_sources_recurses_and_ignores_non_rust_files() {
+fn rust_sources_finds_only_rs_files_recursively() {
     // Scan this crate's own `src/parsers` directory: it is known to contain
     // several `.rs` files, and `src/` contains nested module directories.
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

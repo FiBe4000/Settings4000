@@ -291,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rendered_edit_becomes_a_file_write_carrying_the_file_declarations() {
+    fn a_rendered_edit_becomes_a_declared_file_write() {
         // The happy path: the renderer's bytes and changed keys go into the FileWrite
         // unchanged, and the write carries the path, reload concern and R8.3 validation
         // provenance the file declared (task 9.10).

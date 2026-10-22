@@ -1276,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn value_kind_and_accessors_are_consistent() {
+    fn typed_accessors_agree_with_the_value_kind() {
         // Each accessor returns Some for its own kind and None for the others, and
         // `kind()` reports the matching discriminant. This is the typed-accessor
         // contract the store relies on.
@@ -1308,7 +1308,7 @@ mod tests {
     }
 
     #[test]
-    fn every_setting_has_a_kind_a_category_and_a_valid_value() {
+    fn every_setting_id_has_a_consistent_example_value() {
         // Exhaustive smoke test: for every id, the kind matches its example value
         // and that value validates. Also touches `category()` for every id so the
         // whole mapping surface is exercised.
@@ -1397,7 +1397,7 @@ mod tests {
     }
 
     #[test]
-    fn hex_color_validator_accepts_bare_hex_and_rejects_the_rest() {
+    fn the_hex_color_validator_accepts_only_bare_hex() {
         // Valid: exactly six hex digits, either case.
         assert!(validate_hex_color("83c092").is_ok());
         assert!(validate_hex_color("ABCDEF").is_ok());
@@ -1502,7 +1502,8 @@ mod tests {
     }
 
     #[test]
-    fn monitor_mode_validator_accepts_valid_modes_and_special_tokens() {
+    fn the_monitor_mode_validator_accepts_valid_modes() {
+        // Both WIDTHxHEIGHT[@Hz] modes and Hyprland's special mode tokens.
         for valid in [
             "2880x1800@120",
             "1920x1080@60",
@@ -1524,7 +1525,7 @@ mod tests {
     }
 
     #[test]
-    fn monitor_mode_validator_rejects_malformed_and_out_of_range_modes() {
+    fn the_monitor_mode_validator_rejects_invalid_modes() {
         // Structural problems and out-of-range numbers are both rejected, each as an
         // InvalidMonitorMode carrying the offending value.
         for invalid in [
@@ -1563,7 +1564,8 @@ mod tests {
     }
 
     #[test]
-    fn monitor_position_validator_accepts_auto_tokens_and_coordinate_pairs() {
+    fn the_position_validator_accepts_valid_positions() {
+        // Every documented `auto…` token, and whole-number XxY coordinate pairs.
         for valid in [
             // Every placement token Hyprland documents; a hand-written monitors.conf
             // may carry any of them (see MONITOR_POSITION_TOKENS).
@@ -1653,7 +1655,7 @@ mod tests {
     }
 
     #[test]
-    fn sensitivity_range_covers_boundaries_and_rejects_outside() {
+    fn the_sensitivity_range_is_inclusive() {
         // Boundaries are inclusive; just outside on either side is rejected; NaN is
         // outside every range.
         assert!(validate_float_range(-1.0, &SENSITIVITY_RANGE).is_ok());
@@ -1678,7 +1680,8 @@ mod tests {
     }
 
     #[test]
-    fn scale_range_covers_boundaries_and_rejects_outside() {
+    fn the_scale_range_is_inclusive() {
+        // Boundaries are inclusive; values just outside either one are rejected.
         assert!(validate_float_range(0.5, &SCALE_RANGE).is_ok());
         assert!(validate_float_range(1.333_333, &SCALE_RANGE).is_ok());
         assert!(validate_float_range(3.0, &SCALE_RANGE).is_ok());
@@ -1785,7 +1788,8 @@ mod tests {
     }
 
     #[test]
-    fn image_path_validator_rejects_missing_wrong_type_and_non_image() {
+    fn the_image_path_validator_rejects_unusable_paths() {
+        // Missing paths, non-files and non-images are each rejected with their reason.
         let dir = tempfile::tempdir().expect("temp dir should be creatable");
 
         // Non-existent path.
@@ -1881,7 +1885,7 @@ mod tests {
     }
 
     #[test]
-    fn a_home_relative_image_value_is_validated_on_its_expanded_path() {
+    fn a_tilde_image_value_is_validated_on_its_expanded_path() {
         // Task 11.10: the dotfiles store `~/Pictures/…`; validation must check the file
         // hyprpaper/hyprlock will load, i.e. the path below the home directory.
         let home = tempfile::tempdir().expect("temp dir should be creatable");

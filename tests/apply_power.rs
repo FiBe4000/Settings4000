@@ -67,7 +67,7 @@ fn plan_with_power_write(store: &SettingsStore, model: &PowerModel) -> ApplyPlan
 }
 
 #[test]
-fn a_lock_timeout_edit_touches_one_listener_and_restarts_via_systemd() {
+fn a_lock_timeout_edit_touches_only_its_listener() {
     // The happy path (R5.3): editing the lock timeout rewrites only listener[1]'s
     // `timeout` value span — the dim/DPMS listeners, every inline comment, and all
     // other bytes stay identical — and hypridle is restarted through its active
@@ -124,7 +124,7 @@ fn a_lock_timeout_edit_touches_one_listener_and_restarts_via_systemd() {
 }
 
 #[test]
-fn a_lock_command_edit_restarts_via_the_kill_and_respawn_fallback() {
+fn a_lock_command_edit_restarts_via_the_respawn_fallback() {
     // The other restart mechanism (task 4.4): no active systemd unit (`is-active`
     // exits non-zero — the dotfiles' exec-once case), so hypridle is SIGTERMed and
     // respawned with a detached `setsid --fork`. Also covers the lock-command edit,
@@ -189,7 +189,7 @@ fn a_lock_command_edit_restarts_via_the_kill_and_respawn_fallback() {
 }
 
 #[test]
-fn a_failed_hypridle_restart_is_non_fatal_and_the_write_stands() {
+fn a_failed_hypridle_restart_leaves_the_write_standing() {
     // Failure injection (2), R5.5: the systemd restart itself fails after the write
     // succeeded. The apply still completes, the new bytes stand, and the failure is
     // reported for the UI to toast.

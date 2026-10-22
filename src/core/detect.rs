@@ -1505,7 +1505,7 @@ mod tests {
     }
 
     #[test]
-    fn path_scan_searches_every_directory_and_prefers_executables() {
+    fn path_scan_searches_every_path_directory() {
         // The binary may live in any PATH directory, and the audio composite is
         // satisfied by either client.
         let first = tempfile::tempdir().expect("temp dir");
@@ -1559,7 +1559,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_liveness_is_injectable_present_and_absent() {
+    fn daemon_liveness_follows_the_injected_process_list() {
         // Accept criterion (liveness injectable): a supplied process list flips
         // daemon liveness without a live daemon.
         let mut inputs = base_inputs();
@@ -1582,7 +1582,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_portal_detected_from_a_settings_backend_by_full_name() {
+    fn a_running_settings_backend_signals_the_portal() {
         // Accept criterion (portal injectable, R2.2): a Settings-implementing backend
         // running signals the live-restyle path. Detection matches the full name, so
         // the injected process list carries the untruncated `xdg-desktop-portal-gtk`.
@@ -1657,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    fn hyprland_reloadable_requires_both_the_client_and_a_live_socket() {
+    fn hyprland_reloadable_needs_the_client_and_a_live_socket() {
         let bin = tempfile::tempdir().expect("temp dir");
         write_executable(bin.path(), "hyprctl");
         let run = tempfile::tempdir().expect("temp dir");
@@ -1722,7 +1722,8 @@ mod tests {
     }
 
     #[test]
-    fn a_running_xsettingsd_is_detected_and_logged_at_info() {
+    fn xsettingsd_detection_is_logged_at_info() {
+        // Both its presence (logged) and its absence (silent) are checked.
         // Task 11.12 (analysis §7.7): xsettingsd is the trace of KDE's kded6 gtkconfig
         // module managing GTK settings. It is scanned like the other daemons and its
         // presence logged at info, so the Theme page note has a logged cause.
@@ -1757,7 +1758,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn the_repo_root_is_exposed_even_when_the_palette_source_is_incomplete() {
+    fn the_repo_root_does_not_need_a_complete_palette_source() {
         // Task 11.12: the Theme page compares settings.ini with its repo copy under
         // the detected root, which must not depend on the palette source being
         // complete (a repo without colors/ or the generator still has its configs).
@@ -1779,7 +1780,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn symlinked_config_into_a_complete_repo_yields_the_palette_source() {
+    fn a_complete_linked_repo_yields_the_palette_source() {
         // Accept criterion (R3.2/R8.5): a config symlinked into a repo that has
         // colors/ and scripts/generate-colors makes the palette source present,
         // with the repo root exposed for tasks 3.7/6.3/4.5.
@@ -1845,7 +1846,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn symlink_resolving_outside_the_expected_layout_hides_the_palette_source() {
+    fn an_unexpected_symlink_target_hides_the_palette_source() {
         // Finding 2: exercise the `ends_with(config/hypr/colors.conf)` guard. A
         // symlink that resolves to a target whose tail is NOT the repo-relative
         // anchor path cannot yield a trustworthy repo root, so the source is hidden
@@ -1889,7 +1890,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn an_executable_toggle_script_in_the_repo_yields_the_laptop_toggle() {
+    fn an_executable_repo_toggle_script_is_detected() {
         // Task 11.8 (R4.2/R8.5): the laptop-display toggle script is found under the
         // same repo root as the palette source and is present only as an executable
         // file. The palette source's own completeness does not matter to it.
@@ -1916,7 +1917,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_missing_or_non_executable_toggle_script_hides_the_laptop_toggle() {
+    fn an_unusable_toggle_script_hides_the_laptop_toggle() {
+        // Unusable means missing or not executable.
         use std::os::unix::fs::PermissionsExt;
 
         // A complete palette repo without the script: the toggle is hidden and the
@@ -1986,7 +1988,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn an_executable_bar_text_tone_script_at_its_xdg_path_is_detected() {
+    fn an_executable_bar_text_tone_script_is_detected() {
         // Task 11.14: the script is looked up at its live XDG path, independently of
         // any dotfiles repo (none is behind `base_inputs`), and reported as given.
         let root = tempfile::tempdir().expect("temp dir");
@@ -2003,7 +2005,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_missing_or_non_executable_bar_text_tone_script_is_absent_and_logged() {
+    fn an_unusable_bar_text_tone_script_is_absent() {
+        // Missing, not executable, or a directory: absent; the missing case is logged.
         use std::os::unix::fs::PermissionsExt;
 
         // Missing: absent, with the skipped follow-up logged at `info`.
@@ -2116,7 +2119,7 @@ mod tests {
     }
 
     #[test]
-    fn readable_and_unreadable_configs_are_reported() {
+    fn config_readability_is_reported() {
         // Accept criterion (R4.4): a readable config is fine; a missing one degrades
         // to absent and is recorded so the UI can hide its controls.
         let dir = tempfile::tempdir().expect("temp dir");
@@ -2168,7 +2171,7 @@ mod tests {
     }
 
     #[test]
-    fn detection_is_rerunnable_and_deterministic() {
+    fn detection_is_deterministic_across_reruns() {
         // R4.3: the routine is re-runnable for a manual refresh; the same inputs
         // must produce an equal result.
         let dir = tempfile::tempdir().expect("temp dir");
@@ -2250,7 +2253,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_without_the_provider_line_falls_back_to_the_lua_file_check() {
+    fn a_reply_without_a_provider_falls_back_to_the_lua_file() {
         let run = tempfile::tempdir().expect("temp dir");
         let socket = run.path().join(".socket.sock");
         fs::write(&socket, b"").expect("stand-in socket");
@@ -2313,7 +2316,8 @@ mod tests {
     }
 
     #[test]
-    fn the_provider_line_is_parsed_leniently_and_unknown_names_are_ignored() {
+    fn the_provider_line_is_parsed_leniently() {
+        // Case, surrounding whitespace and other status lines do not matter.
         assert_eq!(
             parse_config_provider("  configProvider:   Lua  \n"),
             Some(HyprConfigProvider::Lua)
@@ -2322,6 +2326,10 @@ mod tests {
             parse_config_provider("backend: drm\nconfigProvider: hyprlang"),
             Some(HyprConfigProvider::Hyprlang)
         );
+    }
+
+    #[test]
+    fn an_unknown_or_missing_provider_parses_as_none() {
         assert_eq!(parse_config_provider("configProvider: toml\n"), None);
         assert_eq!(parse_config_provider(STATUS_WITHOUT_PROVIDER), None);
         assert_eq!(parse_config_provider(""), None);
@@ -2527,7 +2535,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_items_log_info_and_unreadable_configs_log_warn() {
+    fn detection_logs_every_degradation_at_its_level() {
         // Accept criterion (logging): a hidden item (absent binary, absent palette
         // source) is logged at `info`; an unreadable config is logged at `warn`.
         // Captured via a scoped tracing subscriber so no global state is touched.
@@ -2674,7 +2682,7 @@ mod tests {
     }
 
     #[test]
-    fn process_matching_is_exact_and_never_matches_a_prefix() {
+    fn process_matching_is_exact() {
         // Names are untruncated argv[0] basenames, so matching is exact: a mere
         // prefix must not match (this is what stops the shared `xdg-desktop-por`
         // prefix from making the whole portal family look like the GTK backend).

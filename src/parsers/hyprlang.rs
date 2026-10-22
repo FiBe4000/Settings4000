@@ -1349,7 +1349,8 @@ bind = $mainMod, Return, exec, $terminal
     }
 
     #[test]
-    fn round_trips_empty_input_and_a_final_line_without_a_newline() {
+    fn edge_case_inputs_round_trip() {
+        // Empty input, a missing final newline, comment-only and blank-only files.
         for input in [
             "",
             "splash = false",
@@ -1524,7 +1525,7 @@ bind = $mainMod, Return, exec, $terminal
     }
 
     #[test]
-    fn editing_a_value_with_a_trailing_inline_comment_preserves_the_comment() {
+    fn an_edit_keeps_a_trailing_inline_comment() {
         // The lock command lives on a listener line with a trailing comment in
         // some setups; here we edit a plain listener command and, separately, a
         // commented one, to prove the inline comment survives.
@@ -1579,7 +1580,7 @@ bind = $mainMod, Return, exec, $terminal
     }
 
     #[test]
-    fn appending_into_a_section_without_siblings_indents_one_level_in() {
+    fn appending_into_an_empty_section_indents_one_level() {
         // With no sibling assignment to copy, an appended key uses the section
         // header's indentation plus four spaces and a ` = ` separator.
         let (mut file, _) = HyprlangFile::parse("region {\n}\n");
@@ -1589,7 +1590,7 @@ bind = $mainMod, Return, exec, $terminal
     }
 
     #[test]
-    fn a_malformed_line_is_preserved_and_warned_without_panicking() {
+    fn a_malformed_line_is_kept_with_a_warning() {
         // A malformed line surfaces as a warning on its 1-based line, is kept
         // byte-for-byte, and is not addressable.
         let input = "input {\n    this line has no equals or brace\n    kb_layout=us\n}\n";
@@ -1668,7 +1669,7 @@ bind = $mainMod, Return, exec, $terminal
     }
 
     #[test]
-    fn crlf_line_endings_round_trip_and_edits_never_pull_in_the_carriage_return() {
+    fn crlf_line_endings_survive_an_edit() {
         // Windows `\r\n` endings survive round-trip (the `\r` is part of the
         // terminator, not the value), and an edit changes only the value bytes.
         let input = "input {\r\n    kb_layout=us,se\r\n}\r\n";
@@ -1838,7 +1839,7 @@ bind = $mainMod, Return, exec, $terminal
     }
 
     #[test]
-    fn a_doubled_repeatable_field_uses_the_first_line_and_warns() {
+    fn a_doubled_repeatable_field_resolves_to_the_first_line() {
         // Two `env` lines sharing the same first field are an ambiguous address:
         // the parser resolves both reading and writing to the first line — so it
         // never displays one copy while editing another — and logs a `warn`, which

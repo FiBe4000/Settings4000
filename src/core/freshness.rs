@@ -403,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn external_modification_between_record_and_check_is_detected() {
+    fn an_edit_after_recording_is_detected() {
         // Accept criterion (primary): an external edit made after recording is
         // reported as a ContentChanged conflict on the exact tracked path.
         let dir = tempfile::tempdir().expect("temp dir should be creatable");
@@ -672,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn record_bytes_fingerprints_supplied_bytes_not_the_current_file() {
+    fn record_bytes_fingerprints_the_supplied_bytes() {
         // The whole reason `record_bytes` exists (over `record`): it baselines the
         // bytes the caller read, closing the gap where an external edit lands
         // between the store's read and the tracker's own read. Simulate that race

@@ -476,7 +476,8 @@ beta=second";
     }
 
     #[test]
-    fn set_value_rewrites_only_the_value_span_and_keeps_the_spacing() {
+    fn set_value_rewrites_only_the_value_span() {
+        // The spacing around the `=` and after the value is kept.
         let mut file = KvFile::parse(MIXED);
         file.set_value("alpha", Occurrence::First, "three")
             .expect("alpha is an entry");

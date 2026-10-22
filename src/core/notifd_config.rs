@@ -613,9 +613,14 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_file_round_trips_and_reads_its_seven_defaults() {
+    fn the_shipped_file_round_trips() {
         let file = KvFile::parse(SHIPPED);
         assert_eq!(file.emit(), SHIPPED, "parse → emit must be byte-identical");
+    }
+
+    #[test]
+    fn the_shipped_file_reads_its_seven_defaults() {
+        let file = KvFile::parse(SHIPPED);
         let read = read_values(&file);
         assert!(read.missing.is_empty(), "{:?}", read.missing);
         assert!(read.ignored.is_empty(), "{:?}", read.ignored);
@@ -707,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn the_last_valid_assignment_wins_and_invalid_ones_are_ignored() {
+    fn the_last_valid_assignment_wins() {
         // The daemon applies lines in order: a valid line overwrites, an invalid one
         // changes nothing.
         let file = KvFile::parse(
@@ -757,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn spacing_around_the_equals_sign_is_read_and_kept_on_write() {
+    fn spacing_around_the_equals_sign_is_read() {
         let input = "timeout_low_ms = 5000\n  hold_min_ms=\t1500  \n";
         let read = read_values(&KvFile::parse(input));
         assert_eq!(
@@ -768,6 +773,11 @@ mod tests {
             value_of(&read, SettingId::NotifdHoldMin),
             Some(&Value::Integer(1500))
         );
+    }
+
+    #[test]
+    fn spacing_around_the_equals_sign_survives_a_write() {
+        let input = "timeout_low_ms = 5000\n  hold_min_ms=\t1500  \n";
         assert_eq!(
             render(
                 input,
@@ -781,7 +791,8 @@ mod tests {
     }
 
     #[test]
-    fn a_timeout_change_rewrites_exactly_one_value_span_of_the_shipped_file() {
+    fn a_timeout_change_rewrites_exactly_one_value_span() {
+        // Measured against the shipped file.
         let edited = render(
             SHIPPED,
             &[(SettingId::NotifdTimeoutNormal, Value::Integer(7500))],
@@ -795,7 +806,8 @@ mod tests {
     }
 
     #[test]
-    fn a_boolean_is_written_as_true_or_false_even_over_a_numeric_spelling() {
+    fn a_boolean_replaces_a_numeric_spelling_with_a_word() {
+        // Written as `true`/`false`, even where the file spelled it `1`/`0`.
         assert_eq!(
             render(
                 "copy_codes=1\n",
@@ -962,7 +974,7 @@ mod tests {
     }
 
     #[test]
-    fn the_model_is_offered_only_for_a_running_reloadable_daemon_and_a_readable_file() {
+    fn the_model_needs_a_reloadable_daemon_and_a_readable_file() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("config");
         fs::write(&path, SHIPPED).expect("write the file");
@@ -990,12 +1002,11 @@ mod tests {
     }
 
     #[test]
-    fn the_contribution_writes_nothing_when_clean_and_one_reloading_write_when_dirty() {
+    fn a_clean_notifd_config_contributes_nothing() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("config");
         fs::write(&path, SHIPPED).expect("write the file");
-        let model = NotifdConfigModel::offer(running("1.1"), path.clone()).expect("offered");
-        assert_eq!(model.path(), path);
+        let model = NotifdConfigModel::offer(running("1.1"), path).expect("offered");
 
         assert!(
             model
@@ -1003,6 +1014,16 @@ mod tests {
                 .expect("nothing to render")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_dirty_notifd_config_contributes_one_write() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config");
+        fs::write(&path, SHIPPED).expect("write the file");
+        let model = NotifdConfigModel::offer(running("1.1"), path.clone()).expect("offered");
+        assert_eq!(model.path(), path);
+
         let write = model
             .apply_contribution(&[(SettingId::NotifdTimeoutLow, Value::Integer(3000))])
             .expect("renders")

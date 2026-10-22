@@ -501,7 +501,7 @@ shadow=0a0c0d
     }
 
     #[test]
-    fn scan_skips_dotfiles_subdirs_and_non_palette_files() {
+    fn scan_lists_only_palette_files() {
         // Accept criterion: the scheme list is exactly the two palette files, with the
         // README, the dotfile, the state-marker, and the subdirectory all skipped —
         // so a marker never appears as a scheme.
@@ -540,7 +540,7 @@ shadow=0a0c0d
     }
 
     #[test]
-    fn active_scheme_is_detected_and_preselected() {
+    fn the_active_scheme_is_preselected() {
         // Accept criterion: the active scheme is detected from the generated header
         // (task 3.7) and preselected in the drop-down.
         let dir = tempfile::tempdir().expect("temp dir");
@@ -654,7 +654,7 @@ shadow=0a0c0d
     }
 
     #[test]
-    fn staging_a_different_scheme_is_dirty_and_reselecting_active_is_not() {
+    fn reselecting_the_active_scheme_clears_a_pending_switch() {
         let dir = tempfile::tempdir().expect("temp dir");
         let colors = dir.path().join("colors");
         write_colors_dir(&colors, &["everforest", "nord"]);
@@ -680,15 +680,19 @@ shadow=0a0c0d
         assert!(!model.is_dirty());
     }
 
-    #[test]
-    fn reset_discards_and_commit_promotes_the_staged_scheme() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let colors = dir.path().join("colors");
+    /// Loads a [`PaletteModel`] offering `everforest` and `nord`, with `nord` active.
+    fn nord_active_model(dir: &Path) -> PaletteModel {
+        let colors = dir.join("colors");
         write_colors_dir(&colors, &["everforest", "nord"]);
-        let active_source = dir.path().join("colors.conf");
+        let active_source = dir.join("colors.conf");
         write_active_source(&active_source, "nord");
+        PaletteModel::load(&colors, &active_source, PathBuf::from("/gen"))
+    }
 
-        let mut model = PaletteModel::load(&colors, &active_source, PathBuf::from("/gen"));
+    #[test]
+    fn reset_discards_a_staged_scheme() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut model = nord_active_model(dir.path());
 
         model.stage("everforest");
         model.reset();
@@ -698,6 +702,12 @@ shadow=0a0c0d
             Some("nord"),
             "reset reverts to the active scheme"
         );
+    }
+
+    #[test]
+    fn commit_promotes_a_staged_scheme() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut model = nord_active_model(dir.path());
 
         model.stage("everforest");
         model.commit();
@@ -710,7 +720,17 @@ shadow=0a0c0d
     }
 
     #[test]
-    fn apply_contribution_is_none_when_clean_and_carries_the_generator_path_when_dirty() {
+    fn a_clean_palette_contributes_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let model = nord_active_model(dir.path());
+        assert!(
+            model.apply_contribution().is_none(),
+            "nothing staged -> no contribution"
+        );
+    }
+
+    #[test]
+    fn a_staged_scheme_contributes_the_generator_path() {
         let dir = tempfile::tempdir().expect("temp dir");
         let colors = dir.path().join("colors");
         write_colors_dir(&colors, &["everforest", "nord"]);
@@ -719,11 +739,6 @@ shadow=0a0c0d
         let generate_colors = PathBuf::from("/repo/scripts/generate-colors");
 
         let mut model = PaletteModel::load(&colors, &active_source, generate_colors.clone());
-        assert!(
-            model.apply_contribution().is_none(),
-            "nothing staged -> no contribution"
-        );
-
         model.stage("everforest");
         let switch = model
             .apply_contribution()
@@ -733,7 +748,7 @@ shadow=0a0c0d
     }
 
     #[test]
-    fn applying_a_scheme_switch_runs_generate_colors_then_the_reload_chain() {
+    fn a_scheme_switch_runs_generate_colors_then_reloads() {
         // Accept criterion: feeding the model's contribution through the Apply pipeline
         // produces the exact command sequence — `generate-colors <scheme>` (the last
         // write step) then the palette reload chain — with NO colors/<scheme> file
@@ -817,7 +832,7 @@ shadow=0a0c0d
     }
 
     #[test]
-    fn the_schema_is_read_from_the_generator_and_a_17_key_scheme_is_not_offered() {
+    fn a_17_key_scheme_is_not_offered_under_18_names() {
         // The generator's 18-name list applies: a pre-`shadow` 17-key scheme is one
         // `generate-colors` would abort on, so it is not offered, while the complete
         // scheme is (R8.3, analysis §7.6).
@@ -843,7 +858,8 @@ shadow=0a0c0d
     }
 
     #[test]
-    fn a_19th_generator_name_makes_a_19_key_scheme_valid_without_a_code_change() {
+    fn a_19th_generator_name_makes_19_key_schemes_valid() {
+        // No code change is needed: the schema comes from the generator's NAMES line.
         let dir = tempfile::tempdir().expect("temp dir");
         let colors = dir.path().join("colors");
         write_colors_dir(&colors, &["nord"]);
@@ -871,7 +887,8 @@ shadow=0a0c0d
     }
 
     #[test]
-    fn an_unreadable_or_unparseable_generator_falls_back_to_the_built_in_keys() {
+    fn an_unusable_generator_falls_back_to_the_built_in_keys() {
+        // Unusable: absent, with no top-level NAMES line, or not UTF-8 text.
         let dir = tempfile::tempdir().expect("temp dir");
 
         // Absent script: the built-in 18-key list, and the model says so.
@@ -957,7 +974,7 @@ shadow=0a0c0d
     }
 
     #[test]
-    fn parse_hex_rgb_reads_bare_hex_and_rejects_malformed_values() {
+    fn parse_hex_rgb_reads_only_bare_hex() {
         assert_eq!(parse_hex_rgb("000000"), Some((0.0, 0.0, 0.0)));
         assert_eq!(parse_hex_rgb("ffffff"), Some((1.0, 1.0, 1.0)));
         // Wrong length and non-hex characters are rejected (skipped from the preview).

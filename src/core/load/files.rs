@@ -407,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unusable_file_is_skipped_and_the_others_still_load() {
+    fn an_unusable_file_never_blocks_the_others() {
         // R4.4: an input.lua the editor refuses (an opaque line) is skipped, rather than
         // panicking or loading garbage, and the readable hypridle.conf beside it still
         // loads — one bad file never suppresses the others.
@@ -437,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn loaded_files_populate_the_store_with_originals_and_a_baseline() {
+    fn loaded_files_fully_baseline_the_store() {
         // The end-to-end contract the window relies on: applying the LoadedFiles to a
         // store establishes real originals AND a freshness baseline, so a refresh
         // over the unchanged files reports no conflict.
@@ -560,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_merge_tracks_a_new_file_and_preserves_staged_edits() {
+    fn a_refresh_merge_keeps_edits_while_files_change() {
         // The task-9.3 refresh contract end to end at the headless seam: between the
         // startup load and a manual Refresh, one backing file appears (hypridle.conf)
         // and one tracked file is edited externally (input.lua), while the user has a
@@ -646,10 +646,9 @@ mod tests {
     }
 
     #[test]
-    fn the_notifd_loader_seeds_every_setting_and_skips_a_file_it_cannot_read_alike() {
+    fn the_notifd_loader_seeds_every_setting() {
         // Task 11.15: a trimmed file still seeds all seven settings (missing ones at the
-        // daemon default); a file with a character notifd splits differently is not
-        // tracked at all.
+        // daemon default).
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("config");
         std::fs::write(&path, "# trimmed\ncritical_per_app = 2\n").expect("write the file");
@@ -665,7 +664,14 @@ mod tests {
                 .values
                 .contains(&(SettingId::NotifdTimeoutLow, Value::Integer(5000)))
         );
+    }
 
+    #[test]
+    fn the_notifd_loader_refuses_a_file_notifd_reads_differently() {
+        // Task 11.15: a file with a character notifd splits differently than this app
+        // would is not tracked at all.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config");
         std::fs::write(&path, "timeout_low_ms=1\x0c\n").expect("write the file");
         let error = load_notifd_config(&path).expect_err("refused");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);

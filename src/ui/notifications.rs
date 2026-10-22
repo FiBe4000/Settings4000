@@ -551,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_action_names_what_did_not_happen_and_why() {
+    fn a_failed_action_message_explains_itself() {
         let error = NotifdActionError::Failed {
             code: Some(1),
             stderr: Some("Call failed: no such name".to_string()),
@@ -564,13 +564,17 @@ mod tests {
     }
 
     #[test]
-    fn the_staged_rows_exist_only_with_a_model_and_match_the_daemon_ranges() {
+    fn there_are_no_staged_rows_without_a_model() {
         // Task 11.15: without a model (notifd < 1.1, or no readable file) the page has
-        // only its runtime controls; with one, seven well-formed rows whose spin bounds
-        // are exactly notifd's ranges.
-        use crate::core::notifd::{NotifdStatus, NotifdVersion};
-
+        // only its runtime controls.
         assert!(page_rows(None).is_empty());
+    }
+
+    #[test]
+    fn the_staged_rows_match_the_daemon_ranges() {
+        // Task 11.15: with a model, the page has seven well-formed rows whose spin
+        // bounds are exactly notifd's ranges.
+        use crate::core::notifd::{NotifdStatus, NotifdVersion};
 
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("config");

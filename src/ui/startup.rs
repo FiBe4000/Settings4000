@@ -47,7 +47,7 @@ mod tests {
     use crate::testing::input_lua_with_sensitivity;
 
     #[test]
-    fn a_hyprlang_provider_hides_the_input_page_and_the_hyprland_cursor_write() {
+    fn a_hyprlang_provider_hides_the_lua_only_controls() {
         // Task 11.2 (analysis §8.6): the config provider is a guard. With `hyprctl`
         // present, a Lua host shows the Input page and keeps the Hyprland-side cursor
         // copy; a hyprlang host hides both, with nothing routed to a hyprlang writer.
@@ -92,7 +92,7 @@ mod tests {
     }
 
     #[test]
-    fn an_absent_or_unusable_input_lua_hides_the_input_page_and_logs_why_at_info() {
+    fn an_unusable_input_lua_hides_the_input_page() {
         // Task 11.4 (architecture §10, R4.2): on a Lua host with `hyprctl`, the Input
         // page still needs an `input.lua` the editor fully understands. A missing file
         // and one with an opaque line inside the `input` table each build no helper —
@@ -209,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_loads_a_model_when_its_capability_appears_or_disappears() {
+    fn refresh_rebuilds_a_model_as_its_capability_changes() {
         // The task-9.3 accept scenario at the capability seam: hypridle is installed
         // between startup and a Refresh. The startup pass built no Power & Idle model
         // (category hidden, R4.2); the refresh pass runs the *same* loader against the

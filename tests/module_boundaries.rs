@@ -373,7 +373,8 @@ fn assert_documented_blind_spot(line: &str) {
 }
 
 #[test]
-fn import_declarations_are_flagged_in_every_visibility_and_alias_form() {
+fn every_import_form_is_flagged() {
+    // Every visibility and alias form of `use`, and `extern crate`.
     assert_flagged("use gtk4::prelude::*;", "gtk4");
     assert_flagged("use gtk::Widget;", "gtk");
     assert_flagged("pub use relm4::Component;", "relm4");
@@ -391,7 +392,8 @@ fn import_declarations_are_flagged_in_every_visibility_and_alias_form() {
 }
 
 #[test]
-fn paths_rooted_at_a_forbidden_crate_are_flagged_without_any_import() {
+fn paths_rooted_at_a_forbidden_crate_are_flagged() {
+    // Such a path compiles with no import at all, so it is flagged on its own.
     assert_flagged("    let w = gtk4::Window::new();", "gtk4");
     // The globally-qualified spelling: legal with no `use` at all, because the
     // crate is a direct dependency. Missing it was the hole task 9.13 closed.
@@ -427,7 +429,7 @@ fn intra_crate_paths_and_lookalike_names_are_not_flagged() {
 }
 
 #[test]
-fn a_rejected_occurrence_does_not_mask_a_real_one_later_on_the_line() {
+fn a_rejected_occurrence_does_not_mask_a_later_one() {
     // The first `gtk::` is an inner segment; the second is a crate root. A
     // scanner that stopped at the first rejection would miss the real one.
     assert_flagged(
@@ -450,7 +452,7 @@ fn glib_is_forbidden_only_in_the_startup_load_module() {
 }
 
 #[test]
-fn a_reference_sharing_a_line_with_a_string_literal_is_still_flagged() {
+fn a_reference_beside_a_string_literal_is_flagged() {
     // Whole-file scanning strips comments *and* literals before matching, so a
     // string is no longer able to blank the code beside it. Both lines below are
     // legal Rust that a config-editing app could plausibly contain, and both hid a

@@ -1018,7 +1018,7 @@ mod tests {
     // --- (a) a display-class change: exact writes + `hyprctl reload`, nothing else -
 
     #[test]
-    fn a_display_change_writes_the_file_and_runs_only_hyprctl_reload() {
+    fn a_display_apply_runs_only_hyprctl_reload() {
         // Accept criterion (a): a display-class change writes exactly its file and
         // issues exactly `hyprctl reload`, with no other command and no signal.
         let dir = tempfile::tempdir().expect("temp dir should be creatable");
@@ -1283,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn a_deleted_tracked_file_does_not_block_an_apply_to_other_files() {
+    fn a_deleted_unwritten_file_does_not_block_the_apply() {
         // Task 9.11, the defect this scoping fixes: a tracked backing file that was
         // deleted can never be re-baselined by the store's refresh, so a whole-tracker
         // conflict check turned it into a permanent block on *every* category's apply
@@ -1346,7 +1346,7 @@ mod tests {
     }
 
     #[test]
-    fn an_external_edit_to_a_file_this_apply_does_not_write_does_not_block_it() {
+    fn an_external_edit_to_an_unwritten_file_does_not_block() {
         // The same scoping for the recoverable reason (task 9.11): a file someone else
         // edited that this apply does not write is reported, not blocking. Its external
         // bytes must stand untouched — the apply writes only its own target — and the
@@ -1440,7 +1440,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_write_target_whose_contents_cannot_be_read_aborts_the_apply() {
+    fn an_unreadable_write_target_aborts_the_apply() {
         // The case where step 2 is the *only* thing standing between the user and a
         // clobber: a target that still exists (so the atomic writer would happily
         // rewrite it) but whose read permission was revoked after it was loaded, meaning
@@ -1497,7 +1497,7 @@ mod tests {
     // --- (e) a mid-write failure: earlier files rolled back, no reloads ----------
 
     #[test]
-    fn a_mid_write_failure_rolls_back_earlier_files_and_runs_no_reloads() {
+    fn a_mid_write_failure_rolls_back_earlier_files() {
         // Accept criterion (e): when a later write fails, earlier written files are
         // restored to their pre-apply bytes and no reload is attempted (R5.4).
         let dir = tempfile::tempdir().expect("temp dir should be creatable");
@@ -1770,7 +1770,7 @@ mod tests {
     }
 
     #[test]
-    fn link_steps_run_after_the_file_writes_and_a_later_failure_restores_them() {
+    fn a_failure_after_the_link_steps_restores_them() {
         // Task 11.16, R5.4: the GTK-theme links are re-pointed in the write phase,
         // after the settings.ini write, and a failure after them (here the palette
         // generator) restores the old link text and the old file bytes alike.
@@ -1840,7 +1840,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failing_link_step_rolls_back_the_file_writes_and_runs_no_reload() {
+    fn a_failing_link_step_rolls_back_the_file_writes() {
         // A plain file where a link was planned (it appeared after the page looked) is
         // refused by the writer, and the transaction is undone: the settings.ini write
         // before it is restored and no gsettings call is made.
@@ -1916,7 +1916,7 @@ mod tests {
     }
 
     #[test]
-    fn a_generate_colors_failure_carries_the_generators_stderr_into_its_message() {
+    fn a_generate_colors_failure_message_carries_stderr() {
         // Task 9.10: the exit code alone does not say *why* the palette could not be
         // regenerated. Inject the documented `theme/fonts` abort — the generator exits
         // non-zero after printing the reason — and assert the reason survives into the
@@ -2026,7 +2026,7 @@ mod tests {
     }
 
     #[test]
-    fn a_generate_colors_spawn_failure_rolls_back_and_surfaces_a_command_error() {
+    fn a_generate_colors_spawn_failure_rolls_back() {
         // A `generate-colors` that cannot be run at all (not on PATH) is likewise a
         // write failure that rolls back the earlier writes, surfaced distinctly so
         // the UI can tell "the generator is missing" from "the generator failed".
@@ -2086,7 +2086,7 @@ mod tests {
     // --- (g) a reload failure: writes stand, error surfaced, others attempted ----
 
     #[test]
-    fn a_reload_failure_is_non_fatal_and_the_write_stands() {
+    fn a_reload_failure_leaves_the_write_standing() {
         // Accept criterion (g): a reload that fails does not roll back the write —
         // the write stands and the failure is surfaced (R5.5).
         let dir = tempfile::tempdir().expect("temp dir should be creatable");
@@ -2211,7 +2211,7 @@ mod tests {
     // --- A combined file write + palette switch (the deduped union) --------------
 
     #[test]
-    fn a_file_write_and_a_palette_switch_run_generate_colors_after_the_write() {
+    fn a_combined_apply_runs_generate_colors_after_the_write() {
         // A combined apply: rewrite monitors.conf AND switch the palette. The file is
         // written first and generate-colors runs as the last write step (proven
         // strictly by the rollback test above, where a generator failure rolls the
@@ -2478,7 +2478,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plan_with_writes_and_no_validations_is_flagged_as_drifted() {
+    fn a_write_without_its_validations_is_flagged_as_drift() {
         // The drift the guard exists for: a caller rendered a write whose values it
         // claims the plan validates, but dropped them from `validations` — so step 1's
         // R8.3 gate would pass vacuously.
@@ -2497,7 +2497,7 @@ mod tests {
     }
 
     #[test]
-    fn a_by_design_validation_free_plan_is_not_flagged_but_a_mixed_one_is() {
+    fn a_by_design_validation_free_plan_is_not_flagged() {
         // The declaration that keeps the guard honest. Two real applies reach the
         // pipeline with writes and no validations by design: a theme-only change (the
         // GTK/icon/cursor model carries no validations at all — task 9.27) and a
@@ -2516,16 +2516,6 @@ mod tests {
             "writes that declare themselves validation-free must not be flagged"
         );
 
-        // A write that does claim plan validation, alongside by-design ones, is still
-        // flagged — and only it: the declaration must not launder a genuine drift.
-        let mixed = plan_with_writes(&[
-            (BackingFile::GtkSettings, WriteValidation::NotNeeded),
-            (BackingFile::HypridleConf, WriteValidation::InPlan),
-        ]);
-        let flagged = writes_without_validations(&mixed);
-        assert_eq!(flagged.len(), 1);
-        assert_eq!(flagged[0].backing, BackingFile::HypridleConf);
-
         // A palette-only apply has no writes at all, so there is nothing to flag.
         let palette_only = ApplyPlan {
             validations: Vec::new(),
@@ -2538,6 +2528,19 @@ mod tests {
             reload_params: ReloadParams::default(),
         };
         assert!(writes_without_validations(&palette_only).is_empty());
+    }
+
+    #[test]
+    fn a_mixed_plan_flags_only_its_unvalidated_write() {
+        // A write that does claim plan validation, alongside by-design ones, is still
+        // flagged — and only it: the declaration must not launder a genuine drift.
+        let mixed = plan_with_writes(&[
+            (BackingFile::GtkSettings, WriteValidation::NotNeeded),
+            (BackingFile::HypridleConf, WriteValidation::InPlan),
+        ]);
+        let flagged = writes_without_validations(&mixed);
+        assert_eq!(flagged.len(), 1);
+        assert_eq!(flagged[0].backing, BackingFile::HypridleConf);
     }
 
     #[test]
@@ -2573,7 +2576,7 @@ mod tests {
     }
 
     #[test]
-    fn run_warns_about_a_drifted_plan_through_the_pipeline_entry_point() {
+    fn run_warns_about_a_drifted_plan() {
         // The guard is only worth anything if it is actually wired into `run`: the test
         // above exercises the helper, this one goes through the real entry point the UI
         // calls, so deleting the call from `run` fails the suite rather than merely

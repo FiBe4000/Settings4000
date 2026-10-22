@@ -1192,7 +1192,7 @@ mod tests {
     }
 
     #[test]
-    fn every_backing_file_maps_to_its_expected_hyprland_reload_scope() {
+    fn every_backing_file_maps_to_its_hyprland_reload_scope() {
         // Task 11.11, architecture §6: only monitors.conf takes the full reload;
         // every other Hyprland-side write takes `config-only`; the rest take none.
         // The exhaustive match (no `_` arm) forces a decision at compile time: a new
@@ -1215,8 +1215,12 @@ mod tests {
         for &file in BackingFile::ALL {
             assert_eq!(hyprland_scope(file), expected(file), "{file:?}");
         }
+    }
 
-        // Task 11.14 extends the same exhaustive table to the whole planned reload of
+    #[test]
+    fn every_backing_file_plans_its_expected_reloads() {
+        // Task 11.14 extends the exhaustive table of the test above (same compile-time
+        // forcing, same `BackingFile::ALL` gap) to the whole planned reload of
         // each file, with every component running and every value changed: the
         // wallpaper gains the bar text tone after the single hyprpaper request, and
         // only the settings.ini files ask for notifd's `Reload()` (the icon theme
@@ -1336,7 +1340,7 @@ mod tests {
     }
 
     #[test]
-    fn the_bar_text_tone_needs_its_detected_script_and_a_running_eww() {
+    fn the_bar_text_tone_needs_its_script_and_a_running_eww() {
         // Task 11.14: skipped when eww is not running (an `eww update` would find no
         // bar), and when detection reported no script or a different one.
         let without_eww = Capabilities::for_tests(&[], &[Daemon::Kitty], false)
@@ -1366,7 +1370,7 @@ mod tests {
     }
 
     #[test]
-    fn input_and_cursor_lua_files_map_to_exactly_the_config_only_reload() {
+    fn both_lua_files_map_to_the_config_only_reload() {
         // Tasks 11.4 and 11.11: an input.lua or hyprland.lua (cursor `hl.env`) change
         // re-runs the config without re-applying the monitor layout, like
         // `scripts/apply-theme` does.
@@ -1498,7 +1502,7 @@ mod tests {
     }
 
     #[test]
-    fn gtk_settings_maps_to_theme_and_cursor_gsettings_plus_setcursor() {
+    fn gtk_settings_maps_to_all_theme_reloads() {
         // settings.ini carries GTK theme, icon theme, and cursor: all three
         // `gsettings set` calls (in key order) plus `hyprctl setcursor`, and the icon
         // theme also asks notifd to `Reload()` (task 11.14).
@@ -1531,7 +1535,7 @@ mod tests {
     }
 
     #[test]
-    fn uwsm_env_and_the_cursor_fallback_theme_map_to_the_cursor_reload_only() {
+    fn cursor_only_copies_map_to_the_cursor_reload_only() {
         // uwsm/env and ~/.icons/default/index.theme hold only the cursor copy, so they
         // never emit the GTK/icon theme gsettings — only the cursor keys and setcursor.
         for file in [BackingFile::UwsmEnv, BackingFile::CursorFallbackTheme] {
@@ -1634,10 +1638,10 @@ mod tests {
     }
 
     #[test]
-    fn an_icon_theme_and_a_notifd_config_write_plan_one_reload() {
+    fn two_notifd_reload_requests_collapse_into_one() {
         // Task 11.15 on top of 11.14: a settings.ini write that changed the icon theme
         // and a notifd config write each ask for `Reload()`; one Apply issues it once,
-        // last. The config file alone asks for exactly that call.
+        // last.
         let icon_only = ReloadParams {
             icon_theme: Some("Papirus".to_string()),
             ..ReloadParams::default()
@@ -1651,6 +1655,11 @@ mod tests {
             kinds(&planned),
             vec!["gsettings icon-theme", "notifd Reload"]
         );
+    }
+
+    #[test]
+    fn a_notifd_config_write_plans_exactly_one_reload() {
+        // Task 11.15: the config file alone asks for exactly notifd's `Reload()`.
         assert_eq!(
             plan_reloads(
                 &[BackingFile::NotifdConfig],
@@ -1662,7 +1671,7 @@ mod tests {
     }
 
     #[test]
-    fn a_notifd_config_write_plans_nothing_without_a_reloadable_daemon() {
+    fn a_notifd_config_write_needs_a_reloadable_daemon() {
         // The file-backed rows are hidden for these daemons, so the case is a guard: the
         // gate drops the call rather than restart anything.
         for notifd in [
@@ -1717,7 +1726,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wallpaper_change_runs_the_bar_text_tone_after_hyprpaper_only_with_eww() {
+    fn the_bar_text_tone_follows_the_hyprpaper_request() {
         // Task 11.14 (architecture §6): the bar text tone follows the hyprpaper
         // request, and is skipped when eww is down or the script is absent.
         let planned = plan_reloads(
@@ -1784,7 +1793,7 @@ mod tests {
     // --- plan_reloads: dedup + ordering + gating -----------------------------
 
     #[test]
-    fn plan_dedups_and_orders_a_multi_file_cursor_change() {
+    fn a_multi_file_cursor_change_plans_each_reload_once() {
         // A cursor change writes settings.ini, uwsm/env, hyprland.lua and the
         // XCursor fallback index.theme. The files' actions overlap on the cursor
         // reload and must collapse to one of each, in canonical order: `hyprctl
@@ -1970,7 +1979,7 @@ mod tests {
     }
 
     #[test]
-    fn hyprpaper_action_sets_the_wallpaper_in_one_request_with_a_live_fit() {
+    fn the_hyprpaper_action_is_one_request_with_the_fit() {
         // Task 11.14: exactly one `wallpaper` request — no `preload`, which the
         // installed hyprctl rejects — on all outputs (empty monitor field before the
         // comma), with the fit as the third comma-field for the modes that render
@@ -2013,7 +2022,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_hyprpaper_request_is_a_reload_error_after_one_command() {
+    fn a_failed_hyprpaper_request_is_a_reload_error() {
         // A failing `wallpaper` request is surfaced (R5.5); nothing else was tried.
         let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake(1))]);
         let result = ReloadAction::HyprpaperWallpaper {
@@ -2167,7 +2176,7 @@ mod tests {
     }
 
     #[test]
-    fn hypridle_restart_falls_back_to_kill_and_respawn_when_the_unit_is_inactive() {
+    fn an_inactive_hypridle_unit_falls_back_to_a_respawn() {
         // When `is-active` reports non-zero (no active unit — the target dotfiles
         // case, where hypridle runs via exec-once), the fallback kills the running
         // hypridle with SIGTERM and respawns it with `setsid --fork`. This is exactly
@@ -2333,7 +2342,8 @@ mod tests {
     }
 
     #[test]
-    fn eval_quotes_strings_and_writes_numbers_and_booleans_bare() {
+    fn eval_renders_each_literal_kind() {
+        // Strings are quoted; numbers and booleans are written bare.
         let layouts = LuaLiteral::string("us,se").expect("allowed");
         assert_eq!(
             HyprlandEval::config("input.kb_layout", &layouts)

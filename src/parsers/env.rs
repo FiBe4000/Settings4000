@@ -818,7 +818,7 @@ export QT_QPA_PLATFORMTHEME=gtk3
     }
 
     #[test]
-    fn a_bare_assignment_is_recognized_edited_and_not_flagged() {
+    fn a_bare_assignment_is_an_ordinary_editable_entry() {
         // uwsm sources this file with allexport, so a bare `KEY=value` is an
         // exported variable, semantically identical to `export KEY=value`. It must
         // round-trip WITHOUT a warning and be editable value-only, preserving the
@@ -938,7 +938,7 @@ export QT_QPA_PLATFORMTHEME=gtk3
     }
 
     #[test]
-    fn a_commented_gtk_theme_is_present_but_commented_and_never_edited() {
+    fn a_commented_gtk_theme_is_never_edited() {
         // Accept criterion (R3.3): a commented-out `#export GTK_THEME=…` is present
         // but inactive — reported as Commented, `is_active()` false — and a
         // value-set call must NEVER touch the comment. Setting GTK_THEME (which the
@@ -1046,7 +1046,7 @@ export GTK_THEME=LiveValue
     }
 
     #[test]
-    fn a_malformed_line_is_preserved_and_warned_without_panicking() {
+    fn a_malformed_line_is_kept_with_a_warning() {
         // Accept criterion: an uninterpretable line (no `=`) surfaces as a parse
         // warning, not a panic, and is preserved losslessly. A bare `KEY=value`
         // line, by contrast, is a valid (allexport-exported) assignment and must
@@ -1107,7 +1107,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn a_quoted_value_round_trips_and_is_untouched_by_an_unrelated_edit() {
+    fn a_quoted_value_survives_an_unrelated_edit() {
         // A pre-existing quoted value must survive byte-for-byte when a different
         // key is edited (the app never rewrites this key), documenting that this
         // parser does not strip or synthesize shell quoting.
@@ -1122,7 +1122,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn editing_a_quoted_value_replaces_the_whole_span_including_quotes() {
+    fn editing_a_quoted_value_replaces_its_quotes_too() {
         // N1: when the existing value is quoted, the value span includes the
         // quotes, so set_value replaces the entire quoted token (this parser does
         // not peel quotes) and touches nothing else on the line or in the file.
@@ -1154,7 +1154,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn crlf_endings_round_trip_and_edits_keep_them() {
+    fn crlf_line_endings_survive_an_edit() {
         // A file with Windows `\r\n` endings must round-trip byte-for-byte and an
         // edit must change only the value bytes, never dragging the `\r` into the
         // value span. An append on a CRLF file uses CRLF for the new line too.
@@ -1180,7 +1180,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn value_and_set_value_target_the_last_assignment_of_a_duplicate() {
+    fn the_last_duplicate_assignment_is_the_one_addressed() {
         // A variable assigned twice is resolved by the shell to the LAST
         // assignment, so `value()` reads the last and `set_value` rewrites the
         // last, leaving the earlier shadowed copy byte-identical.
@@ -1214,7 +1214,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn an_export_separated_by_a_tab_is_recognized_and_editable() {
+    fn a_tab_after_export_is_recognized() {
         // N2: the `export` keyword may be followed by a tab, not just a space —
         // `skip_ascii_ws` handles both. The value span must be located correctly
         // and the tab preserved on edit.

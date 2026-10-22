@@ -663,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn versions_parse_as_major_minor_and_compare_numerically() {
+    fn versions_parse_as_major_minor() {
         assert_eq!(
             NotifdVersion::parse("1.1"),
             Some(NotifdVersion { major: 1, minor: 1 })
@@ -677,6 +677,10 @@ mod tests {
         ] {
             assert_eq!(NotifdVersion::parse(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn versions_compare_numerically() {
         let v = |text| NotifdVersion::parse(text).expect("valid version");
         assert!(v("1.10") > v("1.9"));
         assert!(!v("1.0").supports_state_and_reload());
@@ -801,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn status_resolution_covers_running_installed_and_absent() {
+    fn status_resolution_covers_every_daemon_state() {
         // Running 1.1 and 1.0.
         let running_1_1 = NotifdStatus::resolve(
             &replies(Some("b true\n"), Some(SERVER_INFO_1_1), None),

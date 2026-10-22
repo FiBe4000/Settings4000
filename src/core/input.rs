@@ -807,7 +807,7 @@ hl.config({
     }
 
     #[test]
-    fn empty_keyboard_options_are_seeded_only_when_the_input_table_exists() {
+    fn empty_keyboard_options_need_an_input_table() {
         // With an `input` table but no `kb_options` field, an empty KeyboardOptions is
         // seeded so a curated switch can stage a first option (the writer inserts the
         // field on Apply). Without an `input` table there is nothing to write into.
@@ -890,12 +890,16 @@ hl.config({
     }
 
     #[test]
-    fn unbalanced_structure_and_a_missing_table_fail_the_gate() {
+    fn unbalanced_structure_fails_the_gate() {
         let unclosed = INPUT_LUA.replace("    },\n})\n", "");
         assert!(matches!(
             check_input_lua(&LuaConfigFile::parse(&unclosed)),
             Err(InputLuaUnavailable::UnsafeStructure(_))
         ));
+    }
+
+    #[test]
+    fn a_missing_input_table_fails_the_gate() {
         assert!(matches!(
             check_input_lua(&LuaConfigFile::parse(
                 "hl.config({\n    general = {\n        gaps_in = 5,\n    },\n})\n"
@@ -959,7 +963,7 @@ hl.config({
     }
 
     #[test]
-    fn sensitivity_and_touchpad_edits_target_their_own_lines() {
+    fn each_input_edit_targets_its_own_line() {
         // The number and the two nested booleans each rewrite only their own literal,
         // at the right table depth, in their own Lua kind.
         let sensitivity = render(&[(SettingId::MouseSensitivity, Value::Float(0.5))]);
@@ -1108,7 +1112,7 @@ hl.config({
     }
 
     #[test]
-    fn a_staged_value_of_the_wrong_kind_fails_the_render_instead_of_being_skipped() {
+    fn a_wrong_kind_staged_value_fails_the_render() {
         // A boolean staged for the layout list has no Lua literal. Skipping it would
         // let the store commit a value that was never written, so the render fails
         // and names the path; an otherwise valid edit in the same batch does not mask
@@ -1265,7 +1269,7 @@ hl.config({
     }
 
     #[test]
-    fn apply_contribution_errors_when_the_file_was_edited_into_a_refusal() {
+    fn a_hand_edit_into_a_refusal_fails_the_contribution() {
         // The file passed the gate at load but was hand-edited since: a kind mismatch
         // must surface as an error so the Apply aborts, rather than skipping the write
         // and letting the store commit an unwritten value. The message names input.lua,
@@ -1296,7 +1300,7 @@ hl.config({
     }
 
     #[test]
-    fn apply_contribution_errors_when_dirty_but_the_file_is_unreadable() {
+    fn a_dirty_edit_on_an_unreadable_file_is_an_error() {
         // A dirty Input edit against a file that vanished since load is an error (the
         // Apply aborts), never a silent skip that would let commit_apply promote an
         // unwritten value.
@@ -1316,7 +1320,7 @@ hl.config({
     }
 
     #[test]
-    fn a_dirty_input_edit_applies_through_the_pipeline_with_a_config_only_reload() {
+    fn an_input_edit_applies_with_a_config_only_reload() {
         // The end-to-end store-SettingId -> FileWrite glue: a dirty Input setting
         // renders a surgical input.lua FileWrite whose diff is limited to the touched
         // line, and applying it through the shared pipeline writes that file and
@@ -1376,7 +1380,7 @@ hl.config({
     }
 
     #[test]
-    fn a_second_apply_after_commit_is_not_a_self_conflict_through_the_real_glue() {
+    fn a_second_apply_after_commit_is_not_a_self_conflict() {
         // Proves the window's fold-before-`store_writes`-capture plus `commit_apply`'s
         // re-baseline of input.lua work through the REAL renderer: load input.lua into
         // a real store, stage an Input edit, build the write via `apply_contribution`,

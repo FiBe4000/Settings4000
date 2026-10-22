@@ -1083,7 +1083,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn write_atomic_rewrites_symlink_target_and_preserves_the_link() {
+    fn write_atomic_rewrites_through_a_symlink() {
         // R5.4/R8.5: the app addresses the live XDG path, which for this
         // dotfiles setup is a symlink into the repo. Writing through it must
         // rewrite the *real* repo file's bytes and leave the link intact.
@@ -1148,7 +1148,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn write_atomic_through_a_relative_settings_ini_link_never_turns_it_into_a_plain_file() {
+    fn write_atomic_never_replaces_a_relative_link() {
         // Task 11.12 (analysis §7.7): the failure mode this guards against is the one
         // `nwg-look` caused on the target machine — saving `gtk-4.0/settings.ini` by
         // replacing the deployment symlink with a plain file, after which the repo copy
@@ -1386,7 +1386,7 @@ mod tests {
     }
 
     #[test]
-    fn create_atomic_creates_the_file_and_its_missing_parents_and_restore_removes_them() {
+    fn create_atomic_then_restore_removes_what_it_created() {
         // The XCursor fallback theme is created when absent (task 11.5, analysis
         // §8.4): `~/.icons` may exist while `default/` does not. The file lands with
         // the given bytes and a normal 0644 mode, the snapshot records "absent", and
@@ -1474,7 +1474,7 @@ mod tests {
     }
 
     #[test]
-    fn create_atomic_below_a_dangling_symlinked_parent_creates_nothing() {
+    fn create_atomic_below_a_dangling_parent_link_fails() {
         // `~/.icons` is a deployment link whose target is missing. The directory walk
         // stops at the link; creating `default/` below it follows the link and fails,
         // so the call is a Write error that creates nothing and keeps the link.
@@ -1585,7 +1585,7 @@ mod tests {
     }
 
     #[test]
-    fn point_symlink_atomically_re_points_an_existing_link_and_restore_puts_it_back() {
+    fn point_symlink_re_points_a_link_then_restore_reverts() {
         // Task 11.16 (analysis §8.4): a GTK-theme change re-points
         // `~/.config/gtk-4.0/gtk.css` from the old theme to the new one. Only the link
         // changes: both themes' files stay byte-identical, no temp link is left, and
@@ -1627,7 +1627,7 @@ mod tests {
     }
 
     #[test]
-    fn point_symlink_creates_an_absent_link_and_parent_and_restore_removes_both() {
+    fn point_symlink_creates_an_absent_link_reversibly() {
         // A host without the dotfiles' links (or without `~/.config/gtk-4.0` at all):
         // the link and the missing directory are created; the rollback removes exactly
         // what was created.
@@ -1657,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    fn link_steps_refuse_a_plain_file_or_directory_and_change_nothing() {
+    fn link_steps_never_replace_a_real_file_or_directory() {
         // A real `gtk.css` (or a real `assets/` directory) is a user-managed override:
         // neither primitive may replace or delete it.
         let tmp = tempfile::tempdir().expect("temp dir should be creatable");
@@ -1733,9 +1733,8 @@ mod tests {
     }
 
     #[test]
-    fn remove_symlink_keeps_relative_link_text_for_the_rollback_and_tolerates_absence() {
-        // The restore re-creates the exact old text — a relative link stays relative —
-        // and removing a link that is not there is already the wanted state.
+    fn removing_a_relative_link_restores_its_exact_text() {
+        // The restore re-creates the exact old text — a relative link stays relative.
         let tmp = tempfile::tempdir().expect("temp dir should be creatable");
         let link = tmp.path().join("gtk.css");
         symlink("../themes/Old/gtk-4.0/gtk.css", &link).expect("a relative link");
@@ -1747,7 +1746,12 @@ mod tests {
             fs::read_link(&link).expect("read"),
             Path::new("../themes/Old/gtk-4.0/gtk.css")
         );
+    }
 
+    #[test]
+    fn removing_an_absent_link_succeeds() {
+        // Removing a link that is not there is already the wanted state.
+        let tmp = tempfile::tempdir().expect("temp dir should be creatable");
         let absent = tmp.path().join("gtk-dark.css");
         let snapshot = remove_symlink(&absent).expect("removing nothing succeeds");
         snapshot.restore().expect("and so does undoing it");
@@ -1755,7 +1759,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_rename_deletes_the_temporary_link_and_keeps_the_old_one() {
+    fn a_failed_link_rename_cleans_up_its_temporary_link() {
         // The cleanup guarantee: if the new link cannot be renamed into place, the
         // temporary link is deleted again and the old link is untouched.
         let tmp = tempfile::tempdir().expect("temp dir should be creatable");
@@ -1800,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn a_link_rollback_leaves_a_path_another_program_changed_meanwhile() {
+    fn a_link_rollback_leaves_a_path_changed_meanwhile() {
         // Like a created file's rollback: once someone else has changed the link (or
         // put a file there), it is no longer the app's to undo.
         let tmp = tempfile::tempdir().expect("temp dir should be creatable");
@@ -1817,7 +1821,7 @@ mod tests {
     }
 
     #[test]
-    fn undoing_a_removal_leaves_a_plain_file_that_appeared_at_the_path() {
+    fn undoing_a_link_removal_leaves_a_new_plain_file() {
         // The warn-and-leave branch for a removed link: if another program puts a file
         // where the app removed a link, the rollback must not replace it with the old
         // link (nor fail the rollback).

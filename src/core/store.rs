@@ -803,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_apply_promotes_staged_and_rebaselines_written_files() {
+    fn commit_apply_makes_the_applied_state_the_baseline() {
         // The task-4.5 commit contract: after a successful apply the store must
         // become clean with the staged values as the new originals, AND treat the
         // just-written on-disk bytes as the freshness baseline — so the app's own
@@ -899,7 +899,7 @@ mod tests {
     }
 
     #[test]
-    fn dirty_in_category_returns_only_that_pages_dirty_settings_with_values() {
+    fn dirty_in_category_returns_only_that_pages_edits() {
         // The reusable Apply-glue seam (task 6.6/6.7): only the dirty settings of the
         // requested page are returned, each with its effective (staged) value, and a
         // clean page yields nothing.
@@ -966,7 +966,7 @@ mod tests {
     }
 
     #[test]
-    fn staging_nan_is_rejected_and_leaves_state_well_behaved() {
+    fn staging_nan_is_rejected_harmlessly() {
         // Dirty-robustness: a NaN float is rejected on stage, so it
         // never enters `staged`. An earlier valid edit is untouched by the rejection,
         // and reset still returns the store to clean.
@@ -1083,7 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn staging_an_unsafe_lock_command_is_rejected_and_reverts() {
+    fn staging_an_unsafe_lock_command_is_refused() {
         // R8.3: the hypridle lock command is free text typed into an
         // Entry, but is written into a hyprlang value — a `#` would be read as a comment
         // and truncate it. Staging such a value must be refused so the framework's
@@ -1400,7 +1400,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lock_command_without_hyprlock_discards_a_pending_grace_edit() {
+    fn a_non_hyprlock_lock_command_drops_a_pending_grace_edit() {
         let mut store = lock_store(REAL_LOCK_CMD, Some(10));
         store
             .stage(SettingId::LockGracePeriod, Value::Integer(30))
@@ -1563,7 +1563,7 @@ mod tests {
     }
 
     #[test]
-    fn an_out_of_range_grace_on_disk_blocks_lock_command_edits_until_lowered() {
+    fn an_out_of_range_grace_on_disk_blocks_lock_command_edits() {
         // The documented corner (see `linked_edit`): a hand-written `--grace 3600` loads
         // verbatim, an edit that keeps the token is refused, and the spin button's
         // in-range value is the way out, rewriting the token in place.

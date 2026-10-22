@@ -156,7 +156,7 @@ fn deployed_config_paths_are_symlinks_into_the_repo() {
 /// its palette source (R3.2/R8.5), and the deployed configs must read as
 /// readable (R4.4).
 #[test]
-fn detection_finds_the_palette_source_behind_the_deployed_symlink() {
+fn detection_finds_the_palette_source_behind_the_symlink() {
     let fx = FixtureDotfiles::install();
 
     let input_lua = fx.config_path("hypr/input.lua");
@@ -230,11 +230,9 @@ fn palette_schemes_parse_and_satisfy_the_schema() {
 }
 
 /// Every generator output named by `parsers::generated` exists in the fixture
-/// repo, and every color partial's header — `colors.lua`'s `-- # Generated …`
-/// included — names the fixture's active scheme, read through its deployed
-/// path (analysis §7.6, §8.3; task 11.6).
+/// repo (analysis §7.6; task 11.6).
 #[test]
-fn every_generated_file_exists_and_every_color_header_names_the_active_scheme() {
+fn every_generated_file_exists_in_the_fixture() {
     let fx = FixtureDotfiles::install();
 
     for relative in generated_files() {
@@ -243,6 +241,15 @@ fn every_generated_file_exists_and_every_color_header_names_the_active_scheme() 
             "{relative} is a generator output and must exist in the fixture"
         );
     }
+}
+
+/// Every color partial's header — `colors.lua`'s `-- # Generated …` included —
+/// names the fixture's active scheme, read through its deployed path (analysis
+/// §7.6, §8.3; task 11.6).
+#[test]
+fn every_color_header_names_the_active_scheme() {
+    let fx = FixtureDotfiles::install();
+
     for relative in GENERATED_COLOR_PARTIALS {
         // Deployed under `$XDG_CONFIG_HOME` (`config/…`) or as `~/.zsh_colors`.
         let live = match relative.strip_prefix("config/") {
@@ -461,7 +468,7 @@ fn active_scheme_reads_from_the_generated_header() {
 /// symlink lands in that tree's repo file — the property the atomic writer's
 /// symlink-following contract (R5.4) relies on.
 #[test]
-fn installs_are_isolated_and_symlinks_write_through_to_the_repo() {
+fn a_write_through_one_install_reaches_only_its_repo() {
     let fx_a = FixtureDotfiles::install();
     let fx_b = FixtureDotfiles::install();
     let original = read(&fx_b.config_path("hypr/input.lua"));
@@ -548,11 +555,9 @@ fn the_cursor_fallback_theme_parses_as_ini() {
 }
 
 /// The generator stub carries the real script's `NAMES=(…)` schema line
-/// verbatim — exactly once, 18 keys with `shadow` last (analysis §7.6) — yet
-/// stays inert when executed: it exits 2 before reaching the copied body, so
-/// no generated file is touched.
+/// verbatim — exactly once, 18 keys with `shadow` last (analysis §7.6).
 #[test]
-fn the_generator_stub_carries_the_real_schema_line_and_stays_inert() {
+fn the_generator_stub_carries_the_real_schema_line() {
     let fx = FixtureDotfiles::install();
     let generator = fx.repo_path("scripts/generate-colors");
 
@@ -569,6 +574,15 @@ fn the_generator_stub_carries_the_real_schema_line_and_stays_inert() {
         ],
         "the stub must carry exactly one, verbatim, NAMES line"
     );
+}
+
+/// For all the real schema line it carries, the generator stub stays inert when
+/// executed: it exits 2 before reaching the copied body, so no generated file is
+/// touched.
+#[test]
+fn the_generator_stub_stays_inert_when_run() {
+    let fx = FixtureDotfiles::install();
+    let generator = fx.repo_path("scripts/generate-colors");
 
     let before = repo_snapshot(&fx);
     let output = Command::new(&generator)
@@ -589,7 +603,7 @@ fn the_generator_stub_carries_the_real_schema_line_and_stays_inert() {
 /// shell-quoted arguments, appended to the file named by
 /// `SETTINGS4000_FIXTURE_STUB_LOG`. Running them changes nothing in the repo.
 #[test]
-fn the_action_script_stubs_record_their_argv_and_succeed() {
+fn the_action_script_stubs_record_their_argv() {
     let fx = FixtureDotfiles::install();
     // Outside the repo, so the untouched-repo assertion below stays meaningful.
     let log = fx.home().join("stub-calls.log");
@@ -638,7 +652,7 @@ fn the_action_script_stubs_record_their_argv_and_succeed() {
 /// are absolute links into the active theme's `gtk-4.0/` — the shape `setup.sh`
 /// creates — beside the still repo-linked `settings.ini`.
 #[test]
-fn the_system_theme_root_and_the_gtk4_theme_links_are_deployed() {
+fn the_gtk4_theme_fixture_is_deployed() {
     let fx = FixtureDotfiles::install();
     let root = fx.system_themes_root();
     assert!(

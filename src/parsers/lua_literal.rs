@@ -1934,7 +1934,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strings_render_double_quoted_and_verbatim() {
+    fn strings_render_verbatim_inside_double_quotes() {
         let layouts = LuaLiteral::string("us,se").expect("a plain layout list is allowed");
         assert_eq!(layouts.to_string(), "\"us,se\"");
         // Single quotes, `#`, `--` and non-ASCII text need no escaping inside a
@@ -1945,7 +1945,7 @@ mod tests {
     }
 
     #[test]
-    fn numbers_and_booleans_render_bare() {
+    fn non_string_literals_render_bare() {
         assert_eq!(LuaLiteral::integer(10).to_string(), "10");
         assert_eq!(LuaLiteral::integer(-3).to_string(), "-3");
         assert_eq!(LuaLiteral::float(0.3).unwrap().to_string(), "0.3");
@@ -1973,7 +1973,8 @@ mod tests {
     }
 
     #[test]
-    fn the_forbidden_character_rule_refuses_quotes_backslashes_and_control_characters() {
+    fn forbidden_characters_are_refused_in_strings() {
+        // Quotes, backslashes and control characters would end or break the literal.
         for (value, character) in [
             ("a\"b", '"'),
             ("C:\\path", '\\'),
@@ -2002,7 +2003,8 @@ mod tests {
     }
 
     #[test]
-    fn identifiers_follow_the_lua_name_rule_and_exclude_reserved_words() {
+    fn identifiers_follow_the_lua_name_rule() {
+        // Lua's Name rule: ASCII letters, digits and `_`, no leading digit, no keyword.
         for name in ["input", "natural_scroll", "_private", "kb_layout2"] {
             assert!(is_identifier(name), "{name} is a valid Lua key");
         }
@@ -2120,9 +2122,14 @@ mod tests {
     }
 
     #[test]
-    fn the_fixture_input_lua_round_trips_and_is_fully_addressable() {
+    fn the_fixture_input_lua_round_trips() {
         let file = parse_ok(INPUT_LUA);
         assert_eq!(file.emit(), INPUT_LUA);
+    }
+
+    #[test]
+    fn every_fixture_input_lua_value_is_addressable() {
+        let file = parse_ok(INPUT_LUA);
         assert_eq!(file.opaque_lines(), Vec::<usize>::new());
         assert_eq!(file.table_status("input"), TableStatus::Clean);
         assert_eq!(file.table_status("input.touchpad"), TableStatus::Clean);
@@ -2160,16 +2167,21 @@ mod tests {
     }
 
     #[test]
-    fn the_fixture_hyprland_lua_round_trips_and_exposes_the_cursor_env_lines() {
+    fn the_fixture_hyprland_lua_round_trips() {
         let file = parse_ok(HYPRLAND_LUA);
         assert_eq!(file.emit(), HYPRLAND_LUA);
+    }
+
+    #[test]
+    fn the_fixture_hyprland_lua_exposes_the_cursor_env_lines() {
+        let file = parse_ok(HYPRLAND_LUA);
         assert_eq!(file.env_value("XCURSOR_THEME"), Some("breeze_cursors"));
         assert_eq!(file.env_value("XCURSOR_SIZE"), Some("24"));
         assert_eq!(file.env_value("GTK_THEME"), None);
     }
 
     #[test]
-    fn hyprland_lua_is_opaque_everywhere_but_the_env_lines_and_its_option_table() {
+    fn hyprland_lua_is_opaque_but_for_env_lines_and_options() {
         let file = parse_ok(HYPRLAND_LUA);
         let opaque = file.opaque_lines();
         let env_lines = [
@@ -2226,7 +2238,8 @@ mod tests {
     }
 
     #[test]
-    fn hl_env_edits_leave_every_other_hyprland_lua_line_byte_identical() {
+    fn hl_env_edits_leave_other_hyprland_lua_lines_intact() {
+        // Every line but the edited hl.env line stays byte-identical.
         let theme_line = line_index(HYPRLAND_LUA, r#"hl.env("XCURSOR_THEME", "breeze_cursors")"#);
         let size_line = line_index(HYPRLAND_LUA, r#"hl.env("XCURSOR_SIZE", "24")"#);
 
@@ -2259,7 +2272,8 @@ mod tests {
     }
 
     #[test]
-    fn a_quote_bearing_value_is_refused_and_the_file_is_unchanged() {
+    fn a_quote_bearing_env_value_is_refused() {
+        // The refusal leaves the file unchanged.
         // No `#` anywhere — the hyprlang rule would let this through; the Lua rule
         // must not, because the `"` would end the string literal early.
         let value = r#"breeze" .. os.getenv("HOME") .. ""#;
@@ -2375,7 +2389,8 @@ mod tests {
     }
 
     #[test]
-    fn insertion_matches_the_sibling_indentation_before_the_closing_brace() {
+    fn insertion_copies_the_sibling_indentation() {
+        // A key is inserted before the table's closing brace, indented like its siblings.
         let mut file = parse_ok(INPUT_LUA);
         file.insert(
             "input",
@@ -2431,7 +2446,8 @@ mod tests {
     }
 
     #[test]
-    fn insertion_into_an_empty_table_indents_one_unit_past_the_opener() {
+    fn insertion_into_an_empty_table_indents_one_unit() {
+        // One indent unit (spaces or a tab, as the file uses) past the table's opener.
         let spaces = "hl.config({\n    input = {\n    },\n})\n";
         let mut file = parse_ok(spaces);
         file.insert("input", "kb_model", &LuaLiteral::string("pc105").unwrap())
@@ -2458,7 +2474,7 @@ mod tests {
     }
 
     #[test]
-    fn insertion_after_a_field_without_a_separator_adds_the_missing_comma() {
+    fn insertion_adds_a_missing_separator_comma() {
         // Lua allows the last field without a trailing comma; a field appended
         // after it would be a syntax error without one.
         let mut file = parse_ok(&lua(&[
@@ -2508,7 +2524,8 @@ mod tests {
     }
 
     #[test]
-    fn the_last_occurrence_of_a_duplicated_key_is_read_and_edited() {
+    fn the_last_duplicate_of_a_key_is_the_one_addressed() {
+        // Reads, edits and insertions all target the last occurrence.
         let text = lua(&[
             "hl.config({",
             "    input = {",
@@ -2570,7 +2587,7 @@ mod tests {
     }
 
     #[test]
-    fn a_repeated_sub_table_in_one_call_is_opaque_but_separate_calls_merge() {
+    fn a_repeated_sub_table_in_one_call_is_opaque() {
         // In one constructor the second `input = {` replaces the first table, so
         // `input.a` is not in effect even though only the first copy declares it.
         let one_call = lua(&[
@@ -2590,7 +2607,10 @@ mod tests {
             file.table_status(""),
             TableStatus::ContainsOpaque(_)
         ));
+    }
 
+    #[test]
+    fn sub_tables_in_separate_calls_merge() {
         // Two calls are applied one after the other, so both tables count.
         let two_calls = lua(&[
             "hl.config({",
@@ -2611,7 +2631,7 @@ mod tests {
     }
 
     #[test]
-    fn a_key_used_as_both_scalar_and_sub_table_in_one_call_is_opaque() {
+    fn a_key_both_scalar_and_table_in_one_call_is_opaque() {
         // Table first, then a scalar: Lua keeps `touchpad = 5`, so every entry of
         // the earlier table is dead and the scalar line is not addressed either.
         let table_then_scalar = lua(&[
@@ -2842,7 +2862,8 @@ mod tests {
     }
 
     #[test]
-    fn unrecognised_shapes_are_opaque_and_preserved() {
+    fn unrecognised_shapes_are_kept_as_opaque_lines() {
+        // Opaque lines are reported and survive the round trip byte-identical.
         // Each case is the body of `hl.config({ input = { … } })` (lines 3 on)
         // and the 1-based lines expected to be opaque.
         let cases: [(&[&str], Vec<usize>); 7] = [

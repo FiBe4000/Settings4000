@@ -145,12 +145,9 @@ fn rows(layouts: &[LayoutOption]) -> Vec<RowDescriptor> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn rows_are_well_formed_and_carry_the_xkb_candidates() {
-        // Every descriptor pairs a compatible widget and setting kind (so the framework
-        // builds the right control), and the layout add-control offers the XKB layouts
-        // with the code stored and the description shown (R2.3).
-        let layouts = vec![
+    /// Two XKB layout candidates, as the evdev rules file would list them.
+    fn two_layouts() -> Vec<LayoutOption> {
+        vec![
             LayoutOption {
                 code: "us".to_string(),
                 description: "English (US)".to_string(),
@@ -159,8 +156,14 @@ mod tests {
                 code: "se".to_string(),
                 description: "Swedish".to_string(),
             },
-        ];
-        let rows = rows(&layouts);
+        ]
+    }
+
+    #[test]
+    fn input_rows_are_well_formed() {
+        // Every descriptor pairs a compatible widget and setting kind, so the framework
+        // builds the right control.
+        let rows = rows(&two_layouts());
 
         for row in &rows {
             assert!(
@@ -169,6 +172,13 @@ mod tests {
                 row.setting
             );
         }
+    }
+
+    #[test]
+    fn the_layout_row_offers_the_xkb_candidates() {
+        // The layout add-control offers the XKB layouts with the code stored and the
+        // description shown (R2.3).
+        let rows = rows(&two_layouts());
 
         // The layout list carries the two candidates, code as token, description shown.
         match &rows[0].widget {
@@ -183,6 +193,11 @@ mod tests {
             }
             other => panic!("expected the first row to be the layout list, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_curated_keyboard_options_are_token_switches() {
+        let rows = rows(&two_layouts());
 
         // Both curated options are token-switches over the single KeyboardOptions string.
         let token_switches: Vec<&str> = rows

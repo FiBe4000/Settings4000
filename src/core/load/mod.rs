@@ -284,18 +284,20 @@ mod tests {
     use super::*;
     use crate::core::theme::{WallpaperModel, WallpaperPaths};
 
-    #[test]
-    fn a_dirty_model_survives_a_refresh_and_a_clean_one_is_replaced() {
-        // The three adopt_refreshed_model rules, on a stand-in staging model (the four
-        // real staging models share no trait; the rule is model-agnostic).
-        struct Staging {
-            label: &'static str,
-            dirty: bool,
-        }
-        fn is_dirty(model: &Staging) -> bool {
-            model.dirty
-        }
+    /// A stand-in staging model for the three `adopt_refreshed_model` rules below: the
+    /// four real staging models share no trait, and the rule is model-agnostic.
+    struct Staging {
+        label: &'static str,
+        dirty: bool,
+    }
 
+    /// The dirty predicate `adopt_refreshed_model` is handed for the stand-in model.
+    fn is_dirty(model: &Staging) -> bool {
+        model.dirty
+    }
+
+    #[test]
+    fn a_clean_model_is_replaced_on_refresh() {
         // Clean -> the fresh load wins, so external source changes are reflected.
         let mut current = Some(Staging {
             label: "stale",
@@ -310,7 +312,10 @@ mod tests {
             is_dirty,
         );
         assert_eq!(current.as_ref().map(|m| m.label), Some("fresh"));
+    }
 
+    #[test]
+    fn a_dirty_model_survives_a_refresh() {
         // Dirty -> the user's staged edits are kept; the fresh load is discarded (R5.6).
         let mut current = Some(Staging {
             label: "dirty",
@@ -325,14 +330,21 @@ mod tests {
             is_dirty,
         );
         assert_eq!(current.as_ref().map(|m| m.label), Some("dirty"));
+    }
 
+    #[test]
+    fn a_model_whose_capability_is_gone_is_dropped() {
         // Capability gone -> dropped even while dirty, so the section hides (R4.2).
+        let mut current = Some(Staging {
+            label: "dirty",
+            dirty: true,
+        });
         adopt_refreshed_model(&mut current, None, is_dirty);
         assert!(current.is_none());
     }
 
     #[test]
-    fn a_real_wallpaper_model_keeps_its_staged_edit_across_a_refresh() {
+    fn a_dirty_wallpaper_model_survives_a_refresh() {
         // The dirty-keep rule on a real staging model (not a stand-in): a staged
         // fit-mode edit on a fixture-backed WallpaperModel must survive adoption of
         // the clean model a refresh pass loads from the same sources — this is the

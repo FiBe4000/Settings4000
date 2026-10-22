@@ -672,12 +672,17 @@ mod tests {
     }
 
     #[test]
-    fn detached_flag_is_off_by_default_and_participates_in_equality() {
+    fn the_detached_flag_is_off_by_default() {
+        let capturing = Command::new("setsid").args(["--fork", "nmtui"]);
+        assert!(!capturing.is_detached(), "capture mode is the default");
+    }
+
+    #[test]
+    fn the_detached_flag_participates_in_equality() {
         // The flag must distinguish otherwise-identical commands: a mock-runner
         // assertion on recorded commands is what verifies a launch really was
         // detached, so an accidental capture-mode launch must fail the equality.
         let capturing = Command::new("setsid").args(["--fork", "nmtui"]);
-        assert!(!capturing.is_detached(), "capture mode is the default");
         let detached = Command::new("setsid").args(["--fork", "nmtui"]).detached();
         assert!(detached.is_detached());
         assert_ne!(
@@ -739,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn mock_returns_queued_outcomes_in_order_then_defaults_to_success() {
+    fn the_mock_replays_queued_outcomes_then_succeeds() {
         let runner = MockCommandRunner::with_outcomes([
             Ok(CommandOutput::fake_with_streams(0, "ready\n", "")),
             Ok(CommandOutput::fake(1)),
@@ -836,7 +841,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn real_runner_times_out_and_kills_a_slow_command() {
+    fn real_runner_kills_a_command_past_its_deadline() {
         use std::time::Instant;
 
         // A short injected deadline keeps the test fast; production stays at the
@@ -897,7 +902,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn real_runner_does_not_interpret_shell_metacharacters_in_arguments() {
+    fn real_runner_never_interprets_shell_metacharacters() {
         // The module's headline invariant is that arguments are handed to the OS
         // `exec` verbatim, never to a shell (architecture §10). This makes that
         // an enforced test rather than a claim: the argument packs shell
@@ -967,7 +972,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn real_runner_returns_promptly_from_a_detached_long_lived_child() {
+    fn real_runner_returns_promptly_from_a_detached_child() {
         use std::time::Instant;
 
         // Regression guard: `setsid --fork` exits immediately, but

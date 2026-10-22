@@ -481,7 +481,7 @@ shadow=0a0c0d
     }
 
     #[test]
-    fn missing_malformed_and_empty_headers_degrade_to_unknown_without_error() {
+    fn unrecognised_headers_degrade_to_unknown() {
         // Accept criterion: a missing/odd header (and an empty file) degrades to
         // "unknown" without an Err or panic.
         let cases = [
@@ -517,9 +517,9 @@ shadow=0a0c0d
     }
 
     #[test]
-    fn read_active_scheme_reads_a_file_and_treats_an_unreadable_path_as_unknown() {
+    fn read_active_scheme_reads_a_file_header() {
         // The file-backed entry point: a real file with a good header resolves to
-        // the scheme...
+        // the scheme.
         let mut file = NamedTempFile::new().expect("create temp colors.conf");
         file.write_all(COLORS_CONF_FIXTURE.as_bytes())
             .expect("write fixture");
@@ -527,9 +527,12 @@ shadow=0a0c0d
             read_active_scheme(file.path()),
             ActiveScheme::Named("everforest".to_string())
         );
+    }
 
-        // ...and an unreadable (here, nonexistent) path degrades to Unknown rather
-        // than returning an error — covering the "unreadable input" acceptance.
+    #[test]
+    fn read_active_scheme_treats_an_unreadable_path_as_unknown() {
+        // An unreadable (here, nonexistent) path degrades to Unknown rather than
+        // returning an error — covering the "unreadable input" acceptance.
         let missing = Path::new("/nonexistent/settings4000/hypr/colors.conf");
         assert_eq!(read_active_scheme(missing), ActiveScheme::Unknown);
     }
@@ -600,7 +603,7 @@ accent0=83c092
     }
 
     #[test]
-    fn read_scheme_swatch_reads_a_file_and_returns_none_for_a_missing_path() {
+    fn read_scheme_swatch_reads_a_scheme_file() {
         let mut file = NamedTempFile::new().expect("create temp scheme file");
         file.write_all(SCHEME_FIXTURE.as_bytes())
             .expect("write fixture");
@@ -609,8 +612,12 @@ accent0=83c092
         let swatch = read_scheme_swatch(file.path(), &schema).expect("readable scheme file");
         assert_eq!(swatch.colors().len(), schema.keys().len());
         assert_eq!(swatch.color("accent0"), Some("83c092"));
+    }
 
+    #[test]
+    fn read_scheme_swatch_is_none_for_a_missing_path() {
         // A missing file yields None (no swatch), never an error.
+        let schema = PaletteSchema::built_in();
         let missing = Path::new("/nonexistent/settings4000/colors/everforest");
         assert!(read_scheme_swatch(missing, &schema).is_none());
     }
@@ -665,7 +672,7 @@ accent0=83c092
     }
 
     #[test]
-    fn the_generated_file_set_is_the_ten_outputs_of_the_current_generator() {
+    fn the_generated_file_set_is_the_generators_ten_outputs() {
         // Analysis §8.3: six color partials (with the Lua one, without the retired
         // notification-daemon stylesheet), three font partials and the marker —
         // exactly the ten `cat >` targets of the `8a5b20b` generator.

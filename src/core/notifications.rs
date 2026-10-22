@@ -576,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_call_reads_as_an_exit_status_with_the_stderr_excerpt() {
+    fn a_failed_call_message_quotes_the_stderr_excerpt() {
         let mut model = running_model();
         let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake_with_streams(
             1,
@@ -646,7 +646,8 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_dnd_call_is_reported_and_keeps_the_shown_state() {
+    fn a_failed_dnd_call_keeps_the_shown_state() {
+        // The failure is still returned as an error.
         let mut model = running_model();
         let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake_with_streams(
             1,

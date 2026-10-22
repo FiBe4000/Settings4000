@@ -461,7 +461,7 @@ listener {
     }
 
     #[test]
-    fn editing_one_listener_timeout_leaves_the_other_blocks_byte_identical() {
+    fn a_listener_timeout_edit_leaves_other_blocks_intact() {
         // THE headline acceptance criterion: editing the dim listener's timeout rewrites
         // only that occurrence's value span; the lock and DPMS listener blocks (and the
         // general block, and every comment) stay byte-identical — occurrence-indexed
@@ -585,7 +585,7 @@ listener {
     }
 
     #[test]
-    fn a_grace_edit_inserts_the_flag_and_keeps_the_trailing_comment() {
+    fn a_grace_edit_inserts_the_flag_keeping_the_comment() {
         // Insert: no flag yet, so ` --grace 15` goes right after the `hyprlock` word;
         // the alignment spaces and the `#` comment after the value survive.
         let edited = String::from_utf8(
@@ -604,7 +604,7 @@ listener {
     }
 
     #[test]
-    fn a_zero_grace_removes_the_flag_and_keeps_the_trailing_comment() {
+    fn a_zero_grace_removes_the_flag_keeping_the_comment() {
         // Remove: grace 0 is hyprlock's default, so the token goes instead of reading
         // `--grace 0`; the rest of the line, comment included, is unchanged.
         let with_grace =
@@ -732,7 +732,7 @@ listener {
     }
 
     #[test]
-    fn a_full_edit_changes_only_the_touched_lines_in_setting_id_order() {
+    fn a_full_edit_changes_only_the_touched_lines() {
         // All four Power & Idle settings at once: each touches exactly its own line, and
         // `changed_keys` is in SettingId order (dim, lock, dpms, then the lock command).
         let edit = render_hypridle_conf(
@@ -810,7 +810,7 @@ listener {
     }
 
     #[test]
-    fn apply_contribution_errors_when_dirty_but_the_file_is_unreadable() {
+    fn a_dirty_edit_on_an_unreadable_file_is_an_error() {
         // A dirty Power & Idle edit against a missing file is an error (the Apply aborts),
         // never a silent skip that would let commit_apply promote an unwritten value.
         let dir = tempfile::tempdir().expect("temp dir");
@@ -831,7 +831,7 @@ listener {
     }
 
     #[test]
-    fn apply_contribution_rejects_an_unsafe_lock_command_defense_in_depth() {
+    fn the_writer_rejects_an_unsafe_lock_command() {
         // Defense in depth: even though the stage-time validator rejects a lock
         // command containing `#`/newline before it can be staged, the writer keeps its own
         // `reject_unsafe_value` guard — a lock command with a `#` surfaces as a
@@ -856,7 +856,7 @@ listener {
     }
 
     #[test]
-    fn a_dirty_power_edit_applies_through_the_pipeline_with_a_hypridle_restart() {
+    fn a_power_edit_applies_with_a_hypridle_restart() {
         // The end-to-end store-SettingId -> FileWrite glue (task 6.8): a dirty timeout +
         // lock-command edit renders a surgical hypridle.conf FileWrite whose diff is limited
         // to the touched lines, and applying it through the shared pipeline writes that file
@@ -980,7 +980,7 @@ listener {
     }
 
     #[test]
-    fn a_second_apply_after_commit_is_not_a_self_conflict_through_the_real_glue() {
+    fn a_second_apply_after_commit_is_not_a_self_conflict() {
         // Mirrors the Input page's end-to-end self-conflict test (task 6.6):
         // hypridle.conf is store-loaded, so the window folds its write into `apply::run`
         // over the store's freshness and `commit_apply` re-baselines it from the exact

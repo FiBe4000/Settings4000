@@ -218,7 +218,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn desktop_entry_icon_and_installer_carry_the_application_id() {
+    fn every_install_artifact_carries_the_application_id() {
         // Task 8.2: on Wayland, GTK sets every window's app_id to `APP_ID`, and
         // compositors/launchers associate that window (and its icon) with the
         // desktop file named `<app-id>.desktop`. The desktop entry's file name,

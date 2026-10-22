@@ -322,7 +322,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_reads_connections_unescapes_names_and_filters_loopback() {
+    fn parse_reads_the_user_facing_connections() {
+        // Names are unescaped; the loopback record is filtered out.
         let connections = parse_active_connections(NMCLI_ACTIVE);
 
         // Three user-facing connections; the loopback record is filtered out.
@@ -432,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn open_settings_spawns_the_expected_detached_command_per_capability() {
+    fn open_settings_launches_the_right_tool_detached() {
         // Accept criterion (button spawns the expected command per available
         // capability, mock runner): drive the full decision + launch for each
         // capability combination and assert the exact setsid arg vector. The

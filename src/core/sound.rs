@@ -662,7 +662,8 @@ Settings
     }
 
     #[test]
-    fn parse_pw_dump_reads_devices_defaults_volume_and_mute() {
+    fn parse_pw_dump_reads_the_audio_device_state() {
+        // Devices, the defaults, and each device's volume and mute state.
         let state = parse_pw_dump(PW_DUMP).expect("valid JSON array parses");
 
         // Two outputs; the first is default, the second muted at full volume. Video and
@@ -695,7 +696,7 @@ Settings
     }
 
     #[test]
-    fn parse_pw_dump_uses_the_first_channel_for_unequal_multichannel_volumes() {
+    fn parse_pw_dump_takes_the_first_of_unequal_channels() {
         // N2: with per-channel imbalance the FIRST channel is the representative level.
         // channelVolumes[0] = 0.125 -> 0.5; the second (0.729 -> 0.9) is ignored.
         let json = r#"[
@@ -764,7 +765,7 @@ Settings
     }
 
     #[test]
-    fn parse_wpctl_status_reads_audio_sinks_and_sources_only() {
+    fn parse_wpctl_status_reads_only_audio_devices() {
         let state = parse_wpctl_status(WPCTL_STATUS);
 
         // The Audio sinks — the Video source and the Settings config lines are excluded.
@@ -887,7 +888,7 @@ Settings
     }
 
     #[test]
-    fn control_functions_issue_the_expected_commands_through_the_runner() {
+    fn controls_issue_their_wpctl_commands_via_the_runner() {
         // Driving a control runs exactly the built command via the runner (R6.1) — the
         // proof that a device switch / volume / mute reaches `wpctl` with the right id.
         let runner = MockCommandRunner::new();

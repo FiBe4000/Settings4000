@@ -632,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_rows_drops_gated_rows_and_keeps_order() {
+    fn visible_rows_drops_gated_rows_in_order() {
         // Per-row gating (R4.2): a row whose capability is absent is filtered out; the
         // rest keep their declared order.
         let descriptors = vec![
@@ -665,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn all_rows_gated_out_yields_an_empty_page_for_the_category_drop() {
+    fn all_rows_gated_out_yields_an_empty_page() {
         // The composition with task 5.1 (R4.2 "hide the whole category when emptied"):
         // when every row of a shown category is gated out, `visible_rows` is empty, and
         // the window builder treats that as an emptied category to drop.
@@ -721,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn list_swap_reorders_and_is_a_no_op_at_the_ends() {
+    fn list_swap_reorders_within_bounds_only() {
         let items = layouts();
 
         // A middle swap (move index 1 up to 0) reorders the two entries.
@@ -746,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn list_remove_deletes_by_index_and_can_empty_the_list() {
+    fn list_remove_deletes_by_index() {
         let items = layouts();
 
         assert_eq!(
@@ -763,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn list_add_appends_and_ignores_duplicates() {
+    fn list_add_appends_only_new_tokens() {
         let items = layouts();
 
         // A new token is appended at the end, preserving order.
@@ -783,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn token_switch_toggles_one_token_and_preserves_the_rest() {
+    fn token_switch_toggles_one_token_in_place() {
         // The curated keyboard-option switch (task 6.6): toggling one token in/out of a
         // comma list must keep every other token — including one the app has no switch
         // for (`compose:ralt`) — in place and in order (R4.2 preserve-unknowns).
@@ -920,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn the_grace_row_is_hidden_and_logged_when_hyprlock_is_not_started() {
+    fn the_grace_row_hides_without_a_hyprlock_lock_command() {
         // R4.2: hidden (not greyed out), with an `info` line naming the row; rows
         // without a gate are unaffected.
         for (command, grace) in [

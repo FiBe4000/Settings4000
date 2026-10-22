@@ -314,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn theme_is_shown_for_any_sub_feature_and_hidden_only_when_all_are_gone() {
+    fn theme_is_hidden_only_when_every_sub_feature_is_gone() {
         // The whole-category-hidden rule (R4.2) for an aggregate page: each of Theme's
         // independent features alone keeps the category visible, and only when every
         // one is absent is the category hidden. (`for_tests` fixes the palette source
@@ -405,16 +405,21 @@ mod tests {
     }
 
     #[test]
-    fn title_and_stack_name_are_unique_across_categories() {
-        // The stack addresses pages by name and the sidebar shows titles, so both
-        // must be unique or pages would collide/shadow. Guards against a copy-paste
-        // slip as categories are added.
+    fn category_titles_are_unique() {
+        // The sidebar shows titles, so they must be unique or pages would shadow one
+        // another. Guards against a copy-paste slip as categories are added.
         let mut titles: Vec<&str> = SidebarCategory::ALL.iter().map(|c| c.title()).collect();
         let count = titles.len();
         titles.sort_unstable();
         titles.dedup();
         assert_eq!(titles.len(), count, "category titles must be unique");
+    }
 
+    #[test]
+    fn category_stack_names_are_unique() {
+        // The stack addresses pages by name, so names must be unique or pages would
+        // collide. Guards against a copy-paste slip as categories are added.
+        let count = SidebarCategory::ALL.len();
         let mut names: Vec<&str> = SidebarCategory::ALL
             .iter()
             .map(|c| c.stack_name())

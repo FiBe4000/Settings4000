@@ -775,7 +775,7 @@ fn an_unreadable_hypridle_conf_aborts_the_whole_apply() {
 }
 
 #[test]
-fn staged_power_edits_without_a_power_model_abort_the_whole_apply() {
+fn orphaned_power_edits_abort_the_whole_apply() {
     // The generic orphaned-edits branch of the store-backed fold, through a page other
     // than Input: a Refresh dropped the Power & Idle helper (hypridle uninstalled, say)
     // while a lock-timeout edit was still staged. There is no write for it to land in,
@@ -797,7 +797,7 @@ fn staged_power_edits_without_a_power_model_abort_the_whole_apply() {
 }
 
 #[test]
-fn staged_notifd_edits_without_a_notifd_model_abort_the_whole_apply() {
+fn orphaned_notifd_edits_abort_the_whole_apply() {
     // Task 11.15, the same branch for the Notifications page: the store tracks
     // notifd/config and holds a staged timeout, but a Refresh found no notifd >= 1.1 (so
     // no helper), leaving the edit with no write to land in.
@@ -857,7 +857,7 @@ fn an_unrenderable_monitor_record_aborts_the_whole_apply() {
 }
 
 #[test]
-fn an_assembled_plan_applies_and_reconciles_every_source() {
+fn an_assembled_plan_applies_then_reconciles_every_source() {
     // The whole seam end to end: assemble one plan carrying a store-backed write and a
     // model write, run it, then reconcile the way the window does — the store from
     // `store_writes`, each model whose flag `commits` set. Afterwards nothing is dirty and
@@ -947,7 +947,7 @@ fn an_assembled_plan_applies_and_reconciles_every_source() {
 }
 
 #[test]
-fn an_assembled_theme_apply_runs_the_follow_up_reloads_in_order_and_once() {
+fn an_assembled_theme_apply_orders_its_follow_up_reloads() {
     // Task 11.14 end to end (architecture §6): one assembled Apply switches the
     // palette, the icon theme and the wallpaper, with every component running. The
     // reloads come out in the canonical order — the apply-theme chain around the

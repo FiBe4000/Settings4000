@@ -102,7 +102,7 @@ fn apply_notifd(
 }
 
 #[test]
-fn a_timeout_change_rewrites_one_value_span_through_the_symlink_and_reloads_notifd_once() {
+fn a_timeout_change_rewrites_one_value_span() {
     // The headline acceptance criterion: staging a timeout rewrites exactly that value
     // span — every comment and blank line of the shipped file intact — at the deployed
     // path, whose repo target receives the bytes while the link stays a link, and the
@@ -164,7 +164,7 @@ fn a_timeout_change_rewrites_one_value_span_through_the_symlink_and_reloads_noti
 }
 
 #[test]
-fn values_notifd_would_ignore_are_refused_when_staged_with_the_rule_named() {
+fn values_notifd_would_ignore_are_refused_when_staged() {
     // R8.3: notifd silently falls back to its default for an out-of-range value, so the
     // app refuses such a value at stage time — the control reverts — and the message
     // names the key and the range.
@@ -213,7 +213,7 @@ fn values_notifd_would_ignore_are_refused_when_staged_with_the_rule_named() {
 }
 
 #[test]
-fn an_icon_theme_and_a_notifd_config_change_in_one_apply_reload_notifd_once() {
+fn two_reload_requests_in_one_apply_reload_notifd_once() {
     // Tasks 11.14/11.15: the icon theme (read by notifd from gtk-3.0/settings.ini) and
     // the notifd config file both ask for `Reload()`; one Apply issues it once, last.
     let fx = FixtureDotfiles::install();
@@ -288,7 +288,7 @@ fn an_icon_theme_and_a_notifd_config_change_in_one_apply_reload_notifd_once() {
 }
 
 #[test]
-fn without_the_file_or_with_notifd_1_0_only_the_runtime_controls_are_shown() {
+fn the_staged_rows_need_notifd_1_1_and_a_readable_file() {
     // R4.2: the staged rows need notifd >= 1.1 *and* a readable file. Either missing
     // leaves the page with its runtime controls alone, and the reason is logged at
     // `info`; with both present the page offers all seven rows.
@@ -333,7 +333,7 @@ fn without_the_file_or_with_notifd_1_0_only_the_runtime_controls_are_shown() {
 }
 
 #[test]
-fn a_key_missing_from_a_trimmed_file_shows_its_default_and_is_appended_when_changed() {
+fn a_missing_key_shows_its_default_then_is_appended() {
     // The shipped file lists all seven keys, but a hand-trimmed one must still work:
     // the missing key is seeded with notifd's default and, once changed, appended as a
     // bare `key=value` line at the end; nothing else moves.
@@ -370,7 +370,7 @@ fn a_key_missing_from_a_trimmed_file_shows_its_default_and_is_appended_when_chan
 }
 
 #[test]
-fn an_external_edit_between_load_and_apply_aborts_as_conflicted() {
+fn an_external_edit_after_load_aborts_as_conflicted() {
     // R5.6: the store baselines the file at load, so an edit by another program (here:
     // the user editing it by hand) aborts the Apply with nothing written or called.
     let fx = FixtureDotfiles::install();
@@ -399,7 +399,7 @@ fn an_external_edit_between_load_and_apply_aborts_as_conflicted() {
 }
 
 #[test]
-fn a_failed_reload_is_non_fatal_and_the_write_stands() {
+fn a_failed_reload_leaves_the_write_standing() {
     // R5.5: a `Reload()` call that fails (the daemon exited in the meantime) is
     // reported, but the written file stays.
     let fx = FixtureDotfiles::install();

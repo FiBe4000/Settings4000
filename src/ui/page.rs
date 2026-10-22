@@ -1148,7 +1148,7 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_edit_is_rejected_and_leaves_the_store_unchanged() {
+    fn an_invalid_edit_leaves_the_store_unchanged() {
         // A value that fails validation (R8.3) is not staged; the control then
         // re-renders to the unchanged stored value on the next `update_view`.
         let mut page = seeded_page(&[(SettingId::MouseSensitivity, Value::Float(0.0))]);
@@ -1254,7 +1254,7 @@ mod tests {
     }
 
     #[test]
-    fn the_grace_spin_appears_only_for_a_lock_command_that_starts_hyprlock() {
+    fn the_grace_spin_appears_only_for_a_hyprlock_command() {
         // Task 11.13: the grace control is a spin button over exactly the validator's
         // range, shown when the loaded lock command starts hyprlock, and hidden (the
         // rest of the page unaffected) when it does not.

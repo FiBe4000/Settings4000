@@ -185,7 +185,8 @@ mod tests {
     }
 
     #[test]
-    fn split_keeps_terminators_attached_and_an_unterminated_tail_as_is() {
+    fn split_keeps_each_terminator_with_its_line() {
+        // An unterminated tail is kept as is, and a lone CR does not split a line.
         let pieces: Vec<&str> = split_raw_lines("a\r\nb\nc").collect();
         assert_eq!(pieces, ["a\r\n", "b\n", "c"]);
         assert_eq!(split_raw_lines("").count(), 0, "empty input has no lines");
@@ -195,7 +196,8 @@ mod tests {
     }
 
     #[test]
-    fn strip_terminator_removes_lf_crlf_and_a_trailing_lone_cr() {
+    fn strip_terminator_removes_exactly_one_terminator() {
+        // An LF, a CRLF or a trailing lone CR.
         assert_eq!(strip_terminator("key=v\n"), "key=v");
         assert_eq!(strip_terminator("key=v\r\n"), "key=v");
         assert_eq!(strip_terminator("key=v"), "key=v", "no terminator");
@@ -244,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn last_terminated_rule_follows_the_last_line_that_has_a_terminator() {
+    fn the_last_terminated_line_sets_the_terminator() {
         assert_eq!(
             terminator_of_last_terminated_line(&lines_of("a\nb\n")),
             "\n"

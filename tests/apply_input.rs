@@ -22,6 +22,7 @@
 //! Theme write that fails, which must restore the already-written `input.lua`
 //! byte-exactly.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -98,7 +99,7 @@ fn plan_with_input_write(
 }
 
 #[test]
-fn natural_scroll_off_and_a_third_layout_rewrite_exactly_two_literals_and_reload_config_only() {
+fn an_input_apply_rewrites_exactly_two_literals() {
     // The task-11.4 acceptance (R5.3): stage natural scrolling off and a third
     // keyboard layout, Apply, and assert that exactly the two literal spans changed
     // in input.lua — every other line byte-identical through the deployed symlink —
@@ -217,7 +218,7 @@ fn natural_scroll_off_and_a_third_layout_rewrite_exactly_two_literals_and_reload
 }
 
 #[test]
-fn a_first_keyboard_option_is_inserted_into_an_input_lua_without_kb_options() {
+fn a_first_keyboard_option_inserts_a_kb_options_field() {
     // The insert path through real files: a hand-written input.lua that never set
     // `kb_options` loads an empty seeded value; switching on a curated option inserts
     // one `kb_options = "…",` field before the `input` table's closing brace, indented
@@ -274,7 +275,7 @@ fn a_first_keyboard_option_is_inserted_into_an_input_lua_without_kb_options() {
 }
 
 #[test]
-fn an_input_lua_with_an_opaque_line_in_the_input_table_is_not_offered() {
+fn an_opaque_line_in_the_input_table_hides_the_page() {
     // Architecture §10 / R4.2: a computed value inside the `input` table means the
     // literals around it may not be the values in effect. The store loader skips the
     // file and no Input helper is built, so the Input page is hidden (the startup-level
@@ -308,7 +309,7 @@ fn an_input_lua_with_an_opaque_line_in_the_input_table_is_not_offered() {
 }
 
 #[test]
-fn a_kind_mismatch_refusal_aborts_the_apply_as_a_failed_input_lua_write() {
+fn a_kind_mismatch_refusal_aborts_the_input_apply() {
     // R8.3: input.lua was hand-edited after the app loaded it so that `natural_scroll`
     // now holds a number. The Lua-literal editor never writes a boolean over it, so
     // preparing the Apply fails, names the Input page and input.lua, writes nothing
@@ -357,7 +358,7 @@ fn a_kind_mismatch_refusal_aborts_the_apply_as_a_failed_input_lua_write() {
 }
 
 #[test]
-fn an_external_edit_between_load_and_apply_aborts_as_conflicted() {
+fn an_external_edit_after_load_aborts_as_conflicted() {
     // Failure injection (3), R5.6: another program edits input.lua after the store
     // loaded it. The apply must abort as Conflicted with NO writes and NO commands,
     // leaving the external edit standing.
@@ -403,35 +404,59 @@ fn an_external_edit_between_load_and_apply_aborts_as_conflicted() {
     assert!(signaller.calls().is_empty());
 }
 
-#[test]
-fn a_deleted_hypridle_conf_neither_blocks_an_input_apply_nor_lets_its_own_page_write() {
-    // Task 9.11 (R5.6/R8.3), both halves of the rule, end to end through the real
-    // loaders and models: a *second* backing file — `hypridle.conf`, the Power & Idle
-    // page's — is loaded into the same store and then deleted, the state the store can
-    // never re-baseline on its own.
-    //
-    // (i) The Input apply must still succeed. It writes only `input.lua`, so it cannot
-    //     clobber the missing file; before task 9.11 the whole-tracker conflict check
-    //     made every category's apply return `Conflicted` until the app was restarted.
-    // (ii) The missing file's own page must still refuse to write. Its write glue reads
-    //     the file to render the edit, so a Power & Idle apply fails at preparation and
-    //     the window aborts — the app never writes bytes rendered from contents it could
-    //     not read. (The pipeline's own guard for the same case — a plan whose write
-    //     target is unreadable — is unit-tested in `core::apply`.)
+/// The state both deleted-`hypridle.conf` tests start from (task 9.11): the fixture
+/// tree with `input.lua` and the Power & Idle page's `hypridle.conf` loaded into one
+/// store, after which the deployed `hypridle.conf` is deleted — the state the store can
+/// never re-baseline on its own.
+struct DeletedHypridleConf {
+    fx: FixtureDotfiles,
+    before: BTreeMap<String, Vec<u8>>,
+    hypridle_conf: PathBuf,
+    store: SettingsStore,
+    input: InputModel,
+    power: PowerModel,
+}
+
+/// Installs the fixture tree, loads both store-backed files, then deletes the deployed
+/// `hypridle.conf` — the shared starting point of the two deleted-file tests below.
+fn with_hypridle_conf_deleted() -> DeletedHypridleConf {
     let fx = FixtureDotfiles::install();
     let before = repo_snapshot(&fx);
-    let path = input_lua(&fx);
-    let original = fs::read_to_string(&path).expect("read the fixture input.lua");
-
-    let (mut store, model) = store_and_model(&fx);
+    let (mut store, input) = store_and_model(&fx);
     let hypridle_conf = fx.config_path("hypr/hypridle.conf");
     load_into_store(&mut store, &hypridle_conf, loaders::hypridle_conf);
     let power = PowerModel::load(hypridle_conf.clone());
 
     // The deployed path disappears — an undeployed dotfiles link, a `rm`, a half-finished
-    // edit in another program. The repo file behind it is untouched, so the assertion
-    // below that no repo file changed still means what it says.
+    // edit in another program. The repo file behind it is untouched, so the assertions
+    // that no repo file changed still mean what they say.
     fs::remove_file(&hypridle_conf).expect("delete the deployed hypridle.conf");
+    DeletedHypridleConf {
+        fx,
+        before,
+        hypridle_conf,
+        store,
+        input,
+        power,
+    }
+}
+
+#[test]
+fn a_deleted_hypridle_conf_does_not_block_an_input_apply() {
+    // Task 9.11 (R5.6), end to end through the real loaders and models: the Input apply
+    // must still succeed. It writes only `input.lua`, so it cannot clobber the missing
+    // file; before task 9.11 the whole-tracker conflict check made every category's
+    // apply return `Conflicted` until the app was restarted.
+    let DeletedHypridleConf {
+        fx,
+        before,
+        hypridle_conf,
+        mut store,
+        input: model,
+        ..
+    } = with_hypridle_conf_deleted();
+    let path = input_lua(&fx);
+    let original = fs::read_to_string(&path).expect("read the fixture input.lua");
 
     store
         .stage(
@@ -475,10 +500,27 @@ fn a_deleted_hypridle_conf_neither_blocks_an_input_apply_nor_lets_its_own_page_w
         vec![config_only_reload()],
         "the apply completed normally, reload included"
     );
+    assert_repo_untouched_except(&fx, &before, &[REPO_INPUT_LUA]);
+}
 
-    // (ii) The Power & Idle page cannot prepare a write for the file that is gone, so an
-    // apply of *its* edits aborts before the pipeline runs — and no repo file changed
-    // beyond the Input write above.
+#[test]
+fn a_deleted_hypridle_conf_cannot_be_written_by_its_page() {
+    // Task 9.11 (R8.3), end to end through the real loaders and models: the missing
+    // file's own page must still refuse to write. Its write glue reads the file to
+    // render the edit, so a Power & Idle apply fails at preparation and the window
+    // aborts — the app never writes bytes rendered from contents it could not read.
+    // (The pipeline's own guard for the same case — a plan whose write target is
+    // unreadable — is unit-tested in `core::apply`.)
+    let DeletedHypridleConf {
+        fx,
+        before,
+        mut store,
+        power,
+        ..
+    } = with_hypridle_conf_deleted();
+
+    // The Power & Idle page cannot prepare a write for the file that is gone, so an
+    // apply of *its* edits aborts before the pipeline runs — and no repo file changed.
     store
         .stage(SettingId::DimTimeout, Value::Integer(600))
         .expect("the Power & Idle edit stages");
@@ -489,11 +531,11 @@ fn a_deleted_hypridle_conf_neither_blocks_an_input_apply_nor_lets_its_own_page_w
         error.to_string().contains("hypridle.conf"),
         "the abort names the file the user has to restore: {error}"
     );
-    assert_repo_untouched_except(&fx, &before, &[REPO_INPUT_LUA]);
+    assert_repo_untouched_except(&fx, &before, &[]);
 }
 
 #[test]
-fn a_failed_hyprctl_reload_is_non_fatal_and_the_write_stands() {
+fn a_failed_hyprctl_reload_leaves_the_write_standing() {
     // Failure injection (2), R5.5: `hyprctl reload config-only` exits non-zero. The
     // apply still completes, the file keeps its new bytes, and the failure is reported.
     let fx = FixtureDotfiles::install();
@@ -524,7 +566,7 @@ fn a_failed_hyprctl_reload_is_non_fatal_and_the_write_stands() {
 }
 
 #[test]
-fn staged_input_edits_whose_page_disappeared_on_refresh_abort_the_apply() {
+fn edits_staged_for_a_vanished_input_page_abort_the_apply() {
     // A manual Refresh rebuilds the Input helper from scratch. If input.lua was edited
     // into something the editor does not understand in the meantime, no helper is built
     // and the page hides — but edits staged before the Refresh are still in the store.

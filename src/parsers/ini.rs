@@ -793,7 +793,7 @@ gtk-application-prefer-dark-theme=1
     }
 
     #[test]
-    fn appending_lands_before_a_following_section_and_copies_sibling_style() {
+    fn an_append_ends_its_section_in_the_sibling_style() {
         // With a following section, the new key must land at the end of the target
         // section (before the blank line and the next header), and copy the
         // sibling entry's spaced `=` style rather than forcing GTK's bare form.
@@ -923,7 +923,7 @@ foo = bar
     }
 
     #[test]
-    fn a_malformed_line_is_preserved_and_warned_without_panicking() {
+    fn a_malformed_line_is_kept_with_a_warning() {
         // Accept criterion: a malformed line surfaces as a parse warning, not a
         // panic, and is preserved losslessly. Here an unclosed `[` header and a
         // line with no `=` are both malformed.
@@ -1004,7 +1004,7 @@ gtk-icon-theme-name=Papirus
     }
 
     #[test]
-    fn crlf_endings_round_trip_and_an_edit_keeps_them() {
+    fn crlf_line_endings_survive_an_edit() {
         // A file with Windows `\r\n` endings must round-trip byte-for-byte and an
         // edit must change only the value bytes, never dragging the `\r` into the
         // value span or losing it.
@@ -1028,7 +1028,7 @@ gtk-icon-theme-name=Papirus
     }
 
     #[test]
-    fn value_and_set_value_target_the_last_occurrence_of_a_duplicate_key() {
+    fn the_last_duplicate_key_is_the_one_addressed() {
         // A key repeated within a section is non-standard, but GLib resolves it to
         // the LAST value. So `value()` must read the last (effective) copy and
         // `set_value` must rewrite the last, leaving the earlier shadowed copy

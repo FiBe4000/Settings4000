@@ -108,7 +108,7 @@ fn plan_from(model: &DisplayModel) -> ApplyPlan {
 }
 
 #[test]
-fn a_mode_and_scale_edit_rewrites_only_the_edp_record_and_reloads() {
+fn a_mode_plus_scale_edit_rewrites_only_the_edp_record() {
     // The happy path (R5.3): stage a resolution and a scale for eDP-1, Apply, and
     // assert the exact bytes — only the eDP-1 record's mode and scale fields
     // change; the catchall, the desc: records, the commented-out records, and
@@ -177,7 +177,7 @@ fn a_mode_and_scale_edit_rewrites_only_the_edp_record_and_reloads() {
 }
 
 #[test]
-fn a_failed_hyprctl_reload_is_non_fatal_and_the_write_stands() {
+fn a_failed_hyprctl_reload_leaves_the_write_standing() {
     // Failure injection (2), R5.5: `hyprctl reload` exits non-zero after the write
     // succeeded. The apply completes, the record keeps its new bytes, and the
     // failure is reported.
@@ -211,7 +211,7 @@ fn a_failed_hyprctl_reload_is_non_fatal_and_the_write_stands() {
 }
 
 #[test]
-fn an_unrenderable_record_aborts_the_contribution_leaving_the_file_untouched() {
+fn an_unrenderable_record_aborts_the_contribution() {
     // Failure injection (4), tasks 9.5 and 11.9: when the writer refuses a dirty edit,
     // the contribution is an Err the window aborts on — so the pipeline never runs and
     // `monitors.conf` keeps its bytes. Without that (a bare `None`), the window would
@@ -255,7 +255,7 @@ fn an_unrenderable_record_aborts_the_contribution_leaving_the_file_untouched() {
 }
 
 #[test]
-fn an_edit_that_would_break_the_grammar_is_refused_at_stage_time() {
+fn a_grammar_breaking_edit_is_refused_at_stage_time() {
     // Task 11.9 acceptance on the live fixture: an edit that would insert `bitdepth`
     // without a value is refused when it is staged, naming the rule (R8.3). Nothing
     // becomes dirty, so nothing can reach the file.
@@ -282,7 +282,7 @@ fn an_edit_that_would_break_the_grammar_is_refused_at_stage_time() {
 }
 
 #[test]
-fn a_hand_edited_record_breaking_the_grammar_makes_the_page_read_only() {
+fn a_grammar_breaking_record_makes_the_page_read_only() {
     // Task 11.9's degradation for a hand-edited `monitors.conf`: the eDP record lost
     // the value of its `bitdepth` extra. Loaded through the deployed symlink, the file
     // is logged at `warn` (line and rule, no contents), the per-monitor controls are
@@ -356,7 +356,7 @@ fn a_hand_edited_record_breaking_the_grammar_makes_the_page_read_only() {
 }
 
 #[test]
-fn an_external_edit_trips_the_models_conflict_guard_before_any_write() {
+fn an_external_edit_trips_the_conflict_guard() {
     // Failure injection (3), R5.6 — the Display flavour: monitors.conf freshness is
     // model-owned, so the window's guard is `check_conflict()` before the plan is
     // built. An external edit after load must trip it (the window then aborts and
@@ -418,7 +418,7 @@ fn monitors_json_disabled() -> String {
 }
 
 #[test]
-fn the_laptop_toggle_runs_the_detected_repo_script_between_two_reads() {
+fn the_laptop_toggle_runs_the_repo_script_between_reads() {
     // Task 11.8 acceptance, end to end from detection: the toggle script is resolved
     // from the fixture repo root behind the deployed symlinks (R8.5); toggling issues
     // exactly `hyprctl monitors all -j`, the script by its repo path with no
@@ -479,7 +479,7 @@ fn the_laptop_toggle_runs_the_detected_repo_script_between_two_reads() {
 }
 
 #[test]
-fn a_tree_without_the_toggle_script_hides_the_laptop_toggle_and_logs_it() {
+fn a_tree_without_the_toggle_script_hides_the_toggle() {
     // R4.2: with the script gone from the repo, detection reports no toggle script
     // and logs the hidden control at `info`; the model built from that offers no
     // laptop toggle while the panel's mode/scale rows (monitors.conf) stay.

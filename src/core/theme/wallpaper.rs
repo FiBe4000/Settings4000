@@ -821,7 +821,7 @@ label {
     }
 
     #[test]
-    fn a_wallpaper_and_fit_change_writes_both_files_and_reloads_hyprpaper() {
+    fn a_wallpaper_plus_fit_change_writes_both_files() {
         // Accept criterion: a staged wallpaper path + fit-mode edit produces the exact
         // surgical hyprpaper.conf/hyprlock.conf FileWrite diffs AND the single hyprctl
         // hyprpaper wallpaper request (task 11.14). With no override, the same path is written
@@ -1174,9 +1174,8 @@ label {
     }
 
     #[test]
-    fn controls_hide_when_hyprlock_is_absent_or_config_is_unreadable() {
-        // R4.2/R4.4: the lock-override control is hidden when hyprlock is absent, and the
-        // wallpaper rows are hidden when hyprpaper.conf is unreadable.
+    fn the_lock_override_hides_when_hyprlock_is_absent() {
+        // R4.2: the lock-override control is hidden when hyprlock is absent.
         let tmp = tempfile::tempdir().expect("temp dir");
         let config = tmp.path().join("config");
         let paths = write_wallpaper_fixture(&config);
@@ -1201,8 +1200,15 @@ label {
             "only hyprpaper.conf is written"
         );
         assert_eq!(contribution.writes[0].backing, BackingFile::HyprpaperConf);
+    }
 
-        // hyprpaper.conf unreadable: the wallpaper rows hide (R4.4).
+    #[test]
+    fn the_wallpaper_rows_hide_when_hyprpaper_conf_is_unreadable() {
+        // R4.4: the wallpaper rows are hidden when hyprpaper.conf is unreadable.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_wallpaper_fixture(&config);
+
         let unreadable = WallpaperModel::load(
             WallpaperPaths {
                 hyprpaper_conf: config.join("hypr").join("does-not-exist.conf"),
@@ -1218,13 +1224,11 @@ label {
     }
 
     #[test]
-    fn reset_restores_the_override_toggle_and_commit_is_not_a_self_conflict() {
-        // Reset restores the toggle baseline and clears staged paths (R5.1); and after a
-        // committed apply the app's own write is not seen as an external conflict (R5.6).
+    fn reset_restores_the_override_toggle() {
+        // Reset restores the toggle baseline and clears staged paths (R5.1).
         let tmp = tempfile::tempdir().expect("temp dir");
         let config = tmp.path().join("config");
         let paths = write_wallpaper_fixture(&config);
-        let wall = write_image(tmp.path(), "wall.png");
         let lock_image = write_image(tmp.path(), "lock.png");
 
         let mut model = WallpaperModel::load(paths, true);
@@ -1238,8 +1242,19 @@ label {
             !model.override_on(),
             "reset restores the toggle baseline (off)"
         );
+    }
 
-        // Now stage a wallpaper change, apply it, and commit.
+    #[test]
+    fn a_committed_wallpaper_write_is_not_a_self_conflict() {
+        // After a committed apply the app's own write is not seen as an external
+        // conflict (R5.6).
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_wallpaper_fixture(&config);
+        let wall = write_image(tmp.path(), "wall.png");
+        let mut model = WallpaperModel::load(paths, true);
+
+        // Stage a wallpaper change, apply it, and commit.
         model.stage_wallpaper(&wall).unwrap();
         let contribution = model.apply_contribution().expect("a change contributes");
         let plan = ApplyPlan {
@@ -1326,7 +1341,7 @@ label {
     }
 
     #[test]
-    fn a_distinct_lock_override_writes_both_files_to_their_two_paths() {
+    fn a_lock_override_writes_each_file_its_own_path() {
         // With the override on, changing both the wallpaper and the lock image writes
         // each file to its own (different) path.
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -1383,7 +1398,7 @@ label {
     }
 
     #[test]
-    fn turning_the_override_off_resyncs_the_lock_to_the_wallpaper_with_no_reload() {
+    fn turning_the_override_off_resyncs_the_lock_image() {
         // Turning the override off resyncs the lock-screen background to the wallpaper:
         // a single hyprlock.conf write equal to the wallpaper path, with no reload
         // (hyprlock reads its config at the next lock).
@@ -1523,7 +1538,7 @@ label {
     }
 
     #[test]
-    fn a_rejected_wallpaper_path_stays_dirty_while_the_fit_mode_is_promoted() {
+    fn a_rejected_path_stays_dirty_while_the_fit_is_promoted() {
         // Task 9.6, per-key promotion *within* one file: an image whose filename contains
         // a `#` is a real, readable file (so `stage_wallpaper`'s validation accepts it) but
         // the hyprlang writer refuses to write it, because hyprlang would read the `#` as
@@ -1584,7 +1599,7 @@ label {
     }
 
     #[test]
-    fn a_hyprpaper_only_write_rebaselines_the_override_toggle_from_the_new_paths() {
+    fn a_hyprpaper_only_write_rebaselines_the_override() {
         // R5.1 / task 9.6: the override toggle's baseline describes the *relationship*
         // between the two on-disk paths, and a `hyprpaper.conf`-only write can change that
         // relationship without `hyprlock.conf` being written at all. On a unified host
@@ -1711,7 +1726,7 @@ label {
     }
 
     #[test]
-    fn an_image_under_home_is_written_home_relative_into_tilde_shaped_configs() {
+    fn an_image_under_home_is_written_tilde_relative() {
         // Task 11.10: both fixture files store `~/…`, so a chosen image below the home
         // directory is written as `~/…` into each, while validation and the hyprpaper
         // reload work on the absolute path.
@@ -1888,7 +1903,7 @@ label {
     }
 
     #[test]
-    fn re_choosing_the_configured_tilde_image_by_its_absolute_path_is_clean() {
+    fn re_choosing_the_current_image_by_absolute_path_is_clean() {
         // The chooser returns absolute paths; picking the image the config names as
         // `~/…` again must not light up Apply (R5.1).
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -1905,19 +1920,23 @@ label {
         assert_eq!(model.wallpaper_path(), Some("~/Pictures/wallpaper/18.jpg"));
     }
 
-    #[test]
-    fn without_a_home_a_tilde_choice_is_rejected_and_absolute_ones_still_work() {
-        // An unknown home directory: a home-relative value names no checkable file, so
-        // it is rejected (R8.3), while an absolute image is staged and written as is.
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let config = tmp.path().join("config");
+    /// Loads a [`WallpaperModel`] over the standard fixture with the home directory
+    /// unknown, for the two tests below.
+    fn homeless_wallpaper_model(tmp: &Path) -> WallpaperModel {
+        let config = tmp.join("config");
         let paths = WallpaperPaths {
             home: None,
             ..write_wallpaper_fixture(&config)
         };
-        let wall = write_image(tmp.path(), "wall.png");
+        WallpaperModel::load(paths, true)
+    }
 
-        let mut model = WallpaperModel::load(paths, true);
+    #[test]
+    fn without_a_home_a_tilde_choice_is_rejected() {
+        // An unknown home directory: a home-relative value names no checkable file, so
+        // it is rejected (R8.3).
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut model = homeless_wallpaper_model(tmp.path());
         assert!(matches!(
             model.stage_wallpaper("~/Pictures/wallpaper/18.jpg"),
             Err(ValidationError::ImagePath {
@@ -1925,6 +1944,15 @@ label {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn without_a_home_an_absolute_choice_still_works() {
+        // An unknown home directory does not matter to an absolute image, which is
+        // staged and written as is.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut model = homeless_wallpaper_model(tmp.path());
+        let wall = write_image(tmp.path(), "wall.png");
         model
             .stage_wallpaper(&wall)
             .expect("an absolute image needs no home");

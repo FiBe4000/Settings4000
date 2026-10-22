@@ -525,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn every_file_backed_sidebar_category_maps_to_its_model_category() {
+    fn each_file_backed_category_maps_to_its_model() {
         assert_eq!(
             marker_category(SidebarCategory::Display),
             Some(Category::Display)
@@ -554,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn actions_track_dirty_and_reset_clears_them() {
+    fn actions_track_dirty_state_through_a_reset() {
         // Accept criterion: dirty markers track store state; Reset clears. The chrome's
         // per-page marker is `store.is_category_dirty`, and its Apply/Reset enablement
         // is `actions_enabled`; both follow a real stage → reset cycle.
@@ -605,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn an_apply_with_a_reload_failure_commits_and_toasts() {
+    fn a_reload_failure_commits_with_a_toast() {
         // R5.5: the writes stand (Commit), and the non-fatal reload failure surfaces as
         // a toast naming the failed component.
         let outcome = ApplyOutcome::Applied {
@@ -629,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn an_apply_with_an_unrelated_conflict_commits_and_toasts_both_notes() {
+    fn an_unrelated_conflict_commits_toasting_both_notes() {
         // Task 9.11 (R5.6): a tracked file another program changed that this apply did not
         // write no longer blocks the apply, so the writes stand and the user is told about
         // the file instead — otherwise the only signal would be an apply aborting later.
@@ -687,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn a_validation_failure_warns_and_does_not_commit() {
+    fn a_validation_failure_warns_without_committing() {
         let error = SettingId::WallpaperPath
             .validate(&Value::String("/definitely/missing.png".to_string()))
             .expect_err("a missing wallpaper path is invalid");
@@ -733,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn a_generate_colors_failure_warning_carries_the_generators_own_diagnostic() {
+    fn a_generate_colors_warning_carries_its_diagnostic() {
         // Task 9.10, failure injection end to end: run the pipeline with a generator
         // that exits non-zero after explaining itself, then assert the *rendered*
         // warning the window shows carries that explanation. Without it the dialog
@@ -768,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn a_conflicted_apply_warns_and_does_not_commit() {
+    fn a_conflicted_apply_warns_without_committing() {
         // The only way to obtain a `Conflicted` outcome is a genuine conflict, so run
         // the pipeline against a file edited externally after its baseline was recorded
         // (R5.6), then assert the chrome maps it to a warning naming the file.
@@ -893,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prepare_failure_warning_names_the_file_and_quotes_the_reason() {
+    fn a_prepare_failure_warning_explains_itself() {
         // Task 9.16: the write-preparation failures each name the file the user has
         // to fix, quote the underlying reason, and promise the edits were kept — the last
         // being the whole point of aborting instead of skipping the write.

@@ -747,7 +747,7 @@ fn an_icon_theme_change_ends_with_exactly_one_notifd_reload() {
 }
 
 #[test]
-fn an_older_notifd_gets_no_reload_and_the_page_says_when_icons_follow() {
+fn an_older_notifd_is_not_reloaded_on_an_icon_change() {
     // Task 11.14: notifd 1.0, as real detection resolves it from the probe replies,
     // has no `Reload()`. The Apply still writes the icon theme and sets gsettings,
     // issues no notifd call at all, and the Theme page carries the note that
@@ -820,7 +820,7 @@ fn the_fixture_wallpaper_value_loads_as_an_existing_image() {
 }
 
 #[test]
-fn a_wallpaper_change_dual_writes_hyprpaper_and_hyprlock_and_reloads() {
+fn a_wallpaper_change_writes_both_files_identically() {
     // Task 6.5 (the unified-wallpaper gotcha): with the lock override off, one
     // wallpaper change writes the SAME new path to hyprpaper.conf and
     // hyprlock.conf, then reloads hyprpaper live with one `wallpaper` request
@@ -888,7 +888,7 @@ fn apply_new_wallpaper(fx: &FixtureDotfiles, caps: &Capabilities) -> (String, Ve
 }
 
 #[test]
-fn a_wallpaper_apply_pushes_the_bar_text_tone_after_the_single_hyprpaper_request() {
+fn a_wallpaper_apply_then_pushes_the_bar_text_tone() {
     // Task 11.14 (architecture §6, analysis §7.8): with eww running and the script
     // present, the wallpaper request is followed by `bar-text-tone --apply`, run by
     // its live XDG path. The sequence has no `preload` and exactly one `wallpaper`
@@ -921,16 +921,19 @@ fn a_wallpaper_apply_pushes_the_bar_text_tone_after_the_single_hyprpaper_request
 }
 
 #[test]
-fn the_bar_text_tone_is_skipped_without_eww_or_without_the_script() {
+fn the_bar_text_tone_is_skipped_without_eww() {
     // Task 11.14: eww not running — there is no bar to update, so only the hyprpaper
     // request runs.
     let fx = FixtureDotfiles::install();
     let caps = bar_tone_capabilities(&fx, &[Daemon::Hyprpaper]);
     let (absolute, recorded) = apply_new_wallpaper(&fx, &caps);
     assert_eq!(recorded, hyprpaper_reload(&absolute));
+}
 
-    // The script absent from the deployed tree: real detection reports none, and
-    // the follow-up is skipped even though eww runs.
+#[test]
+fn the_bar_text_tone_is_skipped_without_the_script() {
+    // Task 11.14: the script absent from the deployed tree: real detection reports
+    // none, and the follow-up is skipped even though eww runs.
     let fx = FixtureDotfiles::install();
     fs::remove_file(fx.config_path("eww/scripts/bar-text-tone")).expect("remove the stub link");
     let detected = detect_fixture(&fx, &[]);
@@ -1032,7 +1035,7 @@ fn a_missing_or_non_image_wallpaper_is_rejected_before_staging() {
 }
 
 #[test]
-fn a_generate_colors_failure_rolls_back_the_theme_writes_and_reloads_nothing() {
+fn a_generate_colors_failure_rolls_back_the_theme_writes() {
     // Failure injection (1), R5.4 + the palette-gotcha ordering: a combined apply
     // (GTK theme switch + palette switch) whose generator exits non-zero. The two
     // settings.ini writes — which genuinely happened first, proven by their
@@ -1141,7 +1144,7 @@ fn a_generate_colors_failure_rolls_back_the_theme_writes_and_reloads_nothing() {
 }
 
 #[test]
-fn an_external_hyprpaper_edit_trips_the_wallpaper_conflict_guard() {
+fn an_external_hyprpaper_edit_trips_the_conflict_guard() {
     // The wallpaper flavour of the model-owned guard (R5.6): an external
     // hyprpaper.conf edit after load must trip `WallpaperModel::check_conflict`,
     // on which the window aborts and reloads before building any plan.
@@ -1177,7 +1180,7 @@ fn an_external_hyprpaper_edit_trips_the_wallpaper_conflict_guard() {
 }
 
 #[test]
-fn an_external_settings_ini_edit_trips_the_themes_conflict_guard() {
+fn an_external_settings_ini_edit_trips_the_conflict_guard() {
     // Failure injection (3), R5.6 — the Theme flavour: the GTK/icon/cursor backing
     // files' freshness is model-owned, so the window's guard is `check_conflict()`
     // before the plan is built. An external edit after load must trip it.
@@ -1252,7 +1255,7 @@ fn unlinked_warnings(events: &[CapturedEvent]) -> Vec<&CapturedEvent> {
 }
 
 #[test]
-fn a_de_linked_gtk4_settings_ini_is_reported_and_its_live_file_still_written() {
+fn a_de_linked_gtk4_settings_ini_is_reported_yet_written() {
     // Task 11.12 (analysis §7.7, R5.6/R8.5): the shape `nwg-look` left on the target
     // machine — the deployed gtk-4.0/settings.ini symlink replaced by a plain copy
     // while the repo keeps its own. The model reports exactly that file, the note
@@ -1359,7 +1362,7 @@ fn a_fully_linked_fixture_tree_reports_no_unlinked_settings_ini() {
 }
 
 #[test]
-fn plain_settings_ini_files_without_a_dotfiles_repo_are_not_reported() {
+fn plain_settings_ini_without_a_repo_are_not_reported() {
     // Task 11.12 (R8.5): on a machine without the dotfiles every config is a plain
     // file and there is no repo root; that is the normal case, not a divergence.
     let tmp = tempfile::tempdir().expect("temp dir");
@@ -1412,7 +1415,7 @@ fn plain_settings_ini_files_without_a_dotfiles_repo_are_not_reported() {
 }
 
 #[test]
-fn a_running_xsettingsd_in_the_process_list_sets_the_external_writer_note() {
+fn a_running_xsettingsd_sets_the_external_writer_note() {
     // Task 11.12 (analysis §7.7): detection scans for xsettingsd like any daemon,
     // and a running one turns on the Theme page's external-writer note.
     let fx = FixtureDotfiles::install();
@@ -1604,7 +1607,8 @@ fn a_gtk_theme_with_a_gtk4_dir_re_points_all_three_links() {
 }
 
 #[test]
-fn a_gtk_theme_without_a_gtk4_dir_removes_the_links_and_the_note_says_so() {
+fn a_gtk3_only_theme_apply_removes_the_gtk4_links() {
+    // The page notes the missing GTK 4 version before and after the Apply.
     let fx = FixtureDotfiles::install();
     let themes_before = theme_root_snapshot(&fx);
 
@@ -1659,7 +1663,7 @@ fn a_gtk_theme_without_a_gtk4_dir_removes_the_links_and_the_note_says_so() {
 }
 
 #[test]
-fn a_plain_gtk_css_blocks_the_link_step_with_a_warning_and_the_ini_writes_still_land() {
+fn a_plain_gtk_css_blocks_only_the_link_step() {
     // A real gtk.css is a user-managed override (like GTK_THEME): none of the three
     // links is changed — mixing two themes would be worse — a `warn` says so, the page
     // notes it, and the settings.ini/gsettings legs of the change still land.
@@ -1733,7 +1737,7 @@ fn a_plain_gtk_css_blocks_the_link_step_with_a_warning_and_the_ini_writes_still_
 }
 
 #[test]
-fn a_failure_after_the_link_step_restores_the_previous_link_targets() {
+fn a_failure_after_the_link_step_restores_the_links() {
     // R5.4: the link steps are part of the write transaction. A GTK-theme change and a
     // palette switch whose generator fails (it runs after the links): the links go back
     // to the old theme and the settings.ini writes are restored, all newest first.
@@ -1799,7 +1803,7 @@ impl Drop for RestoreWritable<'_> {
 }
 
 #[test]
-fn a_failing_link_step_rolls_back_the_ini_writes_and_runs_no_reload() {
+fn a_failing_link_step_rolls_back_the_ini_writes() {
     // R5.4 the other way round: `~/.config/gtk-4.0` is read-only, so the first link
     // step cannot place its temporary link. The settings.ini writes before it (which
     // land in the repo through their links, so they succeed) are rolled back, gsettings
@@ -1861,7 +1865,7 @@ fn a_failing_link_step_rolls_back_the_ini_writes_and_runs_no_reload() {
 }
 
 #[test]
-fn icon_and_cursor_only_applies_never_touch_the_gtk4_links() {
+fn cursor_only_applies_never_touch_the_gtk4_links() {
     // Task 11.16 item 3: the step follows a gtk-theme-name change only.
     let fx = FixtureDotfiles::install();
     fs::create_dir_all(fx.home().join(".icons/Fixture-Cursors/cursors"))
@@ -1876,7 +1880,7 @@ fn icon_and_cursor_only_applies_never_touch_the_gtk4_links() {
 }
 
 #[test]
-fn a_gtk4_link_into_a_folder_of_the_users_own_is_left_alone_like_a_plain_file() {
+fn a_gtk4_link_to_a_user_folder_is_left_alone() {
     // A link that resolves outside every theme root (here `~/custom/gtk.css`) is a
     // user-managed override: all three links stay, a `warn` names the path, the page
     // notes it, and the INI and gsettings writes still land. (A dangling link would

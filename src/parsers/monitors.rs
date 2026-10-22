@@ -1127,7 +1127,8 @@ monitor=desc:AU Optronics 0x2036,2560x1440@60,auto,1
     }
 
     #[test]
-    fn round_trips_empty_input_and_a_final_line_without_a_newline() {
+    fn edge_case_inputs_round_trip() {
+        // Empty input, a final line without a newline, comment-only and refused records.
         for input in [
             "",
             "monitor=eDP-1,preferred,auto,1",
@@ -1262,7 +1263,7 @@ monitor=desc:AU Optronics 0x2036,2560x1440@60,auto,1
     }
 
     #[test]
-    fn the_grammar_refuses_a_hash_or_line_break_in_any_written_value() {
+    fn the_grammar_refuses_a_hash_or_line_break_in_values() {
         // A `#` starts a comment both downstream parsers strip to end of line, so
         // everything after it would be lost; a line break splits the record.
         assert_eq!(
@@ -1288,7 +1289,7 @@ monitor=desc:AU Optronics 0x2036,2560x1440@60,auto,1
     }
 
     #[test]
-    fn the_grammar_requires_the_output_token_to_be_followed_directly_by_a_comma() {
+    fn the_output_token_must_be_followed_directly_by_a_comma() {
         // The profile script's awk matches the literal `eDP-1,` at the start of the
         // body, so a space before the comma hides the record from it.
         assert_eq!(
@@ -1512,7 +1513,7 @@ monitor=desc:AU Optronics 0x2036,2560x1440@60,auto,1
     }
 
     #[test]
-    fn set_field_refuses_to_leave_a_record_that_still_breaks_the_grammar() {
+    fn set_field_refuses_to_leave_a_grammar_violation() {
         // The last line of defence (R8.3): whatever the caller validated, an edit
         // never emits a record the downstream parsers would misread. A hand-edited
         // record with a dangling extra stays broken after a scale edit, so the edit
@@ -1528,7 +1529,7 @@ monitor=desc:AU Optronics 0x2036,2560x1440@60,auto,1
     }
 
     #[test]
-    fn set_field_reports_missing_and_disabled_targets_without_changing_the_file() {
+    fn set_field_reports_a_missing_monitor() {
         let input = "monitor=,preferred,auto,1\nmonitor=DP-2,disable\n";
         let (mut file, _) = MonitorsFile::parse(input);
 
@@ -1537,6 +1538,14 @@ monitor=desc:AU Optronics 0x2036,2560x1440@60,auto,1
             file.set_field("DP-9", MonitorField::Mode, "1920x1080@60"),
             Err(EditError::NoSuchMonitor("DP-9".to_string()))
         );
+        assert_eq!(file.emit(), input, "no rejected edit changed the file");
+    }
+
+    #[test]
+    fn set_field_reports_a_disabled_record() {
+        let input = "monitor=,preferred,auto,1\nmonitor=DP-2,disable\n";
+        let (mut file, _) = MonitorsFile::parse(input);
+
         // A legacy disable record has no mode field to edit.
         assert_eq!(
             file.set_field("DP-2", MonitorField::Mode, "1920x1080@60"),
@@ -1626,7 +1635,7 @@ monitor=desc:AU Optronics 0x2036,2560x1440@60,auto,1
     }
 
     #[test]
-    fn a_refused_append_restores_the_previous_lines_missing_terminator() {
+    fn a_refused_append_restores_the_missing_terminator() {
         // Appending terminates the last record first when it has no newline; a refused
         // append must undo that too, so the file round-trips byte-for-byte.
         let input = "monitor=eDP-1,2880x1800@120,auto,1.333333";
@@ -1640,7 +1649,7 @@ monitor=desc:AU Optronics 0x2036,2560x1440@60,auto,1
     }
 
     #[test]
-    fn set_record_rewrites_a_legacy_disable_record_into_a_complete_one() {
+    fn set_record_completes_a_legacy_disable_record() {
         // The only thing the app writes for an output is a complete record, so a
         // hand-written legacy disable record becomes valid when it is rewritten.
         let input = "monitor=,preferred,auto,1\nmonitor=desc:AU Optronics 0x2036,disable\n";
@@ -1678,7 +1687,7 @@ monitor=desc:AU Optronics 0x2036,2560x1440@60,auto,1
     }
 
     #[test]
-    fn a_malformed_monitor_line_is_preserved_and_warned_without_panicking() {
+    fn a_malformed_monitor_line_is_kept_with_a_warning() {
         // Accept criterion: a `monitor=` line with an unexpected field shape (here
         // only output + mode) surfaces as a grammar warning, not a panic, and is
         // preserved losslessly.
@@ -1714,7 +1723,7 @@ monitor=HDMI-A-1,badmode
     }
 
     #[test]
-    fn a_grammar_warning_is_logged_at_warn_with_line_and_rule_only() {
+    fn a_grammar_warning_log_carries_no_file_contents() {
         // A hand-edited record that breaks the grammar must be visible in the
         // journal (task 11.9), naming the line and the rule but not the values.
         let input = "monitor=eDP-1,2880x1800@120,auto,1.333333,bitdepth\n";
@@ -1778,7 +1787,7 @@ monitor=HDMI-A-1,badmode
     }
 
     #[test]
-    fn crlf_line_endings_round_trip_and_survive_an_edit() {
+    fn crlf_line_endings_survive_an_edit() {
         // A file with Windows `\r\n` endings round-trips byte-for-byte, and an
         // edit changes only the field bytes, never dragging in the carriage return.
         let input = "# CRLF\r\nmonitor=eDP-1,2880x1800@120,0x0,1.0\r\n";
@@ -1851,7 +1860,7 @@ monitor=DP-1,1920x1200@60,0x0,2.0
     }
 
     #[test]
-    fn multi_extra_record_keeps_every_extra_in_position_after_a_scale_edit() {
+    fn a_scale_edit_keeps_every_extra_in_position() {
         // A record with several extra pairs: a scale edit must keep scale in field
         // 4 (awk split) and leave every extra field (5..) in its exact position.
         let input = "monitor=eDP-1,2880x1800@120,0x0,1.5,bitdepth,10,vrr,1\n";

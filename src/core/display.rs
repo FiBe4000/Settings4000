@@ -1884,7 +1884,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     }
 
     #[test]
-    fn merge_pairs_the_live_output_with_its_later_winning_desc_record() {
+    fn merge_pairs_a_live_output_with_its_winning_record() {
         // The core merge (test #1): the live eDP-1 is matched to the LAST matching
         // record — the `desc:AU Optronics 0x2036` rule, which wins over the generic
         // `eDP-1` rule — so its configured mode/scale/position come from that record,
@@ -2098,7 +2098,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     }
 
     #[test]
-    fn commit_promotes_staged_and_updates_the_records() {
+    fn commit_rebaselines_so_later_edits_build_on_it() {
         // After a successful apply, commit makes the staged value the new baseline and
         // keeps the in-memory records in step, so a further edit builds on it.
         let dir = tempfile::tempdir().expect("temp dir");
@@ -2203,7 +2203,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     }
 
     #[test]
-    fn an_empty_position_field_on_disk_makes_the_plan_fail_validation() {
+    fn an_empty_on_disk_position_fails_plan_validation() {
         // Task 9.5, documenting a deliberate consequence of validating the whole staged
         // record: a record whose position field is *empty* (`monitor=DP-1,preferred,,1`,
         // which Hyprland cannot place either) contributes an invalid position, so the
@@ -2254,7 +2254,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     const HYPRCTL_EXTERNAL: &str = r#"[{"name":"DP-1","description":"Ext","width":1920,"height":1080,"refreshRate":60.0,"x":0,"y":0,"scale":1.0,"disabled":false,"availableModes":["1920x1080@60.00Hz"]}]"#;
 
     #[test]
-    fn a_render_failure_aborts_the_apply_and_keeps_the_staged_edit() {
+    fn a_render_failure_aborts_the_apply_keeping_the_edit() {
         // Task 9.5: when the writer cannot render a dirty edit, the contribution is an
         // Err — not an `Ok(None)` the window would read as "nothing to write" and follow
         // with a commit, promoting values that reached no file (R8.3).
@@ -2298,7 +2298,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     }
 
     #[test]
-    fn the_writer_refuses_a_crafted_record_as_the_last_line_of_defence() {
+    fn the_writer_refuses_a_crafted_record() {
         // R8.3 "validate all before any write": whatever reached the staged state, the
         // bytes handed to the writer are checked once more. Both injections bypass the
         // `stage_*` methods.
@@ -2356,7 +2356,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     }
 
     #[test]
-    fn disabling_a_non_laptop_monitor_is_refused_with_the_rule_named() {
+    fn disabling_a_non_laptop_monitor_is_refused() {
         // A non-laptop output's enable switch stages a monitors.conf edit, but the frozen
         // grammar has no record form that turns an output off: the legacy
         // `<output>,disable` record would reach Hyprland through hyprland.lua's loader as
@@ -2389,7 +2389,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     }
 
     #[test]
-    fn a_value_that_would_insert_a_key_without_a_value_is_refused_naming_the_rule() {
+    fn a_value_inserting_a_valueless_key_is_refused() {
         // Acceptance (task 11.9): an edit that would insert `bitdepth` without a value
         // is refused at stage time with the grammar rule named — the comma is caught
         // before the scale/mode validators, so the user reads which rule was broken.
@@ -2422,9 +2422,8 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     }
 
     #[test]
-    fn a_refused_stage_is_logged_at_warn_and_keeps_an_earlier_staged_edit() {
-        // A refusal leaves the model exactly as it was: an edit staged before it
-        // survives, and the refusal is in the journal.
+    fn a_refused_stage_is_logged_at_warn() {
+        // A refusal is in the journal, naming the monitor.
         let dir = tempfile::tempdir().expect("temp dir");
         let mut model = laptop_model(dir.path());
         model
@@ -2440,7 +2439,19 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             .expect("the refusal is logged");
         assert_eq!(warning.level, tracing::Level::WARN);
         assert!(warning.fields.contains("eDP-1"), "{}", warning.fields);
+    }
 
+    #[test]
+    fn a_refused_stage_keeps_an_earlier_staged_edit() {
+        // A refusal leaves the model exactly as it was: an edit staged before it
+        // survives.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut model = laptop_model(dir.path());
+        model
+            .stage_scale(0, "1.25".to_string())
+            .expect("the edit stages");
+
+        let _ = model.stage_position(0, "0,0".to_string());
         assert_eq!(view(&model, 0).effective_scale(), "1.25");
         assert_eq!(view(&model, 0).effective_position(), "auto");
     }
@@ -2486,7 +2497,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     }
 
     #[test]
-    fn a_hand_edited_record_breaking_the_grammar_makes_the_page_read_only() {
+    fn a_grammar_breaking_record_makes_the_page_read_only() {
         // The hand-edited invalid record decision (task 11.9): an eDP record with a
         // `bitdepth` key but no value breaks the frozen grammar, so the file loads
         // read-only — logged at `warn` with the line and the rule — and every edit is
@@ -2600,7 +2611,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     }
 
     #[test]
-    fn laptop_toggle_reads_runs_the_script_and_re_reads_without_touching_monitors_conf() {
+    fn the_laptop_toggle_runs_the_script_between_two_reads() {
         // Task 11.8 acceptance: the toggle issues exactly `hyprctl monitors all -j`,
         // then the dotfiles script with no arguments, then the re-read; the switch
         // follows the re-read; monitors.conf is never written (nor is any state file
@@ -2655,7 +2666,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     }
 
     #[test]
-    fn an_unchanged_panel_after_the_script_is_an_error_and_the_switch_follows_the_read() {
+    fn an_unchanged_panel_after_the_toggle_is_an_error() {
         // The script is a pure toggle the app cannot see into: when the re-read shows
         // no change (the script failed without saying so, or the hotplug watcher
         // switched the panel straight back), the toggle fails and the switch keeps
@@ -2742,7 +2753,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     }
 
     #[test]
-    fn a_timed_out_script_with_a_changed_panel_is_a_success_logged_at_warn() {
+    fn a_timed_out_toggle_that_switched_the_panel_succeeds() {
         // The other half of the exit-status rule: the runner's timeout can stop the
         // script during its bar relaunch, after the monitor call already went
         // through. The re-read shows the switch, so the toggle succeeds and the
@@ -2870,7 +2881,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     }
 
     #[test]
-    fn without_the_script_the_laptop_toggle_is_hidden_and_runs_nothing() {
+    fn without_the_script_the_laptop_toggle_is_unavailable() {
         // R4.2: no detected script, no switch — and a caller that tries anyway gets
         // `Unavailable` without a single command being issued. The panel's
         // file-backed controls stay.
@@ -2985,7 +2996,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     }
 
     #[test]
-    fn changing_resolution_picks_a_valid_refresh_for_the_new_resolution() {
+    fn a_resolution_change_picks_a_refresh_it_offers() {
         // When the resolution changes and the current refresh is not offered for it,
         // the first available refresh for the new resolution is composed into the mode.
         let dir = tempfile::tempdir().expect("temp dir");
@@ -3023,13 +3034,19 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     }
 
     #[test]
-    fn scale_and_position_option_lists_include_the_configured_value() {
+    fn the_scale_options_include_the_configured_value() {
         let dir = tempfile::tempdir().expect("temp dir");
         let model = laptop_model(dir.path());
         // The configured scale is first (preselected), followed by the curated set.
         let scales = view(&model, 0).scale_options();
         assert_eq!(scales[0], "1.066667");
         assert!(scales.contains(&"1.333333".to_string()));
+    }
+
+    #[test]
+    fn the_position_options_include_the_configured_value() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let model = laptop_model(dir.path());
         // The configured position ("auto") is present; the curated set adds "0x0".
         let positions = view(&model, 0).position_options();
         assert!(positions.contains(&"auto".to_string()));
@@ -3037,7 +3054,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     }
 
     #[test]
-    fn an_output_with_no_record_falls_back_to_live_and_appends_on_apply() {
+    fn an_unrecorded_output_starts_from_live_then_appends() {
         // F3(a): a live output that no specific `monitor=` record configures takes its
         // baseline from the live state, and editing it APPENDS a new specific record
         // (first-configure) rather than editing an unrelated line.
@@ -3068,7 +3085,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     }
 
     #[test]
-    fn re_enabling_a_disabled_monitor_sources_mode_and_scale_from_live() {
+    fn re_enabling_an_unrecorded_monitor_uses_live_values() {
         // F3(b): an output that is off with no specific record (configured by the
         // catch-all only) takes its baseline from the live `hyprctl` state, and enabling
         // it appends a complete record with those live-sourced mode/position/scale.
@@ -3096,7 +3113,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     }
 
     #[test]
-    fn a_first_configure_then_second_edit_edits_in_place_after_commit() {
+    fn a_committed_first_configure_is_edited_in_place() {
         // N8: after a first-configure appends a record and the apply is committed, a
         // second edit must edit that record in place (surgical set_field), not append a
         // duplicate — commit refreshes the monitor's record addressing.
@@ -3127,18 +3144,26 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     }
 
     #[test]
-    fn a_stale_monitor_index_yields_no_view_and_every_stage_refuses_it() {
+    fn a_stale_monitor_index_yields_no_view() {
         // Task 9.24: an index held across a model rebuild that dropped a monitor
-        // must never panic. The view accessor answers `None`; every `stage_*`
-        // refuses with `UnknownMonitor` — even for a value its own check would
-        // reject, since the index is checked first — logs the refusal at `warn`,
-        // and leaves the model clean.
+        // must never panic; the view accessor answers `None`.
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut model = laptop_model(dir.path());
+        let model = laptop_model(dir.path());
         let stale = model.monitor_count();
         assert_eq!(stale, 1, "the laptop fixture lists one monitor");
         assert!(model.monitor(stale).is_none());
         assert!(model.monitor(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn every_stage_refuses_a_stale_monitor_index() {
+        // Task 9.24: every `stage_*` refuses an index past the monitor list with
+        // `UnknownMonitor` — even for a value its own check would reject, since the
+        // index is checked first — logs the refusal at `warn`, and leaves the model
+        // clean.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut model = laptop_model(dir.path());
+        let stale = model.monitor_count();
 
         let mut results = Vec::new();
         let events = crate::testing::capture_logs(|| {

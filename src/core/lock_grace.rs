@@ -385,7 +385,8 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_flag_reads_as_zero_but_stays_distinct_from_an_explicit_zero() {
+    fn a_missing_grace_flag_is_distinct_from_an_explicit_zero() {
+        // Both read as a grace of 0.
         assert_eq!(parse_grace("pidof hyprlock || hyprlock"), Ok(None));
         assert_eq!(grace_of("pidof hyprlock || hyprlock"), Some(0));
         assert_eq!(parse_grace("hyprlock --grace 0"), Ok(Some(0)));
@@ -419,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_removes_the_flag_and_the_whitespace_before_it() {
+    fn a_zero_grace_removes_the_flag_with_its_leading_space() {
         assert_eq!(
             set_grace(REAL, 0).as_deref(),
             Ok("pidof hyprlock || hyprlock")
