@@ -1,11 +1,18 @@
 [package]
 name = "settings4000"
-version = "0.1.0"
+# The single source of the application version (R8.6): the CLI `--version`, the
+# startup log and the About window all read it at compile time through
+# `CARGO_PKG_VERSION`, so no source, data or doc file may carry a version literal.
+version = "1.0.0"
 edition = "2024"
 # Minimum supported Rust version. The 2024 edition was stabilized in Rust 1.85,
 # and all dependencies below are pinned to versions that build on 1.85.
 rust-version = "1.85"
 description = "Native GTK4 settings GUI for a dotfiles-managed Hyprland desktop"
+# Shown by the About window (R2.5) through `CARGO_PKG_AUTHORS` and
+# `CARGO_PKG_REPOSITORY`; a unit test in src/ui/app.rs keeps both non-empty.
+authors = ["FiBe4000"]
+repository = "https://github.com/FiBe4000/Settings4000"
 
 [features]
 # Compiles the crate's test-support surface — the fixture-dotfiles installer

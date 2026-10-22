@@ -272,6 +272,56 @@ mod tests {
     }
 
     #[test]
+    fn crate_metadata_carries_the_about_window_fields() {
+        // Task 10.1 (R8.6, R2.5): the About window and the CLI `--version` read
+        // the version, author and repository URL from Cargo's compile-time
+        // package metadata rather than from literals. Cargo silently expands a
+        // missing `authors`/`repository` key to an empty string, so without this
+        // guard deleting either key from Cargo.toml would still compile and only
+        // show up as a blank field in the About window.
+        let authors = env!("CARGO_PKG_AUTHORS");
+        assert!(
+            !authors.trim().is_empty(),
+            "Cargo.toml must declare `authors` for the About window"
+        );
+        assert!(
+            authors.contains("FiBe4000"),
+            "`authors` must name the project author's GitHub handle, got `{authors}`"
+        );
+
+        let repository = env!("CARGO_PKG_REPOSITORY");
+        assert!(
+            repository.starts_with("https://github.com/FiBe4000/Settings4000"),
+            "`repository` must point at the GitHub project, got `{repository}`"
+        );
+
+        // A semantic version is `MAJOR.MINOR.PATCH`, optionally followed by a
+        // `-pre-release` and/or `+build` suffix, which this check strips. 1.0.0
+        // is the feature-complete release (R8.6), so the major part may never
+        // drop back below 1. Cargo has already validated the string as semver
+        // before this test can run, so this only pins the shape and the major; it
+        // does not re-check leading zeros or the suffix grammar.
+        let version = env!("CARGO_PKG_VERSION");
+        let core = version.split(['-', '+']).next().unwrap_or_default();
+        let parts = core
+            .split('.')
+            .map(str::parse::<u64>)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|error| {
+                panic!("CARGO_PKG_VERSION `{version}` is not a semantic version: {error}")
+            });
+        assert_eq!(
+            parts.len(),
+            3,
+            "CARGO_PKG_VERSION `{version}` must have exactly MAJOR.MINOR.PATCH"
+        );
+        assert!(
+            parts[0] >= 1,
+            "CARGO_PKG_VERSION `{version}` must be at least 1.0.0"
+        );
+    }
+
+    #[test]
     fn app_id_is_a_valid_gapplication_id() {
         // Single-instance activation (R8.4) depends on registering this exact ID
         // on the session bus; an invalid ID would make registration fail at
