@@ -38,7 +38,7 @@
 //! at. The idle hop closes the remaining gap: adding the first page to the stack
 //! makes it visible and fires the entry hook synchronously, so for the first visible
 //! category an immediate read would still land inside populate (see
-//! `wire_deferred_page_entry` in [`super::window`]). The Sound page defers its first
+//! `wire_page_entry` in [`super::window`]). The Sound page defers its first
 //! `pw-dump` enumeration the same way (task 9.4). Deferring costs nothing: the
 //! placeholder is visible at most for the instant before the idle callback runs.
 //!

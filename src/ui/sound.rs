@@ -46,7 +46,7 @@
 //! what makes that true in *all* configurations: adding the first page to the stack makes
 //! it visible and fires the entry hook synchronously, so on a host where Sound is the
 //! first visible category (no `hyprctl`, so no Display page) an immediate probe would run
-//! inside populate anyway. The mechanism lives in `wire_deferred_page_entry`
+//! inside populate anyway. The mechanism lives in `wire_page_entry`
 //! ([`super::window`]), whose docs spell out what the idle callback re-checks.
 //!
 //! Deferring also keeps a manual detection refresh (R4.3), which rebuilds all pages, from

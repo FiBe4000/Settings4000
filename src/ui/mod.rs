@@ -63,7 +63,8 @@
 //!   drop-down) and the margin/spacing metrics every page above shares, kept as one
 //!   copy so the pages cannot drift apart visually (task 9.19).
 //!
-//! The real per-category page content (§6) plugs into this shell in later tasks.
+//! Every category page above is mounted into the window shell, which builds each one
+//! from its category's builder — a bespoke page, the declarative framework, or both.
 
 pub mod app;
 mod category;

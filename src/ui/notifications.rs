@@ -49,7 +49,7 @@
 //! [`DaemonView::NotQueried`] and the page shows a placeholder. The first read happens
 //! when the page becomes the visible stack child, through the window's deferred
 //! page-entry hook (which runs it from the GTK idle queue, see
-//! `wire_deferred_page_entry` in [`super::window`]), and again on every later entry —
+//! `wire_page_entry` in [`super::window`]), and again on every later entry —
 //! so a wedged session bus can never stall the populate pass against the R8.1 budget,
 //! and a state change made elsewhere (a keybind toggling do-not-disturb) shows up the
 //! next time the page is opened. The widget handlers connected in [`build`] only run

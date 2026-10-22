@@ -68,7 +68,7 @@
 //! files against the real baselines the startup load recorded (R5.6) rather than an
 //! empty tracker.
 //!
-//! Building that plan out of the store and the six bespoke page models — which writes to
+//! Building that plan out of the store and the bespoke page models — which writes to
 //! fold in, in which order, and when to refuse to apply at all — is **not** done here:
 //! it is [`assemble_apply_plan`](crate::core::assemble::assemble_apply_plan) in the
 //! GTK-free [`core::assemble`](crate::core::assemble) module, so those decisions are
@@ -146,99 +146,221 @@ const DEFAULT_HEIGHT: i32 = 640;
 /// the real pages arrive.
 const LOADING_PAGE_NAME: &str = "__loading";
 
+/// The bespoke per-category models the window owns, shared with the page glue and the
+/// Apply/Reset/Refresh wiring (tasks 6.1, 6.3–6.8, 11.4, 11.15).
+///
+/// Every field starts `None` and is filled by the startup worker ([`spawn_load`]) — and
+/// replaced or kept on each manual refresh, see [`Shell::apply_refresh_load`] — or stays
+/// `None` when the machine cannot back it (the reason is logged by `startup::load`); the
+/// page that renders from it then hides the affected section, page, or category (R4.2).
+///
+/// The models come in two kinds, and the difference decides how the window treats them:
+///
+/// - **Staging sources** (`display`, `palette`, `themes`, `wallpaper`) hold staged edits
+///   of their own, beside the shared [`SettingsStore`], because their values are not
+///   store settings (monitors are discovered at runtime; a palette switch runs
+///   `generate-colors`; the theme and wallpaper changes are multi-file writes). Each one
+///   feeds its dirty state into the same Apply/Reset chrome ([`Self::display_dirty`],
+///   [`Self::theme_dirty`]), is cleared by Reset ([`Self::reset_staged`]), is committed
+///   on its own after an Apply ([`Shell::commit_applied`]), and is kept wholesale on a
+///   refresh while it holds staged edits *and the refresh still produced a replacement*
+///   (a dirty model whose app or source went away is dropped; see
+///   `startup::adopt_refreshed_model`).
+/// - **Write helpers** (`input`, `notifd_config`, `power`) are *not* separate staging
+///   sources: every setting of their page is staged in the shared store as an ordinary
+///   framework row, so they feed neither the dirty rollup nor a bespoke commit and are
+///   simply replaced on a refresh. They only supply what the store cannot — row
+///   candidates, and the rendering of the store's dirty settings into their file's write
+///   on Apply.
+///
+/// Every staging source and write helper is folded into the one Apply plan by
+/// [`assemble_apply_plan`]. The struct is [`Clone`] for the same reason as [`Shell`]: each
+/// field is an `Rc`, so a clone shares the models.
+#[derive(Clone, Default)]
+struct PageModels {
+    /// The Display page's runtime-discovered monitors (task 6.1); a staging source whose
+    /// `monitors.conf` write joins the Apply plan. `None` without a live compositor.
+    display: Rc<RefCell<Option<DisplayModel>>>,
+    /// The Theme page's palette scheme (task 6.3); a staging source whose switch joins the
+    /// Apply plan as a `PaletteSwitch`. `None` without a dotfiles palette source.
+    palette: Rc<RefCell<Option<PaletteModel>>>,
+    /// The Theme page's GTK/icon/cursor themes (task 6.4); a staging source with
+    /// multi-file theme/cursor writes. `None` when `gsettings` is absent.
+    themes: Rc<RefCell<Option<ThemesModel>>>,
+    /// The Theme page's wallpaper and lock background (task 6.5); a staging source writing
+    /// `hyprpaper.conf` / `hyprlock.conf`. `None` when hyprpaper is absent.
+    wallpaper: Rc<RefCell<Option<WallpaperModel>>>,
+    /// The Input page's write helper (tasks 6.6, 11.4): the keyboard-layout candidates
+    /// and the `input.lua` write. `None` — and the Input page hidden — without `hyprctl`,
+    /// on a hyprlang host, or when `input.lua` is missing or not fully understood (see
+    /// `startup::load_input_from`).
+    input: Rc<RefCell<Option<InputModel>>>,
+    /// The Notifications page's write helper for the staged notifd settings (task
+    /// 11.15), whose file write the pipeline follows with notifd's `Reload()`. `None`
+    /// when notifd is not running at version 1.1 or later, or its file is missing or not
+    /// understood (see `startup::load_notifd_config_from`); the page then shows only its
+    /// runtime controls.
+    notifd_config: Rc<RefCell<Option<NotifdConfigModel>>>,
+    /// The Power & Idle page's write helper (task 6.8): the `hypridle.conf` write for the
+    /// store-backed timeouts and lock command, followed by a hypridle restart. `None` when
+    /// hypridle is absent.
+    power: Rc<RefCell<Option<PowerModel>>>,
+}
+
+impl PageModels {
+    /// Whether the Display model holds staged monitor edits (`false` without one).
+    fn display_dirty(&self) -> bool {
+        self.display
+            .borrow()
+            .as_ref()
+            .is_some_and(DisplayModel::is_dirty)
+    }
+
+    /// Whether any of the Theme page's three staging models holds staged edits.
+    fn theme_dirty(&self) -> bool {
+        let palette_dirty = self
+            .palette
+            .borrow()
+            .as_ref()
+            .is_some_and(PaletteModel::is_dirty);
+        let themes_dirty = self
+            .themes
+            .borrow()
+            .as_ref()
+            .is_some_and(ThemesModel::is_dirty);
+        let wallpaper_dirty = self
+            .wallpaper
+            .borrow()
+            .as_ref()
+            .is_some_and(WallpaperModel::is_dirty);
+        palette_dirty || themes_dirty || wallpaper_dirty
+    }
+
+    /// Discards the staged edits of every staging source (R5.1). The write helpers hold
+    /// none — their settings are reset with the store.
+    fn reset_staged(&self) {
+        if let Some(display) = self.display.borrow_mut().as_mut() {
+            display.reset();
+        }
+        if let Some(palette) = self.palette.borrow_mut().as_mut() {
+            palette.reset();
+        }
+        if let Some(themes) = self.themes.borrow_mut().as_mut() {
+            themes.reset();
+        }
+        if let Some(wallpaper) = self.wallpaper.borrow_mut().as_mut() {
+            wallpaper.reset();
+        }
+    }
+}
+
+/// The category pages currently mounted in the window's stack, retained so the window
+/// can drive them after the fact: re-render them after a Reset, a committed Apply, or a
+/// conflict reload; probe the runtime pages on page entry ([`wire_page_entry`]); and
+/// keep the per-page dirty markers in step with the staged state.
+///
+/// Everything here is rebuilt by [`Shell::populate`] — categories, sections and rows may
+/// appear or disappear between populates — and a bespoke-page handle is `None` while
+/// its category is hidden or shows a placeholder instead. Only the Display, Theme and
+/// framework pages stage anything; the Sound, Network and runtime Notifications pages
+/// are runtime-only or read-only, so they never feed the Apply/Reset chrome or a dirty
+/// marker (R3.1, R5.2) and are retained only for their page-entry probe. [`Clone`]
+/// shares the handles, as for [`Shell`].
+#[derive(Clone, Default)]
+struct MountedPages {
+    /// The bespoke Display page (task 6.1), re-rendered from [`PageModels::display`].
+    /// `None` while the category shows a placeholder (no live monitor data).
+    display: Rc<RefCell<Option<DisplayPage>>>,
+    /// The bespoke Theme page (tasks 6.3–6.5), re-rendered from the three Theme models.
+    /// `None` while the category shows a placeholder (no Theme model at all).
+    theme: Rc<RefCell<Option<ThemePage>>>,
+    /// The runtime-only Sound page (task 6.2), probed on every page entry — including
+    /// its deferred first enumeration (task 9.4).
+    sound: Rc<RefCell<Option<SoundPage>>>,
+    /// The Notifications page (task 11.7), whose notifd daemon state is read on every
+    /// page entry (the first read included, task 9.26). Its staged notifd rows are a
+    /// framework page whose controller sits in `controllers` like any other.
+    notifications: Rc<RefCell<Option<NotificationsPage>>>,
+    /// The read-only Network page (task 6.9), whose connection status is re-read on
+    /// every page entry.
+    network: Rc<RefCell<Option<NetworkPage>>>,
+    /// The framework pages' controllers, so the window can send them
+    /// [`PageMsg::Rerender`] and so their widgets stay alive while mounted.
+    controllers: Rc<RefCell<Vec<Controller<SettingsPage>>>>,
+    /// The `(Category, stack page)` pairs whose `needs-attention` marker tracks per-page
+    /// dirty state; read by [`Shell::update_chrome`].
+    marked: Rc<RefCell<Vec<(Category, Widget)>>>,
+}
+
+impl MountedPages {
+    /// Drops the retained bespoke-page handles ahead of a repopulate; see
+    /// [`Shell::populate`] for why this must happen before the stack is torn down.
+    fn release_bespoke(&self) {
+        *self.display.borrow_mut() = None;
+        *self.sound.borrow_mut() = None;
+        *self.notifications.borrow_mut() = None;
+        *self.theme.borrow_mut() = None;
+        *self.network.borrow_mut() = None;
+    }
+
+    /// Records `root` as the stack page whose dirty marker follows `category`.
+    fn mark(&self, category: Category, root: Widget) {
+        self.marked.borrow_mut().push((category, root));
+    }
+
+    /// Re-renders every page that stages something, after the window changed the staged
+    /// state from outside a page (a Reset or a committed Apply), so a control that no
+    /// longer matches its store or model snaps back.
+    fn rerender_all(&self) {
+        self.rerender_framework();
+        self.rerender_display();
+        self.rerender_theme();
+    }
+
+    /// Sends every retained framework-page controller a [`PageMsg::Rerender`] so its
+    /// controls re-render from the shared store (task 5.3).
+    fn rerender_framework(&self) {
+        for controller in self.controllers.borrow().iter() {
+            // The receiver only goes away if the page's runtime has stopped, which cannot
+            // happen while the window holds its controller; ignore the send result rather
+            // than unwrap a case that cannot occur here.
+            let _ = controller.sender().send(PageMsg::Rerender);
+        }
+    }
+
+    /// Re-renders the Display page from its model (task 6.1), so its drop-downs snap to
+    /// the model's values.
+    fn rerender_display(&self) {
+        if let Some(page) = self.display.borrow().as_ref() {
+            page.rerender();
+        }
+    }
+
+    /// Re-renders the Theme page from its three models (tasks 6.3–6.5), so its controls
+    /// snap to the models' active or staged values.
+    fn rerender_theme(&self) {
+        if let Some(page) = self.theme.borrow().as_ref() {
+            page.rerender();
+        }
+    }
+}
+
 /// The shared, persistent handles the window's chrome and page (re)population operate
 /// on (task 5.4).
 ///
 /// The window's structure is built once (see the module docs); this bundle is what the
 /// chrome button closures and the startup/refresh flows capture so they can repopulate
-/// the stack and re-derive the chrome without rebuilding the shell. It is [`Clone`]
-/// because every field is a refcounted handle (GTK objects, `Rc`s, the `Rc<dyn Fn>`
-/// chrome refresher, and the refcounted [`Toast`]), so a clone shares the same
-/// underlying state.
+/// the stack and re-derive the chrome without rebuilding the shell. It reads as the
+/// window, the shared store and detection state, the per-category [`PageModels`] and
+/// [`MountedPages`], and the chrome. It is [`Clone`] because every field is a refcounted
+/// handle (GTK objects, `Rc`s, the `Rc<dyn Fn>` chrome refresher, and the refcounted
+/// [`Toast`]), so a clone shares the same underlying state.
 #[derive(Clone)]
 struct Shell {
     /// The top-level window, used as the transient parent for modal warnings.
     window: ApplicationWindow,
     /// The single staging store every page and the chrome share (task 5.3).
     store: Rc<RefCell<SettingsStore>>,
-    /// The Display page's runtime-discovered model (task 6.1), shared with the Display
-    /// glue. `None` until the startup worker builds it, or when there is no live
-    /// compositor. It is a second staging source alongside the store: its dirty state
-    /// feeds the same Apply/Reset chrome, and its `monitors.conf` write is folded into
-    /// the same Apply pipeline (see [`assemble_apply_plan`]).
-    display: Rc<RefCell<Option<DisplayModel>>>,
-    /// The mounted Display page, retained so the window can re-render it after a Reset
-    /// or a committed Apply. Rebuilt by [`Shell::populate`]; `None` while the Display
-    /// category shows a placeholder (no live monitor data).
-    display_page: Rc<RefCell<Option<DisplayPage>>>,
-    /// The Input page's helper (tasks 6.6, 11.4), shared with the Input glue. `None` until
-    /// the startup worker builds it, or when the page cannot be offered (no `hyprctl`, a
-    /// hyprlang host, or an `input.lua` that is missing or not fully understood — see
-    /// `startup::load_input_from`); the Input page is then hidden. Unlike the Display/Theme
-    /// models it is **not** a separate staging source — every Input setting is staged in
-    /// the shared store — so it feeds neither the dirty rollup nor a bespoke commit; it
-    /// only supplies the keyboard-layout candidates and renders the store's dirty Input
-    /// settings into the `input.lua` write on Apply (see [`assemble_apply_plan`]).
-    input: Rc<RefCell<Option<InputModel>>>,
-    /// The mounted Notifications page (task 11.7), retained so the window can read the
-    /// notifd daemon's state when the page is shown — the first read and every later
-    /// one, from the deferred page-entry hook (the task 9.26 rule). Rebuilt by
-    /// [`Shell::populate`]; `None` when the Notifications category is not visible. Its
-    /// runtime half is runtime-only, so it feeds neither the Apply/Reset chrome nor the
-    /// dirty marker (R5.2); its staged notifd rows are a framework page whose controller
-    /// sits in `controllers` like any other.
-    notifications_page: Rc<RefCell<Option<NotificationsPage>>>,
-    /// The Notifications page's helper for its staged notifd settings (task 11.15),
-    /// shared with the Apply wiring. `None` until the startup worker builds it, or when
-    /// notifd is not running at version 1.1 or later or its file is missing or not
-    /// understood (see `startup::load_notifd_config_from`); the page then shows only its
-    /// runtime controls. Like the [`InputModel`] it is **not** a separate staging source:
-    /// it only renders the store's dirty notifd settings into the file's write on Apply,
-    /// which the pipeline follows with notifd's `Reload()`.
-    notifd_config: Rc<RefCell<Option<NotifdConfigModel>>>,
-    /// The Power & Idle page's helper (task 6.8), shared with the Apply wiring. `None`
-    /// until the startup worker builds it, or when hypridle is absent. Like the
-    /// [`InputModel`] it is **not** a separate staging source —
-    /// the timeouts and lock command are staged in the shared store as ordinary framework
-    /// rows — so it feeds neither the dirty rollup nor a bespoke commit; it only renders
-    /// the store's dirty Power & Idle settings into the `hypridle.conf` write on Apply,
-    /// which the pipeline follows with a hypridle restart (see [`assemble_apply_plan`]).
-    power: Rc<RefCell<Option<PowerModel>>>,
-    /// The mounted Sound page (task 6.2), retained so the window can enumerate it when the
-    /// page is shown — both its deferred first enumeration and every later page entry
-    /// (task 9.4). Rebuilt by [`Shell::populate`]; `None` when the Sound category is not
-    /// visible. It is runtime-only, so — unlike the store and the Display model — it feeds
-    /// neither the Apply/Reset chrome nor a dirty marker (R5.2).
-    sound_page: Rc<RefCell<Option<SoundPage>>>,
-    /// The mounted Network page (task 6.9), retained so the window can re-read the
-    /// connection status when the page is re-shown. Rebuilt by [`Shell::populate`];
-    /// `None` when the Network category is not visible. It is read-only and
-    /// runtime-backed (R3.1), so — like the Sound page — it feeds neither the
-    /// Apply/Reset chrome nor a dirty marker.
-    network_page: Rc<RefCell<Option<NetworkPage>>>,
-    /// The Theme page's palette-scheme model (task 6.3), shared with the Theme glue.
-    /// `None` until the startup worker builds it, or when there is no dotfiles palette
-    /// source. Like the Display model it is a staging source alongside the store: its
-    /// dirty state feeds the same Apply/Reset chrome, and its scheme switch is folded
-    /// into the same Apply pipeline as a `PaletteSwitch` (see [`assemble_apply_plan`]).
-    palette: Rc<RefCell<Option<PaletteModel>>>,
-    /// The Theme page's GTK/icon/cursor theme model (task 6.4), shared with the Theme
-    /// glue. `None` until the startup worker builds it, or when `gsettings` is absent.
-    /// Like the palette model it is a staging source alongside the store: its dirty
-    /// state feeds the same Apply/Reset chrome, and its multi-file theme/cursor writes
-    /// are folded into the same Apply pipeline (see [`assemble_apply_plan`]).
-    themes: Rc<RefCell<Option<ThemesModel>>>,
-    /// The Theme page's wallpaper / lock-background model (task 6.5), shared with the
-    /// Theme glue. `None` until the startup worker builds it, or when hyprpaper is
-    /// absent. Like the other Theme models it is a staging source alongside the store:
-    /// its dirty state feeds the same Apply/Reset chrome, and its `hyprpaper.conf` /
-    /// `hyprlock.conf` writes are folded into the same Apply pipeline (see
-    /// [`assemble_apply_plan`]).
-    wallpaper: Rc<RefCell<Option<WallpaperModel>>>,
-    /// The mounted Theme page, retained so the window can re-render it after a Reset or a
-    /// committed Apply. Rebuilt by [`Shell::populate`]; `None` while the Theme category
-    /// shows a placeholder (no palette source and no `gsettings`, so no section built).
-    theme_page: Rc<RefCell<Option<ThemePage>>>,
     /// The most recent detection result, replaced on a manual refresh (R4.3).
     capabilities: Rc<RefCell<Capabilities>>,
     /// Whether a load pass ([`spawn_load`] — the startup load or a manual refresh) is
@@ -254,17 +376,15 @@ struct Shell {
     /// pre-Apply models and visibly revert the UI. Set by whichever code spawns a
     /// load, cleared when its result is handled.
     load_in_flight: Rc<Cell<bool>>,
-    /// The retained page controllers, so the window can send them [`PageMsg::Rerender`]
-    /// and so their widgets stay alive while mounted in the stack. Replaced by
-    /// [`Shell::populate`].
-    controllers: Rc<RefCell<Vec<Controller<SettingsPage>>>>,
+    /// The bespoke per-category models (staging sources and write helpers).
+    models: PageModels,
+    /// The pages currently mounted in `stack`, with their controllers and dirty markers.
+    pages: MountedPages,
     /// The persistent content stack whose category pages are (re)populated in place.
     stack: Stack,
-    /// The `(Category, stack page)` pairs whose `needs-attention` marker tracks per-page
-    /// dirty state; refilled by [`Shell::populate`] and read by [`Shell::update_chrome`].
-    marked: Rc<RefCell<Vec<(Category, Widget)>>>,
-    /// Re-derives all chrome from the store (Apply/Reset enablement + per-page markers).
-    /// Shared as the pages' `on_changed` and called after every store change.
+    /// Re-derives all chrome from the store and the staging models (Apply/Reset/Refresh
+    /// enablement + per-page markers). Shared as the pages' `on_changed` and called after
+    /// every staged-state change.
     update_chrome: Rc<dyn Fn()>,
     /// The non-fatal reload-failure toast (R5.5).
     toast: Toast,
@@ -295,41 +415,10 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     // no category shows during the (momentary) loading state.
     let store = Rc::new(RefCell::new(SettingsStore::new()));
     let capabilities = Rc::new(RefCell::new(Capabilities::absent()));
-    let controllers: Rc<RefCell<Vec<Controller<SettingsPage>>>> = Rc::new(RefCell::new(Vec::new()));
-    // The Display page's model and mounted page — a second staging source folded into
-    // the chrome and the Apply pipeline (task 6.1). Both start empty; the worker fills
-    // the model and `populate` builds the page.
-    let display: Rc<RefCell<Option<DisplayModel>>> = Rc::new(RefCell::new(None));
-    let display_page: Rc<RefCell<Option<DisplayPage>>> = Rc::new(RefCell::new(None));
-    // The Input page's helper (task 6.6) — the layout candidates + the Apply-time
-    // `input.lua` write. Filled by the worker; the Input page's controls are ordinary
-    // store-backed rows, so no separate page handle is retained (the SettingsPage
-    // controller goes in `controllers` like any framework page).
-    let input: Rc<RefCell<Option<InputModel>>> = Rc::new(RefCell::new(None));
-    // The Notifications page (task 11.7) — a bespoke page with runtime-only controls,
-    // rebuilt by `populate`.
-    let notifications_page: Rc<RefCell<Option<NotificationsPage>>> = Rc::new(RefCell::new(None));
-    // The Notifications page's staged-settings helper (task 11.15) — the Apply-time
-    // `notifd/config` write. Filled by the worker; its rows' SettingsPage controller goes
-    // in `controllers` like any framework page.
-    let notifd_config: Rc<RefCell<Option<NotifdConfigModel>>> = Rc::new(RefCell::new(None));
-    // The Power & Idle page's helper (task 6.8) — the Apply-time hypridle.conf write for the
-    // store-backed timeouts + lock command. Filled by the worker; the page's controls are
-    // ordinary store-backed framework rows, so no separate page handle is retained (the
-    // SettingsPage controller goes in `controllers` like any framework page).
-    let power: Rc<RefCell<Option<PowerModel>>> = Rc::new(RefCell::new(None));
-    // The Sound page (task 6.2) — a runtime-only bespoke page rebuilt by `populate`.
-    let sound_page: Rc<RefCell<Option<SoundPage>>> = Rc::new(RefCell::new(None));
-    // The Network page (task 6.9) — a read-only, runtime-backed bespoke page rebuilt by
-    // `populate`.
-    let network_page: Rc<RefCell<Option<NetworkPage>>> = Rc::new(RefCell::new(None));
-    // The Theme page's palette model and mounted page (task 6.3) — a staging source
-    // folded into the chrome and the Apply pipeline, like the Display model. Both start
-    // empty; the worker fills the model and `populate` builds the page.
-    let palette: Rc<RefCell<Option<PaletteModel>>> = Rc::new(RefCell::new(None));
-    let themes: Rc<RefCell<Option<ThemesModel>>> = Rc::new(RefCell::new(None));
-    let wallpaper: Rc<RefCell<Option<WallpaperModel>>> = Rc::new(RefCell::new(None));
-    let theme_page: Rc<RefCell<Option<ThemePage>>> = Rc::new(RefCell::new(None));
+    // The bespoke models and the mounted-page handles all start empty: the worker fills
+    // the models and `populate` mounts the pages (see the two structs' docs).
+    let models = PageModels::default();
+    let pages = MountedPages::default();
 
     // The persistent content stack + sidebar. Pages are added to this same stack on
     // every populate; the stack itself is never rebuilt.
@@ -349,8 +438,6 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     let refresh_button = Button::with_label("Refresh");
     let toast = Toast::new();
 
-    let marked: Rc<RefCell<Vec<(Category, Widget)>>> = Rc::new(RefCell::new(Vec::new()));
-
     // Whether a worker load pass is in flight (task 9.3; see the Shell field docs).
     // Starts false; `start_load` sets it (and re-derives the chrome) before spawning.
     let load_in_flight = Rc::new(Cell::new(false));
@@ -360,16 +447,13 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     // built once and reused across repopulates.
     let update_chrome: Rc<dyn Fn()> = {
         let store = store.clone();
-        let display = display.clone();
-        let palette = palette.clone();
-        let themes = themes.clone();
-        let wallpaper = wallpaper.clone();
+        let models = models.clone();
         let apply_button = apply_button.clone();
         let reset_button = reset_button.clone();
         let refresh_button = refresh_button.clone();
         let load_in_flight = load_in_flight.clone();
         let stack = stack.clone();
-        let marked = marked.clone();
+        let marked = pages.marked.clone();
         Rc::new(move || {
             let store = store.borrow();
             // The Display and Theme pages are additional dirty sources (tasks 6.1/6.3–6.5):
@@ -377,20 +461,8 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
             // `generate-colors`; the GTK/icon/cursor themes and the wallpaper/lock paths
             // are bespoke models), so each reports its own dirty state, OR-ed into the
             // shared Apply/Reset enablement.
-            let display_dirty = display
-                .borrow()
-                .as_ref()
-                .is_some_and(DisplayModel::is_dirty);
-            let palette_dirty = palette
-                .borrow()
-                .as_ref()
-                .is_some_and(PaletteModel::is_dirty);
-            let themes_dirty = themes.borrow().as_ref().is_some_and(ThemesModel::is_dirty);
-            let wallpaper_dirty = wallpaper
-                .borrow()
-                .as_ref()
-                .is_some_and(WallpaperModel::is_dirty);
-            let theme_dirty = palette_dirty || themes_dirty || wallpaper_dirty;
+            let display_dirty = models.display_dirty();
+            let theme_dirty = models.theme_dirty();
             let enabled = chrome::actions_enabled(&store) || display_dirty || theme_dirty;
             // While a worker load pass runs, all three chrome actions disable (task
             // 9.3): Refresh so only one pass is ever in flight, and Apply/Reset so a
@@ -402,9 +474,9 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
             reset_button.set_sensitive(enabled && !in_flight);
             refresh_button.set_sensitive(!in_flight);
             for (category, child) in marked.borrow().iter() {
-                // Display reads its own model; Theme ORs its two bespoke models (palette +
-                // GTK/icon/cursor) with any store-backed Theme setting so it stays correct
-                // once 6.5 adds one. Every other page reads the store's per-category rollup.
+                // Display reads its own model; Theme ORs its three bespoke models with any
+                // store-backed Theme setting, so the marker stays correct should one be
+                // added. Every other page reads the store's per-category rollup.
                 let dirty = match *category {
                     Category::Display => display_dirty,
                     Category::Theme => theme_dirty || store.is_category_dirty(Category::Theme),
@@ -442,23 +514,11 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     let shell = Shell {
         window: window.clone(),
         store,
-        display,
-        display_page,
-        input,
-        notifications_page,
-        notifd_config,
-        power,
-        sound_page,
-        network_page,
-        palette,
-        themes,
-        wallpaper,
-        theme_page,
         capabilities,
         load_in_flight,
-        controllers,
+        models,
+        pages,
         stack,
-        marked,
         update_chrome,
         toast,
     };
@@ -466,9 +526,7 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     shell.wire_apply(&apply_button);
     shell.wire_reset(&reset_button);
     shell.wire_refresh(&refresh_button);
-    shell.wire_sound_page_entry();
-    shell.wire_notifications_page_entry();
-    shell.wire_network_page_entry();
+    shell.wire_page_entries();
 
     // Initial (disabled) chrome state, then kick off the worker — `start_load` marks
     // the pass in flight and re-derives the chrome again, so Refresh is already
@@ -502,8 +560,11 @@ fn spawn_load(on_done: impl FnOnce(Option<StartupLoad>) + 'static) {
 }
 
 /// Connects a page-entry hook that runs `probe` on the page currently held in `page`
-/// whenever the stack child named `stack_name` becomes visible — but from the GTK main
-/// loop's **idle queue**, not from the notification itself (task 9.4).
+/// whenever `category`'s stack child becomes visible — but from the GTK main loop's
+/// **idle queue**, not from the notification itself (task 9.4).
+///
+/// This is the one mechanism behind every runtime page's entry probe; which pages use it,
+/// and what each probe reads, is listed in [`Shell::wire_page_entries`].
 ///
 /// # Why the idle hop
 ///
@@ -532,12 +593,13 @@ fn spawn_load(on_done: impl FnOnce(Option<StartupLoad>) + 'static) {
 ///
 /// The notification handler itself is connected once, to the stack the window keeps for
 /// its whole lifetime, so it survives every repopulate without handlers accumulating.
-fn wire_deferred_page_entry<P: 'static>(
+fn wire_page_entry<P: 'static>(
     stack: &Stack,
     page: &Rc<RefCell<Option<P>>>,
-    stack_name: &'static str,
+    category: SidebarCategory,
     probe: fn(&P),
 ) {
+    let stack_name = category.stack_name();
     // Set while an idle callback for this page is queued, so repeated entries coalesce.
     let queued = Rc::new(Cell::new(false));
     let page = Rc::downgrade(page);
@@ -649,16 +711,16 @@ impl Shell {
             }
         }
         *self.capabilities.borrow_mut() = capabilities;
-        // Adopt the worker-built Display, Input, Power & Idle, palette, GTK/icon/cursor
-        // theme, and wallpaper models (tasks 6.1/6.3–6.8) before `populate` builds their
+        // Adopt the worker-built models (see `PageModels`) before `populate` builds their
         // pages.
-        *self.display.borrow_mut() = display;
-        *self.input.borrow_mut() = input;
-        *self.notifd_config.borrow_mut() = notifications;
-        *self.power.borrow_mut() = power;
-        *self.palette.borrow_mut() = palette;
-        *self.themes.borrow_mut() = themes;
-        *self.wallpaper.borrow_mut() = wallpaper;
+        let models = &self.models;
+        *models.display.borrow_mut() = display;
+        *models.input.borrow_mut() = input;
+        *models.notifd_config.borrow_mut() = notifications;
+        *models.power.borrow_mut() = power;
+        *models.palette.borrow_mut() = palette;
+        *models.themes.borrow_mut() = themes;
+        *models.wallpaper.borrow_mut() = wallpaper;
 
         self.populate();
 
@@ -695,107 +757,96 @@ impl Shell {
         //
         // This happens *before* the stack is torn down on purpose: removing the visible
         // page makes GTK pick another child as the visible one, which fires the
-        // page-entry hooks ([`Self::wire_sound_page_entry`] and its siblings). With the
-        // handles already cleared those hooks find no page to refresh, so tearing the
-        // stack down can never run a `pw-dump`/`nmcli`/`busctl` probe for a page
-        // that is on its way out (task 9.4).
-        *self.display_page.borrow_mut() = None;
-        *self.sound_page.borrow_mut() = None;
-        *self.notifications_page.borrow_mut() = None;
-        *self.theme_page.borrow_mut() = None;
-        *self.network_page.borrow_mut() = None;
+        // page-entry hooks ([`Self::wire_page_entries`]). With the handles already
+        // cleared those hooks find no page to refresh, so tearing the stack down can
+        // never run a `pw-dump`/`nmcli`/`busctl` probe for a page that is on its way out
+        // (task 9.4).
+        self.pages.release_bespoke();
 
         // Remove every current stack page (the loading placeholder, and any pages from a
         // previous populate).
         while let Some(child) = self.stack.first_child() {
             self.stack.remove(&child);
         }
-        self.marked.borrow_mut().clear();
+        self.pages.marked.borrow_mut().clear();
 
-        // Build one page per visible category, in sidebar order (R4.2).
+        // Build one page per visible category, in sidebar order (R4.2). The match is
+        // exhaustive on purpose: a new category does not compile until it is given a
+        // builder here. Each builder's docs say why its category is built that way.
         let mut controllers = Vec::new();
         for category in visible_categories(&caps) {
-            // Display is bespoke (task 6.1): its per-monitor controls are dynamic and
-            // its laptop toggle is runtime-only, so it does not use the declarative
-            // framework. Build it directly from the runtime-discovered model.
-            if category == SidebarCategory::Display {
-                self.populate_display(category);
-                continue;
-            }
-            // Sound is bespoke too (task 6.2): every control is runtime-only (R5.2), so
-            // it does not use the declarative store-backed framework. Build it directly
-            // from the runtime-enumerated PipeWire state.
-            if category == SidebarCategory::Sound {
-                self.populate_sound(category);
-                continue;
-            }
-            // Theme is bespoke as well (task 6.3): its palette switch runs
-            // `generate-colors` rather than writing a store-backed setting, so it renders
-            // from the [`PaletteModel`] instead of the declarative framework.
-            if category == SidebarCategory::Theme {
-                self.populate_theme(category);
-                continue;
-            }
-            // Input uses the declarative framework (its settings are store-backed), but
-            // its keyboard-layout add-control needs the runtime XKB candidates, so it is
-            // built here rather than through the pure `plan_category` (task 6.6).
-            if category == SidebarCategory::Input {
-                self.populate_input(category, &mut controllers);
-                continue;
-            }
-            // Notifications is bespoke too (task 11.7): its runtime controls drive notifd
-            // state directly (R5.2). Its staged notifd rows (task 11.15) are a framework
-            // page mounted inside it, whose controller joins `controllers`.
-            if category == SidebarCategory::Notifications {
-                self.populate_notifications(category, &mut controllers);
-                continue;
-            }
-            // Network is bespoke too (task 6.9): it is read-only, runtime-backed status
-            // (R3.1) with no store-backed settings, so it does not use the declarative
-            // framework. Build it directly from the live nmcli status.
-            if category == SidebarCategory::Network {
-                self.populate_network(category);
-                continue;
-            }
-            // The plan reads the store too: some rows exist only for certain loaded
-            // configurations (the lock grace period, task 11.13). The borrow ends with
-            // the `plan_category` call, before `build_page` takes its own handle.
-            let plan = page::plan_category(category, &caps, &self.store.borrow());
-            match plan {
-                PagePlan::Framework(rows) => {
-                    let controller =
-                        page::build_page(self.store.clone(), rows, self.update_chrome.clone());
-                    let root = controller.widget().clone();
-                    self.stack
-                        .add_titled(&root, Some(category.stack_name()), category.title());
-                    if let Some(model_category) = chrome::marker_category(category) {
-                        self.marked
-                            .borrow_mut()
-                            .push((model_category, root.upcast()));
-                    }
-                    controllers.push(controller);
+            match category {
+                // Bespoke, store-free staging pages, rendered from their own models.
+                SidebarCategory::Display => self.populate_display(category),
+                SidebarCategory::Theme => self.populate_theme(category),
+                // Runtime-only or read-only pages, probed from their page-entry hooks.
+                SidebarCategory::Sound => self.populate_sound(category),
+                SidebarCategory::Network => self.populate_network(category),
+                // Framework rows that need model data `plan_category` cannot supply;
+                // Notifications also wraps them in its runtime-only notifd controls.
+                SidebarCategory::Input => self.populate_input(category, &mut controllers),
+                SidebarCategory::Notifications => {
+                    self.populate_notifications(category, &mut controllers);
                 }
-                PagePlan::NoSpec => {
-                    let placeholder = build_placeholder_page(category);
-                    self.stack.add_titled(
-                        &placeholder,
-                        Some(category.stack_name()),
-                        category.title(),
-                    );
+                // Pure framework pages: their rows come straight from `plan_category`.
+                SidebarCategory::PowerAndIdle => {
+                    self.populate_framework(category, &caps, &mut controllers);
                 }
-                // Every row gated out: drop the category (R4.2); `plan_category` logged it.
-                PagePlan::Emptied => {}
             }
         }
 
         // Refresh the chrome for the new page set, and retain the fresh controllers so
         // the window can send them `Rerender` (dropping any from a previous populate).
         (self.update_chrome)();
-        *self.controllers.borrow_mut() = controllers;
+        *self.pages.controllers.borrow_mut() = controllers;
+    }
+
+    /// Adds `child` to the stack as `category`'s sidebar page, under its stack name and
+    /// title.
+    fn add_category_page(&self, category: SidebarCategory, child: &impl IsA<Widget>) {
+        self.stack
+            .add_titled(child, Some(category.stack_name()), category.title());
+    }
+
+    /// Builds a category page purely from the declarative row framework (task 5.2).
+    ///
+    /// [`page::plan_category`] decides between a framework page (its controller retained
+    /// in `controllers`, its dirty marker registered), the task-5.1 placeholder for a
+    /// category with no row descriptors, and dropping a category whose rows are all gated
+    /// out (R4.2; `plan_category` logs that case).
+    fn populate_framework(
+        &self,
+        category: SidebarCategory,
+        caps: &Capabilities,
+        controllers: &mut Vec<Controller<SettingsPage>>,
+    ) {
+        // The plan reads the store too: some rows exist only for certain loaded
+        // configurations (the lock grace period, task 11.13). The borrow ends with the
+        // `plan_category` call, before `build_page` takes its own handle.
+        let plan = page::plan_category(category, caps, &self.store.borrow());
+        match plan {
+            PagePlan::Framework(rows) => {
+                let controller =
+                    page::build_page(self.store.clone(), rows, self.update_chrome.clone());
+                let root = controller.widget().clone();
+                self.add_category_page(category, &root);
+                if let Some(model_category) = chrome::marker_category(category) {
+                    self.pages.mark(model_category, root.upcast());
+                }
+                controllers.push(controller);
+            }
+            PagePlan::NoSpec => {
+                self.add_category_page(category, &build_placeholder_page(category));
+            }
+            // Every row gated out: drop the category (R4.2); `plan_category` logged it.
+            PagePlan::Emptied => {}
+        }
     }
 
     /// Builds the Display category's page (task 6.1).
     ///
+    /// Display is bespoke rather than a framework page because its per-monitor controls
+    /// are discovered at runtime and its laptop-display toggle is runtime-only (R5.2).
     /// When a runtime-discovered [`DisplayModel`] is available, mounts the bespoke
     /// [`display`] page (rendering from the shared model and reporting staged edits
     /// through `update_chrome`) and registers its dirty marker under
@@ -803,20 +854,16 @@ impl Shell {
     /// (so the category is visible, task 5.1) but the compositor is not reloadable —
     /// it falls back to the task-5.1 placeholder so the page degrades cleanly (R4.2).
     fn populate_display(&self, category: SidebarCategory) {
-        if self.display.borrow().is_some() {
-            let page = display::build(self.display.clone(), self.update_chrome.clone());
-            self.stack
-                .add_titled(page.root(), Some(category.stack_name()), category.title());
+        if self.models.display.borrow().is_some() {
+            let page = display::build(self.models.display.clone(), self.update_chrome.clone());
+            self.add_category_page(category, page.root());
             // The Display page's marker tracks its own model's dirty state, not the
             // store's (it holds no store-backed settings).
-            self.marked
-                .borrow_mut()
-                .push((Category::Display, page.root().clone().upcast()));
-            *self.display_page.borrow_mut() = Some(page);
+            self.pages
+                .mark(Category::Display, page.root().clone().upcast());
+            *self.pages.display.borrow_mut() = Some(page);
         } else {
-            let placeholder = build_placeholder_page(category);
-            self.stack
-                .add_titled(&placeholder, Some(category.stack_name()), category.title());
+            self.add_category_page(category, &build_placeholder_page(category));
         }
     }
 
@@ -839,7 +886,7 @@ impl Shell {
         controllers: &mut Vec<Controller<SettingsPage>>,
     ) {
         let caps = self.capabilities.borrow();
-        let visible = input::page_rows(self.input.borrow().as_ref(), &caps);
+        let visible = input::page_rows(self.models.input.borrow().as_ref(), &caps);
         if visible.is_empty() {
             tracing::info!(
                 category = category.title(),
@@ -851,19 +898,17 @@ impl Shell {
 
         let controller = page::build_page(self.store.clone(), visible, self.update_chrome.clone());
         let root = controller.widget().clone();
-        self.stack
-            .add_titled(&root, Some(category.stack_name()), category.title());
+        self.add_category_page(category, &root);
         // The Input marker tracks the store's per-page dirty rollup, like any framework
         // page (its settings are all store-backed).
-        self.marked
-            .borrow_mut()
-            .push((Category::Input, root.upcast()));
+        self.pages.mark(Category::Input, root.upcast());
         controllers.push(controller);
     }
 
     /// Builds the Notifications category's page (tasks 11.7, 11.15).
     ///
-    /// Mounts the bespoke [`notifications`] page. When the startup load built the notifd
+    /// Notifications is bespoke because its runtime controls drive notifd state directly
+    /// (R5.2). Mounts the bespoke [`notifications`] page. When the startup load built the notifd
     /// settings helper, the staged rows ([`notifications::page_rows`]) are launched as a
     /// framework [`SettingsPage`] — its controller kept in `controllers` so a Reset or
     /// commit re-renders it — and placed inside the page, and the page's dirty marker
@@ -871,7 +916,7 @@ impl Shell {
     /// Apply/Reset chrome (R5.2). Without the helper the runtime controls stand alone
     /// (the startup load logged why). The category is only reached when detection found
     /// notifd running or installed (task 5.1's gate). Building runs no `busctl`: the
-    /// first read is the page-entry hook's ([`Self::wire_notifications_page_entry`]), and
+    /// first read is the page-entry hook's ([`Self::wire_page_entries`]), and
     /// — as on the Sound and Network pages — the handle is stored *before* the page joins
     /// the stack, because adding the first page fires the entry hooks synchronously and
     /// every hook is written to find the page it is about to refresh.
@@ -880,7 +925,7 @@ impl Shell {
         category: SidebarCategory,
         controllers: &mut Vec<Controller<SettingsPage>>,
     ) {
-        let rows = notifications::page_rows(self.notifd_config.borrow().as_ref());
+        let rows = notifications::page_rows(self.models.notifd_config.borrow().as_ref());
         let staged = (!rows.is_empty())
             .then(|| page::build_page(self.store.clone(), rows, self.update_chrome.clone()));
         let page = notifications::build(
@@ -889,14 +934,11 @@ impl Shell {
                 .map(|controller| controller.widget().upcast_ref::<Widget>()),
         );
         let root = page.root().clone();
-        *self.notifications_page.borrow_mut() = Some(page);
-        self.stack
-            .add_titled(&root, Some(category.stack_name()), category.title());
+        *self.pages.notifications.borrow_mut() = Some(page);
+        self.add_category_page(category, &root);
         if let Some(controller) = staged {
             if let Some(model_category) = chrome::marker_category(category) {
-                self.marked
-                    .borrow_mut()
-                    .push((model_category, root.upcast()));
+                self.pages.mark(model_category, root.upcast());
             }
             controllers.push(controller);
         }
@@ -904,14 +946,15 @@ impl Shell {
 
     /// Builds the Sound category's page (task 6.2).
     ///
-    /// Mounts the bespoke [`sound`] page, which enumerates the live PipeWire devices and
-    /// renders the runtime-only output/input controls. No dirty marker is registered: the
+    /// Sound is bespoke because every control is runtime-only (R5.2), so nothing is staged
+    /// in the store. Mounts the bespoke [`sound`] page, which enumerates the live PipeWire
+    /// devices and renders the runtime-only output/input controls. No dirty marker is registered: the
     /// page stages nothing and never feeds the Apply/Reset chrome (R5.2). The category is
     /// only reached here when the Sound gate found `wpctl` present (task 5.1), so the
     /// enumeration and controls have their client.
     ///
     /// Building runs no `pw-dump`/`wpctl`: the first enumeration is deferred to the page's
-    /// first entry (the [`Self::wire_sound_page_entry`] hook, which runs it from the idle
+    /// first entry (the [`Self::wire_page_entries`] hook, which runs it from the idle
     /// queue), so a wedged PipeWire can never stall populate — and with it every
     /// category's appearance — against the R8.1 startup budget (task 9.4). As on the
     /// Network and Notifications pages the handle is stored *before* the page is added to
@@ -921,14 +964,14 @@ impl Shell {
     fn populate_sound(&self, category: SidebarCategory) {
         let page = sound::build();
         let root = page.root().clone();
-        *self.sound_page.borrow_mut() = Some(page);
-        self.stack
-            .add_titled(&root, Some(category.stack_name()), category.title());
+        *self.pages.sound.borrow_mut() = Some(page);
+        self.add_category_page(category, &root);
     }
 
     /// Builds the Network category's page (task 6.9).
     ///
-    /// Mounts the bespoke [`network`] page, which shows the active NetworkManager
+    /// Network is bespoke because it is read-only, runtime-backed status (R3.1) with no
+    /// store-backed settings. Mounts the bespoke [`network`] page, which shows the active NetworkManager
     /// connections and offers the "Open Network Settings" launcher button. Which
     /// tool that button spawns is decided here from the current capabilities
     /// (nm-connection-editor preferred, else kitty+nmtui, else no button — R4.2). No
@@ -937,7 +980,7 @@ impl Shell {
     /// `nmcli` is present (task 5.1).
     ///
     /// Building runs no `nmcli`: the first status read is deferred to the page's first
-    /// entry (the [`Self::wire_network_page_entry`] hook, which runs it from the idle
+    /// entry (the [`Self::wire_page_entries`] hook, which runs it from the idle
     /// queue), so a wedged NetworkManager can never stall populate — and with it every
     /// category's appearance — against the R8.1 startup budget. The handle is stored
     /// *before* the page is added to the stack: adding the first page makes it the visible
@@ -947,14 +990,15 @@ impl Shell {
         let launcher = crate::core::network::launcher(&self.capabilities.borrow());
         let page = network::build(launcher);
         let root = page.root().clone();
-        *self.network_page.borrow_mut() = Some(page);
-        self.stack
-            .add_titled(&root, Some(category.stack_name()), category.title());
+        *self.pages.network.borrow_mut() = Some(page);
+        self.add_category_page(category, &root);
     }
 
     /// Builds the Theme category's page (tasks 6.3/6.4).
     ///
-    /// The page hosts three independent sections, each present when its model was built
+    /// Theme is bespoke because none of its values is a store setting: the palette switch
+    /// runs `generate-colors`, and the theme and wallpaper changes are multi-file writes
+    /// owned by their models. The page hosts three independent sections, each present when its model was built
     /// by the worker: the palette-scheme section when the dotfiles palette source was
     /// discovered (R3.2/R8.5), the GTK/icon/cursor appearance section when `gsettings`
     /// is present (R3.3/R3.4/R4.2), and the wallpaper section when hyprpaper is present
@@ -965,87 +1009,69 @@ impl Shell {
     /// the reason is logged at `info`, matching the hidden-item convention
     /// (detection/startup also log *why* each model is absent).
     fn populate_theme(&self, category: SidebarCategory) {
-        let has_palette = self.palette.borrow().is_some();
-        let has_themes = self.themes.borrow().is_some();
-        let has_wallpaper = self.wallpaper.borrow().is_some();
+        let models = &self.models;
+        let has_palette = models.palette.borrow().is_some();
+        let has_themes = models.themes.borrow().is_some();
+        let has_wallpaper = models.wallpaper.borrow().is_some();
         if has_palette || has_themes || has_wallpaper {
             let page = theme::build(
-                self.palette.clone(),
-                self.themes.clone(),
-                self.wallpaper.clone(),
+                models.palette.clone(),
+                models.themes.clone(),
+                models.wallpaper.clone(),
                 self.update_chrome.clone(),
             );
-            self.stack
-                .add_titled(page.root(), Some(category.stack_name()), category.title());
-            // The Theme marker tracks the palette and GTK/icon/cursor models' dirty
-            // state (and, later, any store-backed Theme setting).
-            self.marked
-                .borrow_mut()
-                .push((Category::Theme, page.root().clone().upcast()));
-            *self.theme_page.borrow_mut() = Some(page);
+            self.add_category_page(category, page.root());
+            // The Theme marker tracks the three Theme models' dirty state (and any
+            // store-backed Theme setting, should one be added).
+            self.pages
+                .mark(Category::Theme, page.root().clone().upcast());
+            *self.pages.theme.borrow_mut() = Some(page);
         } else {
             tracing::info!(
                 "Theme sections hidden: no dotfiles palette source, no gsettings, and no \
                  hyprpaper (R3.2/R3.3/R4.2/R8.5)"
             );
-            let placeholder = build_placeholder_page(category);
-            self.stack
-                .add_titled(&placeholder, Some(category.stack_name()), category.title());
+            self.add_category_page(category, &build_placeholder_page(category));
         }
     }
 
-    /// Re-enumerates the Sound page whenever it becomes the visible stack child (task
-    /// 6.2), so the controls reflect the live audio state on page entry (R3.1) — picking
-    /// up volume/device changes made elsewhere while the app was on another page. This
-    /// same hook also performs the page's deferred *first* enumeration:
-    /// [`sound::build`] deliberately runs no `pw-dump` (see [`Self::populate_sound`]), so
-    /// the page shows its placeholder until this fires on first entry.
+    /// Connects the page-entry hook of every runtime-backed page, each through the one
+    /// deferred mechanism [`wire_page_entry`] (tasks 6.2, 6.9, 9.4, 11.7).
     ///
-    /// A repopulate therefore does not re-enumerate a Sound page nobody is viewing:
-    /// [`Self::populate`] rebuilds it in its placeholder state and this hook enumerates
-    /// when the user next opens it (task 9.4). The enumeration itself is handed to the
-    /// idle queue — see [`wire_deferred_page_entry`] for why that matters.
-    fn wire_sound_page_entry(&self) {
-        wire_deferred_page_entry(
+    /// Each hook re-reads its page's live state whenever the page becomes the visible
+    /// stack child, so the page reflects changes made elsewhere while the app showed
+    /// another page — and the same hook performs the page's deferred *first* read, since
+    /// none of these pages' `build` runs a command: the page shows its placeholder until
+    /// the hook fires on first entry. A repopulate therefore never re-probes a page
+    /// nobody is viewing: [`Self::populate`] rebuilds it in its placeholder state and the
+    /// hook reads when the user next opens it. Per page:
+    ///
+    /// - **Sound** re-enumerates the PipeWire devices, volumes and mute state (R3.1).
+    /// - **Notifications** reads the notifd daemon's state — do-not-disturb, count,
+    ///   inhibited — including a daemon that started since the page was last shown (R5.2,
+    ///   the rule task 9.26 asked for).
+    /// - **Network** re-reads the NetworkManager connection status (R3.1).
+    ///
+    /// A new runtime page adds one line here. Each hook is connected once, to the
+    /// persistent stack, and reads whichever page its handle holds when it fires.
+    fn wire_page_entries(&self) {
+        let pages = &self.pages;
+        wire_page_entry(
             &self.stack,
-            &self.sound_page,
-            SidebarCategory::Sound.stack_name(),
+            &pages.sound,
+            SidebarCategory::Sound,
             SoundPage::refresh,
         );
-    }
-
-    /// Reads the notifd daemon's state whenever the Notifications page becomes the
-    /// visible stack child (task 11.7), so the runtime-only controls reflect the live
-    /// daemon on page entry (R5.2) — including a do-not-disturb change made elsewhere,
-    /// or a daemon that started since the page was last shown. This same hook performs
-    /// the page's deferred *first* read: [`notifications::build`] runs no command.
-    ///
-    /// Like the Sound and Network hooks, the read is handed to the idle queue so it can
-    /// never run on the populate path — see [`wire_deferred_page_entry`]. This is the
-    /// rule task 9.26 asked for.
-    fn wire_notifications_page_entry(&self) {
-        wire_deferred_page_entry(
+        wire_page_entry(
             &self.stack,
-            &self.notifications_page,
-            SidebarCategory::Notifications.stack_name(),
+            &pages.notifications,
+            SidebarCategory::Notifications,
             NotificationsPage::refresh,
         );
-    }
-
-    /// Re-reads the NetworkManager connection status whenever the Network page becomes
-    /// the visible stack child (task 6.9), so the read-only rows reflect the live state
-    /// on page entry (R3.1) — picking up a connection change made while the app was on
-    /// another page. This same hook also performs the page's deferred *first* read:
-    /// [`network::build`] deliberately runs no `nmcli` (see [`Self::populate_network`]),
-    /// so the page shows its placeholder until this fires on first entry.
-    ///
-    /// Like the Sound hook, the read is handed to the idle queue so it can never run on
-    /// the populate path — see [`wire_deferred_page_entry`].
-    fn wire_network_page_entry(&self) {
-        wire_deferred_page_entry(
+        wire_page_entry(
             &self.stack,
-            &self.network_page,
-            SidebarCategory::Network.stack_name(),
+            &pages.network,
+            SidebarCategory::Network,
             NetworkPage::refresh,
         );
     }
@@ -1076,14 +1102,15 @@ impl Shell {
             // mutates one, so an abort below cannot have disturbed a staged edit. The
             // borrows end with this block, before a commit or reload borrows mutably.
             let assembled = {
+                let models = &shell.models;
                 let store = shell.store.borrow();
-                let display = shell.display.borrow();
-                let input = shell.input.borrow();
-                let notifd_config = shell.notifd_config.borrow();
-                let power = shell.power.borrow();
-                let palette = shell.palette.borrow();
-                let themes = shell.themes.borrow();
-                let wallpaper = shell.wallpaper.borrow();
+                let display = models.display.borrow();
+                let input = models.input.borrow();
+                let notifd_config = models.notifd_config.borrow();
+                let power = models.power.borrow();
+                let palette = models.palette.borrow();
+                let themes = models.themes.borrow();
+                let wallpaper = models.wallpaper.borrow();
                 assemble_apply_plan(ApplySources {
                     store: &store,
                     display: display.as_ref(),
@@ -1158,7 +1185,7 @@ impl Shell {
         // The Display model promotes its staged monitor edits and updates its in-memory
         // records (task 6.1).
         if commits.display {
-            if let Some(display) = self.display.borrow_mut().as_mut() {
+            if let Some(display) = self.models.display.borrow_mut().as_mut() {
                 display.commit();
             }
         }
@@ -1166,27 +1193,25 @@ impl Shell {
         // is clean again (task 6.3). There is no on-disk baseline to re-record: the app
         // does not write the generated `colors.conf`, `generate-colors` does.
         if commits.palette {
-            if let Some(palette) = self.palette.borrow_mut().as_mut() {
+            if let Some(palette) = self.models.palette.borrow_mut().as_mut() {
                 palette.commit();
             }
         }
         // The GTK/icon/cursor model promotes its staged selections and re-baselines its
         // backing files' freshness from the just-written bytes (task 6.4).
         if commits.themes {
-            if let Some(themes) = self.themes.borrow_mut().as_mut() {
+            if let Some(themes) = self.models.themes.borrow_mut().as_mut() {
                 themes.commit();
             }
         }
         // The wallpaper / lock-background model does the same for `hyprpaper.conf` and
         // `hyprlock.conf` (task 6.5).
         if commits.wallpaper {
-            if let Some(wallpaper) = self.wallpaper.borrow_mut().as_mut() {
+            if let Some(wallpaper) = self.models.wallpaper.borrow_mut().as_mut() {
                 wallpaper.commit();
             }
         }
-        self.rerender_pages();
-        self.rerender_display();
-        self.rerender_theme();
+        self.pages.rerender_all();
         (self.update_chrome)();
     }
 
@@ -1209,22 +1234,33 @@ impl Shell {
         match source {
             ConflictedSource::Display => {
                 let reloaded = self
+                    .models
                     .display
                     .borrow()
                     .as_ref()
                     .and_then(|model| model.reload(runner));
-                *self.display.borrow_mut() = reloaded;
-                self.rerender_display();
+                *self.models.display.borrow_mut() = reloaded;
+                self.pages.rerender_display();
             }
             ConflictedSource::Themes => {
-                let reloaded = self.themes.borrow().as_ref().map(ThemesModel::reload);
-                *self.themes.borrow_mut() = reloaded;
-                self.rerender_theme();
+                let reloaded = self
+                    .models
+                    .themes
+                    .borrow()
+                    .as_ref()
+                    .map(ThemesModel::reload);
+                *self.models.themes.borrow_mut() = reloaded;
+                self.pages.rerender_theme();
             }
             ConflictedSource::Wallpaper => {
-                let reloaded = self.wallpaper.borrow().as_ref().map(WallpaperModel::reload);
-                *self.wallpaper.borrow_mut() = reloaded;
-                self.rerender_theme();
+                let reloaded = self
+                    .models
+                    .wallpaper
+                    .borrow()
+                    .as_ref()
+                    .map(WallpaperModel::reload);
+                *self.models.wallpaper.borrow_mut() = reloaded;
+                self.pages.rerender_theme();
             }
         }
         (self.update_chrome)();
@@ -1235,24 +1271,10 @@ impl Shell {
         let shell = self.clone();
         reset_button.connect_clicked(move |_| {
             shell.store.borrow_mut().reset();
-            // Reset the Display, palette, GTK/icon/cursor theme, and wallpaper staging
-            // too (tasks 6.1/6.3–6.5) — they are additional dirty sources, so Reset must
-            // clear them alongside the store.
-            if let Some(display) = shell.display.borrow_mut().as_mut() {
-                display.reset();
-            }
-            if let Some(palette) = shell.palette.borrow_mut().as_mut() {
-                palette.reset();
-            }
-            if let Some(themes) = shell.themes.borrow_mut().as_mut() {
-                themes.reset();
-            }
-            if let Some(wallpaper) = shell.wallpaper.borrow_mut().as_mut() {
-                wallpaper.reset();
-            }
-            shell.rerender_pages();
-            shell.rerender_display();
-            shell.rerender_theme();
+            // Reset the bespoke staging sources too (tasks 6.1/6.3–6.5) — they are
+            // additional dirty sources, so Reset must clear them alongside the store.
+            shell.models.reset_staged();
+            shell.pages.rerender_all();
             (shell.update_chrome)();
             tracing::debug!("discarded staged edits from the Reset button (R5.1)");
         });
@@ -1328,26 +1350,27 @@ impl Shell {
         // R4.3: adopt the refreshed capabilities and models before `populate` rebuilds
         // the pages from them.
         *self.capabilities.borrow_mut() = capabilities;
+        let models = &self.models;
         startup::adopt_refreshed_model(
-            &mut self.display.borrow_mut(),
+            &mut models.display.borrow_mut(),
             display,
             DisplayModel::is_dirty,
         );
-        *self.input.borrow_mut() = input;
-        *self.notifd_config.borrow_mut() = notifications;
-        *self.power.borrow_mut() = power;
+        *models.input.borrow_mut() = input;
+        *models.notifd_config.borrow_mut() = notifications;
+        *models.power.borrow_mut() = power;
         startup::adopt_refreshed_model(
-            &mut self.palette.borrow_mut(),
+            &mut models.palette.borrow_mut(),
             palette,
             PaletteModel::is_dirty,
         );
         startup::adopt_refreshed_model(
-            &mut self.themes.borrow_mut(),
+            &mut models.themes.borrow_mut(),
             themes,
             ThemesModel::is_dirty,
         );
         startup::adopt_refreshed_model(
-            &mut self.wallpaper.borrow_mut(),
+            &mut models.wallpaper.borrow_mut(),
             wallpaper,
             WallpaperModel::is_dirty,
         );
@@ -1363,39 +1386,6 @@ impl Shell {
             "manual refresh complete: detection, backing files, and page models re-read \
              (R4.3/R5.6)"
         );
-    }
-
-    /// Sends every retained page controller a [`PageMsg::Rerender`] so its controls
-    /// re-render from the shared store (task 5.3).
-    ///
-    /// Used after the window changes the store from outside a page — a Reset or an
-    /// applied commit — so a control that no longer matches the store (its original
-    /// reverted, or reloaded) snaps back.
-    fn rerender_pages(&self) {
-        for controller in self.controllers.borrow().iter() {
-            // The receiver only goes away if the page's runtime has stopped, which cannot
-            // happen while the window holds its controller; ignore the send result rather
-            // than unwrap a case that cannot occur here.
-            let _ = controller.sender().send(PageMsg::Rerender);
-        }
-    }
-
-    /// Re-renders the Display page from its model (task 6.1), the bespoke counterpart
-    /// of [`Self::rerender_pages`]. Called after a Reset or a committed Apply so the
-    /// Display drop-downs snap to the model's values.
-    fn rerender_display(&self) {
-        if let Some(page) = self.display_page.borrow().as_ref() {
-            page.rerender();
-        }
-    }
-
-    /// Re-renders the Theme page from its palette model (task 6.3), the bespoke
-    /// counterpart of [`Self::rerender_pages`]. Called after a Reset or a committed Apply
-    /// so the palette drop-down snaps to the model's active/staged scheme.
-    fn rerender_theme(&self) {
-        if let Some(page) = self.theme_page.borrow().as_ref() {
-            page.rerender();
-        }
     }
 }
 
@@ -1426,12 +1416,12 @@ fn build_loading_page() -> GtkBox {
 
 /// Builds the placeholder content for one category page (task 5.1).
 ///
-/// The page is a [`ScrolledWindow`] wrapping a vertical box — the shell the real
-/// controls plug into in later tasks (§6). The scroller is established now so the
-/// content area already scrolls when a page grows taller than the window, keeping it
-/// usable at the small logical sizes R2.4 targets. For now the box holds a single label
-/// with the category title so each page renders as distinct, non-empty content while
-/// the shell is verified.
+/// Shown for a category that is visible but has nothing to render: the Display page
+/// without live monitor data, the Theme page without any of its models, or a framework
+/// category with no row descriptors ([`PagePlan::NoSpec`]). The page is a
+/// [`ScrolledWindow`] wrapping a vertical box that holds a single label with the
+/// category title, so the page still renders as distinct, non-empty content and
+/// scrolls like every real page at the small logical sizes R2.4 targets.
 fn build_placeholder_page(category: SidebarCategory) -> ScrolledWindow {
     let content = GtkBox::new(Orientation::Vertical, SECTION_SPACING);
     content.set_margin_top(PAGE_MARGIN);
@@ -1439,8 +1429,8 @@ fn build_placeholder_page(category: SidebarCategory) -> ScrolledWindow {
     content.set_margin_start(PAGE_MARGIN);
     content.set_margin_end(PAGE_MARGIN);
 
-    // Left-aligned so the heading (and the rows §6 adds beneath it) start at the page's
-    // leading edge rather than centring.
+    // Left-aligned so the heading starts at the page's leading edge, like the section
+    // headings of the real pages, rather than centring.
     let heading = Label::new(Some(category.title()));
     heading.set_halign(Align::Start);
     content.append(&heading);
