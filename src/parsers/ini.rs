@@ -624,11 +624,20 @@ fn classify_line(raw: &str, line_number: usize, warnings: &mut Vec<ParseWarning>
     }
 }
 
-/// Rejects a value that would split the `key=value` line: a newline or carriage
-/// return. Any other character (including `#`) is allowed, since GLib key files
-/// do not treat `#` as an inline comment inside a value.
+/// The characters [`IniFile::set_value`] refuses in a value: a newline or carriage
+/// return, either of which would split the `key=value` line. Any other character
+/// (including `#`) is allowed, since GLib key files do not treat `#` as an inline
+/// comment inside a value.
+///
+/// Public so a caller can check a value against exactly this writer's rule *before*
+/// staging it (R8.3) — the Theme page's stage-time validation does, see
+/// [`crate::core::value_writers`] — instead of restating the set.
+pub const FORBIDDEN_VALUE_CHARACTERS: [char; 2] = LINE_BREAKS;
+
+/// Rejects a value that would split the `key=value` line — one containing any of
+/// the [`FORBIDDEN_VALUE_CHARACTERS`].
 fn reject_unsafe_value(value: &str) -> Result<(), EditError> {
-    if line::find_forbidden(value, &LINE_BREAKS).is_some() {
+    if line::find_forbidden(value, &FORBIDDEN_VALUE_CHARACTERS).is_some() {
         Err(EditError::InvalidValue(value.to_string()))
     } else {
         Ok(())

@@ -63,9 +63,12 @@
 //! returned with its quotes; editing such a key replaces the whole quoted token,
 //! so a caller that wants quoting must supply it. This module deliberately does
 //! **not** parse or synthesize shell quoting (that would be over-engineering for
-//! two bare tokens). The only hard guard is that a written value may not contain
-//! a newline or carriage return, which would split the line
-//! ([`EditError::InvalidValue`], R8.3).
+//! two bare tokens). The hard guard is that a written value must be a **bare shell
+//! word** ([`is_bare_shell_word`]): the file is sourced by a shell, so a space would
+//! split the assignment, a `$`, backtick or `(` would be expanded or executed, and a
+//! line break would split the line ([`EditError::InvalidValue`], R8.3). Such a value
+//! is refused rather than quoted, because a quoted copy would read back with its
+//! quotes and so disagree with the other copies of the same value.
 //!
 //! # Physical file creation is out of scope here
 //!
@@ -77,7 +80,7 @@
 
 use std::fmt;
 
-use super::line::{self, LINE_BREAKS, RawLine, strip_terminator};
+use super::line::{self, RawLine, strip_terminator};
 
 /// A parsed `uwsm/env` file that can re-emit itself byte-for-byte, edit the value
 /// of an assignment in place, and report whether a `GTK_THEME` override is
@@ -277,10 +280,10 @@ impl GtkThemeOverride {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditError {
     /// The requested value contains a newline or carriage return, which would
-    /// split the single assignment line into two and corrupt the file. Rejecting
-    /// it upholds R8.3 — the app never writes a value that breaks a working config.
-    /// (Any other character is left to higher-level validation; the app writes
-    /// bare cursor tokens, which are always safe.)
+    /// split the single assignment line into two and corrupt the file — or, more
+    /// generally, is not a bare shell word ([`is_bare_shell_word`]), which the shell
+    /// sourcing the file would split, expand or execute. Rejecting it upholds R8.3 —
+    /// the app never writes a value that breaks a working config.
     InvalidValue(String),
     /// A key used to append a new assignment is not a valid shell identifier
     /// (empty, starts with a digit, or contains a character outside `[A-Za-z0-9_]`),
@@ -294,7 +297,10 @@ impl fmt::Display for EditError {
         match self {
             EditError::InvalidValue(value) => write!(
                 f,
-                "`{value}` contains a newline or carriage return, which would split the line"
+                "`{}` is not a bare shell word (it is empty, or contains whitespace or a \
+                 shell special character), so the shell sourcing this file would split, \
+                 expand or run it",
+                value.escape_debug()
             ),
             EditError::InvalidKey(key) => write!(
                 f,
@@ -405,8 +411,8 @@ impl EnvFile {
     /// `GTK_THEME`: it reads that key via
     /// [`gtk_theme_override`](Self::gtk_theme_override) and never writes it.
     ///
-    /// `value` must not contain a newline or carriage return
-    /// ([`EditError::InvalidValue`]); when appending, `key` must be a valid shell
+    /// `value` must be a bare shell word ([`is_bare_shell_word`], else
+    /// [`EditError::InvalidValue`]); when appending, `key` must be a valid shell
     /// identifier ([`EditError::InvalidKey`]). Any rejected edit leaves the file
     /// completely unchanged (R8.3).
     pub fn set_value(&mut self, key: &str, value: &str) -> Result<SetOutcome, EditError> {
@@ -670,12 +676,38 @@ fn is_shell_identifier(key: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Rejects a value that would split the assignment line: a newline or carriage
-/// return. Any other character is allowed here — value-content validation (e.g.
-/// shell-safe tokens) is a higher-level concern (task 4.1); the app only ever
-/// writes bare cursor tokens through this path.
+/// The characters that make a value something other than a bare word to the POSIX
+/// shell that sources `uwsm/env` — beyond whitespace, which [`is_bare_shell_word`]
+/// refuses separately: expansion (`$`, backtick, `~`), command separators and
+/// redirection (`;`, `&`, `|`, `<`, `>`), subshells and grouping (`(`, `)`, `{`,
+/// `}`), globbing (`*`, `?`, `[`, `]`), and quoting and escaping (`'`, `"`, `\`).
+/// `!` is deliberately not listed: it is special only to interactive bash history
+/// expansion, never to the non-interactive POSIX shell that sources this file.
+const SHELL_SPECIAL_CHARACTERS: [char; 19] = [
+    '$', '`', ';', '&', '|', '(', ')', '<', '>', '*', '?', '[', ']', '{', '}', '~', '\'', '"', '\\',
+];
+
+/// Whether `value` can be written unquoted after `KEY=` in `uwsm/env`: non-empty, and
+/// free of whitespace (line breaks included) and of every shell special character.
+///
+/// uwsm *sources* the file with a shell (see the module docs), so the value is shell
+/// code, not data: `export XCURSOR_THEME=My Theme` exports `Theme` as a second
+/// variable, and a `$(…)` or backtick would run a command at every login. The app
+/// writes only cursor tokens here, so instead of quoting (which would make the copy
+/// read back with its quotes and disagree with the other copies) it refuses anything
+/// that is not one plain word. The single definition of the rule: [`EnvFile::set_value`]
+/// applies it as the writer's own guard, and the Theme page's stage-time validation asks
+/// it before a value is staged (task 9.27, see [`crate::core::value_writers`]).
+pub fn is_bare_shell_word(value: &str) -> bool {
+    !value.is_empty()
+        && !value.chars().any(|character| {
+            character.is_whitespace() || SHELL_SPECIAL_CHARACTERS.contains(&character)
+        })
+}
+
+/// Rejects a value that is not a bare shell word ([`is_bare_shell_word`]).
 fn reject_unsafe_value(value: &str) -> Result<(), EditError> {
-    if line::find_forbidden(value, &LINE_BREAKS).is_some() {
+    if !is_bare_shell_word(value) {
         Err(EditError::InvalidValue(value.to_string()))
     } else {
         Ok(())
@@ -1104,6 +1136,33 @@ export XCURSOR_SIZE=16
 
         // None of the rejected edits changed the file.
         assert_eq!(env.emit(), UWSM_ENV_COMMENTED);
+    }
+
+    #[test]
+    fn set_value_refuses_a_value_that_is_not_a_bare_shell_word() {
+        // The file is sourced by a shell, so a space would split the assignment and a
+        // `;`, backtick or `(` would run code at login (task 9.27, R8.3).
+        let (mut env, _) = EnvFile::parse(UWSM_ENV_COMMENTED);
+        for value in [
+            "My Theme", "a;b", "a`id`", "a$(id)", "a(b", "x\ty", "\"q\"", "",
+        ] {
+            assert_eq!(
+                env.set_value("XCURSOR_THEME", value),
+                Err(EditError::InvalidValue(value.to_string())),
+                "{value:?}"
+            );
+        }
+        assert_eq!(env.emit(), UWSM_ENV_COMMENTED, "nothing was written");
+        for value in [
+            "breeze_cursors",
+            "Nordic-cursors",
+            "Bibata-Modern.Ice",
+            "Nord#ic",
+            "24",
+        ] {
+            assert!(is_bare_shell_word(value), "{value:?}");
+            assert!(env.set_value("XCURSOR_THEME", value).is_ok(), "{value:?}");
+        }
     }
 
     #[test]

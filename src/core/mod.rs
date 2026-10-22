@@ -86,6 +86,14 @@ pub mod home_path;
 // writing anything (architecture §6 step 1).
 pub mod model;
 
+// Which writers each Theme-page value (theme names, cursor size, wallpaper and lock
+// image paths) reaches, and the union of the characters they refuse (task 9.27, R8.3).
+// The Theme models check a value against it when the user picks it, and `model`'s
+// validator runs the same check in the Apply pipeline's step 1; every rule is asked of
+// the writer that defines it in `parsers` (or of `reload` for the live hyprpaper
+// request), never restated.
+pub mod value_writers;
+
 // The staging state machine (R5.1, R5.2, R5.6). It holds an
 // `original`/`staged` `Value` per `SettingId`, tracks dirty state, and reloads
 // originals on external-edit conflict. It builds on `model` and `freshness`;

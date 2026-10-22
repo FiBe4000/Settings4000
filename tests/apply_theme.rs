@@ -52,7 +52,7 @@ use settings4000::core::apply::WriteMode;
 use settings4000::core::apply::{self, ApplyOutcome, ApplyPlan, LinkAction, WriteFailureCause};
 use settings4000::core::detect::{Binary, Capabilities, Daemon, DetectionInputs};
 use settings4000::core::freshness::FreshnessTracker;
-use settings4000::core::model::validate_image_value;
+use settings4000::core::model::{SettingId, validate_image_value};
 use settings4000::core::notifd::{NotifdReplies, NotifdStatus, NotifdVersion};
 use settings4000::core::reload::BackingFile;
 use settings4000::core::reload::ReloadParams;
@@ -350,13 +350,16 @@ fn a_gtk_theme_change_writes_both_settings_ini_identically() {
         !themes.gtk_dropdown_disabled(),
         "the fixture's GTK_THEME override is commented, so the drop-down is enabled"
     );
-    themes.stage_gtk_theme("Fixture-Theme");
+    themes
+        .stage_gtk_theme("Fixture-Theme")
+        .expect("the value passes the stage-time check");
 
     let mut plan = empty_plan();
     let contribution = themes
         .apply_contribution()
         .expect("a dirty theme contributes");
     plan.writes.extend(contribution.writes);
+    plan.validations.extend(contribution.validations);
     plan.reload_params = contribution.reload_params;
 
     // A notifd that could reload runs (task 11.14), so the absence of its `Reload()`
@@ -433,8 +436,12 @@ fn a_cursor_change_writes_every_duplicated_copy_identically() {
         Vec::new(),
         "the refreshed fixture's five cursor copies all agree on breeze_cursors/24"
     );
-    themes.stage_cursor_theme("Fixture-Cursors");
-    themes.stage_cursor_size("32");
+    themes
+        .stage_cursor_theme("Fixture-Cursors")
+        .expect("the value passes the stage-time check");
+    themes
+        .stage_cursor_size("32")
+        .expect("the value passes the stage-time check");
 
     let mut plan = empty_plan();
     let contribution = themes
@@ -448,6 +455,7 @@ fn a_cursor_change_writes_every_duplicated_copy_identically() {
         "every copy exists in the fixture, so every write is a rewrite"
     );
     plan.writes.extend(contribution.writes);
+    plan.validations.extend(contribution.validations);
     plan.reload_params = contribution.reload_params;
 
     let caps = Capabilities::for_tests(&[Binary::Gsettings, Binary::Hyprctl], &[], true);
@@ -605,7 +613,9 @@ fn a_cursor_change_creates_a_missing_xcursor_fallback_theme() {
     let before = repo_snapshot(&fx);
 
     let mut themes = load_themes(&fx);
-    themes.stage_cursor_theme("Fixture-Cursors");
+    themes
+        .stage_cursor_theme("Fixture-Cursors")
+        .expect("the value passes the stage-time check");
     let contribution = themes
         .apply_contribution()
         .expect("a dirty cursor contributes");
@@ -618,6 +628,7 @@ fn a_cursor_change_creates_a_missing_xcursor_fallback_theme() {
 
     let mut plan = empty_plan();
     plan.writes.extend(contribution.writes);
+    plan.validations.extend(contribution.validations);
     plan.reload_params = contribution.reload_params;
     let caps = Capabilities::for_tests(&[Binary::Gsettings, Binary::Hyprctl], &[], true);
     let outcome = apply::run(
@@ -685,6 +696,7 @@ fn apply_themes(themes: &ThemesModel, caps: &Capabilities) -> Vec<Command> {
         .apply_contribution()
         .expect("a dirty theme contributes");
     plan.writes.extend(contribution.writes);
+    plan.validations.extend(contribution.validations);
     plan.reload_params = contribution.reload_params;
     let runner = MockCommandRunner::new();
     let outcome = apply::run(
@@ -709,7 +721,9 @@ fn an_icon_theme_change_ends_with_exactly_one_notifd_reload() {
     let fx = FixtureDotfiles::install();
     let before = repo_snapshot(&fx);
     let mut themes = themes_with_icon_theme(&fx, "Fixture-Icons");
-    themes.stage_icon_theme("Fixture-Icons");
+    themes
+        .stage_icon_theme("Fixture-Icons")
+        .expect("the value passes the stage-time check");
 
     let caps = Capabilities::for_tests(&[Binary::Gsettings], &[], false)
         .with_notifd_for_tests(notifd_running("1.1"));
@@ -777,7 +791,9 @@ fn an_older_notifd_is_not_reloaded_on_an_icon_change() {
         .notification_icons_note()
         .expect("an older running notifd is noted");
     assert!(note.contains("next time"), "got {note}");
-    themes.stage_icon_theme("Fixture-Icons");
+    themes
+        .stage_icon_theme("Fixture-Icons")
+        .expect("the value passes the stage-time check");
 
     let caps = Capabilities::for_tests(&[Binary::Gsettings], &[], false)
         .with_notifd_for_tests(detected.notifd());
@@ -1050,7 +1066,9 @@ fn a_generate_colors_failure_rolls_back_the_theme_writes() {
     let before = repo_snapshot(&fx);
 
     let mut themes = load_themes_with_system_root(&fx);
-    themes.stage_gtk_theme("Fixture-Theme");
+    themes
+        .stage_gtk_theme("Fixture-Theme")
+        .expect("the value passes the stage-time check");
     let mut palette = load_palette(&fx);
     palette.stage("nord");
 
@@ -1189,7 +1207,9 @@ fn an_external_settings_ini_edit_trips_the_conflict_guard() {
         .expect("create the fixture GTK theme");
 
     let mut themes = load_themes(&fx);
-    themes.stage_gtk_theme("Fixture-Theme");
+    themes
+        .stage_gtk_theme("Fixture-Theme")
+        .expect("the value passes the stage-time check");
     assert!(!themes.check_conflict(), "an untouched file is no conflict");
 
     let live = fx.config_path("gtk-3.0/settings.ini");
@@ -1305,12 +1325,15 @@ fn a_de_linked_gtk4_settings_ini_is_reported_yet_written() {
     );
     assert_eq!(themes.external_gtk_writer_note(), None);
 
-    themes.stage_gtk_theme("Fixture-Theme");
+    themes
+        .stage_gtk_theme("Fixture-Theme")
+        .expect("the value passes the stage-time check");
     let mut plan = empty_plan();
     let contribution = themes
         .apply_contribution()
         .expect("a dirty theme contributes");
     plan.writes.extend(contribution.writes);
+    plan.validations.extend(contribution.validations);
     plan.reload_params = contribution.reload_params;
     let apply_caps = Capabilities::for_tests(&[Binary::Gsettings], &[], false);
     let outcome = apply::run(
@@ -1492,12 +1515,13 @@ fn theme_root_snapshot(fx: &FixtureDotfiles) -> BTreeMap<PathBuf, Option<Vec<u8>
     out
 }
 
-/// A plan holding exactly the Theme contribution: its writes, its link steps and its
-/// reload parameters.
+/// A plan holding exactly the Theme contribution: its writes, its link steps, its
+/// validations and its reload parameters.
 fn plan_with_themes(contribution: ThemesApply) -> ApplyPlan {
     let mut plan = empty_plan();
     plan.writes = contribution.writes;
     plan.links = contribution.links;
+    plan.validations = contribution.validations;
     plan.reload_params = contribution.reload_params;
     plan
 }
@@ -1536,7 +1560,9 @@ fn a_gtk_theme_with_a_gtk4_dir_re_points_all_three_links() {
     let themes_before = theme_root_snapshot(&fx);
 
     let mut themes = load_themes_with_system_root(&fx);
-    themes.stage_gtk_theme(FIXTURE_GTK4_THEME);
+    themes
+        .stage_gtk_theme(FIXTURE_GTK4_THEME)
+        .expect("the value passes the stage-time check");
     let contribution = themes
         .apply_contribution()
         .expect("a dirty theme contributes");
@@ -1613,7 +1639,9 @@ fn a_gtk3_only_theme_apply_removes_the_gtk4_links() {
     let themes_before = theme_root_snapshot(&fx);
 
     let mut themes = load_themes_with_system_root(&fx);
-    themes.stage_gtk_theme(FIXTURE_GTK3_ONLY_THEME);
+    themes
+        .stage_gtk_theme(FIXTURE_GTK3_ONLY_THEME)
+        .expect("the value passes the stage-time check");
     let note = format!(
         "\u{201c}{FIXTURE_GTK3_ONLY_THEME}\u{201d} has no GTK 4 version, so GTK 4 and \
          libadwaita apps fall back to the default Adwaita look."
@@ -1673,7 +1701,9 @@ fn a_plain_gtk_css_blocks_only_the_link_step() {
     fs::write(&gtk_css, b"/* my own GTK 4 tweaks */\n").expect("a plain gtk.css");
 
     let mut themes = load_themes_with_system_root(&fx);
-    themes.stage_gtk_theme(FIXTURE_GTK4_THEME);
+    themes
+        .stage_gtk_theme(FIXTURE_GTK4_THEME)
+        .expect("the value passes the stage-time check");
     let mut contribution = None;
     let events = capture_logs(|| contribution = themes.apply_contribution());
     let contribution = contribution.expect("a dirty theme contributes");
@@ -1746,7 +1776,9 @@ fn a_failure_after_the_link_step_restores_the_links() {
     let themes_before = theme_root_snapshot(&fx);
 
     let mut themes = load_themes_with_system_root(&fx);
-    themes.stage_gtk_theme(FIXTURE_GTK4_THEME);
+    themes
+        .stage_gtk_theme(FIXTURE_GTK4_THEME)
+        .expect("the value passes the stage-time check");
     let mut palette = load_palette(&fx);
     palette.stage("nord");
     let mut plan = plan_with_themes(themes.apply_contribution().expect("dirty"));
@@ -1811,7 +1843,9 @@ fn a_failing_link_step_rolls_back_the_ini_writes() {
     let fx = FixtureDotfiles::install();
     let before = repo_snapshot(&fx);
     let mut themes = load_themes_with_system_root(&fx);
-    themes.stage_gtk_theme(FIXTURE_GTK4_THEME);
+    themes
+        .stage_gtk_theme(FIXTURE_GTK4_THEME)
+        .expect("the value passes the stage-time check");
     let plan = plan_with_themes(themes.apply_contribution().expect("dirty"));
 
     let links_dir = fx.config_path("gtk-4.0");
@@ -1871,8 +1905,12 @@ fn cursor_only_applies_never_touch_the_gtk4_links() {
     fs::create_dir_all(fx.home().join(".icons/Fixture-Cursors/cursors"))
         .expect("create the fixture cursor theme");
     let mut themes = load_themes_with_system_root(&fx);
-    themes.stage_cursor_theme("Fixture-Cursors");
-    themes.stage_cursor_size("32");
+    themes
+        .stage_cursor_theme("Fixture-Cursors")
+        .expect("the value passes the stage-time check");
+    themes
+        .stage_cursor_size("32")
+        .expect("the value passes the stage-time check");
     let contribution = themes
         .apply_contribution()
         .expect("a dirty cursor contributes");
@@ -1895,7 +1933,9 @@ fn a_gtk4_link_to_a_user_folder_is_left_alone() {
     let targets_before = gtk4_link_targets(&fx);
 
     let mut themes = load_themes_with_system_root(&fx);
-    themes.stage_gtk_theme(FIXTURE_GTK4_THEME);
+    themes
+        .stage_gtk_theme(FIXTURE_GTK4_THEME)
+        .expect("the value passes the stage-time check");
     let mut contribution = None;
     let events = capture_logs(|| contribution = themes.apply_contribution());
     let contribution = contribution.expect("a dirty theme contributes");
@@ -1945,4 +1985,141 @@ fn a_gtk4_link_to_a_user_folder_is_left_alone() {
         fs::read(custom.join("gtk.css")).expect("read"),
         b"/* mine */\n"
     );
+}
+
+#[test]
+fn a_hash_bearing_wallpaper_is_refused() {
+    // Task 9.27 (R8.3): an image whose name holds a `#` is a real, readable file, but
+    // hyprpaper.conf and hyprlock.conf would read the `#` as the start of a comment and
+    // truncate the path. Choosing it is refused with a message naming the character and
+    // both files, nothing stages, and no fixture file changes.
+    let fx = FixtureDotfiles::install();
+    let hashed = fx.home().join("Pictures/wallpaper/wall#2.png");
+    fs::write(&hashed, b"fixture image").expect("create a `#`-named image");
+    let before = repo_snapshot(&fx);
+
+    let mut wallpaper = load_wallpaper(&fx);
+    let message = wallpaper
+        .stage_wallpaper(hashed.to_str().expect("UTF-8 path"))
+        .expect_err("a `#` in the path is refused")
+        .to_string();
+    assert!(
+        message.contains("the character `#`")
+            && message.contains("hyprpaper.conf")
+            && message.contains("hyprlock.conf"),
+        "{message}"
+    );
+    assert!(!wallpaper.is_dirty());
+    assert!(wallpaper.apply_contribution().is_none());
+    assert_repo_untouched_except(&fx, &before, &[]);
+}
+
+#[test]
+fn a_quote_or_control_character_in_a_cursor_theme_is_refused() {
+    // Task 9.27 (R8.3, R3.4): installed cursor themes whose names hold a `"` or a
+    // control character are offered by the scan, but the hl.env line of hyprland.lua
+    // cannot hold either in its Lua string, so picking one is refused with a message
+    // naming the character and that writer — rather than reaching four of the five
+    // copies and leaving the page dirty with no reason given.
+    let fx = FixtureDotfiles::install();
+    for name in ["Nord\"ic", "Nord\u{1b}ic"] {
+        fs::create_dir_all(fx.home().join(".icons").join(name).join("cursors"))
+            .expect("create the cursor theme");
+    }
+    let mut themes = load_themes(&fx);
+    for (name, character) in [
+        ("Nord\"ic", "the character `\"`"),
+        ("Nord\u{1b}ic", "the control character U+001B"),
+    ] {
+        assert!(
+            themes.cursor_themes().contains(&name.to_string()),
+            "the scan offers {name:?}"
+        );
+        let message = themes
+            .stage_cursor_theme(name)
+            .expect_err("refused at stage time")
+            .to_string();
+        assert!(
+            message.contains(character) && message.contains("the hl.env lines of hyprland.lua"),
+            "{message}"
+        );
+    }
+    assert!(!themes.is_dirty());
+}
+
+#[test]
+fn a_hash_bearing_cursor_theme_is_applied_to_every_copy() {
+    // The task text this test pins was written when a hyprlang `hyprland.conf` still
+    // carried the cursor and refused `#`. That copy is gone (task 11.5): every current
+    // writer accepts `#` in a theme name, so it stages and the Apply writes all five
+    // copies, including the hl.env line of the deployed hyprland.lua.
+    let fx = FixtureDotfiles::install();
+    fs::create_dir_all(fx.home().join(".icons/Nord#ic/cursors")).expect("create the theme");
+    let mut themes = load_themes(&fx);
+    themes
+        .stage_cursor_theme("Nord#ic")
+        .expect("no current writer refuses `#`");
+
+    let plan = plan_with_themes(themes.apply_contribution().expect("a cursor change"));
+    expect_applied(apply::run(
+        &plan,
+        &FreshnessTracker::new(),
+        &Capabilities::for_tests(&[], &[], false),
+        &MockCommandRunner::new(),
+        &MockProcessSignaller::new(),
+    ));
+    let lua = LuaConfigFile::parse(
+        &fs::read_to_string(fx.config_path("hypr/hyprland.lua")).expect("read hyprland.lua"),
+    );
+    assert_eq!(
+        lua.env_value("XCURSOR_THEME"),
+        Some("Nord#ic"),
+        "the Lua copy holds the `#` name"
+    );
+    themes.commit();
+    assert!(!themes.is_dirty(), "every copy took it, so it is promoted");
+}
+
+#[test]
+fn a_corrupted_theme_value_is_caught_by_pipeline_step_one() {
+    // Task 9.27 accept criterion: the theme contribution carries validations, and a
+    // staged value the stage-time check would have refused — put in place through the
+    // test seam — is caught by step 1 of the pipeline, before any writer sees it. The
+    // outcome names the setting, the repo is byte-identical and no command runs.
+    let fx = FixtureDotfiles::install();
+    let before = repo_snapshot(&fx);
+    let mut themes = load_themes(&fx);
+    themes.stage_unchecked_for_tests(SettingId::CursorTheme, "Nord\"ic");
+
+    let contribution = themes.apply_contribution().expect("a cursor change");
+    assert!(
+        contribution
+            .validations
+            .iter()
+            .any(|(id, _)| *id == SettingId::CursorTheme),
+        "the contribution hands the staged cursor theme to step 1"
+    );
+    let plan = plan_with_themes(contribution);
+    let runner = MockCommandRunner::new();
+    let outcome = apply::run(
+        &plan,
+        &FreshnessTracker::new(),
+        &Capabilities::for_tests(&[Binary::Gsettings, Binary::Hyprctl], &[], true),
+        &runner,
+        &MockProcessSignaller::new(),
+    );
+    match outcome {
+        ApplyOutcome::ValidationFailed(invalid) => {
+            assert_eq!(invalid.len(), 1, "only the corrupted value fails");
+            assert_eq!(invalid[0].id, SettingId::CursorTheme);
+            let message = invalid[0].error.to_string();
+            assert!(
+                message.contains("`\"`") && message.contains("hyprland.lua"),
+                "{message}"
+            );
+        }
+        other => panic!("expected step 1 to refuse the value, got {other:?}"),
+    }
+    assert_repo_untouched_except(&fx, &before, &[]);
+    assert!(runner.recorded().is_empty(), "nothing is reloaded");
 }

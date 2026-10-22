@@ -73,7 +73,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::core::apply::{FileWrite, WriteValidation};
+use crate::core::apply::FileWrite;
 use crate::core::model::{SettingId, ValidationError, Value};
 use crate::core::notifd::NotifdStatus;
 use crate::core::reload::BackingFile;
@@ -570,9 +570,6 @@ fn write_target(path: PathBuf) -> StoreBackedFile {
         path,
         name: "notifd/config",
         backing: BackingFile::NotifdConfig,
-        // Rendered from the store's dirty Notifications settings, which the plan carries
-        // as its validations.
-        validation: WriteValidation::InPlan,
         read_failure_log: "could not read notifd/config to render the Notifications edits; \
                            aborting the apply (R8.3)",
         render_failure_log: "failed to render a notifd/config edit; aborting the apply (R8.3)",

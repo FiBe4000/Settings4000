@@ -491,7 +491,6 @@ mod tests {
     use super::*;
     use crate::core::apply::{
         self, ApplyPlan, FileWrite, InvalidSetting, WriteFailure, WriteFailureCause, WriteMode,
-        WriteValidation,
     };
     use crate::core::detect::{Binary, Capabilities};
     use crate::core::freshness::FreshnessTracker;
@@ -656,7 +655,7 @@ mod tests {
                 contents: b"kb_layout = \"us,se\",\n".to_vec(),
                 changed_keys: vec!["kb_layout".to_string()],
                 backing: BackingFile::InputLua,
-                validation: WriteValidation::InPlan,
+                validated_by: Vec::new(),
                 mode: WriteMode::Replace,
             }],
             links: Vec::new(),
@@ -786,7 +785,7 @@ mod tests {
                 contents: b"kb_layout = \"us,se\",\n".to_vec(),
                 changed_keys: vec!["kb_layout".to_string()],
                 backing: BackingFile::InputLua,
-                validation: WriteValidation::InPlan,
+                validated_by: Vec::new(),
                 mode: WriteMode::Replace,
             }],
             links: Vec::new(),

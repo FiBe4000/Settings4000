@@ -10,16 +10,19 @@
 //! wallpaper` request (plus the eww bar's text-tone follow-up where present, task
 //! 11.14), while a hyprlock-only change issues **no** reload (hyprlock
 //! reads its config only at the next lock — intentional, architecture §6). Chosen image
-//! paths are validated (exists + readable + image extension, R8.3) before staging.
+//! paths are validated (exists + readable + image extension, and holdable by every file
+//! and request they are written to — task 9.27; R8.3) before staging.
 //! Both files may store their path home-relative (`~/Pictures/…`, analysis §7.4); how
 //! the model validates, previews, writes and reloads such a value is described under
 //! "Home-relative paths" on [`WallpaperModel`], whose docs carry the rest.
 
 use std::path::{Path, PathBuf};
 
-use crate::core::apply::{FileWrite, WriteMode, WriteValidation};
+use crate::core::apply::{FileWrite, WriteMode};
 use crate::core::home_path::{expand_home, expand_home_to_string, path_in_form_of};
-use crate::core::model::{SettingId, ValidationError, Value, validate_image_value};
+use crate::core::model::{
+    SettingId, ValidationError, Value, validate_lock_background_value, validate_wallpaper_value,
+};
 use crate::core::reload::{BackingFile, ReloadParams};
 use crate::parsers::hyprlang::{HyprlangFile, KeyPath};
 
@@ -390,24 +393,37 @@ impl WallpaperModel {
 
     /// Stages a wallpaper image path after validating it (R8.3).
     ///
-    /// The path must exist, be readable, and have an image extension; an invalid path is
-    /// rejected (returned as an [`Err`] the UI surfaces) and nothing is staged, so a
-    /// broken wallpaper can never be written. `path` is usually the absolute path the
-    /// file chooser returned; it is staged in `hyprpaper.conf`'s own form (see
-    /// "Home-relative paths" on [`WallpaperModel`]).
+    /// The path must exist, be readable, and have an image extension, and every place it
+    /// is written must be able to hold it — `hyprpaper.conf` and `hyprlock.conf` refuse
+    /// a line break or a `#` (hyprlang reads `#` as the start of a comment), and the
+    /// live `hyprctl hyprpaper` request refuses a `,` (task 9.27; see
+    /// [`validate_wallpaper_value`]). An invalid path is rejected (returned as an
+    /// [`Err`] whose message names the problem, which the UI surfaces) and nothing is
+    /// staged, so a broken wallpaper can never be written — nor a path only some of its
+    /// copies would take. `path` is usually the absolute path the file chooser
+    /// returned; it is staged in `hyprpaper.conf`'s own form (see "Home-relative paths"
+    /// on [`WallpaperModel`]). The pipeline re-runs the same check in step 1 through
+    /// the contribution's [`validations`](WallpaperApply::validations).
+    ///
+    /// Unlike the theme drop-downs, re-picking the path already on disk is checked like
+    /// any other choice — the image must still exist, so there is no exemption for the
+    /// current value — and a configured path holding a refused character (a `#` or `,`
+    /// written by hand) is therefore refused too. That leaves nothing stuck: the refusal
+    /// stages nothing, and Reset still returns the page to the on-disk path.
     pub fn stage_wallpaper(&mut self, path: &str) -> Result<(), ValidationError> {
         let home = self.paths.home.as_deref();
-        validate_image_value(path, home)?;
+        validate_wallpaper_value(path, home)?;
         let in_form = path_in_form_of(path, self.wallpaper.original.as_deref(), home);
         self.wallpaper.stage(&in_form);
         Ok(())
     }
 
     /// Stages a lock-screen override image path after validating it (R8.3), like
-    /// [`Self::stage_wallpaper`], in `hyprlock.conf`'s own form.
+    /// [`Self::stage_wallpaper`] but against `hyprlock.conf` alone, the only file it is
+    /// written to ([`validate_lock_background_value`]), in `hyprlock.conf`'s own form.
     pub fn stage_lock(&mut self, path: &str) -> Result<(), ValidationError> {
         let home = self.paths.home.as_deref();
-        validate_image_value(path, home)?;
+        validate_lock_background_value(path, home)?;
         let in_form = path_in_form_of(path, self.lock.original.as_deref(), home);
         self.lock.stage(&in_form);
         Ok(())
@@ -627,16 +643,17 @@ impl WallpaperModel {
                 contents: file.emit().into_bytes(),
                 changed_keys,
                 backing: BackingFile::HyprpaperConf,
-                // Task 9.10: this write carries a validated value only when it carries
-                // the wallpaper *path* — [`Self::validations`] re-checks that path (it
-                // must still exist and be readable, R8.3) under the same condition that
-                // put it in this write. A fit-only change carries just a mode from a
-                // fixed list, and deliberately does not drag the unchanged path into
-                // validation, so such a write is validation-free by design.
-                validation: if written.wallpaper {
-                    WriteValidation::InPlan
+                // Tasks 9.10, 9.27: this write carries a validated value only when it
+                // carries the wallpaper *path* — [`Self::validations`] re-checks that
+                // path (it must still exist, be readable and be holdable by every
+                // writer, R8.3) under the same condition that put it in this write. A
+                // fit-only change carries just a mode from a fixed list, and
+                // deliberately does not drag the unchanged path into validation, so
+                // such a write declares no setting.
+                validated_by: if written.wallpaper {
+                    vec![SettingId::WallpaperPath]
                 } else {
-                    WriteValidation::NotNeeded
+                    Vec::new()
                 },
                 mode: WriteMode::Replace,
             }),
@@ -663,7 +680,7 @@ impl WallpaperModel {
                 // This write exists only when there is an effective lock path, which is
                 // exactly the condition under which [`Self::validations`] re-checks that
                 // path (R8.3) — so its value is always covered by the plan.
-                validation: WriteValidation::InPlan,
+                validated_by: vec![SettingId::LockBackgroundPath],
                 mode: WriteMode::Replace,
             }),
             Err(error) => {
@@ -862,8 +879,8 @@ label {
             contribution
                 .writes
                 .iter()
-                .all(|write| write.validation == WriteValidation::InPlan),
-            "a path-carrying write's values are validated by the plan"
+                .all(|write| !write.validated_by.is_empty()),
+            "a path-carrying write declares the path setting the plan validates"
         );
 
         let plan = ApplyPlan {
@@ -992,12 +1009,11 @@ label {
             "a fit-only change re-validates no path (the wallpaper is unchanged)"
         );
         // Task 9.10: because this legitimate apply has writes and no validations, the
-        // write must declare itself validation-free — otherwise the Apply pipeline's
-        // plan-drift guard would warn "the caller dropped its validations" on every
-        // fit-only change.
-        assert_eq!(
-            contribution.writes[0].validation,
-            WriteValidation::NotNeeded,
+        // write must declare no setting — otherwise the Apply pipeline's plan-drift
+        // guard would warn "the caller dropped its validations" on every fit-only
+        // change.
+        assert!(
+            contribution.writes[0].validated_by.is_empty(),
             "a fit-only write carries nothing to validate and must say so"
         );
         assert_eq!(
@@ -1126,6 +1142,63 @@ label {
             "the lock override path is validated too"
         );
         assert!(!model.is_dirty(), "a rejected path is never staged");
+    }
+
+    #[test]
+    fn staging_refuses_a_hash_naming_both_hyprlang_files() {
+        // Task 9.27 accept criterion: a `#`-bearing image is a real, readable file, but
+        // hyprpaper.conf and hyprlock.conf would truncate the path at the `#`, so the
+        // choice is refused with a message naming the character and both writers, and
+        // nothing is staged.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let paths = write_wallpaper_fixture(&tmp.path().join("config"));
+        let hashed = write_image(tmp.path(), "wall#1.png");
+        let mut model = WallpaperModel::load(paths, true);
+
+        let message = model
+            .stage_wallpaper(&hashed)
+            .expect_err("a `#` in the path is refused")
+            .to_string();
+        assert!(
+            message.contains("`#`")
+                && message.contains("hyprpaper.conf")
+                && message.contains("hyprlock.conf"),
+            "the message names the character and the writers: {message}"
+        );
+        let lock_message = model
+            .stage_lock(&hashed)
+            .expect_err("the separate lock image follows hyprlock.conf's rule")
+            .to_string();
+        assert!(
+            lock_message.contains("`#`") && lock_message.contains("hyprlock.conf"),
+            "{lock_message}"
+        );
+        assert!(!model.is_dirty(), "a refused path is never staged");
+    }
+
+    #[test]
+    fn a_comma_is_refused_for_the_wallpaper_but_not_the_lock_image() {
+        // The live `hyprctl hyprpaper wallpaper ,<path>` request splits on commas, so the
+        // wallpaper cannot hold one; a separate lock image never reaches that request
+        // and hyprlang itself accepts a comma.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let paths = write_wallpaper_fixture(&tmp.path().join("config"));
+        let comma = write_image(tmp.path(), "wall,1.png");
+        let mut model = WallpaperModel::load(paths, true);
+
+        let message = model
+            .stage_wallpaper(&comma)
+            .expect_err("a comma in the wallpaper path is refused")
+            .to_string();
+        assert!(
+            message.contains("`,`") && message.contains("hyprctl hyprpaper"),
+            "{message}"
+        );
+        model.set_override(true);
+        model
+            .stage_lock(&comma)
+            .expect("a separate lock image may hold a comma");
+        assert!(model.is_dirty());
     }
 
     #[test]
@@ -1539,10 +1612,11 @@ label {
 
     #[test]
     fn a_rejected_path_stays_dirty_while_the_fit_is_promoted() {
-        // Task 9.6, per-key promotion *within* one file: an image whose filename contains
-        // a `#` is a real, readable file (so `stage_wallpaper`'s validation accepts it) but
-        // the hyprlang writer refuses to write it, because hyprlang would read the `#` as
-        // the start of an inline comment and silently truncate the path. The fit mode
+        // Task 9.6, per-key promotion *within* one file: the hyprlang writer refuses an
+        // image path containing a `#`, because hyprlang would read it as the start of an
+        // inline comment and silently truncate the path. Since task 9.27
+        // `stage_wallpaper` refuses such a path up front, so this test stages it into the
+        // field directly to keep the writer's defence-in-depth path covered. The fit mode
         // staged in the same file is written regardless, so commit promotes the fit and
         // leaves the wallpaper path staged.
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -1551,9 +1625,7 @@ label {
         let hashed = write_image(tmp.path(), "wall#1.png");
 
         let mut model = WallpaperModel::load(paths, true);
-        model
-            .stage_wallpaper(&hashed)
-            .expect("a real image file validates");
+        model.wallpaper.stage(&hashed);
         model.stage_fit("tile");
 
         let contribution = model

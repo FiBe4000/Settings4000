@@ -659,15 +659,46 @@ impl ReloadAction {
     }
 }
 
+/// The field separator of the `hyprctl hyprpaper wallpaper` argument
+/// (`<monitor>,<path>[,<fit>]`), which therefore can never appear inside the path.
+///
+/// `hyprctl` splits the whole argument on every comma (`CVarList2(args, 0, ',')` in
+/// Hyprland's `hyprctl/src/hyprpaper/Hyprpaper.cpp`) and takes field 1 as the path and
+/// field 2 as the fit, with no quoting or escaping, so an image path holding a comma
+/// would be cut at it: the daemon would be sent a truncated path and the rest would be
+/// read as a fit mode. The wallpaper model refuses such a path when it is chosen
+/// (R8.3, task 9.27; see [`crate::core::value_writers`]) instead of sending it.
+pub const HYPRPAPER_ARGUMENT_SEPARATOR: char = ',';
+
+/// Whether `character` separates the fields of the `hyprctl setcursor <theme> <size>`
+/// request ([`ReloadAction::HyprctlSetCursor`]), so a cursor theme name cannot safely
+/// contain it.
+///
+/// `hyprctl` joins its arguments into one request string with single spaces
+/// (`hyprctl/src/main.cpp`, `fullRequest += std::format("{} ", ARGS[i])`), so the
+/// argument-vector boundary the app passes is lost. The compositor then splits the
+/// request on spaces (`CVarList vars(request, 0, ' ')` in `dispatchSetCursor`,
+/// `src/ipc/s1/Commands.cpp` at Hyprland commit `8b7aefe`), takes the last field as the
+/// size and re-joins the fields between with single spaces. A theme name with one
+/// interior space happens to survive that round trip, but runs of spaces, a tab, or
+/// whitespace at either end are not reproduced (each field is trimmed), so the request
+/// would set a different theme than the files. Whitespace is therefore refused as a
+/// whole; the Theme page refuses such a name when it is picked (task 9.27, see
+/// [`crate::core::value_writers`]).
+pub fn splits_setcursor_request(character: char) -> bool {
+    character.is_whitespace()
+}
+
 /// The single argument of the `hyprctl hyprpaper wallpaper` request:
 /// `,<path>,<fit>` for the fit modes that render differently live (`contain`,
 /// `tile`), `,<path>` for every other value or none — see
 /// [`ReloadAction::HyprpaperWallpaper`] for why. The leading empty field targets
-/// every output.
+/// every output; the fields are joined with [`HYPRPAPER_ARGUMENT_SEPARATOR`].
 fn hyprpaper_wallpaper_argument(path: &str, fit: Option<&str>) -> String {
+    let separator = HYPRPAPER_ARGUMENT_SEPARATOR;
     match fit {
-        Some(fit) if LIVE_FIT_MODES.contains(&fit) => format!(",{path},{fit}"),
-        _ => format!(",{path}"),
+        Some(fit) if LIVE_FIT_MODES.contains(&fit) => format!("{separator}{path}{separator}{fit}"),
+        _ => format!("{separator}{path}"),
     }
 }
 

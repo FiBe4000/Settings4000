@@ -419,21 +419,36 @@ impl Inner {
 
     /// Stages a theme/cursor change, notifies the chrome, and rebuilds the sections.
     ///
-    /// The mutable model borrow is released before `on_changed` runs (which re-reads
-    /// the model to derive the chrome) and before the rebuild re-reads it.
+    /// A choice the model refuses — a name one of the files it is written to cannot
+    /// hold (R8.3, task 9.27) — stages nothing and is explained in a dialog quoting the
+    /// model's message; the rebuild then puts the drop-down back on the value still in
+    /// effect. The mutable model borrow is released before `on_changed` runs (which
+    /// re-reads the model to derive the chrome) and before the rebuild re-reads it.
     fn stage_theme(self: &Rc<Self>, kind: ThemeKind, value: String) {
-        {
+        let result = {
             let mut themes = self.themes.borrow_mut();
-            if let Some(model) = themes.as_mut() {
-                match kind {
+            match themes.as_mut() {
+                Some(model) => match kind {
                     ThemeKind::Gtk => model.stage_gtk_theme(&value),
                     ThemeKind::Icon => model.stage_icon_theme(&value),
                     ThemeKind::Cursor => model.stage_cursor_theme(&value),
                     ThemeKind::CursorSize => model.stage_cursor_size(&value),
-                }
+                },
+                None => Ok(()),
+            }
+        };
+        match result {
+            Ok(()) => (self.on_changed)(),
+            Err(error) => {
+                let heading = match kind {
+                    ThemeKind::CursorSize => "That cursor size can't be used",
+                    ThemeKind::Gtk | ThemeKind::Icon | ThemeKind::Cursor => {
+                        "That theme can't be used"
+                    }
+                };
+                self.show_rejection(heading, &error.to_string());
             }
         }
-        (self.on_changed)();
         self.rebuild();
     }
 
@@ -626,9 +641,10 @@ impl Inner {
                 self.rebuild();
             }
             Err(error) => {
-                // R8.3: reject a missing / unreadable / non-image path with a clear
-                // message, leaving the previously staged value unchanged.
-                self.show_image_error(&error.to_string());
+                // R8.3: reject a missing / unreadable / non-image path, or one a file it
+                // is written to cannot hold, with a clear message, leaving the previously
+                // staged value unchanged.
+                self.show_rejection("That image can't be used", &error.to_string());
             }
         }
     }
@@ -658,11 +674,12 @@ impl Inner {
         self.rebuild();
     }
 
-    /// Shows a plain `gtk::AlertDialog` explaining why a chosen image was rejected
-    /// (R8.3) — no libadwaita, no custom CSS.
-    fn show_image_error(&self, detail: &str) {
+    /// Shows a plain `gtk::AlertDialog` explaining why a chosen theme or image was
+    /// rejected (R8.3): `message` is the heading, `detail` the model's validation
+    /// message — no libadwaita, no custom CSS.
+    fn show_rejection(&self, message: &str, detail: &str) {
         let dialog = AlertDialog::builder()
-            .message("That image can't be used")
+            .message(message)
             .detail(detail)
             .modal(true)
             .build();

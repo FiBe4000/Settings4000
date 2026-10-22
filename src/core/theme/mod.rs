@@ -36,6 +36,12 @@
 //! of writing a file (see the `palette` submodule for that argument in full), or one
 //! whose two files hold a derived rather than an edited value.
 //!
+//! The theme names, the cursor size and the two image paths do have `SettingId`s all the
+//! same — never stored, only used to validate: the models hand their staged values to the
+//! pipeline's step 1 under those ids, and the same validators run when the user picks a
+//! value, against every writer the value reaches (task 9.27, R8.3; see
+//! [`crate::core::value_writers`]).
+//!
 //! Everything here lives in `core/` so scanning, staging, the multi-file writes, and
 //! the reload decisions are headlessly testable (R6.2) — the layering guard in
 //! `tests/module_boundaries.rs` forbids any `gtk`/`relm4` import. Every path the models
@@ -95,10 +101,16 @@ impl Staged {
         self.staged.as_deref().or(self.original.as_deref())
     }
 
+    /// Whether `value` is what the backing config currently holds, so staging it is a
+    /// return to the current state rather than an edit.
+    fn is_original(&self, value: &str) -> bool {
+        self.original.as_deref() == Some(value)
+    }
+
     /// Stages `value`, clearing the pending edit when it equals the current value (so
     /// re-staging the current value is not dirty).
     fn stage(&mut self, value: &str) {
-        if self.original.as_deref() == Some(value) {
+        if self.is_original(value) {
             self.staged = None;
         } else {
             self.staged = Some(value.to_string());
@@ -170,6 +182,11 @@ impl Selection {
     fn selected_index(&self) -> Option<usize> {
         let effective = self.effective()?;
         self.options.iter().position(|option| option == effective)
+    }
+
+    /// Whether `value` is the current value — see [`Staged::is_original`].
+    fn is_original(&self, value: &str) -> bool {
+        self.value.is_original(value)
     }
 
     /// Stages a switch to `value` — see [`Staged::stage`].

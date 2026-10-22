@@ -85,7 +85,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use crate::core::apply::{FileWrite, WriteValidation};
+use crate::core::apply::FileWrite;
 use crate::core::lock_grace::{GraceError, set_grace};
 use crate::core::model::{SettingId, Value};
 use crate::core::reload::BackingFile;
@@ -375,9 +375,6 @@ fn write_target(path: PathBuf) -> StoreBackedFile {
         path,
         name: "hypridle.conf",
         backing: BackingFile::HypridleConf,
-        // Rendered from the store's dirty Power & Idle settings, which the plan carries as
-        // its validations (both come from the same `dirty_ids()`).
-        validation: WriteValidation::InPlan,
         read_failure_log: "could not read hypridle.conf to render the Power & Idle edits; \
                            aborting the apply (R8.3)",
         render_failure_log: "failed to render a hypridle.conf edit; aborting the apply (R8.3)",
@@ -881,10 +878,11 @@ listener {
             .expect("a dirty Power & Idle setting produces a write");
         assert_eq!(write.path, path);
         assert_eq!(write.backing, BackingFile::HypridleConf);
-        // Task 9.10's drift guard trusts this declaration rather than checking it, so a
-        // page silently claiming NotNeeded would disable the guard for its own write
-        // (task 9.17 review). Pinned here, where the claim is made.
-        assert_eq!(write.validation, WriteValidation::InPlan);
+        // The drift guard (tasks 9.10, 9.27) checks the plan's validations against the
+        // settings each write declares, so a write that declared fewer than it carries
+        // would hide its own drift. Pinned here: exactly the dirty settings it renders.
+        let rendered: Vec<SettingId> = dirty.iter().map(|(id, _)| *id).collect();
+        assert_eq!(write.validated_by, rendered);
         assert_eq!(
             write.changed_keys,
             vec![

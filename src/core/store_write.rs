@@ -19,7 +19,8 @@
 //! 3. hand those bytes and the dirty settings to the page's renderer, logging and aborting
 //!    if *that* fails;
 //! 4. wrap the rendered bytes in a [`FileWrite`] carrying the file's path, its reload
-//!    concern and its R8.3 validation provenance.
+//!    concern and its R8.3 validation provenance (the dirty settings it was rendered
+//!    from).
 //!
 //! [`StoreBackedFile`] holds the per-file data steps 2–4 need, its
 //! [`render_write`](StoreBackedFile::render_write) is the one implementation of the steps
@@ -56,7 +57,7 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
-use crate::core::apply::{FileWrite, WriteMode, WriteValidation};
+use crate::core::apply::{FileWrite, WriteMode};
 use crate::core::model::{SettingId, Value};
 use crate::core::reload::BackingFile;
 
@@ -101,20 +102,6 @@ pub struct StoreBackedFile {
     /// The reload concern this file drives, which decides what the pipeline reloads after
     /// writing it (task 4.4).
     pub backing: BackingFile,
-    /// What every write of this file declares about where its values get their R8.3
-    /// validation ([`WriteValidation`]).
-    ///
-    /// Task 9.10 made this a per-*write* claim, because one file can carry either kind
-    /// depending on which value changed. A store-backed file is the case where it is
-    /// nonetheless constant: every write of it is rendered from the same dirty store
-    /// settings that
-    /// [`base_apply_plan`](crate::core::assemble::base_apply_plan) puts into the plan's
-    /// `validations`, so [`WriteValidation::InPlan`] holds by construction. It is a field
-    /// rather than a constant buried in the glue for two reasons: the declaration stays
-    /// where a reader can check it against the file it describes, and a future page that
-    /// renders something the plan does *not* validate has to say so rather than silently
-    /// inheriting a claim that would then be false.
-    pub validation: WriteValidation,
     /// The `error`-level line logged when [`Self::path`] cannot be read (R7.3).
     ///
     /// Spelled out per file rather than composed from one format string, for the same
@@ -132,7 +119,10 @@ impl StoreBackedFile {
     ///
     /// `dirty` must be the store's dirty settings for the page that owns this file (from
     /// [`SettingsStore::dirty_in_category`](crate::core::store::SettingsStore::dirty_in_category));
-    /// that is the precondition [`Self::validation`] rests on. `render` is the page's own
+    /// the write declares exactly those settings as the ones it carries
+    /// ([`FileWrite::validated_by`]), which
+    /// [`base_apply_plan`](crate::core::assemble::base_apply_plan) puts into the plan's
+    /// `validations` from the same dirty store state. `render` is the page's own
     /// renderer, which applies those settings to the bytes just read through the file's
     /// parser (e.g. [`crate::core::input::render_input_lua`]). Its error need only be
     /// [`Display`](fmt::Display), which is all the glue does with it: log the reason, and
@@ -183,7 +173,7 @@ impl StoreBackedFile {
             contents: edit.contents,
             changed_keys: edit.changed_keys,
             backing: self.backing,
-            validation: self.validation,
+            validated_by: dirty.iter().map(|(id, _)| *id).collect(),
             mode: WriteMode::Replace,
         }))
     }
@@ -266,7 +256,6 @@ mod tests {
             path,
             name: "test.conf",
             backing: BackingFile::InputLua,
-            validation: WriteValidation::InPlan,
             read_failure_log: "could not read test.conf",
             render_failure_log: "could not render test.conf",
         }
@@ -294,7 +283,7 @@ mod tests {
     fn a_rendered_edit_becomes_a_declared_file_write() {
         // The happy path: the renderer's bytes and changed keys go into the FileWrite
         // unchanged, and the write carries the path, reload concern and R8.3 validation
-        // provenance the file declared (task 9.10).
+        // provenance — the dirty settings it was rendered from (tasks 9.10, 9.27).
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("test.conf");
         fs::write(&path, b"before\n").expect("write the fixture");
@@ -316,7 +305,7 @@ mod tests {
         assert_eq!(write.contents, b"after\n");
         assert_eq!(write.changed_keys, vec!["some.key".to_string()]);
         assert_eq!(write.backing, BackingFile::InputLua);
-        assert_eq!(write.validation, WriteValidation::InPlan);
+        assert_eq!(write.validated_by, vec![SettingId::MouseSensitivity]);
     }
 
     #[test]

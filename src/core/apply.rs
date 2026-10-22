@@ -105,8 +105,8 @@
 //!   file's live XDG path, the *complete* new bytes the page produced by applying
 //!   its staged edits through the relevant parser (surgical, span-preserving —
 //!   §3), the changed-key labels for logging, the [`BackingFile`] the file
-//!   maps to (which drives its reload), and a [`WriteValidation`] declaring whether
-//!   the write's values are among the `validations` above (read only by the
+//!   maps to (which drives its reload), and the [`SettingId`]s whose values the write
+//!   carries, each of which must be among the `validations` above (read only by the
 //!   plan-drift guard, [`warn_on_missing_validations`]).
 //! - **`palette`**: `Some` only for a color-scheme switch, carrying the scheme
 //!   name and the `scripts/generate-colors` path detected from the capabilities
@@ -171,10 +171,23 @@ pub struct FileWrite {
     /// The reload concern this file drives, used to plan the post-write reloads
     /// (task 4.4).
     pub backing: BackingFile,
-    /// Where the values in this write get their R8.3 validation — declared by whoever
-    /// built the write, and read only by the plan-drift guard
-    /// ([`warn_on_missing_validations`]). See [`WriteValidation`].
-    pub validation: WriteValidation,
+    /// The settings whose staged values this write carries, each of which the plan's
+    /// [`validations`](ApplyPlan::validations) must re-check in step 1 (R8.3).
+    ///
+    /// Declared by the code that built the write, because only it knows: the pipeline
+    /// sees opaque bytes plus labels, and nothing in them says which [`SettingId`]
+    /// produced them. Read only by the plan-drift guard
+    /// ([`warn_on_missing_validations`]), which warns about every listed id the plan
+    /// does not validate. The declaration is per **write** rather than per file or per
+    /// page because the same file can carry different values on different applies: a
+    /// `hyprpaper.conf` write lists [`SettingId::WallpaperPath`] when it carries a new
+    /// image path (which must still exist and be readable), but nothing when the user
+    /// changed only the fit mode — a token picked from a fixed list — since validating
+    /// the *unchanged* path then could abort an apply over a file the user never
+    /// touched. An empty list therefore means "carries nothing step 1 checks", which is
+    /// correct for that fit-only write and for test fixtures, and a drift everywhere
+    /// else (tasks 9.10, 9.27).
+    pub validated_by: Vec<SettingId>,
     /// Whether the write rewrites an existing file (every backing file but one) or
     /// creates a file that does not exist yet. See [`WriteMode`].
     pub mode: WriteMode,
@@ -252,33 +265,6 @@ pub enum LinkAction {
     Remove,
 }
 
-/// Whether a [`FileWrite`]'s values are covered by its plan's
-/// [`validations`](ApplyPlan::validations) — the provenance signal the plan-drift guard
-/// reads (task 9.10).
-///
-/// The pipeline cannot work this out for itself: a [`FileWrite`] is opaque bytes plus
-/// labels, so nothing in it says which [`SettingId`] produced it. Only the code that
-/// *built* the write knows, so it declares it here. The distinction is per **write**
-/// rather than per file or per page because the same backing file can carry either kind
-/// depending on which value changed — a `hyprpaper.conf` write carries a user-chosen
-/// image path (validated: it must still exist and be readable) when the wallpaper
-/// changed, but carries only a fit mode picked from a fixed list when the user changed
-/// just the fit, and validating the *unchanged* wallpaper path in that second case could
-/// abort an apply over a file the user never touched.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WriteValidation {
-    /// The plan's `validations` re-check the value(s) this write carries, so an empty
-    /// `validations` list alongside this write means the caller dropped them (the drift
-    /// the guard warns about).
-    InPlan,
-    /// This write carries nothing for step 1 to check, so its absence from `validations`
-    /// is correct rather than a bug. Two cases exist today, both documented where they
-    /// are declared: a change confined to values chosen from a list the app itself
-    /// scanned or defined (the GTK/icon/cursor theme names and sizes — see task 9.27,
-    /// which will give those validations of their own — and the wallpaper fit mode).
-    NotNeeded,
-}
-
 /// A palette (color-scheme) switch — the last write step (the palette gotcha, §6
 /// step 3).
 ///
@@ -307,9 +293,10 @@ pub struct PaletteSwitch {
 /// validations from `dirty_ids()`/`value()`, the writes from rendering those same
 /// staged values through the parsers. The two are independent fields (the pipeline
 /// treats them separately), so a buggy caller could let them drift; the contract is
-/// that every dirty setting appears in both. [`run`] guards the most damaging drift —
-/// writes with no validations at all, which would let step 1's R8.3 gate pass
-/// vacuously — by logging a `warn`; see [`warn_on_missing_validations`].
+/// that every dirty setting appears in both. [`run`] guards that drift — a write whose
+/// declared settings ([`FileWrite::validated_by`]) the plan does not validate, which
+/// would let step 1's R8.3 gate pass without having checked them — by logging a `warn`;
+/// see [`warn_on_missing_validations`].
 #[derive(Clone, Debug)]
 pub struct ApplyPlan {
     /// The dirty staged values to re-validate before any write (step 1, R8.3),
@@ -523,9 +510,9 @@ pub fn run(
     runner: &dyn CommandRunner,
     signaller: &dyn ProcessSignaller,
 ) -> ApplyOutcome {
-    // Caller-drift guard, run before the gate it protects: a plan carrying file writes
-    // with nothing to validate would sail through step 1 vacuously (see `ApplyPlan`'s
-    // docs on the two fields being derived from the same dirty settings).
+    // Caller-drift guard, run before the gate it protects: a write whose values the plan
+    // does not validate would sail through step 1 unchecked (see `ApplyPlan`'s docs on
+    // the two fields being derived from the same dirty settings).
     warn_on_missing_validations(plan);
 
     // --- Step 1: validate all staged values before touching anything (R8.3) ---
@@ -656,31 +643,40 @@ fn validate_all(validations: &[(SettingId, Value)]) -> Vec<InvalidSetting> {
     invalid
 }
 
-/// The writes in `plan` that claim their values are validated by it, when it validates
-/// nothing at all — the [`ApplyPlan`] drift guard's predicate (R8.3).
+/// Every write in `plan` that declares a setting the plan does not validate, paired with
+/// the declared settings that are missing — the [`ApplyPlan`] drift guard's predicate
+/// (R8.3).
 ///
-/// Returns an empty vector for a consistent plan. Two things narrow it deliberately:
+/// Returns an empty vector for a consistent plan. Each write is checked on its own
+/// against [`ApplyPlan::validations`], so a *partial* drift — one page's validations
+/// folded in, another's dropped — is caught as well as a plan that validates nothing.
+/// A write that declares no settings ([`FileWrite::validated_by`] empty) carries nothing
+/// step 1 checks and is never flagged; flagging it would make the warning fire on
+/// ordinary, correct applies (a wallpaper fit-only change), the fastest way to make a
+/// diagnostic worth ignoring.
 ///
-/// - Only a plan with *no* `validations` whatsoever is flagged. That is the drift the
-///   pipeline can actually detect; it cannot tell which setting a given [`FileWrite`]'s
-///   bytes came from, so a plan that validates some of its writes' values but not others
-///   is accepted as-is.
-/// - Only writes declaring [`WriteValidation::InPlan`] count. A write that declares
-///   [`WriteValidation::NotNeeded`] is validation-free by design (a theme-name change, a
-///   wallpaper fit-only change), so flagging it would make the warning fire on ordinary,
-///   correct applies — the fastest way to make a diagnostic worth ignoring.
-fn writes_without_validations(plan: &ApplyPlan) -> Vec<&FileWrite> {
-    if !plan.validations.is_empty() {
-        return Vec::new();
-    }
+/// The check is by setting, not by value: when several writes carry values of one
+/// setting (the Display page's per-monitor `MonitorScale`, say), one validation of that
+/// setting satisfies them all. Telling which monitor's value a validation belongs to
+/// would need the values in the write, which the pipeline deliberately treats as opaque.
+fn writes_without_validations(plan: &ApplyPlan) -> Vec<(&FileWrite, Vec<SettingId>)> {
+    let validated: BTreeSet<SettingId> = plan.validations.iter().map(|(id, _)| *id).collect();
     plan.writes
         .iter()
-        .filter(|write| write.validation == WriteValidation::InPlan)
+        .filter_map(|write| {
+            let missing: Vec<SettingId> = write
+                .validated_by
+                .iter()
+                .copied()
+                .filter(|id| !validated.contains(id))
+                .collect();
+            (!missing.is_empty()).then_some((write, missing))
+        })
         .collect()
 }
 
-/// Logs a `warn` when `plan` has file writes but nothing to validate, so a drifted
-/// caller cannot let step 1's R8.3 gate pass vacuously and unnoticed.
+/// Logs a `warn` when a write in `plan` carries settings the plan does not validate, so
+/// a drifted caller cannot let step 1's R8.3 gate pass unnoticed.
 ///
 /// **Why a `warn` rather than a `debug_assert!`.** The condition catches a *developer*
 /// wiring mistake, which is the usual argument for a debug assertion, but all three
@@ -693,11 +689,12 @@ fn writes_without_validations(plan: &ApplyPlan) -> Vec<&FileWrite> {
 ///   perfectly valid, and taking down the app on a heuristic is exactly the "never
 ///   break a working desktop" failure R8.3 is about;
 /// - the pipeline's own tests deliberately build minimal plans (a write, no
-///   validations) to exercise one step in isolation, so an assertion would fail a dozen
-///   tests that document no defect.
+///   validations) to exercise one step in isolation, so an assertion would fail tests
+///   that document no defect.
 ///
 /// A `warn` always fires, in every build, and lands in the journal beside the rest of
-/// the apply record (R7.3) where the changed-key labels name the writes involved.
+/// the apply record (R7.3), naming the unvalidated settings and the writes' changed-key
+/// labels.
 fn warn_on_missing_validations(plan: &ApplyPlan) {
     let unvalidated = writes_without_validations(plan);
     if unvalidated.is_empty() {
@@ -705,14 +702,19 @@ fn warn_on_missing_validations(plan: &ApplyPlan) {
     }
     let keys: Vec<&str> = unvalidated
         .iter()
-        .flat_map(|write| write.changed_keys.iter().map(String::as_str))
+        .flat_map(|(write, _)| write.changed_keys.iter().map(String::as_str))
+        .collect();
+    let missing: BTreeSet<SettingId> = unvalidated
+        .iter()
+        .flat_map(|(_, missing)| missing.iter().copied())
         .collect();
     tracing::warn!(
         writes = unvalidated.len(),
         keys = ?keys,
-        "apply plan carries file writes but no values to validate, so the validation \
-         gate passed vacuously; the caller that assembled this plan has most likely \
-         dropped its validations (R8.3)"
+        missing = ?missing,
+        "apply plan carries file writes whose values it does not validate, so the \
+         validation gate passed without checking them; the caller that assembled this \
+         plan has most likely dropped their validations (R8.3)"
     );
 }
 
@@ -1032,7 +1034,7 @@ mod tests {
                 contents: b"monitor=eDP-1,preferred,auto,1.25\n".to_vec(),
                 changed_keys: vec!["monitor:eDP-1 scale".to_string()],
                 backing: BackingFile::MonitorsConf,
-                validation: WriteValidation::InPlan,
+                validated_by: vec![SettingId::MonitorScale],
                 mode: WriteMode::Replace,
             }],
             links: Vec::new(),
@@ -1166,7 +1168,7 @@ mod tests {
                 contents: b"preload = /new.png\n".to_vec(),
                 changed_keys: vec!["preload".to_string()],
                 backing: BackingFile::HyprpaperConf,
-                validation: WriteValidation::InPlan,
+                validated_by: vec![SettingId::WallpaperPath],
                 mode: WriteMode::Replace,
             }],
             links: Vec::new(),
@@ -1224,7 +1226,7 @@ mod tests {
                 contents: b"kb_layout = \"us,se\",\n".to_vec(),
                 changed_keys: vec!["kb_layout".to_string()],
                 backing: BackingFile::InputLua,
-                validation: WriteValidation::InPlan,
+                validated_by: Vec::new(),
                 mode: WriteMode::Replace,
             }],
             links: Vec::new(),
@@ -1277,7 +1279,7 @@ mod tests {
             contents: b"kb_layout = \"us,se\",\n".to_vec(),
             changed_keys: vec!["kb_layout".to_string()],
             backing: BackingFile::InputLua,
-            validation: WriteValidation::InPlan,
+            validated_by: Vec::new(),
             mode: WriteMode::Replace,
         }
     }
@@ -1403,7 +1405,7 @@ mod tests {
                 contents: b"listener { timeout = 600 }\n".to_vec(),
                 changed_keys: vec!["listener[1].timeout".to_string()],
                 backing: BackingFile::HypridleConf,
-                validation: WriteValidation::InPlan,
+                validated_by: Vec::new(),
                 mode: WriteMode::Replace,
             }],
             links: Vec::new(),
@@ -1464,7 +1466,7 @@ mod tests {
                 contents: b"listener { timeout = 600 }\n".to_vec(),
                 changed_keys: vec!["listener[1].timeout".to_string()],
                 backing: BackingFile::HypridleConf,
-                validation: WriteValidation::InPlan,
+                validated_by: Vec::new(),
                 mode: WriteMode::Replace,
             }],
             links: Vec::new(),
@@ -1515,7 +1517,7 @@ mod tests {
                     contents: b"new input\n".to_vec(),
                     changed_keys: vec!["kb_layout".to_string()],
                     backing: BackingFile::InputLua,
-                    validation: WriteValidation::InPlan,
+                    validated_by: Vec::new(),
                     mode: WriteMode::Replace,
                 },
                 FileWrite {
@@ -1523,7 +1525,7 @@ mod tests {
                     contents: b"new monitors\n".to_vec(),
                     changed_keys: vec!["monitor".to_string()],
                     backing: BackingFile::MonitorsConf,
-                    validation: WriteValidation::InPlan,
+                    validated_by: Vec::new(),
                     mode: WriteMode::Replace,
                 },
             ],
@@ -1581,7 +1583,7 @@ mod tests {
                     contents: b"[Icon Theme]\nInherits=Bibata\n".to_vec(),
                     changed_keys: vec!["cursor theme".to_string()],
                     backing: BackingFile::CursorFallbackTheme,
-                    validation: WriteValidation::NotNeeded,
+                    validated_by: Vec::new(),
                     mode: WriteMode::CreateNew,
                 },
                 FileWrite {
@@ -1589,7 +1591,7 @@ mod tests {
                     contents: b"new monitors\n".to_vec(),
                     changed_keys: vec!["monitor".to_string()],
                     backing: BackingFile::MonitorsConf,
-                    validation: WriteValidation::NotNeeded,
+                    validated_by: Vec::new(),
                     mode: WriteMode::Replace,
                 },
             ],
@@ -1639,7 +1641,7 @@ mod tests {
                 contents: b"[Icon Theme]\nInherits=ours\n".to_vec(),
                 changed_keys: vec!["cursor theme".to_string()],
                 backing: BackingFile::CursorFallbackTheme,
-                validation: WriteValidation::NotNeeded,
+                validated_by: Vec::new(),
                 mode: WriteMode::CreateNew,
             }],
             links: Vec::new(),
@@ -1688,7 +1690,7 @@ mod tests {
                 contents: b"monitor=eDP-1,preferred,auto,1.25\n".to_vec(),
                 changed_keys: vec!["monitor:eDP-1 scale".to_string()],
                 backing: BackingFile::MonitorsConf,
-                validation: WriteValidation::InPlan,
+                validated_by: Vec::new(),
                 mode: WriteMode::Replace,
             }],
             links: Vec::new(),
@@ -1764,7 +1766,7 @@ mod tests {
             contents: b"[Settings]\ngtk-theme-name=New\n".to_vec(),
             changed_keys: vec!["GTK theme".to_string()],
             backing: BackingFile::GtkSettings,
-            validation: WriteValidation::NotNeeded,
+            validated_by: Vec::new(),
             mode: WriteMode::Replace,
         }
     }
@@ -2041,7 +2043,7 @@ mod tests {
                 contents: b"monitor=eDP-1,preferred,auto,1.25\n".to_vec(),
                 changed_keys: vec!["monitor:eDP-1 scale".to_string()],
                 backing: BackingFile::MonitorsConf,
-                validation: WriteValidation::InPlan,
+                validated_by: Vec::new(),
                 mode: WriteMode::Replace,
             }],
             links: Vec::new(),
@@ -2100,7 +2102,7 @@ mod tests {
                 contents: b"monitor=eDP-1,preferred,auto,1.25\n".to_vec(),
                 changed_keys: vec!["monitor:eDP-1 scale".to_string()],
                 backing: BackingFile::MonitorsConf,
-                validation: WriteValidation::InPlan,
+                validated_by: Vec::new(),
                 mode: WriteMode::Replace,
             }],
             links: Vec::new(),
@@ -2228,7 +2230,7 @@ mod tests {
                 contents: b"monitor=eDP-1,preferred,auto,1.25\n".to_vec(),
                 changed_keys: vec!["monitor:eDP-1 scale".to_string()],
                 backing: BackingFile::MonitorsConf,
-                validation: WriteValidation::InPlan,
+                validated_by: Vec::new(),
                 mode: WriteMode::Replace,
             }],
             links: Vec::new(),
@@ -2376,21 +2378,21 @@ mod tests {
         }
     }
 
-    // --- The caller-drift guard on writes without validations (task 9.10) --------
+    // --- The caller-drift guard on writes without validations (tasks 9.10, 9.27) ---
 
-    /// A plan with one write per `(backing, validation)` pair and no `validations` at
-    /// all — the shape the drift guard reacts to.
-    fn plan_with_writes(writes: &[(BackingFile, WriteValidation)]) -> ApplyPlan {
+    /// A plan with one write per `(backing, declared settings)` pair and no
+    /// `validations` at all — the shape the drift guard reacts to.
+    fn plan_with_writes(writes: &[(BackingFile, &[SettingId])]) -> ApplyPlan {
         ApplyPlan {
             validations: Vec::new(),
             writes: writes
                 .iter()
-                .map(|(backing, validation)| FileWrite {
+                .map(|(backing, validated_by)| FileWrite {
                     path: PathBuf::from("/fake/target.conf"),
                     contents: b"contents\n".to_vec(),
                     changed_keys: vec![format!("{backing:?} key")],
                     backing: *backing,
-                    validation: *validation,
+                    validated_by: validated_by.to_vec(),
                     mode: WriteMode::Replace,
                 })
                 .collect(),
@@ -2477,44 +2479,91 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn a_write_without_its_validations_is_flagged_as_drift() {
-        // The drift the guard exists for: a caller rendered a write whose values it
-        // claims the plan validates, but dropped them from `validations` — so step 1's
-        // R8.3 gate would pass vacuously.
-        let plan = plan_with_writes(&[(BackingFile::MonitorsConf, WriteValidation::InPlan)]);
-        let flagged = writes_without_validations(&plan);
-        assert_eq!(flagged.len(), 1, "the unvalidated write must be flagged");
-        assert_eq!(flagged[0].backing, BackingFile::MonitorsConf);
-
-        // Supplying the validation clears it — a consistent plan is never flagged.
-        let mut validated =
-            plan_with_writes(&[(BackingFile::MonitorsConf, WriteValidation::InPlan)]);
-        validated
-            .validations
-            .push((SettingId::MonitorScale, Value::Float(1.25)));
-        assert!(writes_without_validations(&validated).is_empty());
+    /// The backing files of the writes [`writes_without_validations`] flags in `plan`,
+    /// each with the settings it reports missing.
+    fn flagged(plan: &ApplyPlan) -> Vec<(BackingFile, Vec<SettingId>)> {
+        writes_without_validations(plan)
+            .into_iter()
+            .map(|(write, missing)| (write.backing, missing))
+            .collect()
     }
 
     #[test]
-    fn a_by_design_validation_free_plan_is_not_flagged() {
-        // The declaration that keeps the guard honest. Two real applies reach the
-        // pipeline with writes and no validations by design: a theme-only change (the
-        // GTK/icon/cursor model carries no validations at all — task 9.27) and a
-        // wallpaper *fit-only* change, which must not drag the unchanged wallpaper path
-        // into validation. Both must stay quiet, or the warning fires on ordinary applies
-        // and becomes worth ignoring.
-        let by_design = plan_with_writes(&[
-            (BackingFile::GtkSettings, WriteValidation::NotNeeded),
-            (BackingFile::UwsmEnv, WriteValidation::NotNeeded),
-            (BackingFile::HyprlandLua, WriteValidation::NotNeeded),
-            (BackingFile::CursorFallbackTheme, WriteValidation::NotNeeded),
-            (BackingFile::HyprpaperConf, WriteValidation::NotNeeded),
-        ]);
-        assert!(
-            writes_without_validations(&by_design).is_empty(),
-            "writes that declare themselves validation-free must not be flagged"
+    fn a_write_without_its_validations_is_flagged_as_drift() {
+        // The drift the guard exists for: a caller rendered a write carrying a setting's
+        // value, but dropped that value from `validations` — so step 1's R8.3 gate would
+        // pass without checking it.
+        let plan = plan_with_writes(&[(BackingFile::MonitorsConf, &[SettingId::MonitorScale])]);
+        assert_eq!(
+            flagged(&plan),
+            vec![(BackingFile::MonitorsConf, vec![SettingId::MonitorScale])]
         );
+
+        // Supplying the validation clears it — a consistent plan is never flagged.
+        let mut validated = plan.clone();
+        validated
+            .validations
+            .push((SettingId::MonitorScale, Value::Float(1.25)));
+        assert!(flagged(&validated).is_empty());
+    }
+
+    #[test]
+    fn a_theme_write_that_lost_its_validation_is_flagged() {
+        // Task 9.27: the theme writes now declare the settings they carry, so a theme
+        // contribution whose validations were dropped is caught like any other page's.
+        let plan = plan_with_writes(&[
+            (
+                BackingFile::GtkSettings,
+                &[SettingId::CursorTheme, SettingId::CursorSize],
+            ),
+            (BackingFile::HyprlandLua, &[SettingId::CursorTheme]),
+        ]);
+        assert_eq!(
+            flagged(&plan),
+            vec![
+                (
+                    BackingFile::GtkSettings,
+                    vec![SettingId::CursorTheme, SettingId::CursorSize]
+                ),
+                (BackingFile::HyprlandLua, vec![SettingId::CursorTheme]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_partial_drift_is_flagged() {
+        // The case the two-variant declaration of task 9.10 could not see: the plan
+        // validates *something*, so it is not empty, but one write's setting is not
+        // among it. Only the unvalidated part is reported.
+        let mut plan = plan_with_writes(&[
+            (BackingFile::HypridleConf, &[SettingId::LockCommand]),
+            (
+                BackingFile::GtkSettings,
+                &[SettingId::GtkTheme, SettingId::IconTheme],
+            ),
+        ]);
+        plan.validations = vec![
+            (
+                SettingId::LockCommand,
+                Value::String("hyprlock".to_string()),
+            ),
+            (SettingId::GtkTheme, Value::Enum("Adwaita".to_string())),
+        ];
+        assert_eq!(
+            flagged(&plan),
+            vec![(BackingFile::GtkSettings, vec![SettingId::IconTheme])]
+        );
+    }
+
+    #[test]
+    fn a_write_declaring_no_settings_is_not_flagged() {
+        // The declaration that keeps the guard honest: a wallpaper *fit-only* change
+        // reaches the pipeline with a `hyprpaper.conf` write and no validations by
+        // design, because the unchanged wallpaper path must not be dragged into
+        // validation. It must stay quiet, or the warning fires on ordinary applies and
+        // becomes worth ignoring.
+        let fit_only = plan_with_writes(&[(BackingFile::HyprpaperConf, &[])]);
+        assert!(flagged(&fit_only).is_empty());
 
         // A palette-only apply has no writes at all, so there is nothing to flag.
         let palette_only = ApplyPlan {
@@ -2527,31 +2576,18 @@ mod tests {
             }),
             reload_params: ReloadParams::default(),
         };
-        assert!(writes_without_validations(&palette_only).is_empty());
-    }
-
-    #[test]
-    fn a_mixed_plan_flags_only_its_unvalidated_write() {
-        // A write that does claim plan validation, alongside by-design ones, is still
-        // flagged — and only it: the declaration must not launder a genuine drift.
-        let mixed = plan_with_writes(&[
-            (BackingFile::GtkSettings, WriteValidation::NotNeeded),
-            (BackingFile::HypridleConf, WriteValidation::InPlan),
-        ]);
-        let flagged = writes_without_validations(&mixed);
-        assert_eq!(flagged.len(), 1);
-        assert_eq!(flagged[0].backing, BackingFile::HypridleConf);
+        assert!(flagged(&palette_only).is_empty());
     }
 
     #[test]
     fn a_drifted_plan_logs_a_warning_naming_the_unvalidated_keys() {
         // The guard's whole effect is the log line (it deliberately does not abort the
         // apply — see `warn_on_missing_validations` on warn vs debug_assert), so pin that
-        // the line is emitted at `warn` and names the write's changed keys, which is what
-        // makes it actionable in the journal (R7.3).
-        let mut plan = plan_with_writes(&[(BackingFile::HypridleConf, WriteValidation::InPlan)]);
+        // the line is emitted at `warn` and names the write's changed keys and the
+        // missing setting, which is what makes it actionable in the journal (R7.3).
+        let mut plan = plan_with_writes(&[(BackingFile::HypridleConf, &[SettingId::DimTimeout])]);
         plan.writes[0].changed_keys = vec!["listener:timeout".to_string()];
-        let by_design = plan_with_writes(&[(BackingFile::GtkSettings, WriteValidation::NotNeeded)]);
+        let by_design = plan_with_writes(&[(BackingFile::HyprpaperConf, &[])]);
 
         let events = captured_events(
             || warn_on_missing_validations(&plan),
@@ -2569,8 +2605,8 @@ mod tests {
             "exactly the drifted plan warns; the by-design one is silent: {events:?}"
         );
         assert!(
-            warnings[0].contains("listener:timeout"),
-            "the warning names the unvalidated write's changed keys: {}",
+            warnings[0].contains("listener:timeout") && warnings[0].contains("DimTimeout"),
+            "the warning names the unvalidated write's changed keys and setting: {}",
             warnings[0]
         );
     }
@@ -2595,7 +2631,7 @@ mod tests {
                 contents: new_bytes.clone(),
                 changed_keys: vec!["general:lock_cmd".to_string()],
                 backing: BackingFile::HypridleConf,
-                validation: WriteValidation::InPlan,
+                validated_by: vec![SettingId::LockCommand],
                 mode: WriteMode::Replace,
             }],
             links: Vec::new(),
@@ -2700,7 +2736,7 @@ mod tests {
                 contents: new_bytes.clone(),
                 changed_keys: vec!["input.sensitivity".to_string()],
                 backing: BackingFile::InputLua,
-                validation: WriteValidation::InPlan,
+                validated_by: vec![SettingId::MouseSensitivity],
                 mode: WriteMode::Replace,
             }],
             links: Vec::new(),

@@ -115,7 +115,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value as JsonValue;
 
-use crate::core::apply::{FileWrite, WriteMode, WriteValidation, stderr_excerpt};
+use crate::core::apply::{FileWrite, WriteMode, stderr_excerpt};
 use crate::core::freshness::FreshnessTracker;
 use crate::core::model::{
     SCALE_RANGE, SettingId, ValidationError, Value, validate_float_range, validate_monitor_mode,
@@ -1058,18 +1058,23 @@ impl DisplayModel {
             return Ok(None);
         }
 
+        // The write declares exactly the settings whose values `validations` hands the
+        // pipeline to re-check (R8.3), derived from that same list so the two cannot
+        // disagree; the drift guard then catches a caller that drops the validations.
+        let validations = self.staged_validations();
+        let mut validated_by: Vec<SettingId> = validations.iter().map(|(id, _)| *id).collect();
+        validated_by.sort_unstable();
+        validated_by.dedup();
         Ok(Some(DisplayApply {
             write: FileWrite {
                 path: self.monitors_conf_path.clone(),
                 contents: file.emit().into_bytes(),
                 changed_keys,
                 backing: BackingFile::MonitorsConf,
-                // The mode/scale/position values in this write are exactly what the
-                // `validations` below hand the pipeline to re-check (R8.3).
-                validation: WriteValidation::InPlan,
+                validated_by,
                 mode: WriteMode::Replace,
             },
-            validations: self.staged_validations(),
+            validations,
         }))
     }
 

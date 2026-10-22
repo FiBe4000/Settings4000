@@ -242,7 +242,9 @@ fn two_reload_requests_in_one_apply_reload_notifd_once() {
         false,
         None,
     );
-    themes.stage_icon_theme("Fixture-Icons");
+    themes
+        .stage_icon_theme("Fixture-Icons")
+        .expect("the value passes the stage-time check");
 
     let assembled = assemble_apply_plan(ApplySources {
         notifications: Some(&model),

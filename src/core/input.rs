@@ -87,7 +87,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::core::apply::{FileWrite, WriteValidation};
+use crate::core::apply::FileWrite;
 use crate::core::model::{SettingId, Value, ValueKind};
 use crate::core::reload::BackingFile;
 use crate::core::store_write::{RenderedEdit, StoreBackedFile, StoreWriteError};
@@ -658,9 +658,6 @@ fn write_target(path: PathBuf) -> StoreBackedFile {
         path,
         name: "input.lua",
         backing: BackingFile::InputLua,
-        // Rendered from the store's dirty Input settings, which the plan carries as its
-        // validations (the assembler builds both from the same `dirty_ids()`).
-        validation: WriteValidation::InPlan,
         read_failure_log: "could not read input.lua to render the Input edits; aborting \
                            the apply (R8.3)",
         render_failure_log: "failed to render an input.lua edit; aborting the apply (R8.3)",
@@ -1336,10 +1333,11 @@ hl.config({
             .expect("a dirty Input setting produces a write");
         assert_eq!(write.path, path);
         assert_eq!(write.backing, BackingFile::InputLua);
-        // Task 9.10's drift guard trusts this declaration rather than checking it, so a
-        // page silently claiming NotNeeded would disable the guard for its own write
-        // (task 9.17 review). Pinned here, where the claim is made.
-        assert_eq!(write.validation, WriteValidation::InPlan);
+        // The drift guard (tasks 9.10, 9.27) checks the plan's validations against the
+        // settings each write declares, so a write that declared fewer than it carries
+        // would hide its own drift. Pinned here: exactly the dirty settings it renders.
+        let rendered: Vec<SettingId> = dirty.iter().map(|(id, _)| *id).collect();
+        assert_eq!(write.validated_by, rendered);
         assert_eq!(write.changed_keys, vec!["input.sensitivity".to_string()]);
 
         let mut tracker = FreshnessTracker::new();

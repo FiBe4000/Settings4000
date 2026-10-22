@@ -62,6 +62,7 @@ use std::path::{Path, PathBuf};
 use crate::core::home_path::{self, expand_home, is_home_relative};
 use crate::core::lock_grace::GraceError;
 use crate::core::notifd_config;
+use crate::core::value_writers::{self, Unwritable, ValueWriter};
 use crate::parsers::palette::is_bare_hex;
 
 /// A top-level settings category — one entry per sidebar page (R2.4, requirements
@@ -169,6 +170,28 @@ pub enum SettingId {
     WallpaperPath,
     /// The lock-screen background image path (`hyprlock.conf`).
     LockBackgroundPath,
+    /// The GTK theme name (`gtk-theme-name` in both GTK `settings.ini` files; also the
+    /// directory the GTK 4 theme links point into, task 11.16).
+    ///
+    /// This and the next three are staged by the Theme page's own model rather than the
+    /// store (see [`crate::core::theme`] for why). They are ids nonetheless so that the
+    /// model's Apply contribution can hand them to the pipeline's step 1 like every
+    /// other staged value, and so that one validator serves both the stage-time and the
+    /// Apply-time check (task 9.27, R8.3). A [`ValueKind::Enum`]: the value is picked
+    /// from a drop-down of scanned themes.
+    GtkTheme,
+    /// The icon theme name (`gtk-icon-theme-name` in both GTK `settings.ini` files). See
+    /// [`Self::GtkTheme`] on why a bespoke-model value has an id.
+    IconTheme,
+    /// The cursor theme name, written identically to both `settings.ini` files,
+    /// `uwsm/env`, the `hl.env("XCURSOR_THEME", …)` line of `hyprland.lua` and the
+    /// XCursor fallback `~/.icons/default/index.theme` (R3.4). See [`Self::GtkTheme`] on
+    /// why a bespoke-model value has an id.
+    CursorTheme,
+    /// The cursor size in pixels, held as the drop-down's text (`"24"`) and written to
+    /// the same copies as [`Self::CursorTheme`] except `index.theme`, which has no size.
+    /// See [`Self::GtkTheme`] on why a bespoke-model value has an id.
+    CursorSize,
 
     // --- Input (task 6.6) ---
     /// The ordered keyboard layout list, serialized to Hyprland's comma-joined
@@ -259,7 +282,12 @@ impl SettingId {
     /// UI/store use it to build the right widget and coerce input.
     pub fn kind(&self) -> ValueKind {
         match self {
-            SettingId::MonitorMode | SettingId::MonitorPosition => ValueKind::Enum,
+            SettingId::MonitorMode
+            | SettingId::MonitorPosition
+            | SettingId::GtkTheme
+            | SettingId::IconTheme
+            | SettingId::CursorTheme
+            | SettingId::CursorSize => ValueKind::Enum,
             SettingId::MonitorScale | SettingId::MouseSensitivity => ValueKind::Float,
             SettingId::DimTimeout
             | SettingId::LockTimeout
@@ -294,9 +322,13 @@ impl SettingId {
             | SettingId::MonitorScale
             | SettingId::MonitorPosition
             | SettingId::LaptopDisplayEnabled => Category::Display,
-            SettingId::PaletteColor | SettingId::WallpaperPath | SettingId::LockBackgroundPath => {
-                Category::Theme
-            }
+            SettingId::PaletteColor
+            | SettingId::WallpaperPath
+            | SettingId::LockBackgroundPath
+            | SettingId::GtkTheme
+            | SettingId::IconTheme
+            | SettingId::CursorTheme
+            | SettingId::CursorSize => Category::Theme,
             SettingId::KeyboardLayouts
             | SettingId::KeyboardOptions
             | SettingId::MouseSensitivity
@@ -338,6 +370,10 @@ impl SettingId {
             | SettingId::PaletteColor
             | SettingId::WallpaperPath
             | SettingId::LockBackgroundPath
+            | SettingId::GtkTheme
+            | SettingId::IconTheme
+            | SettingId::CursorTheme
+            | SettingId::CursorSize
             | SettingId::KeyboardLayouts
             | SettingId::KeyboardOptions
             | SettingId::MouseSensitivity
@@ -381,9 +417,21 @@ impl SettingId {
             // The value may be the config's own `~/…` form (task 11.10). The wallpaper
             // model already hands over expanded paths against its injected home; reading
             // `$HOME` here covers any other caller with the same rule.
-            (SettingId::WallpaperPath | SettingId::LockBackgroundPath, Value::String(text)) => {
-                validate_image_value(text, home_path::home_dir().as_deref())
+            (SettingId::WallpaperPath, Value::String(text)) => {
+                validate_wallpaper_value(text, home_path::home_dir().as_deref())
             }
+            (SettingId::LockBackgroundPath, Value::String(text)) => {
+                validate_lock_background_value(text, home_path::home_dir().as_deref())
+            }
+            // Theme names: whatever the scan offered, as long as every file the name is
+            // written to can hold it (task 9.27). The Theme model runs this same check
+            // when the user picks a name, so step 1 only catches a value that reached
+            // the staged state some other way.
+            (
+                SettingId::GtkTheme | SettingId::IconTheme | SettingId::CursorTheme,
+                Value::Enum(name),
+            ) => value_writers::check_writable(*self, name),
+            (SettingId::CursorSize, Value::Enum(size)) => validate_cursor_size(size),
             (SettingId::MonitorMode, Value::Enum(token)) => validate_monitor_mode(token),
             (SettingId::MonitorPosition, Value::Enum(token)) => validate_monitor_position(token),
             (SettingId::MonitorScale, Value::Float(scale)) => {
@@ -647,6 +695,26 @@ pub enum ValidationError {
         /// The largest value notifd accepts for the key.
         max: i64,
     },
+    /// A Theme-page value contains something at least one of the files (or the live
+    /// request) it is written to cannot hold, so writing it would leave some copies on
+    /// the new value and others on the old one (task 9.27, R8.3, R3.4). Raised by
+    /// [`value_writers::check_writable`], which names the writers that refuse it.
+    Unwritable {
+        /// The refused value, as supplied.
+        value: String,
+        /// What about it is refused.
+        problem: Unwritable,
+        /// Every writer that refuses it, in the order the message lists them.
+        writers: Vec<ValueWriter>,
+    },
+    /// A cursor size is not a whole number of pixels greater than zero. GTK reads
+    /// `gtk-cursor-theme-size` and Xcursor reads `XCURSOR_SIZE` as integers, and
+    /// `hyprctl setcursor` needs one, so any other text would be written to four files
+    /// and ignored by all of them (task 9.27).
+    InvalidCursorSize {
+        /// The refused size, as supplied.
+        value: String,
+    },
     /// A wallpaper/lock-background path is not a readable image file.
     ImagePath {
         /// The path that was checked.
@@ -719,6 +787,47 @@ impl fmt::Display for ValidationError {
                 f,
                 "{key}={value} would be ignored by notifd, which then uses its default: it \
                  must be a whole number from {min} to {max}"
+            ),
+            ValidationError::Unwritable {
+                value,
+                problem,
+                writers,
+            } => {
+                let value = value_writers::printable(value);
+                let writers_text = value_writers::join_writers(writers);
+                match problem {
+                    Unwritable::Character(character) => write!(
+                        f,
+                        "`{value}` cannot be used: it contains {}, which {writers_text} \
+                         cannot hold",
+                        value_writers::describe_character(*character)
+                    ),
+                    Unwritable::NotABareShellWord {
+                        character: Some(character),
+                    } => write!(
+                        f,
+                        "`{value}` cannot be used: it contains {}, which {writers_text} \
+                         cannot hold — uwsm/env is read by the login shell, so the value \
+                         must be one plain word without spaces or shell special characters",
+                        value_writers::describe_character(*character)
+                    ),
+                    Unwritable::NotABareShellWord { character: None } => write!(
+                        f,
+                        "`{value}` cannot be used: {writers_text} need a non-empty word, \
+                         because uwsm/env is read by the login shell"
+                    ),
+                    Unwritable::NotASingleDirectoryName => write!(
+                        f,
+                        "`{value}` cannot be used: {writers_text} need a single directory \
+                         name (no `/`, and not `.` or `..`)"
+                    ),
+                }
+            }
+            ValidationError::InvalidCursorSize { value } => write!(
+                f,
+                "`{}` is not a cursor size: expected a whole number of pixels greater \
+                 than zero, for example 24",
+                value_writers::printable(value)
             ),
             ValidationError::ImagePath { path, problem } => {
                 let path = path.display();
@@ -1173,6 +1282,93 @@ pub fn validate_image_value(value: &str, home: Option<&Path>) -> Result<(), Vali
     })
 }
 
+/// Validates a desktop-wallpaper **config value** (R8.3): every place the path is
+/// written must be able to hold it, and it must name a readable image
+/// ([`validate_image_value`]).
+///
+/// The character rule is the union of the `hyprpaper.conf` and `hyprlock.conf` writers
+/// (line breaks and `#`) and the live `hyprctl hyprpaper` request (`,`); see
+/// [`value_writers`] for where each comes from (task 9.27). It is checked on the path
+/// expanded against `home`, because that is the form the live request carries and it
+/// contains every character of the `~/…` form a file may store instead — so the check
+/// is the strictest of the forms, and the wallpaper model's stage-time call and the
+/// Apply pipeline's step 1 (which receives the expanded path) reach the same verdict.
+/// The characters are checked before the filesystem, so a refused path is reported by
+/// its character even when it also names no file.
+pub fn validate_wallpaper_value(value: &str, home: Option<&Path>) -> Result<(), ValidationError> {
+    check_image_path_writable(SettingId::WallpaperPath, value, home)?;
+    validate_image_value(value, home)
+}
+
+/// Validates a separate lock-screen image **config value** (R8.3), like
+/// [`validate_wallpaper_value`] but against `hyprlock.conf`'s writer alone (line breaks
+/// and `#`): a separate lock image is written nowhere else and never reaches the live
+/// hyprpaper request.
+pub fn validate_lock_background_value(
+    value: &str,
+    home: Option<&Path>,
+) -> Result<(), ValidationError> {
+    check_image_path_writable(SettingId::LockBackgroundPath, value, home)?;
+    validate_image_value(value, home)
+}
+
+/// Runs [`value_writers::check_writable`] for an image path on its home-expanded form,
+/// reporting the refusal against `value` as the user supplied it.
+///
+/// Checking the expanded form is over-strict in one corner: the `#` rule belongs to the
+/// hyprlang files (`hyprpaper.conf`, `hyprlock.conf`), which store the `~/…` form
+/// without the home prefix, so a `#` inside `$HOME` itself is refused although those
+/// files would never contain it. (A `,` in `$HOME` is refused rightly: the live
+/// hyprpaper request does carry the expanded path.) Accepted as the price of one check
+/// that agrees with the Apply pipeline's step 1, which only sees the expanded path.
+fn check_image_path_writable(
+    id: SettingId,
+    value: &str,
+    home: Option<&Path>,
+) -> Result<(), ValidationError> {
+    let expanded = expand_home(value, home);
+    let expanded = expanded.to_string_lossy();
+    value_writers::check_writable(id, &expanded).map_err(|error| match error {
+        ValidationError::Unwritable {
+            problem, writers, ..
+        } => ValidationError::Unwritable {
+            value: value.to_string(),
+            problem,
+            writers,
+        },
+        other => other,
+    })
+}
+
+/// Parses a cursor size into a pixel count, or `None` when it is not a whole number
+/// greater than zero (surrounding whitespace is ignored, as the INI reader trims it).
+///
+/// The one definition of a usable cursor size, shared by [`validate_cursor_size`] and
+/// by the Theme model, which needs the number for `hyprctl setcursor`.
+pub fn parse_cursor_size(size: &str) -> Option<u32> {
+    match size.trim().parse::<u32>() {
+        Ok(value) if value > 0 => Some(value),
+        _ => None,
+    }
+}
+
+/// Validates a cursor size (R8.3, task 9.27): a whole number of pixels greater than
+/// zero ([`parse_cursor_size`]).
+///
+/// A number this check accepts consists of digits and surrounding spaces only, so it
+/// also passes the character rules of every file the size is written to
+/// ([`value_writers::writers_of`]); those are checked anyway so the guarantee does not
+/// rest on that observation.
+pub fn validate_cursor_size(size: &str) -> Result<(), ValidationError> {
+    value_writers::check_writable(SettingId::CursorSize, size)?;
+    match parse_cursor_size(size) {
+        Some(_) => Ok(()),
+        None => Err(ValidationError::InvalidCursorSize {
+            value: size.to_string(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1188,6 +1384,10 @@ mod tests {
         SettingId::PaletteColor,
         SettingId::WallpaperPath,
         SettingId::LockBackgroundPath,
+        SettingId::GtkTheme,
+        SettingId::IconTheme,
+        SettingId::CursorTheme,
+        SettingId::CursorSize,
         SettingId::KeyboardLayouts,
         SettingId::KeyboardOptions,
         SettingId::MouseSensitivity,
@@ -1219,6 +1419,10 @@ mod tests {
             | SettingId::PaletteColor
             | SettingId::WallpaperPath
             | SettingId::LockBackgroundPath
+            | SettingId::GtkTheme
+            | SettingId::IconTheme
+            | SettingId::CursorTheme
+            | SettingId::CursorSize
             | SettingId::KeyboardLayouts
             | SettingId::KeyboardOptions
             | SettingId::MouseSensitivity
@@ -1254,6 +1458,10 @@ mod tests {
             SettingId::WallpaperPath | SettingId::LockBackgroundPath => {
                 Value::String("/nonexistent.png".to_string())
             }
+            SettingId::GtkTheme => Value::Enum("Adwaita-dark".to_string()),
+            SettingId::IconTheme => Value::Enum("Papirus".to_string()),
+            SettingId::CursorTheme => Value::Enum("breeze_cursors".to_string()),
+            SettingId::CursorSize => Value::Enum("24".to_string()),
             SettingId::KeyboardLayouts => Value::String("us,se".to_string()),
             SettingId::KeyboardOptions => {
                 Value::String("grp:win_space_toggle,caps:escape".to_string())
@@ -1951,6 +2159,83 @@ mod tests {
     }
 
     #[test]
+    fn theme_values_are_validated_against_their_writers() {
+        // Task 9.27: the four Theme-page values reach step 1 as `SettingId`s, and each is
+        // held to the union of its writers' rules (see `core::value_writers`).
+        let name = |text: &str| Value::Enum(text.to_string());
+        assert!(SettingId::CursorTheme.validate(&name("Nord#ic")).is_ok());
+        assert!(SettingId::CursorTheme.validate(&name("Nord\"ic")).is_err());
+        assert!(SettingId::IconTheme.validate(&name("Pap\"irus")).is_ok());
+        assert!(SettingId::IconTheme.validate(&name("Pap\nirus")).is_err());
+        assert!(SettingId::GtkTheme.validate(&name("a/b")).is_err());
+        assert!(SettingId::CursorSize.validate(&name("24")).is_ok());
+        assert!(matches!(
+            SettingId::CursorSize.validate(&name("0")),
+            Err(ValidationError::InvalidCursorSize { .. })
+        ));
+        // The kind guard still applies: a theme name is a drop-down choice.
+        assert!(matches!(
+            SettingId::GtkTheme.validate(&Value::String("Adwaita".to_string())),
+            Err(ValidationError::WrongKind { .. })
+        ));
+    }
+
+    #[test]
+    fn an_unwritable_value_message_names_character_and_writers() {
+        // R8.3 message quality: the user is told which character and which files, and a
+        // control character in the quoted value is escaped so it cannot break the text.
+        let error = SettingId::CursorTheme
+            .validate(&Value::Enum("Nord\nic".to_string()))
+            .expect_err("a line break is refused");
+        assert_eq!(
+            error.to_string(),
+            "`Nord\\nic` cannot be used: it contains a line break (U+000A), which \
+             settings.ini, uwsm/env, the hl.env lines of hyprland.lua, \
+             ~/.icons/default/index.theme and the live hyprctl setcursor request cannot \
+             hold — uwsm/env is read by the login shell, so the value must be one plain \
+             word without spaces or shell special characters"
+        );
+        let error = SettingId::GtkTheme
+            .validate(&Value::Enum("..".to_string()))
+            .expect_err("not a directory name");
+        assert_eq!(
+            error.to_string(),
+            "`..` cannot be used: the GTK 4 theme links in ~/.config/gtk-4.0 need a single \
+             directory name (no `/`, and not `.` or `..`)"
+        );
+    }
+
+    #[test]
+    fn image_path_characters_are_checked_first() {
+        // A refused character is reported even for a path that names no file, so the
+        // user is not first told to pick an existing file and then refused for its name.
+        let error =
+            validate_wallpaper_value("/missing/wall#1.png", None).expect_err("a `#` is refused");
+        assert!(matches!(
+            error,
+            ValidationError::Unwritable {
+                problem: Unwritable::Character('#'),
+                ..
+            }
+        ));
+        // The check runs on the expanded path, but the message quotes the value as
+        // supplied.
+        let home = Path::new("/home/a,b");
+        let error = validate_wallpaper_value("~/wall.png", Some(home))
+            .expect_err("the expanded path holds a comma");
+        assert!(
+            error.to_string().starts_with("`~/wall.png` cannot be used"),
+            "{error}"
+        );
+        // A separate lock image never reaches the hyprpaper request, so its comma passes
+        // the character rule and the missing file is what is reported.
+        assert!(matches!(
+            validate_lock_background_value("/missing/lock,1.png", None),
+            Err(ValidationError::ImagePath { .. })
+        ));
+    }
+
+    #[test]
     fn validation_error_messages_are_human_readable() {
         // The UI shows these verbatim, so exercise every Display arm and confirm it
         // produces a non-empty, contextual message (also covers each error variant).
@@ -2006,6 +2291,19 @@ mod tests {
             ValidationError::ImagePath {
                 path: PathBuf::from("~/x.png"),
                 problem: ImagePathProblem::HomeUnknown,
+            },
+            ValidationError::Unwritable {
+                value: "a\"b".to_string(),
+                problem: Unwritable::Character('"'),
+                writers: vec![ValueWriter::HyprlandLuaEnv],
+            },
+            ValidationError::Unwritable {
+                value: "a/b".to_string(),
+                problem: Unwritable::NotASingleDirectoryName,
+                writers: vec![ValueWriter::Gtk4ThemeLinks],
+            },
+            ValidationError::InvalidCursorSize {
+                value: "big".to_string(),
             },
         ];
         for error in cases {

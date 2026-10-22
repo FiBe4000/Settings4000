@@ -21,15 +21,20 @@
 //! `~/.config/gtk-4.0/{gtk.css,gtk-dark.css,assets}` into the installed theme's
 //! `gtk-4.0/` directory (analysis §8.4), which the model re-points, removes, or —
 //! when one of them is a file of the user's own — leaves alone (task 11.16; see
-//! [`ThemesModel::gtk4_links_note`]). [`ThemesModel`]'s own docs carry the rest.
+//! [`ThemesModel::gtk4_links_note`]). Because each value reaches several writers with
+//! different character rules, a name or size is checked against all of them when the
+//! user picks it, and again in the Apply pipeline's step 1 (task 9.27, R8.3; see
+//! [`crate::core::value_writers`]). [`ThemesModel`]'s own docs carry the rest.
 
 use std::collections::BTreeSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
-use crate::core::apply::{FileWrite, LinkAction, LinkWrite, WriteMode, WriteValidation};
+use crate::core::apply::{FileWrite, LinkAction, LinkWrite, WriteMode};
 use crate::core::home_path::contract_home;
+use crate::core::model::{SettingId, ValidationError, Value, parse_cursor_size};
 use crate::core::notifd::NotifdStatus;
 use crate::core::reload::{BackingFile, CursorValue, ReloadParams};
+use crate::core::value_writers::is_single_directory_name;
 use crate::parsers::env::{EnvFile, GtkThemeOverride};
 use crate::parsers::ini::IniFile;
 use crate::parsers::lua_literal::{LuaConfigFile, LuaEditError};
@@ -306,6 +311,19 @@ enum ThemeValue {
     CursorSize,
 }
 
+impl ThemeValue {
+    /// The [`SettingId`] this value is validated as, at stage time and in the Apply
+    /// pipeline's step 1 (task 9.27).
+    fn setting_id(self) -> SettingId {
+        match self {
+            ThemeValue::GtkTheme => SettingId::GtkTheme,
+            ThemeValue::IconTheme => SettingId::IconTheme,
+            ThemeValue::CursorTheme => SettingId::CursorTheme,
+            ThemeValue::CursorSize => SettingId::CursorSize,
+        }
+    }
+}
+
 /// A flag per theme value, used for the two per-value render outcomes tracked in
 /// [`ThemeRenderRecord`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -376,7 +394,11 @@ impl ThemeValueFlags {
 ///   accept them; or `hyprland.lua`'s structure cannot be followed, so its lines cannot
 ///   be located safely). This *does* block promotion: the copies on disk now differ, or
 ///   may, and R3.4 requires every copy to hold the identical value, so the page must stay
-///   dirty rather than look applied while one copy lags behind.
+///   dirty rather than look applied while one copy lags behind. A refusal over a
+///   *character* no longer happens in normal use — the staging methods refuse such a
+///   value up front and the Apply pipeline re-checks it (task 9.27) — so for that case
+///   this record is defence in depth; a structure the Lua editor cannot follow remains
+///   the everyday reason for a refused copy.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ThemeRenderRecord {
     /// Values that reached at least one of the files carrying them.
@@ -492,6 +514,15 @@ pub struct ThemesApply {
     /// The reload parameters for the changed theme/cursor values (the pipeline merges
     /// these into its plan-wide [`ReloadParams`]).
     pub reload_params: ReloadParams,
+    /// Every staged theme value, as the [`SettingId`] it is validated by, for the
+    /// pipeline's step 1 to re-check before any write (task 9.27, R8.3).
+    ///
+    /// The staging methods already refused a value any of its writers would reject, so
+    /// in normal use these pass; the re-check is what keeps that guarantee from resting
+    /// on every path into the staged state going through those methods. Each write
+    /// declares the settings it carries ([`FileWrite::validated_by`]), which the
+    /// pipeline's plan-drift guard checks against this list.
+    pub validations: Vec<(SettingId, Value)>,
 }
 
 impl ThemesModel {
@@ -811,31 +842,96 @@ impl ThemesModel {
     }
 
     /// Stages a GTK theme switch (ignored when a `GTK_THEME` override is in force).
-    pub fn stage_gtk_theme(&mut self, name: &str) {
+    ///
+    /// Refused, with nothing staged, when one of the places the name is written cannot
+    /// hold it: both `settings.ini` files refuse a line break, and the GTK 4 theme link
+    /// step needs one plain directory name (task 9.27; the rules are listed in
+    /// [`crate::core::value_writers`]).
+    pub fn stage_gtk_theme(&mut self, name: &str) -> Result<(), ValidationError> {
         if self.gtk_dropdown_disabled() {
             // The drop-down is disabled in the UI, so this is a defensive guard against
             // an out-of-band caller: never stage a GTK theme the override would fight.
             tracing::debug!(
                 "ignoring a GTK theme edit while a GTK_THEME override is active (R3.3)"
             );
-            return;
+            return Ok(());
         }
-        self.gtk_theme.stage(name);
+        Self::stage_checked(&mut self.gtk_theme, ThemeValue::GtkTheme, name)
     }
 
-    /// Stages an icon theme switch.
-    pub fn stage_icon_theme(&mut self, name: &str) {
-        self.icon_theme.stage(name);
+    /// Stages an icon theme switch, refused when `settings.ini` could not hold the name
+    /// (a line break; task 9.27).
+    pub fn stage_icon_theme(&mut self, name: &str) -> Result<(), ValidationError> {
+        Self::stage_checked(&mut self.icon_theme, ThemeValue::IconTheme, name)
     }
 
-    /// Stages a cursor theme switch.
-    pub fn stage_cursor_theme(&mut self, name: &str) {
-        self.cursor_theme.stage(name);
+    /// Stages a cursor theme switch, refused when one of its five copies could not hold
+    /// the name — in practice the `hl.env` line of `hyprland.lua`, whose Lua string
+    /// refuses `"`, `\` and every control character, the strictest of the rules (task
+    /// 9.27). A `#` is accepted: no current copy refuses it.
+    pub fn stage_cursor_theme(&mut self, name: &str) -> Result<(), ValidationError> {
+        Self::stage_checked(&mut self.cursor_theme, ThemeValue::CursorTheme, name)
     }
 
-    /// Stages a cursor size switch (the value is a pixel size as a string).
-    pub fn stage_cursor_size(&mut self, size: &str) {
-        self.cursor_size.stage(size);
+    /// Stages a cursor size switch (the value is a pixel size as a string), refused when
+    /// it is not a whole number of pixels greater than zero (task 9.27).
+    pub fn stage_cursor_size(&mut self, size: &str) -> Result<(), ValidationError> {
+        Self::stage_checked(&mut self.cursor_size, ThemeValue::CursorSize, size)
+    }
+
+    /// Stages `value` into `selection` once it passes `which`'s [`SettingId`] validator
+    /// (R8.3, task 9.27), returning the refusal — whose message names the offending
+    /// character and the files that cannot hold it — and staging nothing otherwise.
+    ///
+    /// Why the check happens here, where the user picks the value: the writers of one
+    /// value disagree on what it may contain (see [`crate::core::value_writers`]), so a
+    /// name only some of them accept would reach some copies and not others. Task 9.6
+    /// keeps the model from then claiming it as applied, but the user would be left with
+    /// a page that never stops being dirty and no reason given; refusing the choice up
+    /// front tells them why.
+    ///
+    /// The theme scan deliberately does **not** filter such names out: the drop-down
+    /// lists every installed theme, and picking one that cannot be written explains
+    /// itself, whereas a filtered theme would simply be missing from the list with the
+    /// reason only in the journal. (The value configured on disk is always listed
+    /// anyway — [`Selection::new`] keeps it selectable — so a filter could not keep
+    /// every unwritable name out of the list in any case.)
+    ///
+    /// Re-picking the value the config already holds is a reset, not an edit, and is
+    /// never refused: it writes nothing, and refusing it would leave a pending edit the
+    /// user is trying to undo.
+    fn stage_checked(
+        selection: &mut Selection,
+        which: ThemeValue,
+        value: &str,
+    ) -> Result<(), ValidationError> {
+        if !selection.is_original(value) {
+            which
+                .setting_id()
+                .validate(&Value::Enum(value.to_string()))?;
+        }
+        selection.stage(value);
+        Ok(())
+    }
+
+    /// Stages `value` for the theme setting `id` **without** the stage-time check, so a
+    /// test can put the model into a state the real staging methods refuse (task 9.27).
+    ///
+    /// The seam that proves the Apply pipeline's step 1 still catches such a value before
+    /// any writer sees it, and that the writers' own guards (task 9.6) still hold when it
+    /// gets past step 1 in a unit test. Compiled only for tests and the `testing`
+    /// feature. Panics on a `SettingId` that is not one of the four theme values, so a
+    /// test addressing the wrong setting fails loudly.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn stage_unchecked_for_tests(&mut self, id: SettingId, value: &str) {
+        let selection = match id {
+            SettingId::GtkTheme => &mut self.gtk_theme,
+            SettingId::IconTheme => &mut self.icon_theme,
+            SettingId::CursorTheme => &mut self.cursor_theme,
+            SettingId::CursorSize => &mut self.cursor_size,
+            other => panic!("{other:?} is not a theme setting of this model"),
+        };
+        selection.stage(value);
     }
 
     /// Whether any theme/cursor value has a pending change — the page's dirty state,
@@ -1040,7 +1136,29 @@ impl ThemesModel {
             writes,
             links,
             reload_params: self.reload_params(),
+            validations: self.validations(),
         })
+    }
+
+    /// The staged theme values as the [`SettingId`]s step 1 of the Apply pipeline
+    /// re-checks (task 9.27, R8.3): every dirty value, whether or not a writer accepted
+    /// it — a value that fails here aborts the Apply before any file is touched, which
+    /// is the point.
+    fn validations(&self) -> Vec<(SettingId, Value)> {
+        [
+            (ThemeValue::GtkTheme, &self.gtk_theme),
+            (ThemeValue::IconTheme, &self.icon_theme),
+            (ThemeValue::CursorTheme, &self.cursor_theme),
+            (ThemeValue::CursorSize, &self.cursor_size),
+        ]
+        .into_iter()
+        .filter(|(_, selection)| selection.is_dirty())
+        .filter_map(|(which, selection)| {
+            selection
+                .effective()
+                .map(|value| (which.setting_id(), Value::Enum(value.to_string())))
+        })
+        .collect()
     }
 
     /// The directory holding the GTK 4 theme links: the directory of
@@ -1323,6 +1441,7 @@ impl ThemesModel {
     fn render_settings_ini(&self, backing: &BackingText) -> (Option<FileWrite>, ThemeRenderRecord) {
         let (mut ini, _) = IniFile::parse(&backing.text);
         let mut changed_keys = Vec::new();
+        let mut validated_by = Vec::new();
         let mut record = ThemeRenderRecord::default();
 
         let mut set = |value_id: ThemeValue, key: &str, value: Option<&str>, label: &str| {
@@ -1332,6 +1451,7 @@ impl ThemesModel {
             match ini.set_value(SETTINGS_GROUP, key, value) {
                 Ok(_) => {
                     changed_keys.push(label.to_string());
+                    validated_by.push(value_id.setting_id());
                     *record.written.flag(value_id) = true;
                 }
                 Err(error) => {
@@ -1384,12 +1504,10 @@ impl ThemesModel {
                 contents: ini.emit().into_bytes(),
                 changed_keys,
                 backing: BackingFile::GtkSettings,
-                // Task 9.10: every value here is a theme name or cursor size chosen from
-                // a list this model scanned on disk (or the fixed size list), and
-                // `ThemesApply` carries no validations at all — so this write is
-                // validation-free by design. Task 9.27 will give these values their own
-                // validations; this declaration becomes `InPlan` when it does.
-                validation: WriteValidation::NotNeeded,
+                // The settings whose values this write carries; each is in
+                // `ThemesApply::validations` (task 9.27), which the plan-drift guard
+                // checks.
+                validated_by,
                 mode: WriteMode::Replace,
             }),
             record,
@@ -1428,6 +1546,7 @@ impl ThemesModel {
     fn render_hyprland_lua(&self, backing: &BackingText) -> (Option<FileWrite>, ThemeRenderRecord) {
         let mut file = LuaConfigFile::parse(&backing.text);
         let mut changed_keys = Vec::new();
+        let mut validated_by = Vec::new();
         let mut record = ThemeRenderRecord::default();
 
         let mut set = |value_id: ThemeValue, name: &str, value: Option<&str>, label: &str| {
@@ -1437,6 +1556,7 @@ impl ThemesModel {
             match file.set_env(name, value) {
                 Ok(()) => {
                     changed_keys.push(label.to_string());
+                    validated_by.push(value_id.setting_id());
                     *record.written.flag(value_id) = true;
                 }
                 Err(LuaEditError::EnvNotFound(_)) => {
@@ -1482,9 +1602,8 @@ impl ThemesModel {
                 contents: file.emit().into_bytes(),
                 changed_keys,
                 backing: BackingFile::HyprlandLua,
-                // The cursor copy of the same scanned values as the `settings.ini`
-                // write above, so validation-free by design for the same reason.
-                validation: WriteValidation::NotNeeded,
+                // The cursor settings this write carries, as for `settings.ini`.
+                validated_by,
                 mode: WriteMode::Replace,
             }),
             record,
@@ -1545,9 +1664,8 @@ impl ThemesModel {
                 contents: ini.emit().into_bytes(),
                 changed_keys: vec!["cursor theme (index.theme Inherits)".to_string()],
                 backing: BackingFile::CursorFallbackTheme,
-                // The same scanned cursor theme as every other copy, so
-                // validation-free by design for the same reason.
-                validation: WriteValidation::NotNeeded,
+                // Only the cursor theme lives in this file.
+                validated_by: vec![SettingId::CursorTheme],
                 mode,
             }),
             record,
@@ -1562,6 +1680,7 @@ impl ThemesModel {
     fn render_uwsm_env(&self, backing: &BackingText) -> (Option<FileWrite>, ThemeRenderRecord) {
         let (mut file, _) = EnvFile::parse(&backing.text);
         let mut changed_keys = Vec::new();
+        let mut validated_by = Vec::new();
         let mut record = ThemeRenderRecord::default();
 
         let mut set = |value_id: ThemeValue, key: &str, value: Option<&str>, label: &str| {
@@ -1571,6 +1690,7 @@ impl ThemesModel {
             match file.set_value(key, value) {
                 Ok(_) => {
                     changed_keys.push(label.to_string());
+                    validated_by.push(value_id.setting_id());
                     *record.written.flag(value_id) = true;
                 }
                 Err(error) => {
@@ -1605,9 +1725,8 @@ impl ThemesModel {
                 contents: file.emit().into_bytes(),
                 changed_keys,
                 backing: BackingFile::UwsmEnv,
-                // The `uwsm/env` copy of the same scanned cursor values, so
-                // validation-free by design for the same reason.
-                validation: WriteValidation::NotNeeded,
+                // The cursor settings this write carries, as for `settings.ini`.
+                validated_by,
                 mode: WriteMode::Replace,
             }),
             record,
@@ -1872,8 +1991,11 @@ enum Gtk4ThemeSource {
 /// same "first theme directory that has it wins" order GTK applies when it looks a
 /// theme up. The link targets are built from the *resolved* root, so they are
 /// lexically inside it by construction: the theme name must be one plain path
-/// component (no `/`, no `..`), which a name read from the user's `settings.ini` is
-/// not guaranteed to be — anything else is [`Gtk4ThemeSource::InvalidName`]. On top of that lexical rule, the `gtk-4.0/` directory and
+/// component ([`is_single_directory_name`]: no `/`, not `.` or `..`), which a name read
+/// from the user's `settings.ini` is not guaranteed to be — anything else is
+/// [`Gtk4ThemeSource::InvalidName`]. A name staged through the Theme page has already
+/// been held to the same rule (task 9.27). On top of that lexical rule, the `gtk-4.0/`
+/// directory and
 /// each entry linked must still resolve inside one of the resolved roots, so a theme
 /// directory that is itself a symlink to somewhere else is never linked to (the task's
 /// "never follow a link outside the theme roots"). An entry the theme does not ship —
@@ -1883,11 +2005,7 @@ fn resolve_gtk4_theme(roots: &[PathBuf], theme: &str) -> Gtk4ThemeSource {
     if roots.is_empty() {
         return Gtk4ThemeSource::NoRoots;
     }
-    let mut components = Path::new(theme).components();
-    if !matches!(
-        (components.next(), components.next()),
-        (Some(Component::Normal(_)), None)
-    ) {
+    if !is_single_directory_name(theme) {
         return Gtk4ThemeSource::InvalidName;
     }
     let inside_a_root = |path: &Path| match std::fs::canonicalize(path) {
@@ -1927,15 +2045,6 @@ fn is_absent(path: &Path) -> bool {
         std::fs::symlink_metadata(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
     )
-}
-
-/// Parses a cursor size string into a positive pixel size, or `None` when it is not a
-/// usable size (non-numeric or zero).
-fn parse_cursor_size(size: &str) -> Option<u32> {
-    match size.trim().parse::<u32>() {
-        Ok(value) if value > 0 => Some(value),
-        _ => None,
-    }
 }
 
 /// Resolves the active `GTK_THEME` override, preferring the app's own environment over
@@ -2386,7 +2495,9 @@ export XCURSOR_SIZE=16
         paths.hyprland_lua = None;
 
         let mut model = load_with_cursors(tmp.path(), &paths);
-        model.stage_cursor_theme("Bibata");
+        model
+            .stage_cursor_theme("Bibata")
+            .expect("the value passes the stage-time check");
         let contribution = model
             .apply_contribution()
             .expect("a cursor change still contributes the other writes");
@@ -2444,8 +2555,12 @@ export XCURSOR_SIZE=16
         };
 
         let mut model = ThemesModel::load(&roots, paths.clone(), false, None);
-        model.stage_cursor_theme("Bibata");
-        model.stage_cursor_size("24");
+        model
+            .stage_cursor_theme("Bibata")
+            .expect("the value passes the stage-time check");
+        model
+            .stage_cursor_size("24")
+            .expect("the value passes the stage-time check");
         assert!(model.is_dirty());
 
         let contribution = model
@@ -2474,22 +2589,39 @@ export XCURSOR_SIZE=16
         assert!(contribution.reload_params.gtk_theme.is_none());
         assert!(contribution.reload_params.icon_theme.is_none());
 
-        // Task 9.10: `ThemesApply` carries no validations, so every cursor copy must
-        // declare itself validation-free. Asserted here as well as on the GTK-theme path
-        // because this is the test that renders the hyprland.lua, uwsm/env and index.theme
-        // copies: without it, one of those sites could drift to `InPlan` on its own and
-        // silently make the plan-drift guard warn on every cursor change.
-        assert!(
-            contribution
-                .writes
-                .iter()
-                .all(|write| write.validation == WriteValidation::NotNeeded),
-            "every cursor copy declares that the plan validates nothing for it"
+        // Task 9.27: the contribution carries both staged cursor values for step 1, and
+        // each copy declares exactly the settings it carries — asserted here because this
+        // is the test that renders the hyprland.lua, uwsm/env and index.theme copies, so
+        // a site that declared the wrong settings would make the plan-drift guard warn
+        // on every cursor change (or miss a dropped validation).
+        assert_eq!(
+            contribution.validations,
+            vec![
+                (SettingId::CursorTheme, Value::Enum("Bibata".to_string())),
+                (SettingId::CursorSize, Value::Enum("24".to_string())),
+            ]
+        );
+        let both = vec![SettingId::CursorTheme, SettingId::CursorSize];
+        let declared: Vec<&[SettingId]> = contribution
+            .writes
+            .iter()
+            .map(|write| write.validated_by.as_slice())
+            .collect();
+        assert_eq!(
+            declared,
+            vec![
+                both.as_slice(),
+                both.as_slice(),
+                both.as_slice(),
+                both.as_slice(),
+                &[SettingId::CursorTheme],
+            ],
+            "settings.ini ×2, hyprland.lua and uwsm/env carry both; index.theme the theme"
         );
 
         // Run the writes + reloads through the real pipeline.
         let plan = ApplyPlan {
-            validations: Vec::new(),
+            validations: contribution.validations,
             writes: contribution.writes,
             links: Vec::new(),
             palette: None,
@@ -2584,7 +2716,9 @@ export XCURSOR_SIZE=16
         };
 
         let mut model = ThemesModel::load(&roots, paths.clone(), false, None);
-        model.stage_gtk_theme("Adwaita");
+        model
+            .stage_gtk_theme("Adwaita")
+            .expect("the value passes the stage-time check");
 
         let contribution = model.apply_contribution().expect("a GTK theme write");
         assert_eq!(
@@ -2598,16 +2732,17 @@ export XCURSOR_SIZE=16
                 .iter()
                 .all(|write| write.backing == BackingFile::GtkSettings)
         );
-        // Task 9.10: `ThemesApply` carries no validations at all, so every write it
-        // produces must declare itself validation-free — otherwise the Apply pipeline's
-        // plan-drift guard would warn on every theme change. Task 9.27, which gives these
-        // values validations of their own, is what should flip this to `InPlan`.
+        // Task 9.27: the staged name is handed to step 1, and both writes declare it.
+        assert_eq!(
+            contribution.validations,
+            vec![(SettingId::GtkTheme, Value::Enum("Adwaita".to_string()))]
+        );
         assert!(
             contribution
                 .writes
                 .iter()
-                .all(|write| write.validation == WriteValidation::NotNeeded),
-            "theme writes are validation-free by design until task 9.27"
+                .all(|write| write.validated_by == [SettingId::GtkTheme]),
+            "each settings.ini write declares the GTK theme it carries"
         );
         assert_eq!(
             contribution.reload_params.gtk_theme,
@@ -2616,7 +2751,7 @@ export XCURSOR_SIZE=16
         assert!(contribution.reload_params.cursor.is_none());
 
         let plan = ApplyPlan {
-            validations: Vec::new(),
+            validations: contribution.validations,
             writes: contribution.writes,
             links: Vec::new(),
             palette: None,
@@ -2689,7 +2824,9 @@ export XCURSOR_SIZE=16
             "before any edit the drop-down preselects settings.ini's gtk-icon-theme-name"
         );
 
-        model.stage_icon_theme("Papirus");
+        model
+            .stage_icon_theme("Papirus")
+            .expect("the value passes the stage-time check");
         assert!(model.is_dirty());
         assert_eq!(
             model.selected_icon_index(),
@@ -2711,16 +2848,17 @@ export XCURSOR_SIZE=16
                 .iter()
                 .all(|write| write.backing == BackingFile::GtkSettings)
         );
-        // Task 9.10: `ThemesApply` carries no validations at all, so every write it
-        // produces must declare itself validation-free — otherwise the Apply pipeline's
-        // plan-drift guard would warn on every icon change. Task 9.27, which gives these
-        // values validations of their own, is what should flip this to `InPlan`.
+        // Task 9.27: the staged name is handed to step 1, and both writes declare it.
+        assert_eq!(
+            contribution.validations,
+            vec![(SettingId::IconTheme, Value::Enum("Papirus".to_string()))]
+        );
         assert!(
             contribution
                 .writes
                 .iter()
-                .all(|write| write.validation == WriteValidation::NotNeeded),
-            "theme writes are validation-free by design until task 9.27"
+                .all(|write| write.validated_by == [SettingId::IconTheme]),
+            "each settings.ini write declares the icon theme it carries"
         );
         assert_eq!(
             contribution.reload_params.icon_theme,
@@ -2731,7 +2869,7 @@ export XCURSOR_SIZE=16
         assert!(contribution.reload_params.cursor.is_none());
 
         let plan = ApplyPlan {
-            validations: Vec::new(),
+            validations: contribution.validations,
             writes: contribution.writes,
             links: Vec::new(),
             palette: None,
@@ -2831,7 +2969,9 @@ export XCURSOR_SIZE=16
         let mut model = ThemesModel::load(&roots, paths.clone(), false, None);
 
         // First apply: the icon theme, which lives only in the two settings.ini files.
-        model.stage_icon_theme("Papirus");
+        model
+            .stage_icon_theme("Papirus")
+            .expect("the value passes the stage-time check");
         let first = model
             .apply_contribution()
             .expect("an icon theme change contributes writes");
@@ -2857,7 +2997,9 @@ export XCURSOR_SIZE=16
         // Second apply: the cursor size — a different key in the same files. Its
         // gtk-3.0 write must carry the icon theme the first apply wrote, which only the
         // refreshed in-memory text can supply.
-        model.stage_cursor_size("32");
+        model
+            .stage_cursor_size("32")
+            .expect("the value passes the stage-time check");
         let second = model
             .apply_contribution()
             .expect("a cursor size change contributes writes");
@@ -2979,7 +3121,9 @@ export XCURSOR_SIZE=16
             "the banner names the override value"
         );
         // A GTK theme edit under the override is ignored, so the page stays clean.
-        model.stage_gtk_theme("Adwaita");
+        model
+            .stage_gtk_theme("Adwaita")
+            .expect("the value passes the stage-time check");
         assert!(
             !model.is_dirty(),
             "a GTK theme edit must not stage while a GTK_THEME override is active"
@@ -3061,7 +3205,9 @@ export XCURSOR_SIZE=16
         let tmp = tempfile::tempdir().expect("temp dir");
         let mut model = two_gtk_themes_model(tmp.path());
         // The current GTK theme is Everforest-Green-Dark (from settings.ini).
-        model.stage_gtk_theme("Everforest-Green-Dark");
+        model
+            .stage_gtk_theme("Everforest-Green-Dark")
+            .expect("the value passes the stage-time check");
         assert!(
             !model.is_dirty(),
             "re-selecting the current value is not dirty"
@@ -3072,7 +3218,9 @@ export XCURSOR_SIZE=16
     fn reset_discards_a_staged_gtk_theme() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let mut model = two_gtk_themes_model(tmp.path());
-        model.stage_gtk_theme("Adwaita");
+        model
+            .stage_gtk_theme("Adwaita")
+            .expect("the value passes the stage-time check");
         assert!(model.is_dirty());
         model.reset();
         assert!(!model.is_dirty(), "reset discards the pending change");
@@ -3082,7 +3230,9 @@ export XCURSOR_SIZE=16
     fn commit_promotes_a_staged_gtk_theme() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let mut model = two_gtk_themes_model(tmp.path());
-        model.stage_gtk_theme("Adwaita");
+        model
+            .stage_gtk_theme("Adwaita")
+            .expect("the value passes the stage-time check");
         model.commit();
         assert!(!model.is_dirty(), "commit clears the dirty state");
         let selected = model
@@ -3193,14 +3343,18 @@ export XCURSOR_SIZE=16
         };
 
         let mut model = ThemesModel::load(&roots, paths, false, None);
-        model.stage_cursor_theme("Bibata");
-        model.stage_cursor_size("24");
+        model
+            .stage_cursor_theme("Bibata")
+            .expect("the value passes the stage-time check");
+        model
+            .stage_cursor_size("24")
+            .expect("the value passes the stage-time check");
         let contribution = model
             .apply_contribution()
             .expect("a cursor change contributes");
 
         let plan = ApplyPlan {
-            validations: Vec::new(),
+            validations: contribution.validations,
             writes: contribution.writes,
             links: Vec::new(),
             palette: None,
@@ -3252,7 +3406,9 @@ export XCURSOR_SIZE=16
 
         let mut model = ThemesModel::load(&roots, paths, false, None);
         // Change only the cursor theme; the size stays the garbage on-disk value.
-        model.stage_cursor_theme("Bibata");
+        model
+            .stage_cursor_theme("Bibata")
+            .expect("the value passes the stage-time check");
         let contribution = model
             .apply_contribution()
             .expect("a cursor theme change contributes writes");
@@ -3281,8 +3437,12 @@ export XCURSOR_SIZE=16
         .unwrap();
 
         let mut model = load_with_cursors(tmp.path(), &paths);
-        model.stage_cursor_theme("Bibata");
-        model.stage_cursor_size("24");
+        model
+            .stage_cursor_theme("Bibata")
+            .expect("the value passes the stage-time check");
+        model
+            .stage_cursor_size("24")
+            .expect("the value passes the stage-time check");
         let contribution = model
             .apply_contribution()
             .expect("a cursor change contributes");
@@ -3325,8 +3485,12 @@ export XCURSOR_SIZE=16
         };
 
         let mut model = ThemesModel::load(&roots, paths, false, None);
-        model.stage_gtk_theme("Adwaita");
-        model.stage_icon_theme("Papirus\ngtk-theme-name=Injected");
+        model
+            .stage_gtk_theme("Adwaita")
+            .expect("the value passes the stage-time check");
+        // Since task 9.27 the stage-time check refuses this name, so the test seam puts
+        // it in place to keep the writer's own guard (defence in depth) covered.
+        model.stage_unchecked_for_tests(SettingId::IconTheme, "Papirus\ngtk-theme-name=Injected");
 
         let contribution = model
             .apply_contribution()
@@ -3391,13 +3555,14 @@ export XCURSOR_SIZE=16
     #[test]
     fn a_value_one_existing_copy_refuses_is_not_promoted() {
         // Task 9.6, the divergence rule (R3.4): the writers do not share a value rule —
-        // the Lua writer additionally rejects `"` (it would end the string literal and
-        // break hyprland.lua), while the settings.ini, uwsm/env and index.theme writers
-        // accept it. A cursor theme directory named `Nord"ic` is legal on Linux and
-        // the scan offers it, so the cursor theme can reach four of its five copies
-        // while hyprland.lua's hl.env line keeps the old one. The copies on disk then
-        // genuinely differ, so the change must NOT be promoted: the page stays dirty
-        // rather than looking applied while one copy lags behind.
+        // the Lua writer rejects `"` (it would end the string literal and break
+        // hyprland.lua) and the uwsm/env writer rejects it as not a bare shell word,
+        // while the settings.ini and index.theme writers accept it. A cursor theme
+        // directory named `Nord"ic` is legal on Linux and the scan offers it, so the
+        // cursor theme can reach three of its five copies while the other two keep the
+        // old one. The copies on disk then genuinely differ, so the change must NOT be
+        // promoted: the page stays dirty rather than looking applied while copies lag
+        // behind.
         let tmp = tempfile::tempdir().expect("temp dir");
         let config = tmp.path().join("config");
         let paths = write_backing_fixture(&config, UWSM_ENV);
@@ -3414,7 +3579,11 @@ export XCURSOR_SIZE=16
             model.cursor_themes().contains(&"Nord\"ic".to_string()),
             "the scan surfaces the quote-named cursor theme, so the drop-down offers it"
         );
-        model.stage_cursor_theme("Nord\"ic");
+        // Since task 9.27 `stage_cursor_theme` refuses this name (see
+        // `a_quote_in_a_cursor_theme_is_refused_at_stage_time`), so the test seam puts it
+        // in place to keep the 9.6 divergence rule covered for a value that gets past
+        // staging.
+        model.stage_unchecked_for_tests(SettingId::CursorTheme, "Nord\"ic");
 
         let contribution = model
             .apply_contribution()
@@ -3424,10 +3593,9 @@ export XCURSOR_SIZE=16
             vec![
                 paths.gtk3_settings.as_path(),
                 paths.gtk4_settings.as_path(),
-                paths.uwsm_env.as_path(),
                 fallback(&paths),
             ],
-            "hyprland.lua refuses the quote, so it contributes no write"
+            "hyprland.lua and uwsm/env refuse the quote, so they contribute no write"
         );
 
         model.commit();
@@ -3440,6 +3608,232 @@ export XCURSOR_SIZE=16
             model.cursor_theme.is_dirty() && model.is_dirty(),
             "the page stays dirty, so the user is not told a half-written change is applied"
         );
+    }
+
+    #[test]
+    fn a_quote_in_a_cursor_theme_is_refused_at_stage_time() {
+        // Task 9.27 accept criterion: the scan offers a `Nord"ic` cursor theme, but the
+        // hl.env line of hyprland.lua cannot hold a `"` (it would end the Lua string), so
+        // picking it is refused with a message naming the character and that writer, and
+        // nothing is staged — instead of the four-of-five-copies split 9.6 had to guard.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let paths = write_backing_fixture(&tmp.path().join("config"), UWSM_ENV);
+        let icons = write_icon_root(tmp.path());
+        fs::create_dir_all(icons.join("Nord\"ic").join("cursors"))
+            .expect("create a cursor theme dir whose name contains a quote");
+        let roots = ThemeRoots {
+            gtk_theme_dirs: Vec::new(),
+            icon_dirs: vec![icons],
+        };
+        let mut model = ThemesModel::load(&roots, paths, false, None);
+        assert!(
+            model.cursor_themes().contains(&"Nord\"ic".to_string()),
+            "the scan still lists the theme; staging is where it is refused"
+        );
+
+        let message = model
+            .stage_cursor_theme("Nord\"ic")
+            .expect_err("a `\"` is refused")
+            .to_string();
+        assert!(
+            message.contains("the character `\"`") && message.contains("hl.env"),
+            "the message names the character and the Lua writer: {message}"
+        );
+        assert!(
+            !message.contains("settings.ini"),
+            "writers that accept the character are not blamed: {message}"
+        );
+        assert!(!model.is_dirty(), "nothing was staged");
+        assert!(model.apply_contribution().is_none());
+    }
+
+    #[test]
+    fn a_control_character_in_a_cursor_theme_is_refused() {
+        // The Lua string rule refuses every control character, not only the line breaks
+        // the INI and env writers refuse; a tab therefore names hl.env alone.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let paths = write_backing_fixture(&tmp.path().join("config"), UWSM_ENV);
+        let mut model = load_with_cursors(tmp.path(), &paths);
+
+        let message = model
+            .stage_cursor_theme("Nord\tic")
+            .expect_err("a tab is refused")
+            .to_string();
+        assert!(
+            message.contains("a tab (U+0009)") && message.contains("hl.env"),
+            "{message}"
+        );
+        assert!(
+            message.contains("`Nord\\tic`"),
+            "the quoted value shows the tab escaped, not raw: {message}"
+        );
+        assert!(!model.is_dirty());
+    }
+
+    #[test]
+    fn a_shell_unsafe_cursor_theme_is_refused_naming_uwsm_env() {
+        // Task 9.27 review: uwsm/env is sourced by the login shell, so a cursor theme
+        // with a space would be split there and one with `;`, a backtick or `(` would run
+        // as code. Each is refused when picked, with a message naming uwsm/env and the
+        // character, and nothing is staged.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let paths = write_backing_fixture(&tmp.path().join("config"), UWSM_ENV);
+        let mut model = load_with_cursors(tmp.path(), &paths);
+        for (name, character) in [
+            ("My Theme", "a space"),
+            ("a;b", "the character `;`"),
+            ("a`id`", "a backtick"),
+            ("a(b", "the character `(`"),
+        ] {
+            let message = model
+                .stage_cursor_theme(name)
+                .expect_err("not a bare shell word")
+                .to_string();
+            assert!(
+                message.contains("uwsm/env") && message.contains("login shell"),
+                "{name:?}: {message}"
+            );
+            assert!(message.contains(character), "{message}");
+        }
+        assert!(!model.is_dirty());
+        model
+            .stage_cursor_theme("Bibata")
+            .expect("a shell-safe name still stages");
+    }
+
+    #[test]
+    fn a_hash_in_a_cursor_theme_is_accepted_and_written_everywhere() {
+        // Task 9.27 corrects the premise it was filed under: no current writer of a
+        // cursor theme refuses `#`. The hyprlang `hyprland.conf` copy that did is gone
+        // (task 11.5), and inside a Lua string a `#` is plain text. So the name stages
+        // and reaches all five copies, hyprland.lua included.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let paths = write_backing_fixture(&tmp.path().join("config"), UWSM_ENV);
+        let mut model = load_with_cursors(tmp.path(), &paths);
+
+        model
+            .stage_cursor_theme("Nord#ic")
+            .expect("no writer of a cursor theme refuses `#`");
+        let contribution = model.apply_contribution().expect("a cursor change");
+        assert_eq!(
+            written_paths(&contribution),
+            vec![
+                paths.gtk3_settings.as_path(),
+                paths.gtk4_settings.as_path(),
+                hypr_lua(&paths),
+                paths.uwsm_env.as_path(),
+                fallback(&paths),
+            ]
+        );
+        let lua = contribution
+            .writes
+            .iter()
+            .find(|write| write.path == hypr_lua(&paths))
+            .expect("hyprland.lua is written");
+        assert!(
+            String::from_utf8_lossy(&lua.contents)
+                .contains("hl.env(\"XCURSOR_THEME\", \"Nord#ic\")"),
+            "the `#` is written inside the Lua string"
+        );
+        model.commit();
+        assert!(!model.is_dirty(), "every copy took it, so it is promoted");
+    }
+
+    #[test]
+    fn a_non_numeric_cursor_size_is_refused() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let paths = write_backing_fixture(&tmp.path().join("config"), UWSM_ENV);
+        let mut model = load_with_cursors(tmp.path(), &paths);
+        for size in ["big", "0", "-24", "24.5"] {
+            let message = model
+                .stage_cursor_size(size)
+                .expect_err("not a positive whole number")
+                .to_string();
+            assert!(message.contains("not a cursor size"), "{size}: {message}");
+        }
+        assert!(!model.is_dirty());
+    }
+
+    #[test]
+    fn a_gtk_theme_that_is_not_one_directory_name_is_refused() {
+        // The GTK 4 link step joins the name onto a theme root as one path component, so
+        // a name with a `/` (only possible from a hand-edited value) is refused.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut model = two_gtk_themes_model(tmp.path());
+        let message = model
+            .stage_gtk_theme("../escape")
+            .expect_err("not a single directory name")
+            .to_string();
+        assert!(message.contains("GTK 4 theme links"), "{message}");
+        assert!(!model.is_dirty());
+    }
+
+    #[test]
+    fn re_picking_an_unwritable_on_disk_name_is_not_refused() {
+        // A value already on disk is a reset target, not an edit: re-picking it clears a
+        // pending edit even when it would be refused as a new choice.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = tmp.path().join("config");
+        let paths = write_backing_fixture(&config, UWSM_ENV);
+        let quoted = SETTINGS_INI.replace("Nordic-cursors", "Nord\"ic");
+        fs::write(&paths.gtk3_settings, &quoted).expect("rewrite gtk-3.0 settings.ini");
+        fs::write(&paths.gtk4_settings, &quoted).expect("rewrite gtk-4.0 settings.ini");
+        let mut model = load_with_cursors(tmp.path(), &paths);
+
+        model
+            .stage_cursor_theme("Bibata")
+            .expect("a writable name stages");
+        assert!(model.is_dirty());
+        model
+            .stage_cursor_theme("Nord\"ic")
+            .expect("going back to the configured name is never refused");
+        assert!(!model.is_dirty(), "the pending edit is cleared");
+    }
+
+    #[test]
+    fn a_corrupted_staged_value_fails_pipeline_step_one() {
+        // Task 9.27 accept criterion, in-crate half: a value that got past staging (put
+        // there through the test seam) is caught by the pipeline's validation step, not by
+        // a writer — the outcome is `ValidationFailed` naming the setting, and no file is
+        // written and no command runs.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let paths = write_backing_fixture(&tmp.path().join("config"), UWSM_ENV);
+        let mut model = load_with_cursors(tmp.path(), &paths);
+        model.stage_unchecked_for_tests(SettingId::CursorTheme, "Nord\"ic");
+
+        let contribution = model.apply_contribution().expect("a cursor change");
+        assert_eq!(
+            contribution.validations,
+            vec![(SettingId::CursorTheme, Value::Enum("Nord\"ic".to_string()))]
+        );
+        let before = fs::read(hypr_lua(&paths)).expect("read hyprland.lua");
+        let gtk3_before = fs::read(&paths.gtk3_settings).expect("read settings.ini");
+        let plan = ApplyPlan {
+            validations: contribution.validations,
+            writes: contribution.writes,
+            links: contribution.links,
+            palette: None,
+            reload_params: contribution.reload_params,
+        };
+        let runner = MockCommandRunner::new();
+        let outcome = apply::run(
+            &plan,
+            &FreshnessTracker::new(),
+            &Capabilities::for_tests(&[Binary::Gsettings, Binary::Hyprctl], &[], true),
+            &runner,
+            &MockProcessSignaller::new(),
+        );
+        match outcome {
+            ApplyOutcome::ValidationFailed(invalid) => {
+                assert_eq!(invalid.len(), 1);
+                assert_eq!(invalid[0].id, SettingId::CursorTheme);
+                assert!(invalid[0].error.to_string().contains("hl.env"));
+            }
+            other => panic!("expected step 1 to refuse the value, got {other:?}"),
+        }
+        assert_eq!(fs::read(hypr_lua(&paths)).unwrap(), before);
+        assert_eq!(fs::read(&paths.gtk3_settings).unwrap(), gtk3_before);
+        assert!(runner.recorded().is_empty(), "nothing is reloaded");
     }
 
     #[test]
@@ -3462,7 +3856,9 @@ export XCURSOR_SIZE=16
         .expect("write a hyprland.lua with no XCURSOR_SIZE line");
 
         let mut model = load_with_cursors(tmp.path(), &paths);
-        model.stage_cursor_size("24");
+        model
+            .stage_cursor_size("24")
+            .expect("the value passes the stage-time check");
 
         let contribution = model
             .apply_contribution()
@@ -3520,7 +3916,9 @@ export XCURSOR_SIZE=16
             "an unreadable Lua copy is absent, not a disagreement"
         );
 
-        model.stage_cursor_theme("Bibata");
+        model
+            .stage_cursor_theme("Bibata")
+            .expect("the value passes the stage-time check");
         let contribution = model
             .apply_contribution()
             .expect("the other copies are still written");
@@ -3652,7 +4050,9 @@ export XCURSOR_SIZE=16
 
         let mut model = load_with_cursors(tmp.path(), &paths);
         assert!(!model.check_conflict(), "an absent file is not a conflict");
-        model.stage_cursor_theme("Bibata");
+        model
+            .stage_cursor_theme("Bibata")
+            .expect("the value passes the stage-time check");
         let contribution = model.apply_contribution().expect("a cursor change");
         let create = contribution
             .writes
@@ -3675,7 +4075,7 @@ export XCURSOR_SIZE=16
         );
 
         let plan = ApplyPlan {
-            validations: Vec::new(),
+            validations: contribution.validations,
             writes: contribution.writes,
             links: Vec::new(),
             palette: None,
@@ -3705,7 +4105,9 @@ export XCURSOR_SIZE=16
             !model.check_conflict(),
             "the app's own creation is not a conflict"
         );
-        model.stage_cursor_theme("Nordic-cursors");
+        model
+            .stage_cursor_theme("Nordic-cursors")
+            .expect("the value passes the stage-time check");
         let second = model.apply_contribution().expect("a second cursor change");
         let rewrite = second
             .writes
@@ -3757,7 +4159,9 @@ export XCURSOR_SIZE=16
         symlink(tmp.path().join("missing-repo-file"), fallback(&paths)).unwrap();
 
         let mut model = load_with_cursors(tmp.path(), &paths);
-        model.stage_cursor_theme("Bibata");
+        model
+            .stage_cursor_theme("Bibata")
+            .expect("the value passes the stage-time check");
         let contribution = model.apply_contribution().expect("the other copies");
         assert!(
             contribution
@@ -3769,7 +4173,9 @@ export XCURSOR_SIZE=16
 
         paths.cursor_fallback_theme = None;
         let mut model = load_with_cursors(tmp.path(), &paths);
-        model.stage_cursor_theme("Bibata");
+        model
+            .stage_cursor_theme("Bibata")
+            .expect("the value passes the stage-time check");
         let contribution = model.apply_contribution().expect("the other copies");
         assert_eq!(
             contribution.writes.len(),
@@ -4120,8 +4526,12 @@ export XCURSOR_SIZE=16
         let tmp = tempfile::tempdir().expect("temp dir");
         let (mut model, _, _) = linked_model(tmp.path());
 
-        model.stage_icon_theme("Papirus");
-        model.stage_cursor_theme("Bibata");
+        model
+            .stage_icon_theme("Papirus")
+            .expect("the value passes the stage-time check");
+        model
+            .stage_cursor_theme("Bibata")
+            .expect("the value passes the stage-time check");
         let contribution = model.apply_contribution().expect("dirty");
         assert!(
             contribution.links.is_empty(),
@@ -4135,7 +4545,9 @@ export XCURSOR_SIZE=16
         let tmp = tempfile::tempdir().expect("temp dir");
         let (mut model, links_dir, new) = linked_model(tmp.path());
 
-        model.stage_gtk_theme("New");
+        model
+            .stage_gtk_theme("New")
+            .expect("the value passes the stage-time check");
         let links = model.apply_contribution().expect("dirty").links;
         let expected: Vec<LinkWrite> = GTK4_THEME_LINKS
             .iter()
@@ -4155,7 +4567,9 @@ export XCURSOR_SIZE=16
         let tmp = tempfile::tempdir().expect("temp dir");
         let (mut model, links_dir, _) = linked_model(tmp.path());
 
-        model.stage_gtk_theme("Plain");
+        model
+            .stage_gtk_theme("Plain")
+            .expect("the value passes the stage-time check");
         let links = model.apply_contribution().expect("dirty").links;
         assert_eq!(
             links.iter().map(|link| &link.action).collect::<Vec<_>>(),
@@ -4178,7 +4592,9 @@ export XCURSOR_SIZE=16
         // default look is then what was asked for, so there is nothing to explain.
         let tmp = tempfile::tempdir().expect("temp dir");
         let (mut model, _, _) = linked_model(tmp.path());
-        model.stage_gtk_theme("Adwaita");
+        model
+            .stage_gtk_theme("Adwaita")
+            .expect("the value passes the stage-time check");
         assert_eq!(model.apply_contribution().expect("dirty").links.len(), 3);
         assert_eq!(model.gtk4_links_note(), None);
     }
@@ -4203,7 +4619,9 @@ export XCURSOR_SIZE=16
         let tmp = tempfile::tempdir().expect("temp dir");
         let (mut model, links_dir) = partly_linked_model(tmp.path());
 
-        model.stage_gtk_theme("New");
+        model
+            .stage_gtk_theme("New")
+            .expect("the value passes the stage-time check");
         let links = model.apply_contribution().expect("dirty").links;
         assert_eq!(
             links
@@ -4222,7 +4640,9 @@ export XCURSOR_SIZE=16
         let tmp = tempfile::tempdir().expect("temp dir");
         let (mut model, links_dir) = partly_linked_model(tmp.path());
 
-        model.stage_gtk_theme("Plain");
+        model
+            .stage_gtk_theme("Plain")
+            .expect("the value passes the stage-time check");
         let links = model.apply_contribution().expect("dirty").links;
         assert_eq!(
             links,
@@ -4244,7 +4664,9 @@ export XCURSOR_SIZE=16
         fs::remove_file(links_dir.join("assets")).expect("remove the link");
         fs::create_dir(links_dir.join("assets")).expect("a real assets directory");
 
-        model.stage_gtk_theme("New");
+        model
+            .stage_gtk_theme("New")
+            .expect("the value passes the stage-time check");
         let contribution = model.apply_contribution().expect("dirty");
         assert!(contribution.links.is_empty(), "all three are left alone");
         assert_eq!(
@@ -4284,7 +4706,9 @@ export XCURSOR_SIZE=16
         let tmp = tempfile::tempdir().expect("temp dir");
         let (mut model, _, _) = foreign_linked_model(tmp.path());
 
-        model.stage_gtk_theme("New");
+        model
+            .stage_gtk_theme("New")
+            .expect("the value passes the stage-time check");
         let contribution = model.apply_contribution().expect("dirty");
         assert!(contribution.links.is_empty(), "all three are left alone");
         assert_eq!(
@@ -4305,7 +4729,9 @@ export XCURSOR_SIZE=16
         // The same link dangling (its target gone) is a stale link, not an override.
         let tmp = tempfile::tempdir().expect("temp dir");
         let (mut model, new, custom) = foreign_linked_model(tmp.path());
-        model.stage_gtk_theme("New");
+        model
+            .stage_gtk_theme("New")
+            .expect("the value passes the stage-time check");
         fs::remove_file(custom.join("gtk-dark.css")).expect("delete the target");
         assert_eq!(model.gtk4_links_note(), None);
         let links = model.apply_contribution().expect("dirty").links;

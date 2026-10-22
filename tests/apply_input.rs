@@ -669,11 +669,14 @@ fn a_mid_plan_write_failure_rolls_back_the_earlier_input_write() {
         false,
         None,
     );
-    themes.stage_gtk_theme("Fixture-Theme");
+    themes
+        .stage_gtk_theme("Fixture-Theme")
+        .expect("an installed theme name stages");
     let contribution = themes
         .apply_contribution()
         .expect("a dirty theme contributes");
     plan.writes.extend(contribution.writes);
+    plan.validations.extend(contribution.validations);
     plan.reload_params = contribution.reload_params;
 
     let gtk3_dir = fx.repo_path("config/gtk-3.0");

@@ -1028,16 +1028,24 @@ fn value_portion(value: &str) -> Option<(usize, usize)> {
     Some((after + leading_ws, value.len()))
 }
 
-/// Rejects a new value that would break hyprlang parsing or the file's line
-/// structure: a newline / carriage return (splits the line) or a `#` (starts an
-/// inline comment, silently truncating the value).
+/// The characters the hyprlang writer refuses in a new value: a newline /
+/// carriage return (splits the line) or a `#` (starts an inline comment, silently
+/// truncating the value).
 ///
-/// Braces are deliberately *not* rejected: hyprlang tolerates `{`/`}` inside a
+/// Braces are deliberately *not* in the set: hyprlang tolerates `{`/`}` inside a
 /// value, and semantic validation of typed values (hex, `WxH@Hz`, ranges, paths)
 /// is the settings model's job (task 4.1), not this byte-level structural guard
 /// (R8.3).
+///
+/// Public so a caller can check a value against exactly this writer's rule *before*
+/// staging it — the wallpaper model's stage-time validation does, see
+/// [`crate::core::value_writers`] — instead of restating the set.
+pub const FORBIDDEN_VALUE_CHARACTERS: [char; 3] = ['\n', '\r', '#'];
+
+/// Rejects a new value that would break hyprlang parsing or the file's line
+/// structure — one containing any of the [`FORBIDDEN_VALUE_CHARACTERS`].
 fn reject_unsafe_value(value: &str) -> Result<(), EditError> {
-    if line::find_forbidden(value, &['\n', '\r', '#']).is_some() {
+    if line::find_forbidden(value, &FORBIDDEN_VALUE_CHARACTERS).is_some() {
         Err(EditError::InvalidValue(value.to_string()))
     } else {
         Ok(())

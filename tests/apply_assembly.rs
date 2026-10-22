@@ -344,7 +344,9 @@ fn the_bespoke_models_compose_into_one_plan() {
     let mut palette = palette_model(&fx);
     palette.stage("nord");
     let mut themes = themes_model(&fx);
-    themes.stage_gtk_theme("Fixture-Theme");
+    themes
+        .stage_gtk_theme("Fixture-Theme")
+        .expect("the value passes the stage-time check");
     let mut wallpaper = wallpaper_model(&fx);
     wallpaper
         .stage_wallpaper(new_wallpaper.to_str().expect("UTF-8 path"))
@@ -414,6 +416,14 @@ fn the_bespoke_models_compose_into_one_plan() {
             .any(|(id, _)| matches!(id, SettingId::WallpaperPath)),
         "the wallpaper contribution carries its validations"
     );
+    assert!(
+        assembled
+            .plan
+            .validations
+            .iter()
+            .any(|(id, _)| matches!(id, SettingId::GtkTheme)),
+        "the GTK/icon/cursor contribution carries its validations (task 9.27)"
+    );
     assert_eq!(
         assembled.commits,
         ModelCommits {
@@ -456,9 +466,15 @@ fn no_assembled_write_ever_targets_a_generated_file() {
     let mut palette = palette_model(&fx);
     palette.stage("nord");
     let mut themes = themes_model(&fx);
-    themes.stage_gtk_theme("Fixture-Theme");
-    themes.stage_cursor_theme("Fixture-Cursors");
-    themes.stage_cursor_size("32");
+    themes
+        .stage_gtk_theme("Fixture-Theme")
+        .expect("the value passes the stage-time check");
+    themes
+        .stage_cursor_theme("Fixture-Cursors")
+        .expect("the value passes the stage-time check");
+    themes
+        .stage_cursor_size("32")
+        .expect("the value passes the stage-time check");
     let mut wallpaper = wallpaper_model(&fx);
     wallpaper
         .stage_wallpaper(new_wallpaper.to_str().expect("UTF-8 path"))
@@ -577,7 +593,9 @@ fn a_stale_theme_or_wallpaper_file_aborts_naming_its_model() {
     let store = loaded_store(&fx);
 
     let mut themes = themes_model(&fx);
-    themes.stage_gtk_theme("Fixture-Theme");
+    themes
+        .stage_gtk_theme("Fixture-Theme")
+        .expect("the value passes the stage-time check");
     let gtk3 = fx.config_path("gtk-3.0/settings.ini");
     fs::write(
         &gtk3,
@@ -966,7 +984,9 @@ fn an_assembled_theme_apply_orders_its_follow_up_reloads() {
     let mut palette = palette_model(&fx);
     palette.stage("nord");
     let mut themes = themes_model(&fx);
-    themes.stage_icon_theme("Fixture-Icons");
+    themes
+        .stage_icon_theme("Fixture-Icons")
+        .expect("the value passes the stage-time check");
     let mut wallpaper = wallpaper_model(&fx);
     wallpaper
         .stage_wallpaper(&new_wallpaper)
