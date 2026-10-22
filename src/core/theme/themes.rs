@@ -1191,8 +1191,8 @@ impl ThemesModel {
     /// re-derived on each call, so after a committed Apply it reflects what was written.
     pub fn disagreeing_cursor_copies(&self) -> Vec<CursorCopy> {
         let copies = CursorCopies::read(&self.backing, &self.paths);
-        let shown_theme = self.cursor_theme.value.original.as_deref();
-        let shown_size = self.cursor_size.value.original.as_deref();
+        let shown_theme = self.cursor_theme.original();
+        let shown_size = self.cursor_size.original();
         let differs = |copy: Option<String>, shown: Option<&str>| match (copy, shown) {
             (Some(copy), Some(shown)) => copy != shown,
             _ => false,
@@ -2000,7 +2000,7 @@ impl ThemesModel {
             if written {
                 selection.effective()
             } else {
-                selection.value.original.as_deref()
+                selection.original()
             }
         }
         let cursor = if reached.cursor_theme || reached.cursor_size {
@@ -3899,7 +3899,7 @@ export XCURSOR_SIZE=16
             "the GTK theme reached both settings.ini files, so it is promoted"
         );
         assert_eq!(
-            model.icon_theme.value.original.as_deref(),
+            model.icon_theme.original(),
             Some("Everforest-Dark"),
             "the icon baseline still matches what is on disk"
         );
@@ -3990,7 +3990,7 @@ export XCURSOR_SIZE=16
 
         model.commit();
         assert_eq!(
-            model.cursor_theme.value.original.as_deref(),
+            model.cursor_theme.original(),
             Some("Nordic-cursors"),
             "the cursor baseline is not promoted while one existing copy holds the old value"
         );

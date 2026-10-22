@@ -65,74 +65,114 @@ pub use wallpaper::{
     HYPRLOCK_SCHEMA, HYPRPAPER_SCHEMA, WallpaperApply, WallpaperModel, WallpaperPaths,
 };
 
-/// One staged value: what the backing config currently holds, plus any pending edit.
-///
-/// This is the staging core every Theme-page control is built from — the four theme
-/// drop-downs through the [`Selection`] wrapper that adds their candidate options, the
-/// wallpaper and lock-screen image paths directly (they are free-form values the user
-/// picks with a file chooser, so there is no option list). It mirrors the store's
-/// `original`/`staged` dirty rule: re-staging the current value clears the pending edit,
-/// so it never lights up Apply.
-///
-/// Values are held as strings even when they are conceptually numeric (the cursor size),
-/// so one dirty rule serves every control; such a value is parsed to a number only when
-/// it is written or handed to a reload command.
-#[derive(Clone, Debug)]
-struct Staged {
-    /// The value read from the backing config, or `None` when the config did not set
-    /// it. Staging any value while this is `None` counts as a change (a write that
-    /// appends the key).
-    original: Option<String>,
-    /// The pending value, or `None` when nothing is staged. Only ever set to a value
-    /// that differs from [`original`](Self::original), so `staged.is_some()` is exactly
-    /// the dirty condition.
-    staged: Option<String>,
-}
+use staged::Staged;
 
-impl Staged {
-    /// Builds a clean staged value over what the config currently holds.
-    fn new(original: Option<String>) -> Self {
-        Staged {
-            original,
-            staged: None,
+/// Home of [`Staged`], kept in its own inline module so the compiler enforces its
+/// encapsulation.
+///
+/// Rust lets a child module read its parent's private fields, so a `Staged` declared
+/// directly in this file would expose `original` and `staged` to the `themes`,
+/// `wallpaper` and `palette` submodules. Declaring it one level down instead makes the
+/// fields private to this inner module: every other module, including [`Selection`]
+/// just below, goes through the methods, so the invariant documented on the `staged`
+/// field cannot be broken by a direct assignment elsewhere (task 9.32).
+mod staged {
+    /// One staged value: what the backing config currently holds, plus any pending edit.
+    ///
+    /// This is the staging core every Theme-page control is built from — the four theme
+    /// drop-downs through the [`Selection`](super::Selection) wrapper that adds their
+    /// candidate options, the wallpaper and lock-screen image paths directly (they are
+    /// free-form values the user picks with a file chooser, so there is no option list).
+    /// It mirrors the store's `original`/`staged` dirty rule: re-staging the current value
+    /// clears the pending edit, so it never lights up Apply.
+    ///
+    /// Values are held as strings even when they are conceptually numeric (the cursor
+    /// size), so one dirty rule serves every control; such a value is parsed to a number
+    /// only when it is written or handed to a reload command.
+    #[derive(Clone, Debug)]
+    pub(super) struct Staged {
+        /// The value read from the backing config, or `None` when the config did not set
+        /// it. Staging any value while this is `None` counts as a change (a write that
+        /// appends the key).
+        original: Option<String>,
+        /// The pending value, or `None` when nothing is staged. Only ever set to a value
+        /// that differs from [`original`](Self::original), so `staged.is_some()` is
+        /// exactly the dirty condition.
+        staged: Option<String>,
+    }
+
+    impl Staged {
+        /// Builds a clean staged value over what the config currently holds.
+        pub(super) fn new(original: Option<String>) -> Self {
+            Staged {
+                original,
+                staged: None,
+            }
         }
-    }
 
-    /// The effective value — the pending edit if there is one, else the current value.
-    fn effective(&self) -> Option<&str> {
-        self.staged.as_deref().or(self.original.as_deref())
-    }
+        /// The value the backing config currently holds (the baseline), ignoring any
+        /// pending edit; `None` when the config does not set it.
+        ///
+        /// Callers need the baseline on its own wherever the on-disk state matters rather
+        /// than the user's pending choice: to keep a newly picked path in the form the
+        /// file already uses, to decide whether a derived value would change the file,
+        /// to report which copies of a duplicated value disagree with the file, and to
+        /// hand a reload command the value a file kept when a write was refused.
+        pub(super) fn original(&self) -> Option<&str> {
+            self.original.as_deref()
+        }
 
-    /// Whether `value` is what the backing config currently holds, so staging it is a
-    /// return to the current state rather than an edit.
-    fn is_original(&self, value: &str) -> bool {
-        self.original.as_deref() == Some(value)
-    }
+        /// The effective value — the pending edit if there is one, else the current value.
+        pub(super) fn effective(&self) -> Option<&str> {
+            self.staged.as_deref().or(self.original.as_deref())
+        }
 
-    /// Stages `value`, clearing the pending edit when it equals the current value (so
-    /// re-staging the current value is not dirty).
-    fn stage(&mut self, value: &str) {
-        if self.is_original(value) {
+        /// Whether `value` is what the backing config currently holds, so staging it is a
+        /// return to the current state rather than an edit.
+        pub(super) fn is_original(&self, value: &str) -> bool {
+            self.original.as_deref() == Some(value)
+        }
+
+        /// Stages `value`, clearing the pending edit when it equals the current value (so
+        /// re-staging the current value is not dirty).
+        pub(super) fn stage(&mut self, value: &str) {
+            if self.is_original(value) {
+                self.staged = None;
+            } else {
+                self.staged = Some(value.to_string());
+            }
+        }
+
+        /// Whether an edit differing from the current value is pending.
+        pub(super) fn is_dirty(&self) -> bool {
+            self.staged.is_some()
+        }
+
+        /// Discards the pending edit.
+        pub(super) fn reset(&mut self) {
             self.staged = None;
-        } else {
-            self.staged = Some(value.to_string());
         }
-    }
 
-    /// Whether an edit differing from the current value is pending.
-    fn is_dirty(&self) -> bool {
-        self.staged.is_some()
-    }
+        /// Promotes the pending edit to the current value after a committed Apply.
+        pub(super) fn commit(&mut self) {
+            if let Some(value) = self.staged.take() {
+                self.original = Some(value);
+            }
+        }
 
-    /// Discards the pending edit.
-    fn reset(&mut self) {
-        self.staged = None;
-    }
-
-    /// Promotes the pending edit to the current value after a committed Apply.
-    fn commit(&mut self) {
-        if let Some(value) = self.staged.take() {
-            self.original = Some(value);
+        /// Makes `value` the new baseline and discards any pending edit, after an Apply
+        /// wrote `value` to the backing file.
+        ///
+        /// This is for a file that received something other than this value's own staged
+        /// edit, which [`commit`](Self::commit) cannot express: `hyprlock.conf`'s
+        /// background path follows the wallpaper while the lock-screen override is off,
+        /// so the path written there is derived from another control's edit, and once it
+        /// is on disk the separately staged override path has served its purpose. The
+        /// baseline and the pending edit are replaced together, so the field invariant
+        /// (a pending edit is never equal to the baseline) holds whatever `value` is.
+        pub(super) fn promote(&mut self, value: Option<String>) {
+            self.original = value;
+            self.staged = None;
         }
     }
 }
@@ -184,6 +224,11 @@ impl Selection {
     fn selected_index(&self) -> Option<usize> {
         let effective = self.effective()?;
         self.options.iter().position(|option| option == effective)
+    }
+
+    /// The value the backing config currently holds — see [`Staged::original`].
+    fn original(&self) -> Option<&str> {
+        self.value.original()
     }
 
     /// Whether `value` is the current value — see [`Staged::is_original`].

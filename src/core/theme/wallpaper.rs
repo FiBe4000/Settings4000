@@ -135,7 +135,7 @@ pub struct WallpaperPaths {
 /// Unlike the theme values, these need no separate "a copy refused it" record. With the
 /// override off the wallpaper path *is* written to `hyprlock.conf` as well, so it is not
 /// quite true that each value lives in one file — but that second copy has its own
-/// baseline (`lock.original`), so a copy that refused the value keeps showing up through
+/// baseline (`lock.original()`), so a copy that refused the value keeps showing up through
 /// [`WallpaperModel::hyprlock_write_needed`] and stays retryable. A cursor value has no
 /// such per-copy baseline: one model value covers four files, which is why the theme
 /// record has to track divergence explicitly.
@@ -521,7 +521,7 @@ impl WallpaperModel {
     pub fn stage_wallpaper(&mut self, path: &str) -> Result<(), ValidationError> {
         let home = self.paths.home.as_deref();
         validate_wallpaper_value(path, home)?;
-        let in_form = path_in_form_of(path, self.wallpaper.original.as_deref(), home);
+        let in_form = path_in_form_of(path, self.wallpaper.original(), home);
         self.wallpaper.stage(&in_form);
         Ok(())
     }
@@ -532,7 +532,7 @@ impl WallpaperModel {
     pub fn stage_lock(&mut self, path: &str) -> Result<(), ValidationError> {
         let home = self.paths.home.as_deref();
         validate_lock_background_value(path, home)?;
-        let in_form = path_in_form_of(path, self.lock.original.as_deref(), home);
+        let in_form = path_in_form_of(path, self.lock.original(), home);
         self.lock.stage(&in_form);
         Ok(())
     }
@@ -566,13 +566,9 @@ impl WallpaperModel {
         if self.override_on {
             self.lock.effective().map(str::to_string)
         } else {
-            self.wallpaper.effective().map(|path| {
-                path_in_form_of(
-                    path,
-                    self.lock.original.as_deref(),
-                    self.paths.home.as_deref(),
-                )
-            })
+            self.wallpaper
+                .effective()
+                .map(|path| path_in_form_of(path, self.lock.original(), self.paths.home.as_deref()))
         }
     }
 
@@ -583,7 +579,7 @@ impl WallpaperModel {
             return false;
         }
         match self.effective_lock() {
-            Some(path) => Some(path.as_str()) != self.lock.original.as_deref(),
+            Some(path) => Some(path.as_str()) != self.lock.original(),
             None => false,
         }
     }
@@ -702,8 +698,7 @@ impl WallpaperModel {
         if record.lock {
             // `hyprlock.conf` received exactly this path, so it becomes the baseline and
             // the staged override value (if any) has served its purpose.
-            self.lock.original = new_lock;
-            self.lock.staged = None;
+            self.lock.promote(new_lock);
         }
         // Re-derive the toggle's baseline from the promoted baselines — which are now the
         // paths on disk — with the very rule `load` uses. It must not be taken from
@@ -713,8 +708,8 @@ impl WallpaperModel {
         // files would make `reset` restore a toggle state the config does not have —
         // turning a clean page into a pending change the user never made (R5.1).
         self.override_initial = override_from_paths(
-            self.wallpaper.original.as_deref(),
-            self.lock.original.as_deref(),
+            self.wallpaper.original(),
+            self.lock.original(),
             self.paths.home.as_deref(),
         );
     }
@@ -871,12 +866,12 @@ impl WallpaperModel {
             let path = if record.wallpaper {
                 self.wallpaper.effective()
             } else {
-                self.wallpaper.original.as_deref()
+                self.wallpaper.original()
             };
             let fit = if record.fit {
                 self.fit.effective()
             } else {
-                self.fit.value.original.as_deref()
+                self.fit.original()
             };
             (
                 path.map(|path| expand_home_to_string(path, home)),
@@ -1778,7 +1773,8 @@ label {
             "hyprlock.conf is byte-identical: it never received the path"
         );
         assert_eq!(
-            model.lock.original, None,
+            model.lock.original(),
+            None,
             "the lock baseline is not promoted to a path the file never received"
         );
         assert!(
@@ -1923,7 +1919,7 @@ label {
             "the fit mode reached the file, so it is promoted"
         );
         assert_eq!(
-            model.wallpaper.original.as_deref(),
+            model.wallpaper.original(),
             Some("~/Pictures/wallpaper/18.jpg"),
             "the wallpaper baseline still matches what is on disk"
         );
