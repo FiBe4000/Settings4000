@@ -122,6 +122,7 @@ use crate::ui::page::{self, PageMsg, PagePlan, SettingsPage};
 use crate::ui::sound::{self, SoundPage};
 use crate::ui::startup::{self, LoadedFile, StartupLoad};
 use crate::ui::theme::{self, ThemePage};
+use crate::ui::widgets::{PAGE_MARGIN, SECTION_SPACING};
 
 /// Title shown in the window's title bar and to the compositor.
 const WINDOW_TITLE: &str = "Settings4000";
@@ -137,14 +138,6 @@ const DEFAULT_WIDTH: i32 = 960;
 
 /// Default window height in logical pixels; see [`DEFAULT_WIDTH`].
 const DEFAULT_HEIGHT: i32 = 640;
-
-/// Margin, in pixels, around a page's content inside its scroller.
-const CONTENT_MARGIN: i32 = 18;
-
-/// Vertical spacing, in pixels, between controls stacked on a page. Placeholder
-/// pages hold a single label today, but the spacing is set now so pages read
-/// consistently once §6 adds rows.
-const CONTENT_SPACING: i32 = 12;
 
 /// The `GtkStack` name of the loading placeholder page shown while the worker runs.
 ///
@@ -1413,7 +1406,7 @@ impl Shell {
 /// GTK4 widgets and inherits the system theme (R2.1); [`Shell::populate`] removes it
 /// from the stack once the real pages arrive.
 fn build_loading_page() -> GtkBox {
-    let content = GtkBox::new(Orientation::Vertical, CONTENT_SPACING);
+    let content = GtkBox::new(Orientation::Vertical, SECTION_SPACING);
     content.set_halign(Align::Center);
     content.set_valign(Align::Center);
     content.set_hexpand(true);
@@ -1440,11 +1433,11 @@ fn build_loading_page() -> GtkBox {
 /// with the category title so each page renders as distinct, non-empty content while
 /// the shell is verified.
 fn build_placeholder_page(category: SidebarCategory) -> ScrolledWindow {
-    let content = GtkBox::new(Orientation::Vertical, CONTENT_SPACING);
-    content.set_margin_top(CONTENT_MARGIN);
-    content.set_margin_bottom(CONTENT_MARGIN);
-    content.set_margin_start(CONTENT_MARGIN);
-    content.set_margin_end(CONTENT_MARGIN);
+    let content = GtkBox::new(Orientation::Vertical, SECTION_SPACING);
+    content.set_margin_top(PAGE_MARGIN);
+    content.set_margin_bottom(PAGE_MARGIN);
+    content.set_margin_start(PAGE_MARGIN);
+    content.set_margin_end(PAGE_MARGIN);
 
     // Left-aligned so the heading (and the rows §6 adds beneath it) start at the page's
     // leading edge rather than centring.

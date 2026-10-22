@@ -59,6 +59,9 @@
 //!   GTK-free [`crate::core::notifications`] model, plus the row list of notifd's staged
 //!   settings, which the window renders through the declarative framework and mounts
 //!   inside the page. Bespoke because its runtime half is not staged (R5.2).
+//! - [`widgets`] — the small widget builders (labelled row, informational note,
+//!   drop-down) and the margin/spacing metrics every page above shares, kept as one
+//!   copy so the pages cannot drift apart visually (task 9.19).
 //!
 //! The real per-category page content (§6) plugs into this shell in later tasks.
 
@@ -82,4 +85,5 @@ mod sound;
 // the crate can reach them directly; the public surface stays `ui::app`.
 pub(crate) mod startup;
 mod theme;
+mod widgets;
 pub(crate) mod window;

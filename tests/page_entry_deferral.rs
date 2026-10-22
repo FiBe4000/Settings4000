@@ -39,6 +39,14 @@
 //! connected switch); the pages render before they connect, and a reviewer adding
 //! such a call must keep that order.
 //!
+//! **Calls into the shared widget helpers** are followed: the pages build their rows
+//! with `labelled_row`, `note` and the drop-down builders from `src/ui/widgets.rs`
+//! (task 9.19), so that module's functions are appended to every page's function set.
+//! A walk confined to the page file would stop at those calls and could never notice
+//! a spawn added to a shared helper. Each page's `build_helper` is now one of the
+//! shared helpers, so [`the_walk_follows_calls_from_build`] also proves the walk
+//! crosses into that module.
+//!
 //! **Same-named functions** are walked together: functions are matched by name only,
 //! so reaching `refresh` reaches every `fn refresh` in the module (e.g. a page's
 //! `refresh` and its inner state's). That over-approximates, which for a guard that
@@ -77,6 +85,10 @@ struct Page {
     build_helper: &'static str,
 }
 
+/// The shared widget helpers every page module calls (task 9.19), walked together
+/// with each page's own functions (see the module docs).
+const SHARED_WIDGETS: &str = include_str!("../src/ui/widgets.rs");
+
 /// The Sound page: `pw-dump` / `wpctl status` enumeration (task 9.4).
 const SOUND: Page = Page {
     file: "src/ui/sound.rs",
@@ -109,15 +121,24 @@ impl Page {
         COMMON_MARKERS.iter().chain(self.read_markers).copied()
     }
 
-    /// The production code: comments, strings and character literals blanked, and
-    /// everything from the module's test attribute on cut off, so the guard never
-    /// sees the test module's own mock runners.
+    /// The production code: the page module followed by [`SHARED_WIDGETS`], each with
+    /// comments, strings and character literals blanked and everything from its test
+    /// attribute on cut off, so the guard never sees a test module's mock runners.
     fn production_code(&self) -> String {
-        let code = strip_comments(self.source);
-        match code.find("#[cfg(test)]") {
-            Some(end) => code[..end].to_string(),
-            None => code,
-        }
+        let mut code = production_code_of(self.source);
+        code.push('\n');
+        code.push_str(&production_code_of(SHARED_WIDGETS));
+        code
+    }
+}
+
+/// `source` with comments, strings and character literals blanked and everything from
+/// its `#[cfg(test)]` attribute on cut off.
+fn production_code_of(source: &str) -> String {
+    let code = strip_comments(source);
+    match code.find("#[cfg(test)]") {
+        Some(end) => code[..end].to_string(),
+        None => code,
     }
 }
 

@@ -75,7 +75,7 @@ use std::rc::Rc;
 use gtk4::prelude::*;
 use gtk4::{
     Adjustment, Align, Box as GtkBox, Button, DropDown, Entry, Label, ListBox, Orientation, Scale,
-    SelectionMode, SpinButton, StringList, Switch, Widget, glib,
+    SelectionMode, SpinButton, StringList, Switch, glib,
 };
 use relm4::{Component, ComponentParts, ComponentSender, Controller, SimpleComponent};
 
@@ -90,16 +90,7 @@ use crate::ui::row::{
     token_switch_active_from_value, value_from_entry, value_from_scale, value_from_switch,
     value_from_token_toggle, visible_rows,
 };
-
-/// Vertical spacing, in pixels, between rows on a page.
-const ROW_SPACING: i32 = 12;
-
-/// Horizontal spacing, in pixels, between a label and its control (and between the
-/// buttons of a reorderable-list row).
-const CONTROL_SPACING: i32 = 8;
-
-/// Outer margin, in pixels, around a page's rows.
-const PAGE_MARGIN: i32 = 18;
+use crate::ui::widgets::{PAGE_MARGIN, ROW_SPACING, SECTION_SPACING, labelled_row};
 
 /// The initialization payload for a [`SettingsPage`].
 pub(crate) struct PageInit {
@@ -201,7 +192,7 @@ impl SimpleComponent for SettingsPage {
     fn init_root() -> Self::Root {
         GtkBox::builder()
             .orientation(Orientation::Vertical)
-            .spacing(ROW_SPACING)
+            .spacing(SECTION_SPACING)
             .margin_top(PAGE_MARGIN)
             .margin_bottom(PAGE_MARGIN)
             .margin_start(PAGE_MARGIN)
@@ -475,7 +466,7 @@ impl BoundList {
 
         let count = items.len();
         for (index, item) in items.iter().enumerate() {
-            let row = GtkBox::new(Orientation::Horizontal, CONTROL_SPACING);
+            let row = GtkBox::new(Orientation::Horizontal, ROW_SPACING);
 
             let label = Label::new(Some(item));
             label.set_halign(Align::Start);
@@ -796,7 +787,7 @@ fn build_list(
 ) -> (GtkBox, BoundControl) {
     let setting = descriptor.setting;
 
-    let outer = GtkBox::new(Orientation::Vertical, CONTROL_SPACING);
+    let outer = GtkBox::new(Orientation::Vertical, ROW_SPACING);
     let heading = Label::new(Some(&descriptor.label));
     heading.set_halign(Align::Start);
     outer.append(&heading);
@@ -809,7 +800,7 @@ fn build_list(
 
     // The add-control: pick a candidate and append it (duplicates are ignored, since
     // an ordered layout list has no meaning with repeats).
-    let add_row = GtkBox::new(Orientation::Horizontal, CONTROL_SPACING);
+    let add_row = GtkBox::new(Orientation::Horizontal, ROW_SPACING);
     let add_model = string_list(&candidates);
     let add_dropdown = DropDown::builder().model(&add_model).build();
     add_dropdown.set_hexpand(true);
@@ -846,18 +837,6 @@ fn build_list(
             displayed,
         }),
     )
-}
-
-/// Builds a horizontal row: `label` on the left (taking the free space) and `control`
-/// on the right.
-fn labelled_row(label: &str, control: &impl IsA<Widget>) -> GtkBox {
-    let row = GtkBox::new(Orientation::Horizontal, CONTROL_SPACING);
-    let label = Label::new(Some(label));
-    label.set_halign(Align::Start);
-    label.set_hexpand(true);
-    row.append(&label);
-    row.append(control);
-    row
 }
 
 /// Builds a `GtkStringList` of the options' display labels, in order.

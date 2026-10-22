@@ -61,15 +61,7 @@ use gtk4::{Align, Box as GtkBox, Button, Frame, Label, Orientation, ScrolledWind
 
 use crate::core::network::{self, ActiveConnection, Launcher, NetworkStatus};
 use crate::system::command::SystemCommandRunner;
-
-/// Outer margin, in pixels, around the page content.
-const PAGE_MARGIN: i32 = 18;
-
-/// Vertical spacing, in pixels, between sections and between rows.
-const SECTION_SPACING: i32 = 12;
-
-/// Horizontal spacing, in pixels, between a connection's name and its detail.
-const ROW_SPACING: i32 = 8;
+use crate::ui::widgets::{PAGE_MARGIN, ROW_SPACING, SECTION_SPACING, note};
 
 /// The mounted Network page: the scrollable root plus the handle the window uses to
 /// re-read the status when the page is re-shown.
@@ -243,13 +235,4 @@ fn build_launcher_button(launcher: Launcher) -> Button {
         network::open_settings(&SystemCommandRunner::new(), launcher);
     });
     button
-}
-
-/// A left-aligned, wrapping informational label for an empty/degraded state.
-fn note(text: &str) -> Label {
-    let label = Label::new(Some(text));
-    label.set_halign(Align::Start);
-    label.set_wrap(true);
-    label.set_xalign(0.0);
-    label
 }

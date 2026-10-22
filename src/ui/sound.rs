@@ -73,22 +73,13 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gtk4::prelude::*;
-use gtk4::{
-    Align, Box as GtkBox, Button, DropDown, Frame, Label, Orientation, Scale, ScrolledWindow,
-    StringList, Switch, Widget, glib,
-};
+use gtk4::{Align, Box as GtkBox, Button, Frame, Orientation, Scale, ScrolledWindow, Switch, glib};
 
 use crate::core::sound::{self, SoundDevice, SoundState};
 use crate::system::command::SystemCommandRunner;
-
-/// Outer margin, in pixels, around the page content.
-const PAGE_MARGIN: i32 = 18;
-
-/// Vertical spacing, in pixels, between sections and between rows.
-const SECTION_SPACING: i32 = 12;
-
-/// Horizontal spacing, in pixels, between a row label and its control.
-const ROW_SPACING: i32 = 8;
+use crate::ui::widgets::{
+    PAGE_MARGIN, SECTION_SPACING, build_indexed_dropdown, labelled_row, note,
+};
 
 /// The volume slider range: a 0–100 percentage over the `wpctl`-scale `0.0`..=`1.0`.
 const VOLUME_PERCENT_MAX: f64 = 100.0;
@@ -226,7 +217,7 @@ impl Inner {
             .unwrap_or(0);
 
         let weak = Rc::downgrade(self);
-        let dropdown = build_dropdown(&labels, selected as u32, move |index| {
+        let dropdown = build_indexed_dropdown(&labels, Some(selected as u32), move |index| {
             if let Some(inner) = weak.upgrade() {
                 if let Some(&id) = ids.get(index) {
                     inner.set_default(id);
@@ -364,47 +355,4 @@ pub(crate) fn build() -> SoundPage {
     root.set_child(Some(&content));
 
     SoundPage { root, inner }
-}
-
-/// Builds a `GtkDropDown` over `labels`, preselecting index `selected` and invoking
-/// `on_selected` with the chosen index on a user change.
-///
-/// The selection is set **before** the change handler is connected, so the programmatic
-/// set never fires the handler.
-fn build_dropdown(
-    labels: &[String],
-    selected: u32,
-    on_selected: impl Fn(usize) + 'static,
-) -> DropDown {
-    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-    let model = StringList::new(&refs);
-    let dropdown = DropDown::builder().model(&model).build();
-    dropdown.set_halign(Align::End);
-    dropdown.set_valign(Align::Center);
-    dropdown.set_selected(selected);
-
-    dropdown.connect_selected_notify(move |dropdown| {
-        on_selected(dropdown.selected() as usize);
-    });
-    dropdown
-}
-
-/// A left-aligned row: a `label` taking the free space and its `control` on the right.
-fn labelled_row(label: &str, control: &impl IsA<Widget>) -> GtkBox {
-    let row = GtkBox::new(Orientation::Horizontal, ROW_SPACING);
-    let label = Label::new(Some(label));
-    label.set_halign(Align::Start);
-    label.set_hexpand(true);
-    row.append(&label);
-    row.append(control);
-    row
-}
-
-/// A left-aligned, wrapping informational label for an empty/degraded state.
-fn note(text: &str) -> Label {
-    let label = Label::new(Some(text));
-    label.set_halign(Align::Start);
-    label.set_wrap(true);
-    label.set_xalign(0.0);
-    label
 }

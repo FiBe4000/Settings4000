@@ -80,15 +80,7 @@ use crate::core::notifd_config::{NotifdConfigModel, NotifdRule, NotifdSetting};
 use crate::core::notifications::{DaemonView, NotifdActionError, NotificationsModel};
 use crate::system::command::SystemCommandRunner;
 use crate::ui::row::{RowCapability, RowDescriptor, WidgetKind};
-
-/// Outer margin, in pixels, around the page content.
-const PAGE_MARGIN: i32 = 18;
-
-/// Vertical spacing, in pixels, between sections and between rows.
-const SECTION_SPACING: i32 = 12;
-
-/// Horizontal spacing, in pixels, between a row's label and its control or value.
-const ROW_SPACING: i32 = 8;
+use crate::ui::widgets::{PAGE_MARGIN, ROW_SPACING, SECTION_SPACING, labelled_row, note};
 
 /// The confirmation dialog's button index for "Clear all"; index 0 is "Cancel".
 const CLEAR_BUTTON: i32 = 1;
@@ -521,26 +513,6 @@ fn inhibited_text(state: Option<NotifdState>) -> String {
         Some(_) => "No".to_string(),
         None => "—".to_string(),
     }
-}
-
-/// A row: a `label` taking the free space and its `control` on the right.
-fn labelled_row(label: &str, control: &impl IsA<Widget>) -> GtkBox {
-    let row = GtkBox::new(Orientation::Horizontal, ROW_SPACING);
-    let label = Label::new(Some(label));
-    label.set_halign(Align::Start);
-    label.set_hexpand(true);
-    row.append(&label);
-    row.append(control);
-    row
-}
-
-/// A left-aligned, wrapping informational label.
-fn note(text: &str) -> Label {
-    let label = Label::new(Some(text));
-    label.set_halign(Align::Start);
-    label.set_wrap(true);
-    label.set_xalign(0.0);
-    label
 }
 
 #[cfg(test)]

@@ -83,21 +83,15 @@ use gtk4::gio;
 use gtk4::prelude::*;
 use gtk4::{
     AlertDialog, Align, Box as GtkBox, Button, DrawingArea, DropDown, FileDialog, FileFilter,
-    Frame, Image, Label, Orientation, ScrolledWindow, StringList, Switch, Widget, Window,
+    Frame, Image, Label, Orientation, ScrolledWindow, Switch, Window,
 };
 
 use crate::core::theme::{
     GtkThemeOverrideSource, PaletteModel, Scheme, ThemesModel, WallpaperModel,
 };
-
-/// Outer margin, in pixels, around the page content.
-const PAGE_MARGIN: i32 = 18;
-
-/// Vertical spacing, in pixels, between sections and between rows.
-const SECTION_SPACING: i32 = 12;
-
-/// Horizontal spacing, in pixels, between a row label and its control.
-const ROW_SPACING: i32 = 8;
+use crate::ui::widgets::{
+    PAGE_MARGIN, ROW_SPACING, SECTION_SPACING, build_dropdown, labelled_row, note,
+};
 
 /// Height, in pixels, of the selected scheme's color preview strip.
 const SWATCH_HEIGHT: i32 = 16;
@@ -750,55 +744,6 @@ fn swatch_strip(colors: &[(f64, f64, f64)]) -> DrawingArea {
         }
     });
     area
-}
-
-/// Builds a `GtkDropDown` over `options`, preselecting `selected` (when known) and
-/// invoking `on_selected` with the chosen option on a user change.
-///
-/// The initial selection is set **before** the change handler is connected, so the
-/// programmatic set never fires the handler — the page never mistakes a render for a
-/// user edit.
-fn build_dropdown(
-    options: &[String],
-    selected: Option<u32>,
-    on_selected: impl Fn(String) + 'static,
-) -> DropDown {
-    let labels: Vec<&str> = options.iter().map(String::as_str).collect();
-    let model = StringList::new(&labels);
-    let dropdown = DropDown::builder().model(&model).build();
-    dropdown.set_halign(Align::End);
-    dropdown.set_valign(Align::Center);
-    if let Some(selected) = selected {
-        dropdown.set_selected(selected);
-    }
-
-    let options = options.to_vec();
-    dropdown.connect_selected_notify(move |dropdown| {
-        if let Some(option) = options.get(dropdown.selected() as usize) {
-            on_selected(option.clone());
-        }
-    });
-    dropdown
-}
-
-/// A left-aligned row: a `label` taking the free space and its `control` on the right.
-fn labelled_row(label: &str, control: &impl IsA<Widget>) -> GtkBox {
-    let row = GtkBox::new(Orientation::Horizontal, ROW_SPACING);
-    let label = Label::new(Some(label));
-    label.set_halign(Align::Start);
-    label.set_hexpand(true);
-    row.append(&label);
-    row.append(control);
-    row
-}
-
-/// A left-aligned, wrapping informational label for an empty/degraded state.
-fn note(text: &str) -> Label {
-    let label = Label::new(Some(text));
-    label.set_halign(Align::Start);
-    label.set_wrap(true);
-    label.set_xalign(0.0);
-    label
 }
 
 /// The file name of a path, for a compact chooser-button label. Falls back to the whole
