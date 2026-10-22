@@ -332,9 +332,12 @@ pub fn assemble_apply_plan(sources: ApplySources<'_>) -> Result<AssembledPlan, P
     // The GTK/icon/cursor theme writes (task 6.4): the value goes identically to every
     // copy the app owns (both `settings.ini` files and, for the cursor, `hyprland.lua`'s
     // hl.env lines, `uwsm/env` and `~/.icons/default/index.theme` — R3.4), and the
-    // reload parameters drive `gsettings set` plus `hyprctl setcursor`.
+    // reload parameters drive `gsettings set` plus `hyprctl setcursor`. A GTK-theme
+    // change also brings the GTK 4 theme link steps (task 11.16), which the pipeline
+    // runs after every file write.
     if let Some(contribution) = sources.themes.and_then(ThemesModel::apply_contribution) {
         plan.writes.extend(contribution.writes);
+        plan.links.extend(contribution.links);
         merge_reload_params(&mut plan.reload_params, contribution.reload_params);
         commits.themes = true;
     }
@@ -381,6 +384,7 @@ pub fn base_apply_plan(store: &SettingsStore) -> ApplyPlan {
     ApplyPlan {
         validations,
         writes: Vec::new(),
+        links: Vec::new(),
         palette: None,
         reload_params: ReloadParams::default(),
     }

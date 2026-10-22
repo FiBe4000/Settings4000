@@ -58,7 +58,13 @@
 //!    [`create_atomic`] — see [`WriteMode`]), collecting a [`FileSnapshot`] per
 //!    success. If any write fails, every already-written file is rolled back from
 //!    its in-memory pre-apply snapshot (a created file is deleted again) and the
-//!    failure is returned, leaving the desktop as it was.
+//!    failure is returned, leaving the desktop as it was. After the file writes come
+//!    the plan's **symbolic-link steps** ([`LinkWrite`]) — today only the GTK 4 theme
+//!    links a GTK-theme change re-points (task 11.16, analysis §8.4) — each through
+//!    [`point_symlink`] / [`remove_symlink`] with a [`LinkSnapshot`] of its own. They
+//!    are part of the same transaction: a failed link step rolls back the file writes
+//!    before it, and a later failure rolls the link steps back too (see [`LinkWrite`]
+//!    for why this is a write step and not a best-effort reload).
 //! 4. **Palette generator, last** (the palette gotcha): if the change is a
 //!    color-scheme switch, run the discovered `scripts/generate-colors <scheme>`
 //!    as the **last** write step. A non-zero exit — which also covers a
@@ -148,7 +154,10 @@ use crate::core::model::{SettingId, ValidationError, Value};
 use crate::core::reload::{BackingFile, ReloadError, ReloadParams, plan_reloads};
 use crate::system::command::{Command, CommandError, CommandRunner, STDERR_EXCERPT_LIMIT};
 use crate::system::signal::ProcessSignaller;
-use crate::system::writer::{FileSnapshot, WriteError, create_atomic, write_atomic};
+use crate::system::writer::{
+    FileSnapshot, LinkSnapshot, WriteError, create_atomic, point_symlink, remove_symlink,
+    write_atomic,
+};
 
 /// One planned atomic write of a backing config file — the pipeline's file-write
 /// seam (see the module docs).
@@ -202,6 +211,54 @@ pub enum WriteMode {
     /// `~/.icons/default/index.theme`, which the cursor write set creates when it is
     /// absent (task 11.5, analysis §8.4).
     CreateNew,
+}
+
+/// One planned change to a symbolic link the app manages — the write phase's link step
+/// (step 3, after every [`FileWrite`]; task 11.16).
+///
+/// The only links the app changes are GTK 4's theme links
+/// `~/.config/gtk-4.0/{gtk.css,gtk-dark.css,assets}`, which point into the installed
+/// theme's `gtk-4.0/` directory and are what GTK 4 and libadwaita apps on this desktop
+/// are themed by (analysis §8.4). Changing `gtk-theme-name` without re-pointing them
+/// leaves those apps on the old theme, so the GTK-theme Apply plans one of these per
+/// link that must change. The step edits the *link*, never the file it points at — the
+/// theme's files belong to the installed package (R8.2) — which is why it is not a
+/// [`FileWrite`]: [`write_atomic`] follows symlinks and would rewrite the theme's own
+/// `gtk.css`.
+///
+/// **Transactional, not best-effort.** A link step is part of the write phase with its
+/// own [`LinkSnapshot`], rather than a non-fatal reload (R5.5), because it changes
+/// on-disk configuration exactly like a file write does: if it could fail without
+/// undoing the `settings.ini` writes, the desktop would be left with `gtk-theme-name`
+/// naming the new theme while GTK 4 apps are linked to the old one — the very split the
+/// step exists to prevent — and the page would report success. Rolling everything back
+/// keeps the three legs of a GTK-theme change (gsettings, both `settings.ini`, the
+/// links) together, and the user can retry. Its failure modes are also write failures in
+/// kind (a read-only directory, a plain file that appeared where a link was), not a
+/// component that happens not to be running.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkWrite {
+    /// The link path to change, as the desktop reads it (e.g.
+    /// `~/.config/gtk-4.0/gtk.css`). Never canonicalized: the link itself is the target.
+    pub path: PathBuf,
+    /// What the path should hold afterwards.
+    pub action: LinkAction,
+    /// A human-readable label for the apply-level log record (R7.3), e.g.
+    /// `"GTK 4 theme link (gtk.css)"`.
+    pub label: String,
+}
+
+/// What a [`LinkWrite`] leaves at its path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkAction {
+    /// A symbolic link with this exact target text, created when absent or atomically
+    /// re-pointed when present ([`point_symlink`]). The page that plans it has already
+    /// checked the target lies where it may point (for the GTK 4 links: inside a theme
+    /// root, R3.3).
+    PointAt(PathBuf),
+    /// No link: an existing link is removed, an absent one stays absent
+    /// ([`remove_symlink`]).
+    Remove,
 }
 
 /// Whether a [`FileWrite`]'s values are covered by its plan's
@@ -269,6 +326,9 @@ pub struct ApplyPlan {
     pub validations: Vec<(SettingId, Value)>,
     /// The backing-file writes to apply atomically, in order (step 3, R5.4).
     pub writes: Vec<FileWrite>,
+    /// The symbolic-link steps, run in order after every file write and before the
+    /// palette generator (step 3, R5.4; task 11.16). See [`LinkWrite`].
+    pub links: Vec<LinkWrite>,
     /// The palette switch to run last, if this Apply changes the color scheme
     /// (step 4).
     pub palette: Option<PaletteSwitch>,
@@ -294,6 +354,19 @@ pub enum WriteFailureCause {
     File {
         /// The live path the failed write targeted.
         path: PathBuf,
+        /// The underlying writer error.
+        error: WriteError,
+    },
+    /// A symbolic-link step failed (step 3, task 11.16) — for instance because a plain
+    /// file appeared at the link path after the page planned the step
+    /// ([`WriteError::NotASymlink`]), or the directory is not writable. Carries the link
+    /// path and the underlying writer error.
+    Link {
+        /// The link path the failed step targeted.
+        path: PathBuf,
+        /// The failed step's [`LinkWrite::label`], which names the step in the message
+        /// (the writer error already names the path).
+        label: String,
         /// The underlying writer error.
         error: WriteError,
     },
@@ -323,6 +396,12 @@ impl fmt::Display for WriteFailureCause {
         match self {
             WriteFailureCause::File { path, error } => {
                 write!(f, "failed to write {}: {error}", path.display())
+            }
+            // The writer error names the path itself, so the outer message names the
+            // step instead of repeating the path ("the GTK 4 theme link (gtk.css) step
+            // failed: refused to change /…/gtk.css: …").
+            WriteFailureCause::Link { label, error, .. } => {
+                write!(f, "the {label} step failed: {error}")
             }
             WriteFailureCause::GenerateColorsExit {
                 code,
@@ -365,7 +444,8 @@ pub struct WriteFailure {
     /// What went wrong in the write phase.
     pub cause: WriteFailureCause,
     /// The resolved (symlink-followed) paths of files that had already been written
-    /// and were successfully restored to their pre-apply contents.
+    /// and were successfully restored to their pre-apply contents, newest first. A
+    /// rolled-back link step is listed by its link path, which is never resolved.
     pub rolled_back: Vec<PathBuf>,
     /// Rollback restores that themselves failed, each with the resolved path and the
     /// writer error. Non-empty means the desktop may be left partially changed.
@@ -516,6 +596,7 @@ pub fn run(
 
     tracing::info!(
         files_written = written.len(),
+        links_updated = plan.links.len(),
         palette_regenerated = plan.palette.is_some(),
         reload_failures = reload_failures.len(),
         unrelated_conflicts = unrelated_conflicts.len(),
@@ -652,12 +733,40 @@ fn warn_on_missing_validations(plan: &ApplyPlan) {
 struct WritePhaseFailure {
     /// What went wrong.
     cause: WriteFailureCause,
-    /// The snapshots of the files written before the failure, in write order
+    /// The snapshots of the steps completed before the failure, in write order
     /// (newest last). [`run`] rolls these back on any write-phase failure.
-    written: Vec<FileSnapshot>,
+    written: Vec<StepSnapshot>,
 }
 
-/// Performs the atomic writes (step 3) then the palette generator (step 4).
+/// The rollback record of one completed write-phase step: a file write or a link step.
+enum StepSnapshot {
+    /// A [`FileWrite`]'s pre-write state.
+    File(FileSnapshot),
+    /// A [`LinkWrite`]'s pre-step state.
+    Link(LinkSnapshot),
+}
+
+impl StepSnapshot {
+    /// The path reported for this step in [`WriteFailure`]: a file's resolved path, a
+    /// link's own path.
+    fn path(&self) -> &std::path::Path {
+        match self {
+            StepSnapshot::File(snapshot) => snapshot.resolved_path(),
+            StepSnapshot::Link(snapshot) => snapshot.path(),
+        }
+    }
+
+    /// Undoes the step (see [`FileSnapshot::restore`] and [`LinkSnapshot::restore`]).
+    fn restore(&self) -> Result<(), WriteError> {
+        match self {
+            StepSnapshot::File(snapshot) => snapshot.restore(),
+            StepSnapshot::Link(snapshot) => snapshot.restore(),
+        }
+    }
+}
+
+/// Performs the atomic writes and the link steps (step 3) then the palette generator
+/// (step 4).
 ///
 /// On success there is nothing to return — the writes stand. On failure it returns
 /// a [`WritePhaseFailure`] carrying the cause *and* the snapshots of the files
@@ -665,7 +774,7 @@ struct WritePhaseFailure {
 /// this a straight-line sequence of side effects whose only job is to attempt the
 /// writes in order and report the first failure with enough state to undo it.
 fn write_phase(plan: &ApplyPlan, runner: &dyn CommandRunner) -> Result<(), WritePhaseFailure> {
-    let mut snapshots: Vec<FileSnapshot> = Vec::new();
+    let mut snapshots: Vec<StepSnapshot> = Vec::new();
 
     // Step 3: write each backing file atomically, snapshotting for rollback. A
     // created file's snapshot records it as absent, so the same rollback removes it.
@@ -683,12 +792,43 @@ fn write_phase(plan: &ApplyPlan, runner: &dyn CommandRunner) -> Result<(), Write
                     keys = ?write.changed_keys,
                     "wrote backing file"
                 );
-                snapshots.push(snapshot);
+                snapshots.push(StepSnapshot::File(snapshot));
             }
             Err(error) => {
                 return Err(WritePhaseFailure {
                     cause: WriteFailureCause::File {
                         path: write.path.clone(),
+                        error,
+                    },
+                    written: snapshots,
+                });
+            }
+        }
+    }
+
+    // Step 3, continued: the link steps, after every file write (so a failed file
+    // write never reaches them) and before the generator (so a generator failure rolls
+    // them back with everything else). Each records its own snapshot (task 11.16).
+    for link in &plan.links {
+        let result = match &link.action {
+            LinkAction::PointAt(target) => point_symlink(&link.path, target),
+            LinkAction::Remove => remove_symlink(&link.path),
+        };
+        match result {
+            Ok(snapshot) => {
+                // R7.3: the apply-level record; the writer logs the link target.
+                tracing::info!(
+                    path = %link.path.display(),
+                    step = %link.label,
+                    "updated symbolic link"
+                );
+                snapshots.push(StepSnapshot::Link(snapshot));
+            }
+            Err(error) => {
+                return Err(WritePhaseFailure {
+                    cause: WriteFailureCause::Link {
+                        path: link.path.clone(),
+                        label: link.label.clone(),
                         error,
                     },
                     written: snapshots,
@@ -784,11 +924,11 @@ pub(crate) fn stderr_excerpt(stderr: &[u8]) -> Option<String> {
 /// correctness). A restore that itself fails is logged at `error` and collected
 /// rather than aborting the remaining rollbacks — one un-restorable file must not
 /// leave the others un-rolled-back.
-fn roll_back(snapshots: &[FileSnapshot]) -> (Vec<PathBuf>, Vec<(PathBuf, WriteError)>) {
+fn roll_back(snapshots: &[StepSnapshot]) -> (Vec<PathBuf>, Vec<(PathBuf, WriteError)>) {
     let mut rolled_back = Vec::new();
     let mut failures = Vec::new();
     for snapshot in snapshots.iter().rev() {
-        let path = snapshot.resolved_path().to_path_buf();
+        let path = snapshot.path().to_path_buf();
         match snapshot.restore() {
             Ok(()) => rolled_back.push(path),
             Err(error) => {
@@ -904,6 +1044,7 @@ mod tests {
                 validation: WriteValidation::InPlan,
                 mode: WriteMode::Replace,
             }],
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };
@@ -956,6 +1097,7 @@ mod tests {
         let plan = ApplyPlan {
             validations: Vec::new(),
             writes: Vec::new(),
+            links: Vec::new(),
             palette: Some(PaletteSwitch {
                 scheme: "nord".to_string(),
                 generate_colors: PathBuf::from("/fake/repo/scripts/generate-colors"),
@@ -1036,6 +1178,7 @@ mod tests {
                 validation: WriteValidation::InPlan,
                 mode: WriteMode::Replace,
             }],
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };
@@ -1093,6 +1236,7 @@ mod tests {
                 validation: WriteValidation::InPlan,
                 mode: WriteMode::Replace,
             }],
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };
@@ -1161,6 +1305,7 @@ mod tests {
         let plan = ApplyPlan {
             validations: Vec::new(),
             writes: vec![input_lua_write(&written)],
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };
@@ -1221,6 +1366,7 @@ mod tests {
         let plan = ApplyPlan {
             validations: Vec::new(),
             writes: vec![input_lua_write(&written)],
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };
@@ -1269,6 +1415,7 @@ mod tests {
                 validation: WriteValidation::InPlan,
                 mode: WriteMode::Replace,
             }],
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };
@@ -1329,6 +1476,7 @@ mod tests {
                 validation: WriteValidation::InPlan,
                 mode: WriteMode::Replace,
             }],
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };
@@ -1388,6 +1536,7 @@ mod tests {
                     mode: WriteMode::Replace,
                 },
             ],
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };
@@ -1453,6 +1602,7 @@ mod tests {
                     mode: WriteMode::Replace,
                 },
             ],
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };
@@ -1501,6 +1651,7 @@ mod tests {
                 validation: WriteValidation::NotNeeded,
                 mode: WriteMode::CreateNew,
             }],
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };
@@ -1549,6 +1700,7 @@ mod tests {
                 validation: WriteValidation::InPlan,
                 mode: WriteMode::Replace,
             }],
+            links: Vec::new(),
             palette: Some(PaletteSwitch {
                 scheme: "nord".to_string(),
                 generate_colors: PathBuf::from("/fake/repo/scripts/generate-colors"),
@@ -1612,6 +1764,166 @@ mod tests {
         );
     }
 
+    // --- (f2) link steps: ordered after the file writes, rolled back with them ----
+
+    /// A `settings.ini`-style write of `path`, as the GTK-theme Apply plans it.
+    fn gtk_settings_write(path: &Path) -> FileWrite {
+        FileWrite {
+            path: path.to_path_buf(),
+            contents: b"[Settings]\ngtk-theme-name=New\n".to_vec(),
+            changed_keys: vec!["GTK theme".to_string()],
+            backing: BackingFile::GtkSettings,
+            validation: WriteValidation::NotNeeded,
+            mode: WriteMode::Replace,
+        }
+    }
+
+    #[test]
+    fn link_steps_run_after_the_file_writes_and_a_later_failure_restores_them() {
+        // Task 11.16, R5.4: the GTK-theme links are re-pointed in the write phase,
+        // after the settings.ini write, and a failure after them (here the palette
+        // generator) restores the old link text and the old file bytes alike.
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let settings = write_file(&dir, "settings.ini", b"[Settings]\ngtk-theme-name=Old\n");
+        let tracker = record_baseline(&[&settings]);
+        let link = dir.path().join("gtk.css");
+        symlink("/themes/Old/gtk-4.0/gtk.css", &link).expect("the old link");
+        let created = dir.path().join("assets");
+
+        let plan = ApplyPlan {
+            validations: Vec::new(),
+            writes: vec![gtk_settings_write(&settings)],
+            links: vec![
+                LinkWrite {
+                    path: link.clone(),
+                    action: LinkAction::PointAt(PathBuf::from("/themes/New/gtk-4.0/gtk.css")),
+                    label: "GTK 4 theme link (gtk.css)".to_string(),
+                },
+                LinkWrite {
+                    path: created.clone(),
+                    action: LinkAction::PointAt(PathBuf::from("/themes/New/gtk-4.0/assets")),
+                    label: "GTK 4 theme link (assets)".to_string(),
+                },
+            ],
+            palette: Some(PaletteSwitch {
+                scheme: "nord".to_string(),
+                generate_colors: PathBuf::from("/fake/repo/scripts/generate-colors"),
+            }),
+            reload_params: ReloadParams::default(),
+        };
+        let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake(1))]);
+        let outcome = run(
+            &plan,
+            &tracker,
+            &palette_capabilities(),
+            &runner,
+            &MockProcessSignaller::new(),
+        );
+
+        match outcome {
+            ApplyOutcome::WriteFailed(failure) => assert_eq!(
+                failure.rolled_back,
+                vec![
+                    created.clone(),
+                    link.clone(),
+                    fs::canonicalize(&settings).expect("canonicalize"),
+                ],
+                "every step is undone, newest first; links by their own path"
+            ),
+            other => panic!("expected WriteFailed, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read_link(&link).expect("read the link"),
+            Path::new("/themes/Old/gtk-4.0/gtk.css")
+        );
+        assert!(
+            fs::symlink_metadata(&created).is_err(),
+            "the new link is gone"
+        );
+        assert_eq!(
+            fs::read(&settings).expect("read"),
+            b"[Settings]\ngtk-theme-name=Old\n"
+        );
+    }
+
+    #[test]
+    fn a_failing_link_step_rolls_back_the_file_writes_and_runs_no_reload() {
+        // A plain file where a link was planned (it appeared after the page looked) is
+        // refused by the writer, and the transaction is undone: the settings.ini write
+        // before it is restored and no gsettings call is made.
+        let dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let settings = write_file(&dir, "settings.ini", b"[Settings]\ngtk-theme-name=Old\n");
+        let tracker = record_baseline(&[&settings]);
+        let plain = write_file(&dir, "gtk.css", b"/* the user's own */\n");
+
+        let plan = ApplyPlan {
+            validations: Vec::new(),
+            writes: vec![gtk_settings_write(&settings)],
+            links: vec![LinkWrite {
+                path: plain.clone(),
+                action: LinkAction::Remove,
+                label: "GTK 4 theme link (gtk.css)".to_string(),
+            }],
+            palette: None,
+            reload_params: ReloadParams {
+                gtk_theme: Some("New".to_string()),
+                ..ReloadParams::default()
+            },
+        };
+        let runner = MockCommandRunner::new();
+        let outcome = run(
+            &plan,
+            &tracker,
+            &Capabilities::for_tests(&[Binary::Gsettings], &[], false),
+            &runner,
+            &MockProcessSignaller::new(),
+        );
+
+        match outcome {
+            ApplyOutcome::WriteFailed(failure) => {
+                assert!(
+                    matches!(
+                        &failure.cause,
+                        WriteFailureCause::Link {
+                            path,
+                            error: WriteError::NotASymlink { .. },
+                            ..
+                        } if path == &plain
+                    ),
+                    "{:?}",
+                    failure.cause
+                );
+                let message = failure.cause.to_string();
+                assert!(
+                    message.starts_with("the GTK 4 theme link (gtk.css) step failed: "),
+                    "{message}"
+                );
+                assert!(message.contains("not a symbolic link"), "{message}");
+                assert_eq!(
+                    message.matches(&plain.display().to_string()).count(),
+                    1,
+                    "the path is rendered once: {message}"
+                );
+                assert_eq!(
+                    failure.rolled_back,
+                    vec![fs::canonicalize(&settings).expect("canonicalize")]
+                );
+            }
+            other => panic!("expected WriteFailed, got {other:?}"),
+        }
+        assert_eq!(fs::read(&plain).expect("read"), b"/* the user's own */\n");
+        assert_eq!(
+            fs::read(&settings).expect("read"),
+            b"[Settings]\ngtk-theme-name=Old\n"
+        );
+        assert!(
+            runner.recorded().is_empty(),
+            "no reload after a failed write"
+        );
+    }
+
     #[test]
     fn a_generate_colors_failure_carries_the_generators_stderr_into_its_message() {
         // Task 9.10: the exit code alone does not say *why* the palette could not be
@@ -1621,6 +1933,7 @@ mod tests {
         let plan = ApplyPlan {
             validations: Vec::new(),
             writes: Vec::new(),
+            links: Vec::new(),
             palette: Some(PaletteSwitch {
                 scheme: "nord".to_string(),
                 generate_colors: PathBuf::from("/fake/repo/scripts/generate-colors"),
@@ -1740,6 +2053,7 @@ mod tests {
                 validation: WriteValidation::InPlan,
                 mode: WriteMode::Replace,
             }],
+            links: Vec::new(),
             palette: Some(PaletteSwitch {
                 scheme: "nord".to_string(),
                 generate_colors: PathBuf::from("/fake/generate-colors"),
@@ -1798,6 +2112,7 @@ mod tests {
                 validation: WriteValidation::InPlan,
                 mode: WriteMode::Replace,
             }],
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };
@@ -1844,6 +2159,7 @@ mod tests {
         let plan = ApplyPlan {
             validations: Vec::new(),
             writes: Vec::new(),
+            links: Vec::new(),
             palette: Some(PaletteSwitch {
                 scheme: "nord".to_string(),
                 generate_colors: PathBuf::from("/fake/generate-colors"),
@@ -1924,6 +2240,7 @@ mod tests {
                 validation: WriteValidation::InPlan,
                 mode: WriteMode::Replace,
             }],
+            links: Vec::new(),
             palette: Some(PaletteSwitch {
                 scheme: "nord".to_string(),
                 generate_colors: PathBuf::from("/fake/repo/scripts/generate-colors"),
@@ -2015,7 +2332,7 @@ mod tests {
         let result = if fs::File::create(subdir.join(".probe")).is_ok() {
             None
         } else {
-            Some(roll_back(std::slice::from_ref(&snapshot)))
+            Some(roll_back(&[StepSnapshot::File(snapshot)]))
         };
 
         // Restore write permission so the temp dir can be cleaned up.
@@ -2086,6 +2403,7 @@ mod tests {
                     mode: WriteMode::Replace,
                 })
                 .collect(),
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         }
@@ -2221,6 +2539,7 @@ mod tests {
         let palette_only = ApplyPlan {
             validations: Vec::new(),
             writes: Vec::new(),
+            links: Vec::new(),
             palette: Some(PaletteSwitch {
                 scheme: "nord".to_string(),
                 generate_colors: PathBuf::from("/fake/generate-colors"),
@@ -2285,6 +2604,7 @@ mod tests {
                 validation: WriteValidation::InPlan,
                 mode: WriteMode::Replace,
             }],
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };
@@ -2389,6 +2709,7 @@ mod tests {
                 validation: WriteValidation::InPlan,
                 mode: WriteMode::Replace,
             }],
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };
@@ -2419,6 +2740,7 @@ mod tests {
         let empty_plan = ApplyPlan {
             validations: Vec::new(),
             writes: Vec::new(),
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };

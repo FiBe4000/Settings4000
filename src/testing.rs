@@ -70,6 +70,21 @@ const HOME_LINKS: &[(&str, &str)] = &[
     (".icons/default/index.theme", "icons/default/index.theme"),
 ];
 
+/// The GTK theme the fixture `settings.ini` files name, whose GTK 4 part the
+/// installer links from `~/.config/gtk-4.0` like `setup.sh` does (task 11.16).
+pub const FIXTURE_ACTIVE_GTK_THEME: &str = "Everforest-Green-Dark";
+
+/// A second installed theme with a GTK 4 part, for tests that switch to it.
+pub const FIXTURE_GTK4_THEME: &str = "Fixture-Gtk4";
+
+/// An installed theme with only a GTK 3 part, for tests of the "no GTK 4 version"
+/// path (the GTK 4 links are removed).
+pub const FIXTURE_GTK3_ONLY_THEME: &str = "Fixture-Gtk3-Only";
+
+/// The entries of `~/.config/gtk-4.0/` that `setup.sh` links into the active theme's
+/// `gtk-4.0/` directory (analysis §8.4).
+pub const GTK4_THEME_LINK_NAMES: [&str; 3] = ["gtk.css", "gtk-dark.css", "assets"];
+
 /// An installed fixture dotfiles tree (task 7.1, R6.1).
 ///
 /// Owns the backing [`TempDir`]: the whole tree is deleted when the handle is
@@ -92,7 +107,14 @@ const HOME_LINKS: &[(&str, &str)] = &[
 /// ├── .icons/default/index.theme -> …/.dotfiles/icons/default/index.theme
 /// ├── .zsh_colors -> .dotfiles/zsh/colors.zsh
 /// └── Pictures/wallpaper/18.jpg          — stub the configs' `~/…` paths name
+/// <temp>/usr/share/themes/               — stand-in for the system theme root
+/// ├── Everforest-Green-Dark/{gtk-3.0,gtk-4.0/{gtk.css,gtk-dark.css,assets/}}
+/// ├── Fixture-Gtk4/{gtk-3.0,gtk-4.0/{gtk.css,gtk-dark.css,assets/}}
+/// └── Fixture-Gtk3-Only/gtk-3.0
 /// ```
+///
+/// plus the three GTK 4 theme links `<home>/.config/gtk-4.0/{gtk.css,gtk-dark.css,
+/// assets}` pointing into `Everforest-Green-Dark/gtk-4.0/` (absolute targets).
 #[derive(Debug)]
 pub struct FixtureDotfiles {
     /// Keeps the temp directory alive; dropping it removes the whole tree.
@@ -101,6 +123,8 @@ pub struct FixtureDotfiles {
     home: PathBuf,
     /// The dotfiles repo root: `<home>/.dotfiles`.
     repo_root: PathBuf,
+    /// The stand-in for `/usr/share/themes`: `<temp>/usr/share/themes`.
+    system_themes_root: PathBuf,
     /// The fake `$XDG_CONFIG_HOME`: `<home>/.config`.
     config_root: PathBuf,
 }
@@ -119,7 +143,10 @@ impl FixtureDotfiles {
     /// 3. create the home-level deployment links in [`HOME_LINKS`]
     ///    (`<home>/.zsh_colors`, `<home>/.icons/default/index.theme`), which
     ///    live outside `$XDG_CONFIG_HOME`;
-    /// 4. create the stub wallpaper file the configs' home-relative paths name.
+    /// 4. create the stub wallpaper file the configs' home-relative paths name;
+    /// 5. build the stand-in system theme root and link the GTK 4 theme entries of
+    ///    the active theme from `<home>/.config/gtk-4.0`, as `setup.sh` does (task
+    ///    11.16, analysis §8.4).
     ///
     /// Each call builds a completely independent tree, so parallel tests never
     /// share state. Panics on any I/O failure (see the module docs).
@@ -170,10 +197,22 @@ impl FixtureDotfiles {
         fs::write(&wallpaper, b"fixture wallpaper stand-in")
             .unwrap_or_else(|e| panic!("failed to write {}: {e}", wallpaper.display()));
 
+        let system_themes_root = temp_root.join("usr/share/themes");
+        build_system_themes(&system_themes_root);
+        let active_gtk4 = system_themes_root
+            .join(FIXTURE_ACTIVE_GTK_THEME)
+            .join("gtk-4.0");
+        for name in GTK4_THEME_LINK_NAMES {
+            let link = config_root.join("gtk-4.0").join(name);
+            symlink(active_gtk4.join(name), &link)
+                .unwrap_or_else(|e| panic!("failed to symlink {}: {e}", link.display()));
+        }
+
         FixtureDotfiles {
             _temp: temp,
             home,
             repo_root,
+            system_themes_root,
             config_root,
         }
     }
@@ -187,6 +226,20 @@ impl FixtureDotfiles {
     /// discovery (R8.5) resolves from a deployed config symlink.
     pub fn repo_root(&self) -> &Path {
         &self.repo_root
+    }
+
+    /// The stand-in for `/usr/share/themes` (`<temp>/usr/share/themes`, outside
+    /// the fake home) — a GTK theme root to pass in
+    /// [`ThemeRoots::gtk_theme_dirs`](crate::core::theme::ThemeRoots::gtk_theme_dirs)
+    /// (task 11.16).
+    pub fn system_themes_root(&self) -> &Path {
+        &self.system_themes_root
+    }
+
+    /// The `gtk-4.0/` directory of the installed fixture theme `theme` under
+    /// [`Self::system_themes_root`] — what the GTK 4 theme links point into.
+    pub fn system_theme_gtk4_dir(&self, theme: &str) -> PathBuf {
+        self.system_themes_root.join(theme).join("gtk-4.0")
     }
 
     /// The fake `$XDG_CONFIG_HOME` (`<home>/.config`) holding the deployment
@@ -298,6 +351,41 @@ fn deploy_config_symlinks(repo_config: &Path, config_root: &Path) {
             });
         }
     }
+}
+
+/// Builds the stand-in system theme root at `root` (see the [`FixtureDotfiles`]
+/// layout): two themes with a GTK 4 part and one with only a GTK 3 part. Each file
+/// names its theme and role, so a test can tell from the bytes which theme a link
+/// reaches and prove the files were never rewritten.
+fn build_system_themes(root: &Path) {
+    let write = |path: PathBuf, contents: String| {
+        create_parent_dirs(&path);
+        fs::write(&path, contents)
+            .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
+    };
+    for theme in [FIXTURE_ACTIVE_GTK_THEME, FIXTURE_GTK4_THEME] {
+        let dir = root.join(theme);
+        write(
+            dir.join("gtk-3.0/gtk.css"),
+            format!("/* {theme} gtk-3.0 */\n"),
+        );
+        write(
+            dir.join("gtk-4.0/gtk.css"),
+            format!("/* {theme} gtk-4.0 */\n"),
+        );
+        write(
+            dir.join("gtk-4.0/gtk-dark.css"),
+            format!("/* {theme} gtk-4.0 dark */\n"),
+        );
+        write(
+            dir.join("gtk-4.0/assets/check.svg"),
+            format!("<svg><!-- {theme} --></svg>\n"),
+        );
+    }
+    write(
+        root.join(FIXTURE_GTK3_ONLY_THEME).join("gtk-3.0/gtk.css"),
+        format!("/* {FIXTURE_GTK3_ONLY_THEME} gtk-3.0 */\n"),
+    );
 }
 
 /// Creates all missing parent directories of `path`.

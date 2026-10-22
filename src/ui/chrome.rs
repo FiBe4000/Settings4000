@@ -659,6 +659,7 @@ mod tests {
                 validation: WriteValidation::InPlan,
                 mode: WriteMode::Replace,
             }],
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };
@@ -740,6 +741,7 @@ mod tests {
         let plan = ApplyPlan {
             validations: Vec::new(),
             writes: Vec::new(),
+            links: Vec::new(),
             palette: Some(apply::PaletteSwitch {
                 scheme: "nord".to_string(),
                 generate_colors: PathBuf::from("/fake/repo/scripts/generate-colors"),
@@ -787,6 +789,7 @@ mod tests {
                 validation: WriteValidation::InPlan,
                 mode: WriteMode::Replace,
             }],
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };

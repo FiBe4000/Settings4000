@@ -901,6 +901,7 @@ listener {
         let plan = ApplyPlan {
             validations: dirty,
             writes: vec![write],
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };
@@ -961,6 +962,7 @@ listener {
         let plan = ApplyPlan {
             validations: Vec::new(),
             writes: Vec::new(),
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };
@@ -1037,6 +1039,7 @@ listener {
         let plan = ApplyPlan {
             validations: dirty,
             writes: vec![write],
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };
@@ -1064,6 +1067,7 @@ listener {
         let plan2 = ApplyPlan {
             validations: dirty2,
             writes: vec![write2],
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };

@@ -1344,6 +1344,7 @@ hl.config({
         let plan = ApplyPlan {
             validations: dirty,
             writes: vec![write],
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };
@@ -1422,6 +1423,7 @@ hl.config({
         let plan = ApplyPlan {
             validations: dirty,
             writes: vec![write],
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };
@@ -1446,6 +1448,7 @@ hl.config({
         let plan2 = ApplyPlan {
             validations: dirty2,
             writes: vec![write2],
+            links: Vec::new(),
             palette: None,
             reload_params: ReloadParams::default(),
         };

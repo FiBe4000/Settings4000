@@ -753,6 +753,7 @@ shadow=0a0c0d
             validations: Vec::new(),
             // The switch contributes NO file write: v1 never edits colors/<scheme>.
             writes: Vec::new(),
+            links: Vec::new(),
             palette: model.apply_contribution(),
             reload_params: ReloadParams::default(),
         };

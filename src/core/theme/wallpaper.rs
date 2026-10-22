@@ -869,6 +869,7 @@ label {
         let plan = ApplyPlan {
             validations: contribution.validations,
             writes: contribution.writes,
+            links: Vec::new(),
             palette: None,
             reload_params: contribution.reload_params,
         };
@@ -1008,6 +1009,7 @@ label {
         let plan = ApplyPlan {
             validations: contribution.validations,
             writes: contribution.writes,
+            links: Vec::new(),
             palette: None,
             reload_params: contribution.reload_params,
         };
@@ -1065,6 +1067,7 @@ label {
         let plan = ApplyPlan {
             validations: contribution.validations,
             writes: contribution.writes,
+            links: Vec::new(),
             palette: None,
             reload_params: contribution.reload_params,
         };
@@ -1242,6 +1245,7 @@ label {
         let plan = ApplyPlan {
             validations: contribution.validations,
             writes: contribution.writes,
+            links: Vec::new(),
             palette: None,
             reload_params: contribution.reload_params,
         };
@@ -1348,6 +1352,7 @@ label {
         let plan = ApplyPlan {
             validations: contribution.validations,
             writes: contribution.writes,
+            links: Vec::new(),
             palette: None,
             reload_params: contribution.reload_params,
         };
@@ -1480,6 +1485,7 @@ label {
         let plan = ApplyPlan {
             validations: contribution.validations,
             writes: contribution.writes,
+            links: Vec::new(),
             palette: None,
             reload_params: contribution.reload_params,
         };
@@ -1618,6 +1624,7 @@ label {
         let plan = ApplyPlan {
             validations: contribution.validations,
             writes: contribution.writes,
+            links: Vec::new(),
             palette: None,
             reload_params: contribution.reload_params,
         };
@@ -1683,6 +1690,7 @@ label {
         let plan = ApplyPlan {
             validations: contribution.validations,
             writes: contribution.writes,
+            links: Vec::new(),
             palette: None,
             reload_params: contribution.reload_params,
         };

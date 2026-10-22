@@ -38,7 +38,9 @@
 //! and that the session environment copies take effect at the next login. Above the
 //! drop-downs it shows the notes that another program is likely to rewrite the GTK
 //! settings (task 11.12): a `settings.ini` no longer linked to its dotfiles repo copy,
-//! and a running `xsettingsd`.
+//! and a running `xsettingsd`. Under the GTK-theme drop-down it shows when GTK 4 and
+//! libadwaita apps will not follow the chosen theme through the `~/.config/gtk-4.0`
+//! theme links (task 11.16).
 //!
 //! # Why this page is bespoke, not declarative
 //!
@@ -286,8 +288,9 @@ impl Inner {
     /// cursor-theme, and cursor-size drop-downs, preselected from the backing config,
     /// with the `GTK_THEME` override banner, the live-restyle note (task 6.4), the
     /// cursor-copy and next-login notes (task 11.5), the external-writer notes
-    /// (task 11.12), and the note that an older notifd shows a new icon theme only
-    /// after its next start (task 11.14).
+    /// (task 11.12), the note that an older notifd shows a new icon theme only
+    /// after its next start (task 11.14), and the GTK 4 theme-link note under the
+    /// GTK-theme drop-down (task 11.16).
     ///
     /// When `settings.ini` is unreadable the rows are hidden behind a note (R4.4); when
     /// a `GTK_THEME` override is active the GTK-theme drop-down is disabled and the
@@ -343,6 +346,12 @@ impl Inner {
         );
         gtk_dropdown.set_sensitive(!model.gtk_dropdown_disabled());
         section.append(&labelled_row("GTK theme", &gtk_dropdown));
+        // Task 11.16 (analysis §8.4): GTK 4 and libadwaita apps follow the GTK theme
+        // through three links in ~/.config/gtk-4.0; say when they cannot (the theme has
+        // no GTK 4 version, or a file of the user's own sits where a link would be).
+        if let Some(gtk4) = model.gtk4_links_note() {
+            section.append(&note(&gtk4));
+        }
 
         // R2.2: whether a GTK theme change restyles live or takes effect next launch.
         let restyle = if model.live_restyle() {

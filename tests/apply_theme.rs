@@ -29,23 +29,34 @@
 //! wallpaper` request (no `preload`) followed by the fixture's
 //! `~/.config/eww/scripts/bar-text-tone --apply` while eww runs.
 //!
+//! Task 11.16 adds the third leg of a GTK-theme change: the GTK 4 theme links
+//! `~/.config/gtk-4.0/{gtk.css,gtk-dark.css,assets}`, which the fixture deploys
+//! into a stand-in `/usr/share/themes` like `setup.sh` does (analysis §8.4). A
+//! theme with a `gtk-4.0/` directory re-points all three, one without removes
+//! them (with a page note), a plain file at any of them blocks the step with a
+//! `warn` while the INI and gsettings writes land, and a failure after — or in —
+//! the link step rolls the links and the INI writes back together.
+//!
 //! Like Display, these models own their files' freshness (R5.6): the window
 //! checks `check_conflict()` and aborts before building the plan, so the
 //! conflict test asserts that guard.
 
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 use nix::sys::signal::Signal;
 
 use settings4000::core::apply::WriteMode;
-use settings4000::core::apply::{self, ApplyOutcome, ApplyPlan, WriteFailureCause};
+use settings4000::core::apply::{self, ApplyOutcome, ApplyPlan, LinkAction, WriteFailureCause};
 use settings4000::core::detect::{Binary, Capabilities, Daemon, DetectionInputs};
 use settings4000::core::freshness::FreshnessTracker;
 use settings4000::core::model::validate_image_value;
 use settings4000::core::notifd::{NotifdReplies, NotifdStatus, NotifdVersion};
 use settings4000::core::reload::BackingFile;
 use settings4000::core::reload::ReloadParams;
+use settings4000::core::theme::ThemesApply;
 use settings4000::core::theme::{
     PaletteModel, ThemeRoots, ThemesModel, ThemesPaths, WallpaperModel, WallpaperPaths,
 };
@@ -54,8 +65,9 @@ use settings4000::parsers::palette::SchemaSource;
 use settings4000::system::command::{Command, CommandOutput, MockCommandRunner};
 use settings4000::system::signal::{MockProcessSignaller, SignalCall};
 use settings4000::testing::{
-    CapturedEvent, FixtureDotfiles, assert_repo_untouched_except, capture_logs, differing_lines,
-    expect_applied, replace_once, repo_snapshot,
+    CapturedEvent, FIXTURE_ACTIVE_GTK_THEME, FIXTURE_GTK3_ONLY_THEME, FIXTURE_GTK4_THEME,
+    FixtureDotfiles, GTK4_THEME_LINK_NAMES, assert_repo_untouched_except, capture_logs,
+    differing_lines, expect_applied, replace_once, repo_snapshot,
 };
 
 /// Builds the palette model exactly as the startup worker does (task 6.3): the
@@ -248,6 +260,7 @@ fn empty_plan() -> ApplyPlan {
     ApplyPlan {
         validations: Vec::new(),
         writes: Vec::new(),
+        links: Vec::new(),
         palette: None,
         reload_params: ReloadParams::default(),
     }
@@ -1026,22 +1039,30 @@ fn a_generate_colors_failure_rolls_back_the_theme_writes_and_reloads_nothing() {
     // rollback — are restored byte-exactly, generate-colors is the ONLY command
     // ever run (it is the LAST write step, so no reload followed), and the whole
     // repo — the generated partials above all — is byte-identical afterwards.
+    // Fixture-Theme ships only gtk-3.0, so the plan also removes the three GTK 4
+    // theme links (task 11.16); the rollback re-creates them.
     let fx = FixtureDotfiles::install();
     fs::create_dir_all(fx.home().join(".themes/Fixture-Theme/gtk-3.0"))
         .expect("create the fixture GTK theme");
     let before = repo_snapshot(&fx);
 
-    let mut themes = load_themes(&fx);
+    let mut themes = load_themes_with_system_root(&fx);
     themes.stage_gtk_theme("Fixture-Theme");
     let mut palette = load_palette(&fx);
     palette.stage("nord");
 
-    let mut plan = empty_plan();
     let contribution = themes
         .apply_contribution()
         .expect("a dirty theme contributes");
-    plan.writes.extend(contribution.writes);
-    plan.reload_params = contribution.reload_params;
+    assert_eq!(contribution.links.len(), 3, "one removal per link");
+    assert!(
+        contribution
+            .links
+            .iter()
+            .all(|link| link.action == LinkAction::Remove),
+        "a GTK 3-only theme removes the links"
+    );
+    let mut plan = plan_with_themes(contribution);
     plan.palette = palette.apply_contribution();
 
     // The generator fails — also the shape of a missing/incomplete theme/fonts,
@@ -1081,11 +1102,15 @@ fn a_generate_colors_failure_rolls_back_the_theme_writes_and_reloads_nothing() {
                 "the failure message must carry the generator's diagnostic, got {}",
                 failure.cause
             );
-            // Both already-written files are rolled back (resolved repo targets,
-            // newest-first) — proof the writes preceded the generator.
+            // Every completed step is rolled back newest-first — the three link
+            // removals (by their own path), then both settings.ini files (resolved
+            // repo targets) — proof they all preceded the generator.
             assert_eq!(
                 failure.rolled_back,
                 vec![
+                    gtk4_link(&fx, "assets"),
+                    gtk4_link(&fx, "gtk-dark.css"),
+                    gtk4_link(&fx, "gtk.css"),
                     fx.repo_path("config/gtk-4.0/settings.ini"),
                     fx.repo_path("config/gtk-3.0/settings.ini"),
                 ]
@@ -1106,8 +1131,13 @@ fn a_generate_colors_failure_rolls_back_the_theme_writes_and_reloads_nothing() {
     assert!(signaller.calls().is_empty());
 
     // The rollback restored everything: the whole repo — settings.ini files,
-    // palette sources, and every generated partial — is byte-identical (R5.4).
+    // palette sources, and every generated partial — is byte-identical (R5.4), and
+    // the GTK 4 links point at the active theme again.
     assert_repo_untouched_except(&fx, &before, &[]);
+    assert_eq!(
+        gtk4_link_targets(&fx),
+        targets_into(&fx, FIXTURE_ACTIVE_GTK_THEME)
+    );
 }
 
 #[test]
@@ -1397,5 +1427,518 @@ fn a_running_xsettingsd_in_the_process_list_sets_the_external_writer_note() {
     assert_eq!(
         load_themes_detected(&fx, &caps).external_gtk_writer_note(),
         None
+    );
+}
+
+// --- Task 11.16: the GTK 4 theme links ---------------------------------------------
+
+/// The GTK/icon/cursor model with the stand-in system theme root among its GTK theme
+/// roots, as the startup loader includes `/usr/share/themes` (task 11.16).
+fn load_themes_with_system_root(fx: &FixtureDotfiles) -> ThemesModel {
+    let roots = ThemeRoots {
+        gtk_theme_dirs: vec![
+            fx.home().join(".themes"),
+            fx.system_themes_root().to_path_buf(),
+        ],
+        icon_dirs: vec![fx.home().join(".icons")],
+    };
+    ThemesModel::load(&roots, themes_paths(fx), false, None)
+}
+
+/// The live path of one GTK 4 theme link, `~/.config/gtk-4.0/<name>`.
+fn gtk4_link(fx: &FixtureDotfiles, name: &str) -> PathBuf {
+    fx.config_path("gtk-4.0").join(name)
+}
+
+/// The target text of each GTK 4 theme link, `None` for one that is not a link.
+fn gtk4_link_targets(fx: &FixtureDotfiles) -> Vec<Option<PathBuf>> {
+    GTK4_THEME_LINK_NAMES
+        .iter()
+        .map(|name| fs::read_link(gtk4_link(fx, name)).ok())
+        .collect()
+}
+
+/// The three link targets into `theme`'s `gtk-4.0/` under the system root.
+fn targets_into(fx: &FixtureDotfiles, theme: &str) -> Vec<Option<PathBuf>> {
+    let dir = fx.system_theme_gtk4_dir(theme);
+    GTK4_THEME_LINK_NAMES
+        .iter()
+        .map(|name| Some(dir.join(name)))
+        .collect()
+}
+
+/// Every entry under the system theme root: a file's bytes, `None` for a directory.
+/// Panics on a symlink — the stand-in root has none, so one appearing would mean a
+/// link step wrote inside the theme root.
+fn theme_root_snapshot(fx: &FixtureDotfiles) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    fn walk(dir: &Path, out: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+        for entry in fs::read_dir(dir).expect("read a theme dir") {
+            let path = entry.expect("entry").path();
+            let kind = fs::symlink_metadata(&path).expect("lstat").file_type();
+            assert!(!kind.is_symlink(), "{} became a link", path.display());
+            if kind.is_dir() {
+                out.insert(path.clone(), None);
+                walk(&path, out);
+            } else {
+                out.insert(path.clone(), Some(fs::read(&path).expect("read")));
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(fx.system_themes_root(), &mut out);
+    out
+}
+
+/// A plan holding exactly the Theme contribution: its writes, its link steps and its
+/// reload parameters.
+fn plan_with_themes(contribution: ThemesApply) -> ApplyPlan {
+    let mut plan = empty_plan();
+    plan.writes = contribution.writes;
+    plan.links = contribution.links;
+    plan.reload_params = contribution.reload_params;
+    plan
+}
+
+/// The one `gsettings set … gtk-theme <theme>` call a GTK-theme Apply makes.
+fn gsettings_gtk_theme(theme: &str) -> Command {
+    Command::new("gsettings").args(["set", "org.gnome.desktop.interface", "gtk-theme", theme])
+}
+
+#[test]
+fn the_fixture_deploys_the_gtk4_links_into_the_active_theme() {
+    // The starting state every test below relies on: setup.sh's three links into the
+    // theme the fixture settings.ini names, and the page shows no link note for it.
+    let fx = FixtureDotfiles::install();
+    assert_eq!(
+        gtk4_link_targets(&fx),
+        targets_into(&fx, FIXTURE_ACTIVE_GTK_THEME)
+    );
+    let themes = load_themes_with_system_root(&fx);
+    assert_eq!(themes.gtk4_links_note(), None);
+    assert!(
+        themes
+            .gtk_themes()
+            .iter()
+            .any(|name| name == FIXTURE_GTK4_THEME)
+    );
+}
+
+#[test]
+fn a_gtk_theme_with_a_gtk4_dir_re_points_all_three_links() {
+    // R3.3, analysis §8.4: the GTK-theme Apply writes both settings.ini, sets
+    // gsettings, and re-points the three links at the new theme's gtk-4.0 entries —
+    // touching only the links: every theme file stays byte-identical and in place.
+    let fx = FixtureDotfiles::install();
+    let before = repo_snapshot(&fx);
+    let themes_before = theme_root_snapshot(&fx);
+
+    let mut themes = load_themes_with_system_root(&fx);
+    themes.stage_gtk_theme(FIXTURE_GTK4_THEME);
+    let contribution = themes
+        .apply_contribution()
+        .expect("a dirty theme contributes");
+    assert_eq!(contribution.links.len(), 3, "one step per link");
+    let plan = plan_with_themes(contribution);
+
+    let caps = Capabilities::for_tests(&[Binary::Gsettings], &[], false);
+    let runner = MockCommandRunner::new();
+    let outcome = apply::run(
+        &plan,
+        &FreshnessTracker::new(),
+        &caps,
+        &runner,
+        &MockProcessSignaller::new(),
+    );
+    let (reload_failures, written) = expect_applied(outcome);
+    assert!(reload_failures.is_empty());
+    assert_eq!(written.len(), 2, "the links are not file writes");
+    assert_eq!(
+        runner.recorded(),
+        vec![gsettings_gtk_theme(FIXTURE_GTK4_THEME)]
+    );
+
+    assert_eq!(
+        gtk4_link_targets(&fx),
+        targets_into(&fx, FIXTURE_GTK4_THEME)
+    );
+    for name in GTK4_THEME_LINK_NAMES {
+        assert!(
+            fs::symlink_metadata(gtk4_link(&fx, name))
+                .expect("lstat")
+                .file_type()
+                .is_symlink(),
+            "{name} is still a link"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(gtk4_link(&fx, "gtk.css")).expect("read through the link"),
+        format!("/* {FIXTURE_GTK4_THEME} gtk-4.0 */\n")
+    );
+    assert!(
+        fx.system_theme_gtk4_dir(FIXTURE_GTK4_THEME)
+            .join("assets")
+            .is_dir()
+    );
+    assert_eq!(
+        theme_root_snapshot(&fx),
+        themes_before,
+        "no theme file changed"
+    );
+    assert_repo_untouched_except(
+        &fx,
+        &before,
+        &["config/gtk-3.0/settings.ini", "config/gtk-4.0/settings.ini"],
+    );
+    // The 11.12 rule still holds for the settings.ini written beside the links.
+    assert!(
+        fs::symlink_metadata(fx.config_path("gtk-4.0/settings.ini"))
+            .expect("lstat")
+            .file_type()
+            .is_symlink()
+    );
+
+    // After the commit the model plans nothing more for the links.
+    themes.commit();
+    assert!(!themes.is_dirty());
+    assert_eq!(themes.gtk4_links_note(), None);
+}
+
+#[test]
+fn a_gtk_theme_without_a_gtk4_dir_removes_the_links_and_the_note_says_so() {
+    let fx = FixtureDotfiles::install();
+    let themes_before = theme_root_snapshot(&fx);
+
+    let mut themes = load_themes_with_system_root(&fx);
+    themes.stage_gtk_theme(FIXTURE_GTK3_ONLY_THEME);
+    let note = format!(
+        "\u{201c}{FIXTURE_GTK3_ONLY_THEME}\u{201d} has no GTK 4 version, so GTK 4 and \
+         libadwaita apps fall back to the default Adwaita look."
+    );
+    assert_eq!(
+        themes.gtk4_links_note(),
+        Some(note.clone()),
+        "said before the Apply"
+    );
+    let contribution = themes
+        .apply_contribution()
+        .expect("a dirty theme contributes");
+    assert!(
+        contribution
+            .links
+            .iter()
+            .all(|link| link.action == LinkAction::Remove)
+    );
+    let plan = plan_with_themes(contribution);
+
+    let outcome = apply::run(
+        &plan,
+        &FreshnessTracker::new(),
+        &Capabilities::for_tests(&[Binary::Gsettings], &[], false),
+        &MockCommandRunner::new(),
+        &MockProcessSignaller::new(),
+    );
+    expect_applied(outcome);
+    assert_eq!(gtk4_link_targets(&fx), vec![None, None, None]);
+    for name in GTK4_THEME_LINK_NAMES {
+        assert!(
+            fs::symlink_metadata(gtk4_link(&fx, name)).is_err(),
+            "{name} removed"
+        );
+    }
+    assert_eq!(
+        theme_root_snapshot(&fx),
+        themes_before,
+        "removing the links never touches the old theme's files"
+    );
+    themes.commit();
+    assert_eq!(
+        themes.gtk4_links_note(),
+        Some(note),
+        "and still true after it"
+    );
+}
+
+#[test]
+fn a_plain_gtk_css_blocks_the_link_step_with_a_warning_and_the_ini_writes_still_land() {
+    // A real gtk.css is a user-managed override (like GTK_THEME): none of the three
+    // links is changed — mixing two themes would be worse — a `warn` says so, the page
+    // notes it, and the settings.ini/gsettings legs of the change still land.
+    let fx = FixtureDotfiles::install();
+    let gtk_css = gtk4_link(&fx, "gtk.css");
+    fs::remove_file(&gtk_css).expect("remove the link");
+    fs::write(&gtk_css, b"/* my own GTK 4 tweaks */\n").expect("a plain gtk.css");
+
+    let mut themes = load_themes_with_system_root(&fx);
+    themes.stage_gtk_theme(FIXTURE_GTK4_THEME);
+    let mut contribution = None;
+    let events = capture_logs(|| contribution = themes.apply_contribution());
+    let contribution = contribution.expect("a dirty theme contributes");
+    let warnings: Vec<&CapturedEvent> = events
+        .iter()
+        .filter(|event| {
+            event.level == tracing::Level::WARN && event.message.contains("user-managed override")
+        })
+        .collect();
+    assert_eq!(warnings.len(), 1, "{events:?}");
+    assert!(
+        warnings[0].fields.contains(&gtk_css.display().to_string()),
+        "{:?}",
+        warnings[0]
+    );
+    assert!(
+        contribution.links.is_empty(),
+        "all three links are left alone"
+    );
+    assert_eq!(
+        themes.gtk4_links_note().as_deref(),
+        Some(
+            "~/.config/gtk-4.0/gtk.css is a file of its own rather than a link to a theme, \
+             so GTK 4 and libadwaita apps are left as they are: they do not follow a \
+             GTK-theme change made here."
+        )
+    );
+
+    let plan = plan_with_themes(contribution);
+    let runner = MockCommandRunner::new();
+    let outcome = apply::run(
+        &plan,
+        &FreshnessTracker::new(),
+        &Capabilities::for_tests(&[Binary::Gsettings], &[], false),
+        &runner,
+        &MockProcessSignaller::new(),
+    );
+    let (_, written) = expect_applied(outcome);
+    assert_eq!(written.len(), 2, "both settings.ini files are written");
+    assert_eq!(
+        runner.recorded(),
+        vec![gsettings_gtk_theme(FIXTURE_GTK4_THEME)]
+    );
+    for relative in ["gtk-3.0/settings.ini", "gtk-4.0/settings.ini"] {
+        assert!(
+            fs::read_to_string(fx.config_path(relative))
+                .expect("read")
+                .contains(&format!("gtk-theme-name={FIXTURE_GTK4_THEME}")),
+            "{relative}"
+        );
+    }
+    assert_eq!(
+        fs::read(&gtk_css).expect("read"),
+        b"/* my own GTK 4 tweaks */\n"
+    );
+    let active = targets_into(&fx, FIXTURE_ACTIVE_GTK_THEME);
+    assert_eq!(
+        gtk4_link_targets(&fx),
+        vec![None, active[1].clone(), active[2].clone()]
+    );
+}
+
+#[test]
+fn a_failure_after_the_link_step_restores_the_previous_link_targets() {
+    // R5.4: the link steps are part of the write transaction. A GTK-theme change and a
+    // palette switch whose generator fails (it runs after the links): the links go back
+    // to the old theme and the settings.ini writes are restored, all newest first.
+    let fx = FixtureDotfiles::install();
+    let before = repo_snapshot(&fx);
+    let themes_before = theme_root_snapshot(&fx);
+
+    let mut themes = load_themes_with_system_root(&fx);
+    themes.stage_gtk_theme(FIXTURE_GTK4_THEME);
+    let mut palette = load_palette(&fx);
+    palette.stage("nord");
+    let mut plan = plan_with_themes(themes.apply_contribution().expect("dirty"));
+    plan.palette = palette.apply_contribution();
+
+    let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake(1))]);
+    let outcome = apply::run(
+        &plan,
+        &FreshnessTracker::new(),
+        &Capabilities::for_tests(&[Binary::Gsettings, Binary::Hyprctl], &[], true),
+        &runner,
+        &MockProcessSignaller::new(),
+    );
+    match outcome {
+        ApplyOutcome::WriteFailed(failure) => {
+            assert!(matches!(
+                failure.cause,
+                WriteFailureCause::GenerateColorsExit { code: Some(1), .. }
+            ));
+            assert_eq!(
+                failure.rolled_back,
+                vec![
+                    gtk4_link(&fx, "assets"),
+                    gtk4_link(&fx, "gtk-dark.css"),
+                    gtk4_link(&fx, "gtk.css"),
+                    fx.repo_path("config/gtk-4.0/settings.ini"),
+                    fx.repo_path("config/gtk-3.0/settings.ini"),
+                ]
+            );
+            assert!(failure.rollback_failures.is_empty());
+        }
+        other => panic!("expected WriteFailed, got {other:?}"),
+    }
+    assert_eq!(
+        gtk4_link_targets(&fx),
+        targets_into(&fx, FIXTURE_ACTIVE_GTK_THEME)
+    );
+    assert_eq!(theme_root_snapshot(&fx), themes_before);
+    assert_repo_untouched_except(&fx, &before, &[]);
+}
+
+/// Restores a directory's mode on drop, so a test that made it read-only cleans up
+/// even when an assertion fails first (the pattern of `tests/apply_input.rs`).
+struct RestoreWritable<'a> {
+    /// The directory whose permissions are restored on drop.
+    dir: &'a Path,
+}
+
+impl Drop for RestoreWritable<'_> {
+    fn drop(&mut self) {
+        // Best-effort: an error here would only mask the original panic.
+        let _ = fs::set_permissions(self.dir, fs::Permissions::from_mode(0o755));
+    }
+}
+
+#[test]
+fn a_failing_link_step_rolls_back_the_ini_writes_and_runs_no_reload() {
+    // R5.4 the other way round: `~/.config/gtk-4.0` is read-only, so the first link
+    // step cannot place its temporary link. The settings.ini writes before it (which
+    // land in the repo through their links, so they succeed) are rolled back, gsettings
+    // is never called, and the links are as they were.
+    let fx = FixtureDotfiles::install();
+    let before = repo_snapshot(&fx);
+    let mut themes = load_themes_with_system_root(&fx);
+    themes.stage_gtk_theme(FIXTURE_GTK4_THEME);
+    let plan = plan_with_themes(themes.apply_contribution().expect("dirty"));
+
+    let links_dir = fx.config_path("gtk-4.0");
+    fs::set_permissions(&links_dir, fs::Permissions::from_mode(0o555))
+        .expect("make the GTK 4 config directory read-only");
+    let _restore = RestoreWritable { dir: &links_dir };
+    // Running as root bypasses directory modes; say so rather than pass silently.
+    if fs::File::create(links_dir.join(".probe")).is_ok() {
+        eprintln!(
+            "skipped: directory modes are not enforced (running as root), so the \
+             link-failure injection cannot work"
+        );
+        return;
+    }
+
+    let runner = MockCommandRunner::new();
+    let outcome = apply::run(
+        &plan,
+        &FreshnessTracker::new(),
+        &Capabilities::for_tests(&[Binary::Gsettings], &[], false),
+        &runner,
+        &MockProcessSignaller::new(),
+    );
+    match outcome {
+        ApplyOutcome::WriteFailed(failure) => {
+            match &failure.cause {
+                WriteFailureCause::Link { path, .. } => {
+                    assert_eq!(path, &gtk4_link(&fx, "gtk.css"));
+                }
+                other => panic!("expected a Link failure, got {other:?}"),
+            }
+            assert_eq!(
+                failure.rolled_back,
+                vec![
+                    fx.repo_path("config/gtk-4.0/settings.ini"),
+                    fx.repo_path("config/gtk-3.0/settings.ini"),
+                ]
+            );
+        }
+        other => panic!("expected WriteFailed, got {other:?}"),
+    }
+    assert!(
+        runner.recorded().is_empty(),
+        "no reload after a failed write phase"
+    );
+    assert_eq!(
+        gtk4_link_targets(&fx),
+        targets_into(&fx, FIXTURE_ACTIVE_GTK_THEME)
+    );
+    assert_repo_untouched_except(&fx, &before, &[]);
+}
+
+#[test]
+fn icon_and_cursor_only_applies_never_touch_the_gtk4_links() {
+    // Task 11.16 item 3: the step follows a gtk-theme-name change only.
+    let fx = FixtureDotfiles::install();
+    fs::create_dir_all(fx.home().join(".icons/Fixture-Cursors/cursors"))
+        .expect("create the fixture cursor theme");
+    let mut themes = load_themes_with_system_root(&fx);
+    themes.stage_cursor_theme("Fixture-Cursors");
+    themes.stage_cursor_size("32");
+    let contribution = themes
+        .apply_contribution()
+        .expect("a dirty cursor contributes");
+    assert!(contribution.links.is_empty());
+}
+
+#[test]
+fn a_gtk4_link_into_a_folder_of_the_users_own_is_left_alone_like_a_plain_file() {
+    // A link that resolves outside every theme root (here `~/custom/gtk.css`) is a
+    // user-managed override: all three links stay, a `warn` names the path, the page
+    // notes it, and the INI and gsettings writes still land. (A dangling link would
+    // instead be repaired — see the unit tests.)
+    let fx = FixtureDotfiles::install();
+    let custom = fx.home().join("custom");
+    fs::create_dir_all(&custom).expect("create the user's folder");
+    fs::write(custom.join("gtk.css"), b"/* mine */\n").expect("the user's css");
+    let gtk_css = gtk4_link(&fx, "gtk.css");
+    fs::remove_file(&gtk_css).expect("remove the theme link");
+    std::os::unix::fs::symlink(custom.join("gtk.css"), &gtk_css).expect("link to custom");
+    let targets_before = gtk4_link_targets(&fx);
+
+    let mut themes = load_themes_with_system_root(&fx);
+    themes.stage_gtk_theme(FIXTURE_GTK4_THEME);
+    let mut contribution = None;
+    let events = capture_logs(|| contribution = themes.apply_contribution());
+    let contribution = contribution.expect("a dirty theme contributes");
+    let warnings: Vec<&CapturedEvent> = events
+        .iter()
+        .filter(|event| {
+            event.level == tracing::Level::WARN && event.message.contains("user-managed override")
+        })
+        .collect();
+    assert_eq!(warnings.len(), 1, "{events:?}");
+    assert!(
+        warnings[0].fields.contains(&gtk_css.display().to_string())
+            && warnings[0].fields.contains("link outside the theme roots"),
+        "{:?}",
+        warnings[0]
+    );
+    assert!(
+        contribution.links.is_empty(),
+        "all three links are left alone"
+    );
+    assert_eq!(
+        themes.gtk4_links_note().as_deref(),
+        Some(
+            "~/.config/gtk-4.0/gtk.css links to a place outside the theme folders, so GTK 4 \
+             and libadwaita apps are left as they are: they do not follow a GTK-theme \
+             change made here."
+        )
+    );
+
+    let plan = plan_with_themes(contribution);
+    let runner = MockCommandRunner::new();
+    let outcome = apply::run(
+        &plan,
+        &FreshnessTracker::new(),
+        &Capabilities::for_tests(&[Binary::Gsettings], &[], false),
+        &runner,
+        &MockProcessSignaller::new(),
+    );
+    let (_, written) = expect_applied(outcome);
+    assert_eq!(written.len(), 2, "both settings.ini files are written");
+    assert_eq!(
+        runner.recorded(),
+        vec![gsettings_gtk_theme(FIXTURE_GTK4_THEME)]
+    );
+    assert_eq!(gtk4_link_targets(&fx), targets_before);
+    assert_eq!(
+        fs::read(custom.join("gtk.css")).expect("read"),
+        b"/* mine */\n"
     );
 }

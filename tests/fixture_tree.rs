@@ -35,7 +35,10 @@ use settings4000::parsers::ini::IniFile;
 use settings4000::parsers::lua_literal::{LuaConfigFile, LuaValue, TableStatus};
 use settings4000::parsers::monitors::{MonitorField, MonitorsFile};
 use settings4000::parsers::palette::{PaletteFile, PaletteSchema, SchemaSource};
-use settings4000::testing::{FixtureDotfiles, assert_repo_untouched_except, repo_snapshot};
+use settings4000::testing::{
+    FIXTURE_ACTIVE_GTK_THEME, FIXTURE_GTK3_ONLY_THEME, FIXTURE_GTK4_THEME, FixtureDotfiles,
+    GTK4_THEME_LINK_NAMES, assert_repo_untouched_except, repo_snapshot,
+};
 
 /// Reads a file, panicking with the path on failure (test-only convenience).
 fn read(path: &std::path::Path) -> String {
@@ -627,4 +630,44 @@ fn the_action_script_stubs_record_their_argv_and_succeed() {
          bar-text-tone --apply\n"
     );
     assert_repo_untouched_except(&fx, &before, &[]);
+}
+
+/// The stand-in system theme root and the GTK 4 theme links (task 11.16, analysis
+/// §8.4): the root lies outside the fake home, two themes ship a full `gtk-4.0/`,
+/// one ships only `gtk-3.0/`, and `~/.config/gtk-4.0/{gtk.css,gtk-dark.css,assets}`
+/// are absolute links into the active theme's `gtk-4.0/` — the shape `setup.sh`
+/// creates — beside the still repo-linked `settings.ini`.
+#[test]
+fn the_system_theme_root_and_the_gtk4_theme_links_are_deployed() {
+    let fx = FixtureDotfiles::install();
+    let root = fx.system_themes_root();
+    assert!(
+        !root.starts_with(fx.home()),
+        "the theme root is not under $HOME"
+    );
+
+    for theme in [FIXTURE_ACTIVE_GTK_THEME, FIXTURE_GTK4_THEME] {
+        let gtk4 = fx.system_theme_gtk4_dir(theme);
+        assert!(gtk4.join("gtk.css").is_file(), "{theme}");
+        assert!(gtk4.join("gtk-dark.css").is_file(), "{theme}");
+        assert!(gtk4.join("assets").is_dir(), "{theme}");
+        assert!(root.join(theme).join("gtk-3.0").is_dir(), "{theme}");
+    }
+    assert!(root.join(FIXTURE_GTK3_ONLY_THEME).join("gtk-3.0").is_dir());
+    assert!(!root.join(FIXTURE_GTK3_ONLY_THEME).join("gtk-4.0").exists());
+
+    let active = fx.system_theme_gtk4_dir(FIXTURE_ACTIVE_GTK_THEME);
+    for name in GTK4_THEME_LINK_NAMES {
+        let link = fx.config_path("gtk-4.0").join(name);
+        assert_eq!(
+            fs::read_link(&link).unwrap_or_else(|e| panic!("{name} is not a link: {e}")),
+            active.join(name)
+        );
+    }
+    let settings = IniFile::parse(&read(&fx.config_path("gtk-4.0/settings.ini"))).0;
+    assert_eq!(
+        settings.value("Settings", "gtk-theme-name"),
+        Some(FIXTURE_ACTIVE_GTK_THEME),
+        "the links match the theme settings.ini names, as setup.sh derives them"
+    );
 }

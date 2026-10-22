@@ -68,6 +68,46 @@
 //!   deletes the created file and removes the parent directories this call
 //!   created (only while they are still empty) — the pre-write state was "no
 //!   file", and restoring it means exactly that.
+//!
+//! # Re-pointing a symbolic link the app owns
+//!
+//! Everything above writes *file contents* and deliberately follows symlinks. One
+//! write target is the link itself: GTK 4 and libadwaita apps on this desktop take
+//! their theme from three symlinks `~/.config/gtk-4.0/{gtk.css,gtk-dark.css,assets}`
+//! into `/usr/share/themes/<theme>/gtk-4.0/` (analysis §8.4), so a GTK-theme change
+//! must change *where the links point*, never the files behind them — those belong to
+//! the installed theme package (R8.2). [`write_atomic`] would be exactly wrong here:
+//! it canonicalizes, so it would rewrite the theme's own `gtk.css` under
+//! `/usr/share/themes`. [`point_symlink`] and [`remove_symlink`] are the separate
+//! primitives for this case:
+//!
+//! - They **never follow the link**: the path is inspected with `symlink_metadata`
+//!   and `read_link` only, a link is replaced by renaming a new link over it (which
+//!   replaces the directory entry, not what it points to), and removed with
+//!   `remove_file` (which removes the link, not its target). A dangling link, or one
+//!   pointing anywhere at all, is handled the same way, and its target is never
+//!   opened, created or modified.
+//! - They **refuse a plain file or directory** at the path
+//!   ([`WriteError::NotASymlink`]): that is a user-managed override, not a link the
+//!   app may re-point, and replacing it would destroy the user's file.
+//! - Re-pointing an existing link is **atomic**: the new link is created under a
+//!   temporary name in the same directory and `rename(2)`d over the old one, so a
+//!   program starting meanwhile sees either the old link or the new one, never no
+//!   link. A temporary link that cannot be renamed into place is deleted again.
+//! - Creating a link where nothing exists uses `symlink(2)` directly, which is
+//!   atomic and fails rather than overwrite anything that appeared meanwhile
+//!   ([`WriteError::AlreadyExists`]); missing parent directories are created as
+//!   plain directories, as [`create_atomic`] does.
+//! - Each returns a [`LinkSnapshot`] recording what was at the path before (nothing,
+//!   or a link with its exact old target text) and what the call left there, so the
+//!   Apply pipeline can roll the step back like a file write (R5.4).
+//!
+//! One residual window remains and is accepted: re-pointing and removing an
+//! existing link inspect the path and then rename over or remove it, so a plain file
+//! that another program puts at the path in the microseconds between the two steps
+//! would be replaced. POSIX offers no portable "rename only over a symlink"; the
+//! only other writers of these paths (`setup.sh`, `nwg-look`) create links, not
+//! files, and the Theme page re-inspects the paths when it plans the Apply.
 
 use std::fmt;
 use std::fs;
@@ -75,6 +115,7 @@ use std::fs::File;
 use std::io;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 use tempfile::NamedTempFile;
@@ -123,6 +164,14 @@ pub enum WriteError {
         /// The path that was to be created.
         target: PathBuf,
     },
+    /// [`point_symlink`] or [`remove_symlink`] found a plain file or a directory
+    /// where it expected a symbolic link (or nothing). Nothing was changed: a real
+    /// file at a path the app manages as a link is a user-managed override, and
+    /// replacing or deleting it would destroy the user's own file.
+    NotASymlink {
+        /// The path that holds something other than a symbolic link.
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for WriteError {
@@ -146,6 +195,11 @@ impl fmt::Display for WriteError {
                 "refused to create {}: something already exists at that path",
                 target.display()
             ),
+            WriteError::NotASymlink { path } => write!(
+                f,
+                "refused to change {}: it is a plain file or directory, not a symbolic link",
+                path.display()
+            ),
         }
     }
 }
@@ -158,7 +212,7 @@ impl std::error::Error for WriteError {
             WriteError::Resolve { source, .. }
             | WriteError::Snapshot { source, .. }
             | WriteError::Write { source, .. } => Some(source),
-            WriteError::AlreadyExists { .. } => None,
+            WriteError::AlreadyExists { .. } | WriteError::NotASymlink { .. } => None,
         }
     }
 }
@@ -517,6 +571,308 @@ fn remove_created_dirs(created_dirs: &[PathBuf]) {
                 "could not remove a directory created for a new file; leaving it"
             );
         }
+    }
+}
+
+/// The pre-step state of a symbolic link path, kept in memory so the Apply pipeline
+/// can undo a [`point_symlink`] or [`remove_symlink`] call (R5.4).
+///
+/// It records the path exactly as given — never a resolved form, because the link
+/// itself is what changed — together with what the path held before the call and what
+/// the call left there. [`LinkSnapshot::restore`] uses the second to make sure it only
+/// ever undoes the app's own change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkSnapshot {
+    /// The link path the call changed, as passed in (not canonicalized).
+    path: PathBuf,
+    /// What the path held before the call.
+    prior: LinkPrior,
+    /// The target text of the link the call left at the path, or `None` when it left
+    /// nothing there (a removal, or a removal of an already-absent link).
+    left: Option<PathBuf>,
+}
+
+/// What a link path held before [`point_symlink`] or [`remove_symlink`] changed it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LinkPrior {
+    /// Nothing was at the path.
+    Absent {
+        /// The parent directories the call created because they were missing too,
+        /// outermost first; a rollback removes them again while they are empty.
+        created_dirs: Vec<PathBuf>,
+    },
+    /// A symbolic link was at the path, with this exact target text (as `read_link`
+    /// returned it — relative or absolute, dangling or not). A rollback re-creates
+    /// the link with the same text.
+    Symlink {
+        /// The old link's target text.
+        target: PathBuf,
+    },
+}
+
+/// What a link path holds right now, inspected without following it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LinkState {
+    /// Nothing exists at the path.
+    Absent,
+    /// A symbolic link with this target text.
+    Symlink(PathBuf),
+    /// A plain file, a directory, or any other non-link entry.
+    Other,
+}
+
+/// Inspects `path` with `symlink_metadata`/`read_link`, never following a link.
+fn link_state(path: &Path) -> io::Result<LinkState> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::read_link(path).map(LinkState::Symlink)
+        }
+        Ok(_) => Ok(LinkState::Other),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(LinkState::Absent),
+        Err(error) => Err(error),
+    }
+}
+
+impl LinkSnapshot {
+    /// The link path this snapshot belongs to, exactly as the step was given it.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the link path to its pre-step state (the rollback of a link step, R5.4).
+    ///
+    /// A link that existed before is re-created with its exact old target text (by an
+    /// atomic rename over the app's link, or a plain `symlink(2)` when the app had
+    /// removed it); a link that did not exist is removed again, together with the
+    /// directories the step created while they are empty.
+    ///
+    /// The restore first checks that the path still holds what the step left there.
+    /// When it does not — another program has re-pointed, removed or replaced the link
+    /// since — the path is no longer the app's to change: it is left alone, the skip
+    /// is logged at `warn`, and the restore counts as done (R5.6, the same rule
+    /// [`FileSnapshot::restore`] follows for a created file).
+    pub fn restore(&self) -> Result<(), WriteError> {
+        let unchanged = match &self.prior {
+            LinkPrior::Symlink { target } => self.left.as_ref() == Some(target),
+            LinkPrior::Absent { .. } => self.left.is_none(),
+        };
+        if unchanged {
+            // The step found the path already as it wanted it and changed nothing, so
+            // there is nothing to undo (and nothing to warn about if it changed since).
+            return Ok(());
+        }
+        let io_error = |source| WriteError::Write {
+            path: self.path.clone(),
+            source,
+        };
+        let current = link_state(&self.path).map_err(io_error)?;
+        let as_left = match &self.left {
+            Some(target) => LinkState::Symlink(target.clone()),
+            None => LinkState::Absent,
+        };
+        if current != as_left {
+            tracing::warn!(
+                path = %self.path.display(),
+                "the link this apply changed was changed again by another program before \
+                 the rollback; leaving it as it is"
+            );
+            return Ok(());
+        }
+        match &self.prior {
+            LinkPrior::Symlink { target } => {
+                match current {
+                    LinkState::Absent => {
+                        symlink(target, &self.path).map_err(io_error)?;
+                        fsync_parent(&self.path);
+                    }
+                    _ => swap_in_link(&self.path, target, persist_link)?,
+                }
+                tracing::info!(
+                    path = %self.path.display(),
+                    target = %target.display(),
+                    "restored a symbolic link to its pre-apply target"
+                );
+            }
+            LinkPrior::Absent { created_dirs } => {
+                if current != LinkState::Absent {
+                    fs::remove_file(&self.path).map_err(io_error)?;
+                    fsync_parent(&self.path);
+                }
+                remove_created_dirs(created_dirs);
+                tracing::info!(
+                    path = %self.path.display(),
+                    "removed the symbolic link this apply had created"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Makes `link` a symbolic link to `target`, without ever following `link` (see the
+/// module section "Re-pointing a symbolic link the app owns").
+///
+/// - Nothing at `link`: missing parent directories are created as plain directories,
+///   then the link is created with `symlink(2)`, which fails with
+///   [`WriteError::AlreadyExists`] rather than overwrite anything that appeared in
+///   the meantime.
+/// - Parent directories are reached the ordinary way: an existing parent that is
+///   itself a symbolic link (say `~/.config/gtk-4.0` linked into a dotfiles repo) is
+///   followed, so the link lands in the directory it points to. Only the final
+///   component, `link` itself, is never followed. The temporary link is created in
+///   that same (pointed-to) directory, so it is on the same filesystem and the
+///   atomic rename still works.
+/// - A symbolic link at `link` (pointing anywhere, dangling or not): when it already
+///   has exactly `target` as its text nothing is touched; otherwise a new link is
+///   created under a temporary name beside it and atomically renamed over it. The old
+///   link's target is never opened or modified.
+/// - A plain file or directory at `link`: refused with [`WriteError::NotASymlink`],
+///   nothing changed.
+///
+/// `target` is written as the link text verbatim; the caller decides it (and checks
+/// that it is acceptable — this primitive does not resolve or validate it, since a
+/// link to a not-yet-existing path is legitimate in general). On any error nothing is
+/// left behind: no temporary link and no created directory. The returned
+/// [`LinkSnapshot`] undoes the change.
+pub fn point_symlink(link: &Path, target: &Path) -> Result<LinkSnapshot, WriteError> {
+    let io_error = |source| WriteError::Write {
+        path: link.to_path_buf(),
+        source,
+    };
+    let prior = match link_state(link).map_err(io_error)? {
+        LinkState::Other => {
+            return Err(WriteError::NotASymlink {
+                path: link.to_path_buf(),
+            });
+        }
+        LinkState::Symlink(current) if current == target => {
+            tracing::debug!(
+                path = %link.display(),
+                "symbolic link already points at the wanted target; leaving it"
+            );
+            return Ok(LinkSnapshot {
+                path: link.to_path_buf(),
+                prior: LinkPrior::Symlink { target: current },
+                left: Some(target.to_path_buf()),
+            });
+        }
+        LinkState::Symlink(current) => {
+            swap_in_link(link, target, persist_link)?;
+            LinkPrior::Symlink { target: current }
+        }
+        LinkState::Absent => {
+            let parent = link.parent().ok_or_else(|| {
+                io_error(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the link path has no parent directory",
+                ))
+            })?;
+            let created_dirs = create_missing_dirs(parent).map_err(io_error)?;
+            if let Err(error) = symlink(target, link) {
+                remove_created_dirs(&created_dirs);
+                return Err(if error.kind() == io::ErrorKind::AlreadyExists {
+                    WriteError::AlreadyExists {
+                        target: link.to_path_buf(),
+                    }
+                } else {
+                    io_error(error)
+                });
+            }
+            fsync_parent(link);
+            LinkPrior::Absent { created_dirs }
+        }
+    };
+    // R7.3: the link path and its new target text; links carry no contents to hide.
+    tracing::info!(
+        path = %link.display(),
+        target = %target.display(),
+        "pointed symbolic link at a new target"
+    );
+    Ok(LinkSnapshot {
+        path: link.to_path_buf(),
+        prior,
+        left: Some(target.to_path_buf()),
+    })
+}
+
+/// Removes the symbolic link at `link`, never its target (see the module section
+/// "Re-pointing a symbolic link the app owns").
+///
+/// A missing `link` is already the wanted state and succeeds without a change; a plain
+/// file or directory is refused with [`WriteError::NotASymlink`]. The returned
+/// [`LinkSnapshot`] re-creates the removed link with its exact old target text.
+pub fn remove_symlink(link: &Path) -> Result<LinkSnapshot, WriteError> {
+    let io_error = |source| WriteError::Write {
+        path: link.to_path_buf(),
+        source,
+    };
+    let prior = match link_state(link).map_err(io_error)? {
+        LinkState::Other => {
+            return Err(WriteError::NotASymlink {
+                path: link.to_path_buf(),
+            });
+        }
+        LinkState::Absent => LinkPrior::Absent {
+            created_dirs: Vec::new(),
+        },
+        LinkState::Symlink(current) => {
+            fs::remove_file(link).map_err(io_error)?;
+            fsync_parent(link);
+            tracing::info!(path = %link.display(), "removed symbolic link");
+            LinkPrior::Symlink { target: current }
+        }
+    };
+    Ok(LinkSnapshot {
+        path: link.to_path_buf(),
+        prior,
+        left: None,
+    })
+}
+
+/// The production rename step of [`swap_in_link`]: `rename(2)` the temporary link over
+/// `link`. On failure the returned error's temporary link is dropped, which deletes it.
+fn persist_link(temp: NamedTempFile<()>, link: &Path) -> io::Result<()> {
+    temp.persist(link).map_err(|error| error.error)
+}
+
+/// Atomically replaces the symbolic link at `link` with one pointing at `target`.
+///
+/// The new link is created under a random temporary name in `link`'s own directory —
+/// the same directory, so the rename cannot cross a filesystem — then handed to
+/// `persist`, which production passes as [`persist_link`]. Factoring the rename out is
+/// the test seam for the cleanup guarantee: a test passes a failing `persist` to prove
+/// that the temporary link is deleted again (the [`NamedTempFile`] removes its path on
+/// drop; for a symlink that removes the link, never its target) and the old link is
+/// left as it was.
+fn swap_in_link(
+    link: &Path,
+    target: &Path,
+    persist: impl FnOnce(NamedTempFile<()>, &Path) -> io::Result<()>,
+) -> Result<(), WriteError> {
+    let io_error = |source| WriteError::Write {
+        path: link.to_path_buf(),
+        source,
+    };
+    let dir = link.parent().ok_or_else(|| {
+        io_error(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the link path has no parent directory",
+        ))
+    })?;
+    let temp = tempfile::Builder::new()
+        .prefix(".settings4000-link-")
+        .make_in(dir, |path| symlink(target, path))
+        .map_err(io_error)?;
+    persist(temp, link).map_err(io_error)?;
+    fsync_dir(dir);
+    Ok(())
+}
+
+/// Fsyncs the directory holding `path`, best-effort (see [`fsync_dir`]), so a link
+/// created or removed there is durable.
+fn fsync_parent(path: &Path) {
+    if let Some(dir) = path.parent() {
+        fsync_dir(dir);
     }
 }
 
@@ -1200,5 +1556,285 @@ mod tests {
         snapshot.restore().expect("roll back");
         assert!(!real.join("index.theme").exists());
         assert!(real.is_dir(), "a directory the call did not create is kept");
+    }
+
+    /// The names in `dir`, sorted — for proving no temporary link was left behind.
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .expect("read dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A fake installed theme: `<root>/<name>/gtk-4.0/{gtk.css,assets/}` with known
+    /// bytes, returning its `gtk-4.0` directory.
+    fn theme_gtk4_dir(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(name).join("gtk-4.0");
+        fs::create_dir_all(dir.join("assets")).expect("create the theme dirs");
+        fs::write(dir.join("gtk.css"), format!("/* {name} */\n")).expect("write gtk.css");
+        fs::write(dir.join("assets").join("check.png"), b"png").expect("write an asset");
+        dir
+    }
+
+    #[test]
+    fn point_symlink_atomically_re_points_an_existing_link_and_restore_puts_it_back() {
+        // Task 11.16 (analysis §8.4): a GTK-theme change re-points
+        // `~/.config/gtk-4.0/gtk.css` from the old theme to the new one. Only the link
+        // changes: both themes' files stay byte-identical, no temp link is left, and
+        // the rollback restores the exact old link text.
+        let tmp = tempfile::tempdir().expect("temp dir should be creatable");
+        let themes = tmp.path().join("themes");
+        let old = theme_gtk4_dir(&themes, "Old");
+        let new = theme_gtk4_dir(&themes, "New");
+        let config = tmp.path().join("gtk-4.0");
+        fs::create_dir(&config).expect("create the config dir");
+        let link = config.join("gtk.css");
+        symlink(old.join("gtk.css"), &link).expect("deploy the old link");
+
+        let snapshot = point_symlink(&link, &new.join("gtk.css")).expect("re-point the link");
+        assert_eq!(
+            fs::read_link(&link).expect("read link"),
+            new.join("gtk.css")
+        );
+        assert_eq!(snapshot.path(), link.as_path());
+        assert_eq!(fs::read(old.join("gtk.css")).expect("old"), b"/* Old */\n");
+        assert_eq!(fs::read(new.join("gtk.css")).expect("new"), b"/* New */\n");
+        assert_eq!(
+            entries(&config),
+            vec!["gtk.css".to_string()],
+            "no temp link"
+        );
+
+        snapshot.restore().expect("roll back");
+        assert_eq!(
+            fs::read_link(&link).expect("read link"),
+            old.join("gtk.css")
+        );
+        assert_eq!(
+            entries(&config),
+            vec!["gtk.css".to_string()],
+            "no temp link"
+        );
+        assert_eq!(fs::read(new.join("gtk.css")).expect("new"), b"/* New */\n");
+    }
+
+    #[test]
+    fn point_symlink_creates_an_absent_link_and_parent_and_restore_removes_both() {
+        // A host without the dotfiles' links (or without `~/.config/gtk-4.0` at all):
+        // the link and the missing directory are created; the rollback removes exactly
+        // what was created.
+        let tmp = tempfile::tempdir().expect("temp dir should be creatable");
+        let theme = theme_gtk4_dir(&tmp.path().join("themes"), "New");
+        let config = tmp.path().join("config");
+        fs::create_dir(&config).expect("create the existing parent");
+        let link = config.join("gtk-4.0").join("assets");
+
+        let snapshot = point_symlink(&link, &theme.join("assets")).expect("create the link");
+        assert_eq!(
+            fs::read_link(&link).expect("read link"),
+            theme.join("assets")
+        );
+        let created = fs::symlink_metadata(config.join("gtk-4.0")).expect("dir created");
+        assert!(created.is_dir() && !created.file_type().is_symlink());
+
+        snapshot.restore().expect("roll back");
+        assert!(fs::symlink_metadata(&link).is_err(), "the link is gone");
+        assert!(!config.join("gtk-4.0").exists(), "the created dir is gone");
+        assert!(config.is_dir(), "the pre-existing parent is kept");
+        assert_eq!(
+            fs::read(theme.join("assets").join("check.png")).expect("asset"),
+            b"png",
+            "removing a link to a directory never touches the directory"
+        );
+    }
+
+    #[test]
+    fn link_steps_refuse_a_plain_file_or_directory_and_change_nothing() {
+        // A real `gtk.css` (or a real `assets/` directory) is a user-managed override:
+        // neither primitive may replace or delete it.
+        let tmp = tempfile::tempdir().expect("temp dir should be creatable");
+        let file = tmp.path().join("gtk.css");
+        fs::write(&file, b"/* my own css */\n").expect("write the user's file");
+        let dir = tmp.path().join("assets");
+        fs::create_dir(&dir).expect("create the user's dir");
+        fs::write(dir.join("mine.png"), b"mine").expect("write into it");
+        let target = tmp.path().join("elsewhere");
+
+        for path in [&file, &dir] {
+            let pointed = point_symlink(path, &target);
+            assert!(
+                matches!(pointed, Err(WriteError::NotASymlink { .. })),
+                "{}: {pointed:?}",
+                path.display()
+            );
+            let removed = remove_symlink(path);
+            assert!(
+                matches!(removed, Err(WriteError::NotASymlink { .. })),
+                "{}: {removed:?}",
+                path.display()
+            );
+        }
+        assert_eq!(fs::read(&file).expect("file"), b"/* my own css */\n");
+        assert_eq!(
+            fs::read(dir.join("mine.png")).expect("dir content"),
+            b"mine"
+        );
+        assert_eq!(
+            entries(tmp.path()),
+            vec!["assets".to_string(), "gtk.css".to_string()],
+            "nothing was created, not even a temp link"
+        );
+    }
+
+    #[test]
+    fn link_steps_never_follow_a_dangling_or_outside_link() {
+        // The existing link is only ever replaced or removed as a directory entry: a
+        // dangling link's missing target is not created, and the file an outside link
+        // points at is neither rewritten nor deleted.
+        let tmp = tempfile::tempdir().expect("temp dir should be creatable");
+        let config = tmp.path().join("gtk-4.0");
+        fs::create_dir(&config).expect("create the config dir");
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&outside).expect("create the outside dir");
+        let precious = outside.join("precious.css");
+        fs::write(&precious, b"precious\n").expect("write the outside file");
+        let missing = tmp.path().join("missing").join("gtk.css");
+
+        let dangling = config.join("gtk.css");
+        symlink(&missing, &dangling).expect("a dangling link");
+        let to_outside = config.join("gtk-dark.css");
+        symlink(&precious, &to_outside).expect("a link outside");
+        let new_target = tmp.path().join("new.css");
+
+        point_symlink(&dangling, &new_target).expect("re-point the dangling link");
+        point_symlink(&to_outside, &new_target).expect("re-point the outside link");
+        assert_eq!(fs::read_link(&dangling).expect("read"), new_target);
+        assert_eq!(fs::read_link(&to_outside).expect("read"), new_target);
+        assert!(!tmp.path().join("missing").exists(), "never created");
+        assert_eq!(fs::read(&precious).expect("outside file"), b"precious\n");
+
+        symlink(&precious, config.join("assets")).expect("another outside link");
+        let snapshot = remove_symlink(&config.join("assets")).expect("remove it");
+        assert!(fs::symlink_metadata(config.join("assets")).is_err());
+        assert_eq!(fs::read(&precious).expect("outside file"), b"precious\n");
+        snapshot.restore().expect("roll the removal back");
+        assert_eq!(
+            fs::read_link(config.join("assets")).expect("read"),
+            precious
+        );
+    }
+
+    #[test]
+    fn remove_symlink_keeps_relative_link_text_for_the_rollback_and_tolerates_absence() {
+        // The restore re-creates the exact old text — a relative link stays relative —
+        // and removing a link that is not there is already the wanted state.
+        let tmp = tempfile::tempdir().expect("temp dir should be creatable");
+        let link = tmp.path().join("gtk.css");
+        symlink("../themes/Old/gtk-4.0/gtk.css", &link).expect("a relative link");
+
+        let snapshot = remove_symlink(&link).expect("remove");
+        assert!(fs::symlink_metadata(&link).is_err());
+        snapshot.restore().expect("roll back");
+        assert_eq!(
+            fs::read_link(&link).expect("read"),
+            Path::new("../themes/Old/gtk-4.0/gtk.css")
+        );
+
+        let absent = tmp.path().join("gtk-dark.css");
+        let snapshot = remove_symlink(&absent).expect("removing nothing succeeds");
+        snapshot.restore().expect("and so does undoing it");
+        assert!(fs::symlink_metadata(&absent).is_err());
+    }
+
+    #[test]
+    fn a_failed_rename_deletes_the_temporary_link_and_keeps_the_old_one() {
+        // The cleanup guarantee: if the new link cannot be renamed into place, the
+        // temporary link is deleted again and the old link is untouched.
+        let tmp = tempfile::tempdir().expect("temp dir should be creatable");
+        let link = tmp.path().join("gtk.css");
+        symlink("/old/gtk.css", &link).expect("the old link");
+
+        let result = swap_in_link(&link, Path::new("/new/gtk.css"), |_temp, _link| {
+            Err(io::Error::other("injected rename failure"))
+        });
+        assert!(
+            matches!(result, Err(WriteError::Write { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            fs::read_link(&link).expect("read"),
+            Path::new("/old/gtk.css")
+        );
+        assert_eq!(entries(tmp.path()), vec!["gtk.css".to_string()]);
+    }
+
+    #[test]
+    fn pointing_a_link_where_it_already_points_changes_nothing() {
+        let tmp = tempfile::tempdir().expect("temp dir should be creatable");
+        let link = tmp.path().join("gtk.css");
+        symlink("/themes/New/gtk-4.0/gtk.css", &link).expect("the link");
+        // A replaced link would be a new directory entry with a new inode.
+        use std::os::unix::fs::MetadataExt;
+        let before = fs::symlink_metadata(&link).expect("lstat").ino();
+
+        let snapshot =
+            point_symlink(&link, Path::new("/themes/New/gtk-4.0/gtk.css")).expect("no-op");
+        assert_eq!(
+            fs::symlink_metadata(&link).expect("lstat").ino(),
+            before,
+            "the link was not replaced"
+        );
+        snapshot.restore().expect("undoing a no-op is a no-op");
+        assert_eq!(
+            fs::read_link(&link).expect("read"),
+            Path::new("/themes/New/gtk-4.0/gtk.css")
+        );
+    }
+
+    #[test]
+    fn a_link_rollback_leaves_a_path_another_program_changed_meanwhile() {
+        // Like a created file's rollback: once someone else has changed the link (or
+        // put a file there), it is no longer the app's to undo.
+        let tmp = tempfile::tempdir().expect("temp dir should be creatable");
+        let link = tmp.path().join("gtk.css");
+        symlink("/themes/Old/gtk-4.0/gtk.css", &link).expect("the old link");
+
+        let snapshot =
+            point_symlink(&link, Path::new("/themes/New/gtk-4.0/gtk.css")).expect("re-point");
+        fs::remove_file(&link).expect("another program removes the link");
+        fs::write(&link, b"/* theirs */\n").expect("and writes a file");
+
+        snapshot.restore().expect("the rollback itself succeeds");
+        assert_eq!(fs::read(&link).expect("their file"), b"/* theirs */\n");
+    }
+
+    #[test]
+    fn undoing_a_removal_leaves_a_plain_file_that_appeared_at_the_path() {
+        // The warn-and-leave branch for a removed link: if another program puts a file
+        // where the app removed a link, the rollback must not replace it with the old
+        // link (nor fail the rollback).
+        let tmp = tempfile::tempdir().expect("temp dir should be creatable");
+        let link = tmp.path().join("gtk.css");
+        symlink("/themes/Old/gtk-4.0/gtk.css", &link).expect("the old link");
+
+        let snapshot = remove_symlink(&link).expect("remove the link");
+        fs::write(&link, b"/* theirs */\n").expect("another program writes a file");
+
+        snapshot.restore().expect("the rollback itself succeeds");
+        let metadata = fs::symlink_metadata(&link).expect("lstat");
+        assert!(
+            metadata.is_file(),
+            "the file is not replaced by the old link"
+        );
+        assert_eq!(fs::read(&link).expect("their file"), b"/* theirs */\n");
+        assert_eq!(entries(tmp.path()), vec!["gtk.css".to_string()]);
     }
 }

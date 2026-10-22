@@ -95,6 +95,7 @@ fn plan_from(model: &DisplayModel) -> ApplyPlan {
     ApplyPlan {
         validations: contribution.validations,
         writes: vec![contribution.write],
+        links: Vec::new(),
         palette: None,
         reload_params: ReloadParams::default(),
     }

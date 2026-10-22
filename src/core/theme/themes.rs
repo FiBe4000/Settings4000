@@ -16,12 +16,17 @@
 //! `xsettingsd`. An icon-theme change also reaches the notification daemon, notifd,
 //! through its `Reload()` method (task 11.14); on a notifd too old to have it, the
 //! model supplies the note that notification icons follow at notifd's next start.
-//! [`ThemesModel`]'s own docs carry the rest.
+//! A GTK-theme change has a third leg beside gsettings and the two `settings.ini`
+//! files: GTK 4 and libadwaita apps take their theme from three symlinks
+//! `~/.config/gtk-4.0/{gtk.css,gtk-dark.css,assets}` into the installed theme's
+//! `gtk-4.0/` directory (analysis §8.4), which the model re-points, removes, or —
+//! when one of them is a file of the user's own — leaves alone (task 11.16; see
+//! [`ThemesModel::gtk4_links_note`]). [`ThemesModel`]'s own docs carry the rest.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use crate::core::apply::{FileWrite, WriteMode, WriteValidation};
+use crate::core::apply::{FileWrite, LinkAction, LinkWrite, WriteMode, WriteValidation};
 use crate::core::home_path::contract_home;
 use crate::core::notifd::NotifdStatus;
 use crate::core::reload::{BackingFile, CursorValue, ReloadParams};
@@ -71,6 +76,20 @@ const GTK3_SETTINGS_REPO_RELATIVE: &str = "config/gtk-3.0/settings.ini";
 /// to the repo root — see [`GTK3_SETTINGS_REPO_RELATIVE`]. This is the file `nwg-look`
 /// replaced with a plain copy on the target machine (analysis §7.7).
 const GTK4_SETTINGS_REPO_RELATIVE: &str = "config/gtk-4.0/settings.ini";
+
+/// The entries of `~/.config/gtk-4.0/` that theme GTK 4 and libadwaita apps, in the
+/// order the link steps are planned (task 11.16, analysis §8.4).
+///
+/// GTK 4 loads `gtk.css` from its user configuration directory on top of the theme it
+/// was told to use, and libadwaita — which ignores `gtk-theme-name` — loads `gtk.css`
+/// or, in dark mode, `gtk-dark.css` from there; `assets` holds the images those
+/// stylesheets reference by relative path. The dotfiles' `setup.sh` links each of the
+/// three to the entry of the same name in `/usr/share/themes/<gtk-theme-name>/gtk-4.0/`
+/// (originally `nwg-look` did), which is the layout the app maintains.
+const GTK4_THEME_LINKS: [&str; 3] = ["gtk.css", "gtk-dark.css", "assets"];
+
+/// The subdirectory of an installed GTK theme that holds its GTK 4 part.
+const GTK4_THEME_SUBDIR: &str = "gtk-4.0";
 
 /// Cursor pixel sizes offered in the cursor-size drop-down, in ascending order. The
 /// currently-configured size is added too (see [`ThemesModel::load`]) so an unusual
@@ -128,6 +147,11 @@ pub struct ThemeRoots {
     /// Directories that hold GTK theme directories (`~/.themes`,
     /// `~/.local/share/themes`, `/usr/share/themes`). A subdirectory is a GTK theme
     /// when it contains a `gtk-3.0/` or `gtk-4.0/` subdirectory (R3.3).
+    ///
+    /// They are also the only places the GTK 4 theme links may point into (task
+    /// 11.16): a theme's `gtk-4.0/` directory is linked from the first of these roots
+    /// that has one, and only when it — and each entry linked — still resolves inside
+    /// one of these roots.
     pub gtk_theme_dirs: Vec<PathBuf>,
     /// Directories that hold icon and cursor theme directories (`~/.icons`,
     /// `~/.local/share/icons`, `/usr/share/icons`). A subdirectory with a `cursors/`
@@ -155,7 +179,8 @@ pub struct ThemeRoots {
 pub struct ThemesPaths {
     /// `~/.config/gtk-3.0/settings.ini`.
     pub gtk3_settings: PathBuf,
-    /// `~/.config/gtk-4.0/settings.ini`.
+    /// `~/.config/gtk-4.0/settings.ini`. Its directory is also where the GTK 4 theme
+    /// links `gtk.css`, `gtk-dark.css` and `assets` live (task 11.16).
     pub gtk4_settings: PathBuf,
     /// `~/.config/hypr/hyprland.lua`, of which only the two cursor `hl.env` lines are
     /// ever edited, or `None` when the Hyprland-side cursor write is hidden because the
@@ -448,11 +473,18 @@ struct UnlinkedSettingsIni {
 /// A cursor change contributes writes for *every* file carrying the value (both
 /// `settings.ini`, `uwsm/env`, the `hl.env` lines of `hyprland.lua`, and — for the theme
 /// — `~/.icons/default/index.theme`) with the identical value, so they never desync
-/// (R3.4); a GTK/icon theme change contributes only the two `settings.ini` writes. The reload parameters carry only the values that changed, so the reload
-/// table (task 4.4) emits `gsettings set` / `hyprctl setcursor` only for those.
+/// (R3.4); a GTK/icon theme change contributes only the two `settings.ini` writes, plus,
+/// for a GTK theme, the GTK 4 theme link steps (task 11.16). The reload parameters carry
+/// only the values that changed, so the reload table (task 4.4) emits `gsettings set` /
+/// `hyprctl setcursor` only for those.
 pub struct ThemesApply {
     /// The atomic writes, one per changed backing file.
     pub writes: Vec<FileWrite>,
+    /// The GTK 4 theme link steps, one per link that must change; empty unless the GTK
+    /// theme changed (task 11.16). The pipeline runs them after every file write — see
+    /// [`LinkWrite`] — and [`ThemesModel::gtk4_links_note`] explains on the page what
+    /// they do not cover.
+    pub links: Vec<LinkWrite>,
     /// The reload parameters for the changed theme/cursor values (the pipeline merges
     /// these into its plan-wide [`ReloadParams`]).
     pub reload_params: ReloadParams,
@@ -636,21 +668,14 @@ impl ThemesModel {
     /// file and the repo copy the app's changes will no longer reach (task 11.12). Paths
     /// under [`ThemesPaths::home`] are shown as `~/…`, any other path absolute.
     pub fn unlinked_gtk_settings_notes(&self) -> Vec<String> {
-        let shown = |path: &Path| {
-            self.paths
-                .home
-                .as_deref()
-                .and_then(|home| contract_home(path, home))
-                .unwrap_or_else(|| path.display().to_string())
-        };
         self.unlinked_gtk_settings
             .iter()
             .map(|unlinked| {
                 format!(
                     "{} is no longer linked to the dotfiles; changes here will not reach \
                      the repo copy at {}.",
-                    shown(&unlinked.live),
-                    shown(&unlinked.repo_copy)
+                    self.shown_path(&unlinked.live),
+                    self.shown_path(&unlinked.repo_copy)
                 )
             })
             .collect()
@@ -991,7 +1016,7 @@ impl ThemesModel {
         if !self.is_dirty() {
             return None;
         }
-        let (writes, _) = self.render_writes();
+        let (writes, record) = self.render_writes();
         if writes.is_empty() {
             // Dirty but nothing could be written — e.g. both settings.ini files were
             // unreadable. Nothing to apply; the page stays dirty for a retry.
@@ -1000,10 +1025,207 @@ impl ThemesModel {
             );
             return None;
         }
+        // The links follow the `gtk-theme-name` write (task 11.16): only when the GTK
+        // theme reached a settings.ini file, never for an icon- or cursor-only change.
+        let links = if record.written.gtk_theme {
+            self.plan_gtk4_links()
+        } else {
+            Vec::new()
+        };
         Some(ThemesApply {
             writes,
+            links,
             reload_params: self.reload_params(),
         })
+    }
+
+    /// The directory holding the GTK 4 theme links: the directory of
+    /// [`ThemesPaths::gtk4_settings`] (`~/.config/gtk-4.0`).
+    fn gtk4_links_dir(&self) -> Option<&Path> {
+        self.paths.gtk4_settings.parent()
+    }
+
+    /// The first GTK 4 theme link path that holds a user-managed override, with its
+    /// kind — what makes the app leave all three links alone (task 11.16).
+    ///
+    /// An override is a plain file or directory, a path that cannot be inspected, or a
+    /// symbolic link that resolves to an existing location **outside** every theme root
+    /// (for instance into `~/custom/`): the user pointed GTK 4 somewhere of their own,
+    /// which the app must not silently replace with a theme link, just as it never
+    /// replaces a plain file. A dangling link (whose target no longer resolves — say
+    /// the theme it pointed into was uninstalled) is not an override: it is a stale
+    /// app/`setup.sh` link and gets repaired. The foreign-link rule is applied only
+    /// when at least one theme root exists; without any, nothing could be inside a
+    /// root, and the Apply plans no link step anyway.
+    fn gtk4_links_override(&self) -> Option<(PathBuf, LinkOverride)> {
+        let dir = self.gtk4_links_dir()?;
+        let roots = resolved_theme_roots(&self.roots.gtk_theme_dirs);
+        GTK4_THEME_LINKS.iter().find_map(|name| {
+            let path = dir.join(name);
+            let kind = match inspect_link(&path) {
+                LinkEntry::NotALink => LinkOverride::NotALink,
+                LinkEntry::Unreadable => LinkOverride::Unreadable,
+                LinkEntry::Symlink(_) if !roots.is_empty() => match std::fs::canonicalize(&path) {
+                    Ok(resolved) if !roots.iter().any(|root| resolved.starts_with(root)) => {
+                        LinkOverride::ForeignLink
+                    }
+                    _ => return None,
+                },
+                LinkEntry::Symlink(_) | LinkEntry::Absent => return None,
+            };
+            Some((path, kind))
+        })
+    }
+
+    /// Plans the GTK 4 theme link steps for the staged GTK theme (task 11.16; R3.3,
+    /// analysis §8.4), logging why when it plans none.
+    ///
+    /// The rule, mirroring what the dotfiles' `setup.sh` does after a theme change:
+    ///
+    /// - When any of `gtk.css`, `gtk-dark.css`, `assets` in `~/.config/gtk-4.0` is a
+    ///   plain file or a directory, cannot be inspected, or is a link resolving outside
+    ///   every theme root (see `gtk4_links_override`), none of the three is
+    ///   touched and a `warn` says so: a real file there is the user's own override —
+    ///   like a set `GTK_THEME`, the app does not fight it — and changing only some of
+    ///   the three would mix two themes. The `settings.ini`/gsettings writes still land.
+    /// - When the theme has a `gtk-4.0/` directory under a theme root
+    ///   ([`ThemeRoots::gtk_theme_dirs`]), each link is pointed at the entry of the same
+    ///   name inside it; an entry the theme does not ship is not linked (an existing
+    ///   link is removed rather than left on the old theme, and never made dangling).
+    /// - When no theme root has a `gtk-4.0/` directory for it — a GTK 3-only theme, or
+    ///   a built-in like Adwaita that has no theme directory — the links are removed,
+    ///   so GTK 4 and libadwaita apps use their default look (the page says so, see
+    ///   [`Self::gtk4_links_note`]).
+    /// - When the theme's `gtk-4.0/` directory resolves outside every theme root, when
+    ///   the name is not a single directory name (only possible for a hand-edited
+    ///   `settings.ini` value), or when no theme root exists at all, nothing is planned
+    ///   (logged at `warn`, `warn` and `info`).
+    ///
+    /// A link that already points where it should is not planned again, so a no-op
+    /// theme change leaves the links untouched.
+    fn plan_gtk4_links(&self) -> Vec<LinkWrite> {
+        let (Some(theme), Some(dir)) = (self.gtk_theme.effective(), self.gtk4_links_dir()) else {
+            return Vec::new();
+        };
+        if let Some((path, kind)) = self.gtk4_links_override() {
+            tracing::warn!(
+                path = %path.display(),
+                kind = kind.as_str(),
+                "a GTK 4 theme path is a user-managed override, not a theme link; \
+                 leaving all three GTK 4 theme links alone, so GTK 4 and libadwaita apps \
+                 do not follow this GTK-theme change (analysis §8.4)"
+            );
+            return Vec::new();
+        }
+        let wanted = match resolve_gtk4_theme(&self.roots.gtk_theme_dirs, theme) {
+            Gtk4ThemeSource::Found { targets } => targets,
+            Gtk4ThemeSource::Missing => {
+                tracing::info!(
+                    theme,
+                    "the GTK theme has no gtk-4.0 directory under any theme root; \
+                     removing the GTK 4 theme links"
+                );
+                [None, None, None]
+            }
+            Gtk4ThemeSource::OutsideRoots { resolved } => {
+                tracing::warn!(
+                    theme,
+                    resolved = %resolved.display(),
+                    "the GTK theme's GTK 4 files resolve outside every theme root; \
+                     leaving the GTK 4 theme links alone"
+                );
+                return Vec::new();
+            }
+            Gtk4ThemeSource::InvalidName => {
+                tracing::warn!(
+                    theme,
+                    "the GTK theme name is not a single directory name; leaving the GTK 4 \
+                     theme links alone"
+                );
+                return Vec::new();
+            }
+            Gtk4ThemeSource::NoRoots => {
+                tracing::info!("no GTK theme root could be found; skipping the GTK 4 theme links");
+                return Vec::new();
+            }
+        };
+        GTK4_THEME_LINKS
+            .iter()
+            .zip(wanted)
+            .filter_map(|(name, wanted)| {
+                let path = dir.join(name);
+                let current = inspect_link(&path);
+                let action = match (current, wanted) {
+                    (LinkEntry::Symlink(current), Some(target)) if current == target => {
+                        return None;
+                    }
+                    (_, Some(target)) => LinkAction::PointAt(target),
+                    (LinkEntry::Symlink(_), None) => LinkAction::Remove,
+                    (_, None) => return None,
+                };
+                Some(LinkWrite {
+                    path,
+                    action,
+                    label: format!("GTK 4 theme link ({name})"),
+                })
+            })
+            .collect()
+    }
+
+    /// The Theme-page note about the GTK 4 theme links, or `None` when there is
+    /// nothing to say (task 11.16; analysis §8.4).
+    ///
+    /// - When one of `~/.config/gtk-4.0/{gtk.css,gtk-dark.css,assets}` is a file or
+    ///   directory of the user's own, or a link of the user's own into a place outside
+    ///   the theme folders, the note says the app leaves them alone, so GTK 4 and
+    ///   libadwaita apps do not follow a theme change made here.
+    /// - Otherwise it is about the GTK theme the page shows (the staged one, or the
+    ///   current one): a theme without a GTK 4 version means those apps fall back to the
+    ///   default Adwaita look (an Apply removes the links), and a theme whose GTK 4
+    ///   files lie outside the theme folders is not linked. A built-in theme (Adwaita)
+    ///   gets no note: the default look is then exactly what was chosen, and neither
+    ///   does a name that is not a theme name at all (it cannot come from the
+    ///   drop-down's discovered list, only from a hand-edited `settings.ini`).
+    ///
+    /// Derived from the filesystem on every call, so it reflects the state after an
+    /// Apply or an external change without a reload; it never logs (the Apply logs
+    /// its decisions when it plans the steps).
+    pub fn gtk4_links_note(&self) -> Option<String> {
+        if let Some((path, kind)) = self.gtk4_links_override() {
+            let what = match kind {
+                LinkOverride::NotALink | LinkOverride::Unreadable => {
+                    "is a file of its own rather than a link to a theme"
+                }
+                LinkOverride::ForeignLink => "links to a place outside the theme folders",
+            };
+            return Some(format!(
+                "{} {what}, so GTK 4 and libadwaita apps are left as they are: they do not \
+                 follow a GTK-theme change made here.",
+                self.shown_path(&path)
+            ));
+        }
+        let theme = self.gtk_theme.effective()?;
+        match resolve_gtk4_theme(&self.roots.gtk_theme_dirs, theme) {
+            Gtk4ThemeSource::Missing if !BUILTIN_GTK_THEMES.contains(&theme) => Some(format!(
+                "\u{201c}{theme}\u{201d} has no GTK 4 version, so GTK 4 and libadwaita apps \
+                 fall back to the default Adwaita look."
+            )),
+            Gtk4ThemeSource::OutsideRoots { .. } => Some(format!(
+                "The GTK 4 files of \u{201c}{theme}\u{201d} lie outside the theme folders, so \
+                 GTK 4 and libadwaita apps are not switched to it."
+            )),
+            _ => None,
+        }
+    }
+
+    /// `path` as the Theme page shows it: `~/…` under [`ThemesPaths::home`], absolute
+    /// otherwise.
+    fn shown_path(&self, path: &Path) -> String {
+        self.paths
+            .home
+            .as_deref()
+            .and_then(|home| contract_home(path, home))
+            .unwrap_or_else(|| path.display().to_string())
     }
 
     /// Commits the staged changes after a successful Apply: takes the written bytes back
@@ -1548,6 +1770,150 @@ fn is_plain_file_beside(live: &Path, repo_copy: &Path) -> bool {
         (Ok(live), Ok(repo_copy)) => live != repo_copy,
         _ => false,
     }
+}
+
+/// What one GTK 4 theme link path holds, inspected without following it (task 11.16).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LinkEntry {
+    /// Nothing is there.
+    Absent,
+    /// A symbolic link with this target text.
+    Symlink(PathBuf),
+    /// A plain file, a directory, or another non-link entry — a user-managed override.
+    NotALink,
+    /// The path could not be inspected (e.g. permission denied). Treated like
+    /// [`LinkEntry::NotALink`]: what cannot be seen is not changed.
+    Unreadable,
+}
+
+/// Inspects a GTK 4 theme link path with `symlink_metadata`/`read_link` only.
+fn inspect_link(path: &Path) -> LinkEntry {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => match std::fs::read_link(path) {
+            Ok(target) => LinkEntry::Symlink(target),
+            Err(_) => LinkEntry::Unreadable,
+        },
+        Ok(_) => LinkEntry::NotALink,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => LinkEntry::Absent,
+        Err(_) => LinkEntry::Unreadable,
+    }
+}
+
+/// Why a GTK 4 theme link path counts as a user-managed override (task 11.16; see
+/// [`ThemesModel::gtk4_links_override`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinkOverride {
+    /// A plain file or a directory.
+    NotALink,
+    /// The path could not be inspected.
+    Unreadable,
+    /// A symbolic link resolving to an existing place outside every theme root.
+    ForeignLink,
+}
+
+impl LinkOverride {
+    /// The short name logged in the `kind` field of the override `warn`.
+    fn as_str(self) -> &'static str {
+        match self {
+            LinkOverride::NotALink => "plain file or directory",
+            LinkOverride::Unreadable => "not inspectable",
+            LinkOverride::ForeignLink => "link outside the theme roots",
+        }
+    }
+}
+
+/// The theme roots that exist, canonicalized — the shared basis of both "inside a
+/// theme root" checks (the link targets in [`resolve_gtk4_theme`] and the
+/// foreign-link override in [`ThemesModel::gtk4_links_override`]). A root that does
+/// not exist or cannot be resolved is skipped.
+fn resolved_theme_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    roots
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .collect()
+}
+
+/// Where a GTK theme's GTK 4 part lives, as far as the GTK 4 theme links are concerned
+/// (task 11.16).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Gtk4ThemeSource {
+    /// The theme has a `gtk-4.0/` directory inside a theme root. Holds the link target
+    /// for each of [`GTK4_THEME_LINKS`], in order, or `None` for an entry the theme
+    /// does not ship. Every target is `<resolved root>/<theme>/gtk-4.0/<entry>` and has
+    /// been checked to resolve inside a theme root.
+    Found {
+        /// The link targets, aligned with [`GTK4_THEME_LINKS`].
+        targets: [Option<PathBuf>; 3],
+    },
+    /// No theme root has a `gtk-4.0/` directory for the theme (a GTK 3-only theme or
+    /// a built-in theme).
+    Missing,
+    /// The name is not a single plain directory name (it holds a `/`, is `..`, …), so
+    /// it is never joined onto a root. Only a hand-edited `settings.ini` can hold one.
+    InvalidName,
+    /// The theme's `gtk-4.0/` directory, or an entry in it, resolves outside every
+    /// theme root (through a symlink), so the app will not link to it.
+    OutsideRoots {
+        /// Where it resolved to, for the log.
+        resolved: PathBuf,
+    },
+    /// None of the theme roots exists, so there is nowhere a theme could be found.
+    NoRoots,
+}
+
+/// Finds the GTK 4 part of `theme` under the theme roots `roots` (task 11.16; R3.3).
+///
+/// Each root is canonicalized first ([`resolved_theme_roots`]; a root that does not
+/// exist is skipped), and the
+/// first root in the given order holding a `<theme>/gtk-4.0/` directory is used — the
+/// same "first theme directory that has it wins" order GTK applies when it looks a
+/// theme up. The link targets are built from the *resolved* root, so they are
+/// lexically inside it by construction: the theme name must be one plain path
+/// component (no `/`, no `..`), which a name read from the user's `settings.ini` is
+/// not guaranteed to be — anything else is [`Gtk4ThemeSource::InvalidName`]. On top of that lexical rule, the `gtk-4.0/` directory and
+/// each entry linked must still resolve inside one of the resolved roots, so a theme
+/// directory that is itself a symlink to somewhere else is never linked to (the task's
+/// "never follow a link outside the theme roots"). An entry the theme does not ship —
+/// or a dangling one — gets no target.
+fn resolve_gtk4_theme(roots: &[PathBuf], theme: &str) -> Gtk4ThemeSource {
+    let roots = resolved_theme_roots(roots);
+    if roots.is_empty() {
+        return Gtk4ThemeSource::NoRoots;
+    }
+    let mut components = Path::new(theme).components();
+    if !matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(_)), None)
+    ) {
+        return Gtk4ThemeSource::InvalidName;
+    }
+    let inside_a_root = |path: &Path| match std::fs::canonicalize(path) {
+        Ok(resolved) if roots.iter().any(|root| resolved.starts_with(root)) => Ok(()),
+        Ok(resolved) => Err(resolved),
+        Err(_) => Err(path.to_path_buf()),
+    };
+    for root in &roots {
+        let gtk4 = root.join(theme).join(GTK4_THEME_SUBDIR);
+        if !gtk4.is_dir() {
+            continue;
+        }
+        if let Err(resolved) = inside_a_root(&gtk4) {
+            return Gtk4ThemeSource::OutsideRoots { resolved };
+        }
+        let mut targets: [Option<PathBuf>; 3] = [None, None, None];
+        for (slot, name) in targets.iter_mut().zip(GTK4_THEME_LINKS) {
+            let entry = gtk4.join(name);
+            if !entry.exists() {
+                continue;
+            }
+            if let Err(resolved) = inside_a_root(&entry) {
+                return Gtk4ThemeSource::OutsideRoots { resolved };
+            }
+            *slot = Some(entry);
+        }
+        return Gtk4ThemeSource::Found { targets };
+    }
+    Gtk4ThemeSource::Missing
 }
 
 /// Whether nothing at all exists at `path` — not a file, a directory, or a symlink
@@ -2110,6 +2476,7 @@ export XCURSOR_SIZE=16
         let plan = ApplyPlan {
             validations: Vec::new(),
             writes: contribution.writes,
+            links: Vec::new(),
             palette: None,
             reload_params: contribution.reload_params,
         };
@@ -2236,6 +2603,7 @@ export XCURSOR_SIZE=16
         let plan = ApplyPlan {
             validations: Vec::new(),
             writes: contribution.writes,
+            links: Vec::new(),
             palette: None,
             reload_params: contribution.reload_params,
         };
@@ -2350,6 +2718,7 @@ export XCURSOR_SIZE=16
         let plan = ApplyPlan {
             validations: Vec::new(),
             writes: contribution.writes,
+            links: Vec::new(),
             palette: None,
             reload_params: contribution.reload_params,
         };
@@ -2455,6 +2824,7 @@ export XCURSOR_SIZE=16
             &ApplyPlan {
                 validations: Vec::new(),
                 writes: first.writes,
+                links: Vec::new(),
                 palette: None,
                 reload_params: first.reload_params,
             },
@@ -2501,6 +2871,7 @@ export XCURSOR_SIZE=16
             &ApplyPlan {
                 validations: Vec::new(),
                 writes: second.writes,
+                links: Vec::new(),
                 palette: None,
                 reload_params: second.reload_params,
             },
@@ -2801,6 +3172,7 @@ export XCURSOR_SIZE=16
         let plan = ApplyPlan {
             validations: Vec::new(),
             writes: contribution.writes,
+            links: Vec::new(),
             palette: None,
             reload_params: contribution.reload_params,
         };
@@ -3275,6 +3647,7 @@ export XCURSOR_SIZE=16
         let plan = ApplyPlan {
             validations: Vec::new(),
             writes: contribution.writes,
+            links: Vec::new(),
             palette: None,
             reload_params: contribution.reload_params,
         };
@@ -3584,5 +3957,301 @@ export XCURSOR_SIZE=16
             assert!(model.themes_editable(), "the note gates no control");
             assert_eq!(model.reload().notification_icons_note(), Some(note));
         }
+    }
+
+    // --- Task 11.16: the GTK 4 theme links ---------------------------------------
+
+    /// Creates `<root>/<theme>/gtk-4.0/` with the given entries (`assets` as a
+    /// directory, the rest as files) plus a `gtk-3.0/`, returning the `gtk-4.0` dir.
+    fn gtk4_theme(root: &Path, theme: &str, entries: &[&str]) -> PathBuf {
+        let gtk4 = root.join(theme).join("gtk-4.0");
+        fs::create_dir_all(&gtk4).expect("create gtk-4.0");
+        fs::create_dir_all(root.join(theme).join("gtk-3.0")).expect("create gtk-3.0");
+        for entry in entries {
+            if *entry == "assets" {
+                fs::create_dir_all(gtk4.join(entry)).expect("create assets");
+            } else {
+                fs::write(gtk4.join(entry), format!("/* {theme} */\n")).expect("write css");
+            }
+        }
+        gtk4
+    }
+
+    #[test]
+    fn the_first_theme_root_with_a_gtk4_dir_provides_the_link_targets() {
+        // GTK's own lookup order: the first root holding `<theme>/gtk-4.0` wins, a root
+        // with only `gtk-3.0` for that name does not shadow it, and the targets are
+        // built from the resolved root. An entry the theme does not ship gets none.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let user = tmp.path().join("user-themes");
+        let system = tmp.path().join("system-themes");
+        fs::create_dir_all(user.join("Shared/gtk-3.0")).expect("a GTK 3-only shadow");
+        let gtk4 = gtk4_theme(&system, "Shared", &["gtk.css", "assets"]);
+        let missing_root = tmp.path().join("does-not-exist");
+
+        let source = resolve_gtk4_theme(&[missing_root, user, system.clone()], "Shared");
+        let resolved = fs::canonicalize(&gtk4).expect("canonicalize");
+        assert_eq!(
+            source,
+            Gtk4ThemeSource::Found {
+                targets: [
+                    Some(resolved.join("gtk.css")),
+                    None,
+                    Some(resolved.join("assets")),
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn theme_names_that_are_not_one_directory_name_never_reach_outside_a_root() {
+        // A name read from the user's settings.ini could hold a path; it must never be
+        // joined onto a root to escape it.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let root = tmp.path().join("themes");
+        gtk4_theme(&root, "Real", &["gtk.css"]);
+        gtk4_theme(tmp.path(), "Escaped", &["gtk.css"]);
+        let roots = [root];
+        for name in ["../Escaped", "Real/../../Escaped", "/abs", "", ".", ".."] {
+            assert_eq!(
+                resolve_gtk4_theme(&roots, name),
+                Gtk4ThemeSource::InvalidName,
+                "{name:?}"
+            );
+        }
+        assert!(matches!(
+            resolve_gtk4_theme(&roots, "Real"),
+            Gtk4ThemeSource::Found { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_theme_whose_gtk4_files_resolve_outside_the_roots_is_not_linked() {
+        // "Never follow a link outside the theme roots": a theme directory, or one of
+        // its entries, that is a symlink to somewhere else is refused.
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let root = tmp.path().join("themes");
+        fs::create_dir_all(&root).expect("create root");
+        let elsewhere = gtk4_theme(&tmp.path().join("elsewhere"), "Linked", &["gtk.css"]);
+        symlink(tmp.path().join("elsewhere/Linked"), root.join("Linked")).expect("link");
+        let partly = gtk4_theme(&root, "Partly", &["gtk.css"]);
+        symlink(elsewhere.join("gtk.css"), partly.join("gtk-dark.css")).expect("link");
+
+        for theme in ["Linked", "Partly"] {
+            assert!(
+                matches!(
+                    resolve_gtk4_theme(std::slice::from_ref(&root), theme),
+                    Gtk4ThemeSource::OutsideRoots { .. }
+                ),
+                "{theme}"
+            );
+        }
+        assert_eq!(
+            resolve_gtk4_theme(&[tmp.path().join("nothing")], "Linked"),
+            Gtk4ThemeSource::NoRoots
+        );
+    }
+
+    /// A model over a backing fixture whose `gtk-4.0` directory holds the three GTK 4
+    /// links into `<tmp>/themes/Old/gtk-4.0`, with themes `Old` and `New` (both with a
+    /// GTK 4 part) and `Plain` (GTK 3 only) installed there.
+    #[cfg(unix)]
+    fn linked_model(tmp: &Path) -> (ThemesModel, PathBuf, PathBuf) {
+        use std::os::unix::fs::symlink;
+
+        let root = tmp.join("themes");
+        let all = ["gtk.css", "gtk-dark.css", "assets"];
+        let old = gtk4_theme(&root, "Old", &all);
+        let new = gtk4_theme(&root, "New", &all);
+        fs::create_dir_all(root.join("Plain/gtk-3.0")).expect("a GTK 3-only theme");
+        let paths = write_backing_fixture(&tmp.join("config"), UWSM_ENV);
+        let links_dir = paths.gtk4_settings.parent().expect("dir").to_path_buf();
+        for name in all {
+            symlink(old.join(name), links_dir.join(name)).expect("deploy a link");
+        }
+        let roots = ThemeRoots {
+            gtk_theme_dirs: vec![root],
+            icon_dirs: vec![write_icon_root(tmp)],
+        };
+        let model = ThemesModel::load(&roots, paths, false, None);
+        (
+            model,
+            links_dir,
+            fs::canonicalize(new).expect("canonicalize"),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_gtk_theme_change_plans_one_point_step_per_link_and_other_changes_none() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let (mut model, links_dir, new) = linked_model(tmp.path());
+
+        model.stage_icon_theme("Papirus");
+        model.stage_cursor_theme("Bibata");
+        let contribution = model.apply_contribution().expect("dirty");
+        assert!(
+            contribution.links.is_empty(),
+            "icon/cursor changes never touch the GTK 4 links"
+        );
+
+        model.stage_gtk_theme("New");
+        let links = model.apply_contribution().expect("dirty").links;
+        let expected: Vec<LinkWrite> = GTK4_THEME_LINKS
+            .iter()
+            .map(|name| LinkWrite {
+                path: links_dir.join(name),
+                action: LinkAction::PointAt(new.join(name)),
+                label: format!("GTK 4 theme link ({name})"),
+            })
+            .collect();
+        assert_eq!(links, expected);
+        assert_eq!(model.gtk4_links_note(), None, "New has a GTK 4 version");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_gtk3_only_theme_plans_removals_and_a_builtin_gets_no_note() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let (mut model, links_dir, _) = linked_model(tmp.path());
+
+        model.stage_gtk_theme("Plain");
+        let links = model.apply_contribution().expect("dirty").links;
+        assert_eq!(
+            links.iter().map(|link| &link.action).collect::<Vec<_>>(),
+            vec![&LinkAction::Remove; 3]
+        );
+        assert_eq!(links[0].path, links_dir.join("gtk.css"));
+        assert_eq!(
+            model.gtk4_links_note().as_deref(),
+            Some(
+                "\u{201c}Plain\u{201d} has no GTK 4 version, so GTK 4 and libadwaita apps \
+                 fall back to the default Adwaita look."
+            )
+        );
+
+        // A built-in theme has no directory either, so the links go too — but the
+        // default look is then what was asked for, so there is nothing to explain.
+        model.stage_gtk_theme("Adwaita");
+        assert_eq!(model.apply_contribution().expect("dirty").links.len(), 3);
+        assert_eq!(model.gtk4_links_note(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_already_on_the_chosen_theme_and_absent_removals_plan_nothing() {
+        // Re-applying the theme the links already point at is a no-op for them, and a
+        // missing link needs no removal.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let (mut model, links_dir, new) = linked_model(tmp.path());
+        for name in GTK4_THEME_LINKS {
+            fs::remove_file(links_dir.join(name)).expect("remove the old link");
+        }
+        std::os::unix::fs::symlink(new.join("gtk.css"), links_dir.join("gtk.css"))
+            .expect("one link already on New");
+
+        model.stage_gtk_theme("New");
+        let links = model.apply_contribution().expect("dirty").links;
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| link.path.clone())
+                .collect::<Vec<_>>(),
+            vec![links_dir.join("gtk-dark.css"), links_dir.join("assets")],
+            "only the two links that are not on New yet are planned"
+        );
+
+        model.stage_gtk_theme("Plain");
+        let links = model.apply_contribution().expect("dirty").links;
+        assert_eq!(
+            links,
+            vec![LinkWrite {
+                path: links_dir.join("gtk.css"),
+                action: LinkAction::Remove,
+                label: "GTK 4 theme link (gtk.css)".to_string(),
+            }],
+            "only the one existing link needs removing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_file_or_directory_at_a_link_path_blocks_all_three_and_is_noted() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let (mut model, links_dir, _) = linked_model(tmp.path());
+        fs::remove_file(links_dir.join("assets")).expect("remove the link");
+        fs::create_dir(links_dir.join("assets")).expect("a real assets directory");
+
+        model.stage_gtk_theme("New");
+        let contribution = model.apply_contribution().expect("dirty");
+        assert!(contribution.links.is_empty(), "all three are left alone");
+        assert_eq!(
+            contribution.writes.len(),
+            2,
+            "the settings.ini writes still land"
+        );
+        let note = model.gtk4_links_note().expect("the override is noted");
+        assert!(
+            note.contains("/gtk-4.0/assets is a file of its own"),
+            "{note}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_outside_the_theme_roots_blocks_all_three_but_a_dangling_one_is_repaired() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let (mut model, links_dir, new) = linked_model(tmp.path());
+        let custom = tmp.path().join("custom");
+        fs::create_dir_all(&custom).expect("create the user's folder");
+        fs::write(custom.join("gtk-dark.css"), b"/* mine */\n").expect("write css");
+        fs::remove_file(links_dir.join("gtk-dark.css")).expect("remove the link");
+        symlink(custom.join("gtk-dark.css"), links_dir.join("gtk-dark.css"))
+            .expect("a link of the user's own");
+
+        model.stage_gtk_theme("New");
+        let contribution = model.apply_contribution().expect("dirty");
+        assert!(contribution.links.is_empty(), "all three are left alone");
+        assert_eq!(
+            contribution.writes.len(),
+            2,
+            "the settings.ini writes still land"
+        );
+        let note = model.gtk4_links_note().expect("the override is noted");
+        assert!(
+            note.contains("/gtk-4.0/gtk-dark.css links to a place outside the theme folders"),
+            "{note}"
+        );
+
+        // The same link dangling (its target gone) is a stale link, not an override.
+        fs::remove_file(custom.join("gtk-dark.css")).expect("delete the target");
+        assert_eq!(model.gtk4_links_note(), None);
+        let links = model.apply_contribution().expect("dirty").links;
+        assert_eq!(
+            links.len(),
+            3,
+            "the dangling link is repaired with the others"
+        );
+        assert_eq!(
+            links[1].action,
+            LinkAction::PointAt(new.join("gtk-dark.css"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_gtk_theme_name_that_is_not_a_directory_name_gets_no_note_and_no_link_step() {
+        // Only a hand-edited settings.ini can hold such a name; it is neither joined
+        // onto a root nor described as a theme "without a GTK 4 version".
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let (mut model, _, _) = linked_model(tmp.path());
+        model.gtk_theme.stage("../x");
+        assert_eq!(model.gtk4_links_note(), None);
+        assert!(model.apply_contribution().expect("dirty").links.is_empty());
     }
 }

@@ -97,6 +97,16 @@ The installer creates two links outside `$XDG_CONFIG_HOME`: `~/.zsh_colors`
 and `~/.icons/default/index.theme` (`HOME_LINKS` in `src/testing.rs`); the
 parent directories are plain, as `setup.sh` creates them.
 
+It also builds a stand-in for `/usr/share/themes` outside the fake home,
+`<temp>/usr/share/themes` (`FixtureDotfiles::system_themes_root`; task 11.16),
+which is generated in code rather than copied from this snapshot because it is
+not part of the dotfiles: `Everforest-Green-Dark` (the theme the fixture
+`settings.ini` names) and `Fixture-Gtk4`, each with `gtk-3.0/` and a
+`gtk-4.0/{gtk.css,gtk-dark.css,assets/}`, and `Fixture-Gtk3-Only` with only
+`gtk-3.0/`. Like `setup.sh`, the installer then links
+`~/.config/gtk-4.0/{gtk.css,gtk-dark.css,assets}` to the entries of
+`Everforest-Green-Dark/gtk-4.0/` (absolute link targets).
+
 ### Refreshed to `8a5b20b` in task 11.1
 
 - `config/hypr/monitors.conf` — the current file: frozen-grammar header,
