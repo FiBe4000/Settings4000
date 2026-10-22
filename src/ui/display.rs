@@ -74,7 +74,7 @@ use std::rc::Rc;
 use gtk4::prelude::*;
 use gtk4::{Align, Box as GtkBox, Frame, Orientation, ScrolledWindow, Switch};
 
-use crate::core::display::{DisplayModel, StageRefusal};
+use crate::core::display::{DisplayModel, MonitorView, StageRefusal};
 use crate::system::command::SystemCommandRunner;
 use crate::ui::widgets::{PAGE_MARGIN, SECTION_SPACING, build_dropdown, labelled_row, note};
 
@@ -166,19 +166,28 @@ impl Inner {
             ));
         }
 
+        let editable = model.records_editable();
         for index in 0..model.monitor_count() {
-            self.content.append(&self.build_section(model, index));
+            // `monitor` is `Some` for every index below the count; going through it
+            // keeps the rebuild free of a panic path all the same (task 9.24).
+            if let Some(view) = model.monitor(index) {
+                self.content
+                    .append(&self.build_section(index, view, editable));
+            }
         }
     }
 
-    /// Builds one monitor's section: a titled frame with its enable control and, when
-    /// enabled and editable, the resolution/refresh/scale/position drop-downs.
-    fn build_section(self: &Rc<Self>, model: &DisplayModel, index: usize) -> Frame {
-        let title = format!(
-            "{} — {}",
-            model.monitor_name(index),
-            model.monitor_description(index)
-        );
+    /// Builds the section of monitor `index` from its `view`: a titled frame with its
+    /// enable control and, when enabled and `editable` (the model's
+    /// [`DisplayModel::records_editable`]), the resolution/refresh/scale/position
+    /// drop-downs. `index` is what the controls' handlers hand back to the model.
+    fn build_section(
+        self: &Rc<Self>,
+        index: usize,
+        view: MonitorView<'_>,
+        editable: bool,
+    ) -> Frame {
+        let title = format!("{} — {}", view.name(), view.description());
         let frame = Frame::new(Some(title.trim_end_matches(" — ")));
 
         let section = GtkBox::new(Orientation::Vertical, SECTION_SPACING);
@@ -193,34 +202,34 @@ impl Inner {
         // only while the output is off: the frozen grammar has no record form that
         // turns an output off (task 11.9), so a switch on a running output could only
         // ever refuse. The model refuses a disable too, as the defence behind this.
-        if model.is_laptop(index) {
-            if model.laptop_toggle_available(index) {
-                section.append(&self.build_laptop_toggle(model, index));
+        if view.is_laptop() {
+            if view.laptop_toggle_available() {
+                section.append(&self.build_laptop_toggle(index, view));
                 if let Some(error) = self.laptop_error.borrow().as_deref() {
                     section.append(&note(error));
                 }
             }
-        } else if model.records_editable() {
-            if model.effective_enabled(index) {
+        } else if editable {
+            if view.effective_enabled() {
                 section.append(&note(
                     "Turning an external monitor off is not supported yet.",
                 ));
             } else {
-                section.append(&self.build_enable_switch(model, index));
+                section.append(&self.build_enable_switch(index, view));
             }
         }
 
         // The mode/scale/position drop-downs appear only while the output is enabled
         // and the file is editable — there is nothing meaningful to configure on a
         // disabled or unwritable output.
-        if model.records_editable() && model.effective_enabled(index) {
-            section.append(&self.build_resolution_row(model, index));
-            let refresh_rate_options = model.refresh_rate_options(index);
+        if editable && view.effective_enabled() {
+            section.append(&self.build_resolution_row(index, view));
+            let refresh_rate_options = view.refresh_rate_options();
             if !refresh_rate_options.is_empty() {
-                section.append(&self.build_refresh_rate_row(model, index, refresh_rate_options));
+                section.append(&self.build_refresh_rate_row(index, view, refresh_rate_options));
             }
-            section.append(&self.build_scale_row(model, index));
-            section.append(&self.build_position_row(model, index));
+            section.append(&self.build_scale_row(index, view));
+            section.append(&self.build_position_row(index, view));
         }
 
         // Why the last edit on this monitor was refused (R8.3).
@@ -240,11 +249,11 @@ impl Inner {
     /// The runtime laptop-display enable toggle (R5.2): flipping it runs the dotfiles'
     /// toggle script (task 11.8), never staging or touching `monitors.conf`. Its
     /// position is the panel's last *read* state.
-    fn build_laptop_toggle(self: &Rc<Self>, model: &DisplayModel, index: usize) -> GtkBox {
+    fn build_laptop_toggle(self: &Rc<Self>, index: usize, view: MonitorView<'_>) -> GtkBox {
         let switch = Switch::new();
         switch.set_halign(Align::End);
         switch.set_valign(Align::Center);
-        switch.set_active(model.laptop_enabled(index));
+        switch.set_active(view.laptop_enabled());
 
         let weak = Rc::downgrade(self);
         switch.connect_active_notify(move |switch| {
@@ -261,11 +270,11 @@ impl Inner {
     /// [`DisplayModel::stage_enabled`]). Once it is staged on, the rebuild shows the
     /// "not supported yet" note and the output's mode/scale rows in its place; Reset
     /// discards the staged enable.
-    fn build_enable_switch(self: &Rc<Self>, model: &DisplayModel, index: usize) -> GtkBox {
+    fn build_enable_switch(self: &Rc<Self>, index: usize, view: MonitorView<'_>) -> GtkBox {
         let switch = Switch::new();
         switch.set_halign(Align::End);
         switch.set_valign(Align::Center);
-        switch.set_active(model.effective_enabled(index));
+        switch.set_active(view.effective_enabled());
 
         let weak = Rc::downgrade(self);
         switch.connect_active_notify(move |switch| {
@@ -278,9 +287,9 @@ impl Inner {
     }
 
     /// The resolution drop-down row.
-    fn build_resolution_row(self: &Rc<Self>, model: &DisplayModel, index: usize) -> GtkBox {
-        let options = model.resolution_options(index);
-        let selected = position_of(&options, &model.effective_resolution(index));
+    fn build_resolution_row(self: &Rc<Self>, index: usize, view: MonitorView<'_>) -> GtkBox {
+        let options = view.resolution_options();
+        let selected = position_of(&options, &view.effective_resolution());
         let weak = Rc::downgrade(self);
         let dropdown = build_dropdown(&options, selected, move |resolution| {
             if let Some(inner) = weak.upgrade() {
@@ -294,12 +303,12 @@ impl Inner {
     /// options).
     fn build_refresh_rate_row(
         self: &Rc<Self>,
-        model: &DisplayModel,
         index: usize,
+        view: MonitorView<'_>,
         options: Vec<String>,
     ) -> GtkBox {
-        let selected = model
-            .effective_refresh(index)
+        let selected = view
+            .effective_refresh()
             .and_then(|refresh| position_of(&options, &refresh));
         let weak = Rc::downgrade(self);
         let dropdown = build_dropdown(&options, selected, move |refresh| {
@@ -311,9 +320,9 @@ impl Inner {
     }
 
     /// The scale drop-down row.
-    fn build_scale_row(self: &Rc<Self>, model: &DisplayModel, index: usize) -> GtkBox {
-        let options = model.scale_options(index);
-        let selected = position_of(&options, &model.effective_scale(index));
+    fn build_scale_row(self: &Rc<Self>, index: usize, view: MonitorView<'_>) -> GtkBox {
+        let options = view.scale_options();
+        let selected = position_of(&options, &view.effective_scale());
         let weak = Rc::downgrade(self);
         let dropdown = build_dropdown(&options, selected, move |scale| {
             if let Some(inner) = weak.upgrade() {
@@ -324,9 +333,9 @@ impl Inner {
     }
 
     /// The position drop-down row.
-    fn build_position_row(self: &Rc<Self>, model: &DisplayModel, index: usize) -> GtkBox {
-        let options = model.position_options(index);
-        let selected = position_of(&options, &model.effective_position(index));
+    fn build_position_row(self: &Rc<Self>, index: usize, view: MonitorView<'_>) -> GtkBox {
+        let options = view.position_options();
+        let selected = position_of(&options, &view.effective_position());
         let weak = Rc::downgrade(self);
         let dropdown = build_dropdown(&options, selected, move |position| {
             if let Some(inner) = weak.upgrade() {

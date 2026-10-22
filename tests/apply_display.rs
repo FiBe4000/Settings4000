@@ -24,7 +24,7 @@ use std::fs;
 
 use settings4000::core::apply::{self, ApplyPlan};
 use settings4000::core::detect::{Binary, Capabilities, DetectionInputs};
-use settings4000::core::display::DisplayModel;
+use settings4000::core::display::{DisplayModel, MonitorView};
 use settings4000::core::freshness::FreshnessTracker;
 use settings4000::core::notifd::NotifdReplies;
 use settings4000::core::reload::ReloadParams;
@@ -73,9 +73,15 @@ fn load_model(fx: &FixtureDotfiles) -> DisplayModel {
         probe_runner.recorded(),
         vec![Command::new("hyprctl").args(["monitors", "all", "-j"])]
     );
-    assert_eq!(model.monitor_name(0), "eDP-1");
+    assert_eq!(monitor_0(&model).name(), "eDP-1");
     assert!(model.records_editable(), "monitors.conf was readable");
     model
+}
+
+/// The model's first monitor — the fixture's laptop panel — failing the test when
+/// the model lists none.
+fn monitor_0(model: &DisplayModel) -> MonitorView<'_> {
+    model.monitor(0).expect("the laptop panel is listed")
 }
 
 /// A display change reloads only via `hyprctl reload` (task 4.4).
@@ -435,8 +441,8 @@ fn the_laptop_toggle_runs_the_detected_repo_script_between_two_reads() {
         caps.laptop_toggle_script().map(|path| path.to_path_buf()),
     )
     .expect("a successful probe yields a model");
-    assert!(model.laptop_toggle_available(0));
-    assert!(model.laptop_enabled(0));
+    assert!(monitor_0(&model).laptop_toggle_available());
+    assert!(monitor_0(&model).laptop_enabled());
 
     let runner = MockCommandRunner::with_outcomes([
         Ok(CommandOutput::fake_with_streams(
@@ -464,7 +470,10 @@ fn the_laptop_toggle_runs_the_detected_repo_script_between_two_reads() {
             Command::new("hyprctl").args(["monitors", "all", "-j"]),
         ]
     );
-    assert!(!model.laptop_enabled(0), "the switch shows the read state");
+    assert!(
+        !monitor_0(&model).laptop_enabled(),
+        "the switch shows the read state"
+    );
     assert!(!model.is_dirty(), "the runtime toggle never stages");
     assert_repo_untouched_except(&fx, &before, &[]);
 }
@@ -504,7 +513,10 @@ fn a_tree_without_the_toggle_script_hides_the_laptop_toggle_and_logs_it() {
         caps.laptop_toggle_script().map(|path| path.to_path_buf()),
     )
     .expect("a successful probe yields a model");
-    assert!(model.is_laptop(0));
-    assert!(!model.laptop_toggle_available(0), "no script, no toggle");
+    assert!(monitor_0(&model).is_laptop());
+    assert!(
+        !monitor_0(&model).laptop_toggle_available(),
+        "no script, no toggle"
+    );
     assert!(model.records_editable(), "the file-backed rows stay");
 }

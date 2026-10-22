@@ -111,7 +111,7 @@
 
 use std::fmt;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value as JsonValue;
 
@@ -142,7 +142,7 @@ const LAPTOP_OUTPUT_PREFIX: &str = "edp";
 
 /// Curated scale factors offered in the scale drop-down, in ascending order. The
 /// monitor's currently-configured scale is always added too (see
-/// [`DisplayModel::scale_options`]) so an unusual on-disk value stays selectable.
+/// [`MonitorView::scale_options`]) so an unusual on-disk value stays selectable.
 /// These cover the common integer and fractional scales in use (analysis §4/§6.2:
 /// `1`, `1.066667`, `1.333333`).
 const CURATED_SCALES: &[&str] = &["1", "1.25", "1.333333", "1.5", "1.75", "2"];
@@ -365,6 +365,14 @@ pub enum StageRefusal {
     /// The output is a laptop panel, whose on/off state is the runtime toggle
     /// ([`DisplayModel::toggle_laptop`], R5.2), never a staged record edit.
     LaptopEnablement,
+    /// The index names no monitor (task 9.24): it was taken before the model was
+    /// rebuilt with fewer monitors (a Refresh or a conflict reload). Refusing —
+    /// rather than panicking, or silently reporting success — keeps the app
+    /// running and tells the caller that nothing was staged (R8.3).
+    UnknownMonitor {
+        /// The index that was asked for.
+        index: usize,
+    },
 }
 
 impl fmt::Display for StageRefusal {
@@ -391,6 +399,10 @@ impl fmt::Display for StageRefusal {
                 f,
                 "the laptop panel is switched on and off with its runtime toggle, not a \
                  monitors.conf record"
+            ),
+            StageRefusal::UnknownMonitor { index } => write!(
+                f,
+                "monitor {index} is no longer listed; the page is out of date"
             ),
         }
     }
@@ -423,9 +435,10 @@ impl From<DisplayWriteError> for StageRefusal {
 #[derive(Debug)]
 pub enum LaptopToggleError {
     /// The toggle is not offered for this monitor: detection found no toggle script,
-    /// or the monitor is not the output the script switches. The page hides the
-    /// switch in that case, so this is reached only by a caller that skipped
-    /// [`DisplayModel::laptop_toggle_available`].
+    /// the monitor is not the output the script switches, or the index names no
+    /// monitor at all (an index left over from before a model rebuild). The page
+    /// hides the switch in the first two cases, so this is reached only by a caller
+    /// that skipped [`MonitorView::laptop_toggle_available`] or held a stale index.
     Unavailable,
     /// The state could not be read *before* the script, so the script was not run:
     /// without that read a pure toggle could flip the panel the wrong way.
@@ -753,115 +766,20 @@ impl DisplayModel {
         self.records_problem.as_ref()
     }
 
-    /// The live output name of monitor `index` (e.g. `eDP-1`).
-    pub fn monitor_name(&self, index: usize) -> &str {
-        &self.monitors[index].output_name
-    }
-
-    /// The `hyprctl` description (make/model) of monitor `index`.
-    pub fn monitor_description(&self, index: usize) -> &str {
-        &self.monitors[index].description
-    }
-
-    /// Whether monitor `index` is an internal laptop panel — its enablement uses the
-    /// runtime toggle (R5.2), its mode/scale the staged record edit.
-    pub fn is_laptop(&self, index: usize) -> bool {
-        self.monitors[index].is_laptop
-    }
-
-    /// The resolution (`WIDTHxHEIGHT`) drop-down options for monitor `index`: the
-    /// distinct resolutions the compositor reports, plus the configured resolution
-    /// when it is not among them, so the current value is always selectable.
-    pub fn resolution_options(&self, index: usize) -> Vec<String> {
-        let mut options: Vec<String> = Vec::new();
-        for mode in &self.monitors[index].available {
-            if !options.contains(&mode.resolution) {
-                options.push(mode.resolution.clone());
-            }
-        }
-        let configured = self.effective_resolution(index);
-        if !options.contains(&configured) {
-            options.insert(0, configured);
-        }
-        options
-    }
-
-    /// The refresh-rate drop-down options for monitor `index`, for its currently
-    /// selected resolution: the refresh rates the compositor reports for that
-    /// resolution, plus the configured refresh when set and not among them. Empty for
-    /// a special mode token (`preferred`), whose refresh is Hyprland's choice.
-    pub fn refresh_rate_options(&self, index: usize) -> Vec<String> {
-        let resolution = self.effective_resolution(index);
-        self.refresh_rate_options_for(index, &resolution)
-    }
-
-    /// The scale drop-down options for monitor `index`: the configured scale (first,
-    /// so it is preselected) followed by the [`CURATED_SCALES`] not already listed.
-    pub fn scale_options(&self, index: usize) -> Vec<String> {
-        let configured = self.effective_scale(index);
-        let mut options = vec![configured.clone()];
-        for scale in CURATED_SCALES {
-            if *scale != configured {
-                options.push((*scale).to_string());
-            }
-        }
-        options
-    }
-
-    /// The position drop-down options for monitor `index`: [`CURATED_POSITIONS`] plus
-    /// the configured position when it is neither.
-    pub fn position_options(&self, index: usize) -> Vec<String> {
-        let mut options: Vec<String> = CURATED_POSITIONS.iter().map(|p| (*p).to_string()).collect();
-        let configured = self.effective_position(index);
-        if !options.contains(&configured) {
-            options.push(configured);
-        }
-        options
-    }
-
-    /// The currently selected resolution (`WIDTHxHEIGHT` or a mode token) of monitor
-    /// `index`, from its staged-or-original mode.
-    pub fn effective_resolution(&self, index: usize) -> String {
-        split_mode(&self.monitors[index].effective().mode).0
-    }
-
-    /// The currently selected refresh rate of monitor `index`, or `None` when the mode
-    /// carries none (a bare `WIDTHxHEIGHT` or a token).
-    pub fn effective_refresh(&self, index: usize) -> Option<String> {
-        split_mode(&self.monitors[index].effective().mode).1
-    }
-
-    /// The currently selected scale of monitor `index`.
-    pub fn effective_scale(&self, index: usize) -> String {
-        self.monitors[index].effective().scale.clone()
-    }
-
-    /// The currently selected position of monitor `index`.
-    pub fn effective_position(&self, index: usize) -> String {
-        self.monitors[index].effective().position.clone()
-    }
-
-    /// Whether monitor `index` is currently enabled (staged-or-original). For a
-    /// non-laptop output this drives its enable switch; a laptop panel's live
-    /// enablement is the runtime toggle instead (see [`Self::laptop_enabled`]).
-    pub fn effective_enabled(&self, index: usize) -> bool {
-        self.monitors[index].effective().enabled
-    }
-
-    /// Whether the laptop panel `index` is currently on, from the last `hyprctl`
-    /// read (`!disabled`). This drives the runtime laptop enable switch's position —
-    /// the panel's actual on/off state — independent of the staged record edits.
-    pub fn laptop_enabled(&self, index: usize) -> bool {
-        self.monitors[index].live_enabled
-    }
-
-    /// Whether monitor `index` gets the runtime laptop toggle (R4.2, R5.2; task
-    /// 11.8): it is the output the dotfiles' toggle script switches (`eDP-1`, which
-    /// the script hard-codes) and detection found the script. Otherwise the toggle
-    /// is hidden, never shown greyed out; the panel's file-backed mode and scale
-    /// controls are unaffected.
-    pub fn laptop_toggle_available(&self, index: usize) -> bool {
-        self.toggle_program(index).is_some()
+    /// A read-only view of monitor `index` — its identity, drop-down options and
+    /// current values — or `None` when `index` names no monitor (task 9.24).
+    ///
+    /// Indices are positions in the order `hyprctl` reported the outputs, from `0`
+    /// to [`Self::monitor_count`]` - 1`. The page builds each monitor's section from
+    /// one view; an index held across a model rebuild (a Refresh or conflict reload
+    /// can change the monitor count) yields `None` rather than a panic, so stale UI
+    /// state can never take the app down (R8.3).
+    pub fn monitor(&self, index: usize) -> Option<MonitorView<'_>> {
+        let monitor = self.monitors.get(index)?;
+        Some(MonitorView {
+            monitor,
+            laptop_toggle_script: self.laptop_toggle_script.as_deref(),
+        })
     }
 
     /// Whether `monitors.conf` changed on disk since it was loaded (R5.6).
@@ -895,27 +813,34 @@ impl DisplayModel {
     /// the first the compositor reports) into the mode field.
     ///
     /// Refused (nothing staged) when the composed mode is malformed or the resulting
-    /// `monitors.conf` would break its frozen grammar (R8.3; see [`StageRefusal`]).
+    /// `monitors.conf` would break its frozen grammar (R8.3; see [`StageRefusal`]),
+    /// and with [`StageRefusal::UnknownMonitor`] when `index` names no monitor.
     pub fn stage_resolution(
         &mut self,
         index: usize,
         resolution: String,
     ) -> Result<(), StageRefusal> {
-        let refresh = {
-            let current = self.effective_refresh(index);
-            let available = self.refresh_rate_options_for(index, &resolution);
-            match current {
+        // A stale index has no refresh to keep; the composed mode is then never
+        // staged, because `stage_checked` refuses the index before any value check.
+        let refresh = self.monitor(index).and_then(|view| {
+            let available = view.refresh_rate_options_for(&resolution);
+            match view.effective_refresh() {
                 Some(refresh) if available.contains(&refresh) => Some(refresh),
                 _ => available.into_iter().next(),
             }
-        };
+        });
         self.stage_mode(index, compose_mode(&resolution, refresh.as_deref()))
     }
 
     /// Stages a new refresh rate for monitor `index`, keeping its current resolution.
     /// Refused like [`Self::stage_resolution`].
     pub fn stage_refresh(&mut self, index: usize, refresh: String) -> Result<(), StageRefusal> {
-        let resolution = self.effective_resolution(index);
+        // As in `stage_resolution`, a stale index is refused by `stage_checked`
+        // before the (then meaningless) composed mode is looked at.
+        let resolution = self
+            .monitor(index)
+            .map(|view| view.effective_resolution())
+            .unwrap_or_default();
         self.stage_mode(index, compose_mode(&resolution, Some(&refresh)))
     }
 
@@ -939,9 +864,9 @@ impl DisplayModel {
     /// `hyprland.lua`'s loader nor `scripts/hypr-display-profile.sh`'s awk could parse.
     ///
     /// The check is here, in the model, rather than being left to the curated
-    /// [`Self::position_options`] drop-down that feeds it today: the model is the
-    /// enforcement layer, so a future free-text position control — or a position picked
-    /// up from a hand-edited `monitors.conf` — cannot bypass it. See
+    /// [`MonitorView::position_options`] drop-down that feeds it today: the model is
+    /// the enforcement layer, so a future free-text position control — or a position
+    /// picked up from a hand-edited `monitors.conf` — cannot bypass it. See
     /// [`validate_monitor_position`] for what a position may look like and why a comma
     /// or `#` in one would break the record.
     pub fn stage_position(&mut self, index: usize, position: String) -> Result<(), StageRefusal> {
@@ -961,7 +886,8 @@ impl DisplayModel {
     /// under `hyprland.lua`'s loader — see the module docs). Enabling an output that is
     /// off writes a complete record and stages normally.
     pub fn stage_enabled(&mut self, index: usize, enabled: bool) -> Result<(), StageRefusal> {
-        let valid = if self.monitors[index].is_laptop {
+        let is_laptop = self.monitor(index).is_some_and(|view| view.is_laptop());
+        let valid = if is_laptop {
             Err(StageRefusal::LaptopEnablement)
         } else {
             Ok(())
@@ -982,32 +908,40 @@ impl DisplayModel {
         self.stage_checked(index, valid, |config| config.mode = mode)
     }
 
-    /// The shared tail of every `stage_*` call: when the caller's value checks
-    /// (`valid`) passed, applies `edit` to a copy of monitor `index`'s effective config
-    /// and stages it only when the whole resulting `monitors.conf` follows the frozen
-    /// grammar (task 11.9, R8.3).
+    /// The shared tail of every `stage_*` call: when `index` names a monitor and the
+    /// caller's value checks (`valid`) passed, applies `edit` to a copy of that
+    /// monitor's effective config and stages it only when the whole resulting
+    /// `monitors.conf` follows the frozen grammar (task 11.9, R8.3).
     ///
-    /// The check is a trial render of every pending edit — this one included — into a
-    /// copy of the parsed file, followed by the same whole-file validation
+    /// The index is checked first, so an index left over from before a model rebuild
+    /// is reported as [`StageRefusal::UnknownMonitor`] rather than as whatever its
+    /// value check would say about a monitor that no longer exists (task 9.24).
+    ///
+    /// The grammar check is a trial render of every pending edit — this one included
+    /// — into a copy of the parsed file, followed by the same whole-file validation
     /// [`Self::apply_contribution`] runs before writing. Validating the rendered file
     /// rather than the changed value is what makes it a whole-record check: the
     /// record's untouched fields and extras, and the file-level rules (one record per
     /// laptop-panel key, the catch-all first), are covered too. An edit back to the
-    /// original needs no check — it unstages. A refused edit — by the value checks or
-    /// the render — leaves the model unchanged and is logged at `warn`.
+    /// original needs no check — it unstages. A refused edit — by the index, the value
+    /// checks or the render — leaves the model unchanged and is logged at `warn`.
     fn stage_checked(
         &mut self,
         index: usize,
         valid: Result<(), StageRefusal>,
         edit: impl FnOnce(&mut MonitorConfig),
     ) -> Result<(), StageRefusal> {
-        let result = valid.and_then(|()| self.try_stage(index, edit));
+        let result = if index < self.monitors.len() {
+            valid.and_then(|()| self.try_stage(index, edit))
+        } else {
+            Err(StageRefusal::UnknownMonitor { index })
+        };
         if let Err(refusal) = &result {
-            tracing::warn!(
-                output = %self.monitors[index].output_name,
-                %refusal,
-                "refusing a monitor edit (R8.3)"
-            );
+            let output = self
+                .monitors
+                .get(index)
+                .map_or("(none)", |monitor| monitor.output_name.as_str());
+            tracing::warn!(index, %output, %refusal, "refusing a monitor edit (R8.3)");
         }
         result
     }
@@ -1018,7 +952,9 @@ impl DisplayModel {
     /// Every real `stage_*` call trial-renders its edit, so a staged state the writer
     /// refuses cannot be reached through them; this seam lets an integration test
     /// craft one and prove [`Self::apply_contribution`] still refuses it before any
-    /// write. Compiled only for tests and the `testing` feature.
+    /// write. Compiled only for tests and the `testing` feature. Unlike the real
+    /// `stage_*` methods it panics on an out-of-range `index`, so a test that
+    /// addresses the wrong monitor fails loudly instead of silently staging nothing.
     #[cfg(any(test, feature = "testing"))]
     pub fn stage_scale_unchecked_for_tests(&mut self, index: usize, scale: &str) {
         let monitor = &mut self.monitors[index];
@@ -1027,7 +963,12 @@ impl DisplayModel {
         monitor.staged = Some(staged);
     }
 
-    /// [`Self::stage_checked`] without the logging.
+    /// [`Self::stage_checked`] without the logging or the up-front index check.
+    ///
+    /// The candidate edit is made on a copy of all monitors, which is trial-rendered
+    /// and then becomes the model's state only when accepted. Reaching the monitor
+    /// through `get_mut` on that copy, rather than indexing, keeps this free of a
+    /// panic path even if a future caller skips `stage_checked`.
     fn try_stage(
         &mut self,
         index: usize,
@@ -1040,51 +981,23 @@ impl DisplayModel {
             return Err(StageRefusal::RecordsUnavailable);
         };
 
-        let mut candidate = self.monitors[index].effective().clone();
+        let mut monitors = self.monitors.clone();
+        let Some(monitor) = monitors.get_mut(index) else {
+            return Err(StageRefusal::UnknownMonitor { index });
+        };
+        let mut candidate = monitor.effective().clone();
         edit(&mut candidate);
-        if candidate != self.monitors[index].original {
-            let mut monitors = self.monitors.clone();
-            monitors[index].staged = Some(candidate.clone());
+        // An edit back to the original unstages, so re-selecting the current value
+        // never leaves the page dirty — and needs no grammar check.
+        if candidate == monitor.original {
+            monitor.staged = None;
+        } else {
+            monitor.staged = Some(candidate);
             render_checked(&mut records.clone(), &monitors)?;
         }
 
-        self.monitors[index].staged = Some(candidate);
-        self.clear_if_unchanged(index);
+        self.monitors = monitors;
         Ok(())
-    }
-
-    /// Drops monitor `index`'s staged config when it has been edited back to equal the
-    /// original, so re-selecting the current value never leaves the page dirty.
-    fn clear_if_unchanged(&mut self, index: usize) {
-        let monitor = &mut self.monitors[index];
-        if monitor.staged.as_ref() == Some(&monitor.original) {
-            monitor.staged = None;
-        }
-    }
-
-    /// The refresh-rate options for a specific `resolution` of monitor `index`: the
-    /// refreshes the compositor reports for it, plus the configured refresh when the
-    /// selected resolution is the configured one and it is not otherwise listed. Empty
-    /// for a special mode token.
-    fn refresh_rate_options_for(&self, index: usize, resolution: &str) -> Vec<String> {
-        if is_special_mode(resolution) {
-            return Vec::new();
-        }
-        let mut options: Vec<String> = Vec::new();
-        for mode in &self.monitors[index].available {
-            if mode.resolution == resolution && !options.contains(&mode.refresh) {
-                options.push(mode.refresh.clone());
-            }
-        }
-        // Keep the configured refresh selectable when it applies to this resolution.
-        if self.effective_resolution(index) == resolution {
-            if let Some(refresh) = self.effective_refresh(index) {
-                if !options.contains(&refresh) {
-                    options.insert(0, refresh);
-                }
-            }
-        }
-        options
     }
 
     /// Whether any monitor has a pending file-backed edit — the Display page's dirty
@@ -1259,9 +1172,10 @@ impl DisplayModel {
     /// panel, and the runner's 5 s timeout can stop it after the monitor call already
     /// went through. A changed state is success (a script failure alongside it is
     /// logged at `warn`); an unchanged state is [`LaptopToggleError::Unchanged`].
-    /// The stored state — and with it [`Self::laptop_enabled`] and the switch — is
-    /// only ever updated from a read. Every failure is logged and returned for the
-    /// page to show; none is fatal (R5.5).
+    /// The stored state — and with it [`MonitorView::laptop_enabled`] and the
+    /// switch — is only ever updated from a read. Every failure is logged and
+    /// returned for the page to show; none is fatal (R5.5). An `index` that names no
+    /// monitor is [`LaptopToggleError::Unavailable`] and runs nothing.
     ///
     /// This never stages, never becomes dirty, and never touches `monitors.conf`.
     pub fn toggle_laptop(
@@ -1270,10 +1184,13 @@ impl DisplayModel {
         enable: bool,
         runner: &dyn CommandRunner,
     ) -> Result<(), LaptopToggleError> {
-        let Some(script) = self.toggle_program(index).map(str::to_string) else {
+        // An index that names no monitor (stale UI state) is unavailable too.
+        let Some((output, script)) = self.monitor(index).and_then(|view| {
+            let script = view.toggle_program()?;
+            Some((view.name().to_string(), script.to_string()))
+        }) else {
             return Err(LaptopToggleError::Unavailable);
         };
-        let output = self.monitors[index].output_name.clone();
 
         let before = read_output_enabled(runner, &output).map_err(|error| {
             tracing::error!(
@@ -1283,7 +1200,7 @@ impl DisplayModel {
             );
             LaptopToggleError::ReadBefore(error)
         })?;
-        self.monitors[index].live_enabled = before;
+        self.set_live_enabled(index, before);
         if before == enable {
             tracing::info!(
                 %output,
@@ -1311,7 +1228,7 @@ impl DisplayModel {
                 });
             }
         };
-        self.monitors[index].live_enabled = after;
+        self.set_live_enabled(index, after);
 
         if after == before {
             tracing::error!(
@@ -1339,18 +1256,199 @@ impl DisplayModel {
         Ok(())
     }
 
-    /// The toggle script to run for monitor `index`, as the program string of a
+    /// Stores the on/off state just read for monitor `index` — the only way
+    /// [`MonitorView::laptop_enabled`] changes after load.
+    ///
+    /// [`Self::toggle_laptop`] calls this only for an index its availability check
+    /// already resolved, so the monitor is always found; reaching it through
+    /// `get_mut` rather than indexing keeps the toggle free of a panic path all the
+    /// same.
+    fn set_live_enabled(&mut self, index: usize, enabled: bool) {
+        if let Some(monitor) = self.monitors.get_mut(index) {
+            monitor.live_enabled = enabled;
+        }
+    }
+}
+
+/// A borrowed, read-only view of one monitor of a [`DisplayModel`], returned by
+/// [`DisplayModel::monitor`] (task 9.24).
+///
+/// It answers everything the Display page renders for one output: the identity
+/// reported by the compositor, the options of each drop-down, the value each control
+/// currently shows, and whether the runtime laptop toggle is offered. Values come
+/// from two places, and each getter says which:
+///
+/// - the **live** state, read from `hyprctl monitors all -j` at load (and, for the
+///   laptop panel's on/off state, re-read around each toggle);
+/// - the **effective** configuration — the pending staged edit if there is one,
+///   otherwise the value configured by the output's `monitor=` record in
+///   `monitors.conf`, or the live state when no specific enabled record configures
+///   the output.
+///
+/// The view borrows the model, so it cannot outlive a mutation: after any `stage_*`
+/// or toggle call, ask [`DisplayModel::monitor`] for a fresh one.
+#[derive(Clone, Copy, Debug)]
+pub struct MonitorView<'a> {
+    /// The monitor this view reports on.
+    monitor: &'a Monitor,
+    /// The detected toggle script (the model's), needed to tell whether this
+    /// monitor gets the runtime laptop toggle.
+    laptop_toggle_script: Option<&'a Path>,
+}
+
+impl<'a> MonitorView<'a> {
+    /// The live output name reported by the compositor (e.g. `eDP-1`, `DP-1`).
+    pub fn name(&self) -> &'a str {
+        &self.monitor.output_name
+    }
+
+    /// The compositor's description of the output (make and model, e.g.
+    /// `AU Optronics 0x2036`), possibly empty.
+    pub fn description(&self) -> &'a str {
+        &self.monitor.description
+    }
+
+    /// Whether the output is an internal laptop panel (its live name starts with
+    /// `eDP`, any case). A panel's on/off state is the runtime toggle (R5.2), never
+    /// a staged edit; its mode and scale are staged like any monitor's.
+    pub fn is_laptop(&self) -> bool {
+        self.monitor.is_laptop
+    }
+
+    /// The resolution (`WIDTHxHEIGHT`) drop-down options: the distinct resolutions
+    /// the compositor reports the output supports, plus the effective resolution
+    /// (first) when it is not among them, so the current value is always selectable.
+    pub fn resolution_options(&self) -> Vec<String> {
+        let mut options: Vec<String> = Vec::new();
+        for mode in &self.monitor.available {
+            if !options.contains(&mode.resolution) {
+                options.push(mode.resolution.clone());
+            }
+        }
+        let configured = self.effective_resolution();
+        if !options.contains(&configured) {
+            options.insert(0, configured);
+        }
+        options
+    }
+
+    /// The refresh-rate drop-down options for the effective resolution: the refresh
+    /// rates the compositor reports for that resolution, plus the effective refresh
+    /// when set and not among them. Empty for a special mode token (`preferred`),
+    /// whose refresh is Hyprland's choice.
+    pub fn refresh_rate_options(&self) -> Vec<String> {
+        self.refresh_rate_options_for(&self.effective_resolution())
+    }
+
+    /// The scale drop-down options: the effective scale (first, so it is
+    /// preselected) followed by the curated common scales (`1` up to `2`) not
+    /// already listed.
+    pub fn scale_options(&self) -> Vec<String> {
+        let configured = self.effective_scale();
+        let mut options = vec![configured.clone()];
+        for scale in CURATED_SCALES {
+            if *scale != configured {
+                options.push((*scale).to_string());
+            }
+        }
+        options
+    }
+
+    /// The position drop-down options: the curated `auto` and `0x0`, plus the
+    /// effective position when it is neither.
+    pub fn position_options(&self) -> Vec<String> {
+        let mut options: Vec<String> = CURATED_POSITIONS.iter().map(|p| (*p).to_string()).collect();
+        let configured = self.effective_position();
+        if !options.contains(&configured) {
+            options.push(configured);
+        }
+        options
+    }
+
+    /// The effective resolution: the `WIDTHxHEIGHT` part of the effective mode
+    /// field, or the whole field when it is a token such as `preferred`.
+    pub fn effective_resolution(&self) -> String {
+        split_mode(&self.monitor.effective().mode).0
+    }
+
+    /// The effective refresh rate (the part of the mode field after `@`), or `None`
+    /// when the mode carries none (a bare `WIDTHxHEIGHT` or a token).
+    pub fn effective_refresh(&self) -> Option<String> {
+        split_mode(&self.monitor.effective().mode).1
+    }
+
+    /// The effective scale field (e.g. `1.066667`).
+    pub fn effective_scale(&self) -> String {
+        self.monitor.effective().scale.clone()
+    }
+
+    /// The effective position field (`XxY` or `auto`).
+    pub fn effective_position(&self) -> String {
+        self.monitor.effective().position.clone()
+    }
+
+    /// Whether the output is enabled in its effective configuration. This drives a
+    /// non-laptop output's enable switch. For a laptop panel it is always `true` —
+    /// the panel's enablement is not a record setting — and its live on/off state is
+    /// [`Self::laptop_enabled`] instead.
+    pub fn effective_enabled(&self) -> bool {
+        self.monitor.effective().enabled
+    }
+
+    /// Whether the compositor last reported the output as on (`!disabled`). Only
+    /// ever set from a read — at load, and by [`DisplayModel::toggle_laptop`] from
+    /// the reads around the toggle script — and drives the runtime laptop switch's
+    /// position, independent of any staged record edit.
+    pub fn laptop_enabled(&self) -> bool {
+        self.monitor.live_enabled
+    }
+
+    /// Whether this output gets the runtime laptop toggle (R4.2, R5.2; task 11.8):
+    /// it is the output the dotfiles' toggle script switches (`eDP-1`, which the
+    /// script hard-codes) and detection found the script. Otherwise the toggle is
+    /// hidden, never shown greyed out; the panel's file-backed mode and scale
+    /// controls are unaffected.
+    pub fn laptop_toggle_available(&self) -> bool {
+        self.toggle_program().is_some()
+    }
+
+    /// The toggle script to run for this output, as the program string of a
     /// [`Command`], or `None` when the laptop toggle is unavailable for it (see
     /// [`Self::laptop_toggle_available`]).
     ///
     /// Detection only reports a script whose path is valid UTF-8 (a [`Command`] holds
     /// its program as a `String`), so the `to_str` here cannot fail for a detected
     /// script; it is a plain conversion, never a lossy one.
-    fn toggle_program(&self, index: usize) -> Option<&str> {
-        if self.monitors[index].output_name != TOGGLE_SCRIPT_OUTPUT {
+    fn toggle_program(&self) -> Option<&'a str> {
+        if self.monitor.output_name != TOGGLE_SCRIPT_OUTPUT {
             return None;
         }
-        self.laptop_toggle_script.as_deref()?.to_str()
+        self.laptop_toggle_script?.to_str()
+    }
+
+    /// The refresh-rate options for a specific `resolution`: the refreshes the
+    /// compositor reports for it, plus the effective refresh when `resolution` is
+    /// the effective one and that refresh is not otherwise listed. Empty for a
+    /// special mode token.
+    fn refresh_rate_options_for(&self, resolution: &str) -> Vec<String> {
+        if is_special_mode(resolution) {
+            return Vec::new();
+        }
+        let mut options: Vec<String> = Vec::new();
+        for mode in &self.monitor.available {
+            if mode.resolution == resolution && !options.contains(&mode.refresh) {
+                options.push(mode.refresh.clone());
+            }
+        }
+        // Keep the configured refresh selectable when it applies to this resolution.
+        if self.effective_resolution() == resolution {
+            if let Some(refresh) = self.effective_refresh() {
+                if !options.contains(&refresh) {
+                    options.insert(0, refresh);
+                }
+            }
+        }
+        options
     }
 }
 
@@ -1564,24 +1662,32 @@ fn merge_monitor(live: LiveMonitor, records: Option<&MonitorsFile>) -> Monitor {
         .name
         .to_ascii_lowercase()
         .starts_with(LAPTOP_OUTPUT_PREFIX);
-    let record_name = records.and_then(|file| match_record(file, &live.name, &live.description));
+    // The specific record configuring this output, together with the file it was
+    // found in. Keeping the two in one `Option` makes "a record name implies a
+    // records file" hold by construction: a name only ever comes out of searching a
+    // file, so there is no state in which code below has a name but no file to read
+    // it from, and no unreachable branch to guard.
+    let matched = records.and_then(|file| {
+        match_record(file, &live.name, &live.description).map(|name| (file, name))
+    });
 
     // Read the configured values from a specific, enabled record; otherwise fall back
     // to the live state so the drop-downs still show something meaningful.
-    let record_enabled = record_name
+    let record_enabled = matched
         .as_ref()
-        .and_then(|name| records.and_then(|file| file.is_enabled(name)));
+        .and_then(|(file, name)| file.is_enabled(name));
     let has_enabled_record = record_enabled == Some(true);
 
     let live_mode = live_mode_string(&live);
     let live_scale = trim_float(live.scale);
     let live_position = format!("{}x{}", live.position.0, live.position.1);
 
-    let (mode, position, scale) = if has_enabled_record {
-        let name = record_name
-            .as_deref()
-            .expect("an enabled record has a name");
-        let file = records.expect("a record implies a records file");
+    let enabled_record = if has_enabled_record {
+        matched.as_ref().map(|(file, name)| (*file, name.as_str()))
+    } else {
+        None
+    };
+    let (mode, position, scale) = if let Some((file, name)) = enabled_record {
         (
             file.field(name, MonitorField::Mode)
                 .map(str::to_string)
@@ -1621,7 +1727,7 @@ fn merge_monitor(live: LiveMonitor, records: Option<&MonitorsFile>) -> Monitor {
         description: live.description,
         is_laptop,
         live_enabled: !live.disabled,
-        record_name,
+        record_name: matched.map(|(_, name)| name),
         has_enabled_record,
         available: live.available,
         original,
@@ -1761,6 +1867,11 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         String::from_utf8(rendered_contribution(model).write.contents).expect("utf-8")
     }
 
+    /// Monitor `index`'s view, failing the test when the model has no such monitor.
+    fn view(model: &DisplayModel, index: usize) -> MonitorView<'_> {
+        model.monitor(index).expect("the monitor exists")
+    }
+
     /// Builds a laptop-only model without a detected toggle script, from the canned
     /// sources — the merge under test.
     fn laptop_model(dir: &std::path::Path) -> DisplayModel {
@@ -1782,24 +1893,33 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         let model = laptop_model(dir.path());
 
         assert_eq!(model.monitor_count(), 1);
-        assert_eq!(model.monitor_name(0), "eDP-1");
-        assert_eq!(model.monitor_description(0), "AU Optronics 0x2036");
-        assert!(model.is_laptop(0), "eDP-1 is the internal laptop panel");
+        assert_eq!(view(&model, 0).name(), "eDP-1");
+        assert_eq!(view(&model, 0).description(), "AU Optronics 0x2036");
+        assert!(
+            view(&model, 0).is_laptop(),
+            "eDP-1 is the internal laptop panel"
+        );
         assert!(model.records_editable());
 
         // Configured values from the winning desc record (not the generic eDP-1 rule).
-        assert_eq!(model.effective_resolution(0), "2560x1440");
+        assert_eq!(view(&model, 0).effective_resolution(), "2560x1440");
         assert_eq!(
-            model.effective_refresh(0),
+            view(&model, 0).effective_refresh(),
             None,
             "the record's mode is a bare WIDTHxHEIGHT, so no refresh is preselected"
         );
-        assert_eq!(model.effective_scale(0), "1.066667");
-        assert_eq!(model.effective_position(0), "auto");
+        assert_eq!(view(&model, 0).effective_scale(), "1.066667");
+        assert_eq!(view(&model, 0).effective_position(), "auto");
 
         // Available modes come from the live probe.
-        assert_eq!(model.resolution_options(0), vec!["2560x1440".to_string()]);
-        assert_eq!(model.refresh_rate_options(0), vec!["60.01".to_string()]);
+        assert_eq!(
+            view(&model, 0).resolution_options(),
+            vec!["2560x1440".to_string()]
+        );
+        assert_eq!(
+            view(&model, 0).refresh_rate_options(),
+            vec!["60.01".to_string()]
+        );
         assert!(!model.is_dirty());
     }
 
@@ -1821,7 +1941,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             DisplayModel::load(&runner, path, None).expect("a successful probe yields a model");
 
         assert_eq!(model.monitor_count(), 1);
-        assert_eq!(model.effective_scale(0), "1.066667");
+        assert_eq!(view(&model, 0).effective_scale(), "1.066667");
         assert_eq!(
             runner.recorded(),
             vec![Command::new("hyprctl").args(["monitors", "all", "-j"])],
@@ -1974,7 +2094,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         assert!(model.is_dirty());
         model.reset();
         assert!(!model.is_dirty());
-        assert_eq!(model.effective_scale(0), "1.066667");
+        assert_eq!(view(&model, 0).effective_scale(), "1.066667");
     }
 
     #[test]
@@ -1989,7 +2109,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         model.commit();
         assert!(!model.is_dirty(), "commit clears dirty");
         assert_eq!(
-            model.effective_scale(0),
+            view(&model, 0).effective_scale(),
             "1.5",
             "the staged value is the new original"
         );
@@ -2065,7 +2185,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
                 "`{malformed}` must not stage as a position"
             );
             assert_eq!(
-                model.effective_position(0),
+                view(&model, 0).effective_position(),
                 "auto",
                 "the rejected value must leave the shown position untouched"
             );
@@ -2102,7 +2222,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         let mut model =
             DisplayModel::from_sources(Some(conf), hyprctl, dir.path().join("monitors.conf"), None);
         assert_eq!(
-            model.effective_position(0),
+            view(&model, 0).effective_position(),
             "",
             "the empty position field is read as an empty value"
         );
@@ -2170,11 +2290,11 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         // The staged edit survives the aborted Apply, so the user can change it and try
         // again.
         assert!(model.is_dirty(), "the staged edit must be retained");
-        assert!(!model.effective_enabled(0));
+        assert!(!view(&model, 0).effective_enabled());
         // Nothing was promoted: dropping the staged edit restores the on-disk baseline,
         // proving the model was never re-baselined against unwritten bytes.
         model.reset();
-        assert!(model.effective_enabled(0));
+        assert!(view(&model, 0).effective_enabled());
     }
 
     #[test]
@@ -2250,8 +2370,8 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             dir.path().join("monitors.conf"),
             None,
         );
-        assert!(!model.is_laptop(0));
-        assert!(model.effective_enabled(0));
+        assert!(!view(&model, 0).is_laptop());
+        assert!(view(&model, 0).effective_enabled());
 
         let refusal = model
             .stage_enabled(0, false)
@@ -2265,7 +2385,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             "the refusal names the rule: {refusal}"
         );
         assert!(!model.is_dirty());
-        assert!(model.effective_enabled(0));
+        assert!(view(&model, 0).effective_enabled());
     }
 
     #[test]
@@ -2321,8 +2441,8 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         assert_eq!(warning.level, tracing::Level::WARN);
         assert!(warning.fields.contains("eDP-1"), "{}", warning.fields);
 
-        assert_eq!(model.effective_scale(0), "1.25");
-        assert_eq!(model.effective_position(0), "auto");
+        assert_eq!(view(&model, 0).effective_scale(), "1.25");
+        assert_eq!(view(&model, 0).effective_position(), "auto");
     }
 
     #[test]
@@ -2403,7 +2523,10 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         let problem = model.records_problem().expect("the violation is reported");
         assert_eq!(problem.line(), 2);
         assert_eq!(problem.rule(), &GrammarRule::IncompleteExtra);
-        assert!(model.laptop_toggle_available(0), "the runtime toggle stays");
+        assert!(
+            view(&model, 0).laptop_toggle_available(),
+            "the runtime toggle stays"
+        );
 
         let refusal = model
             .stage_scale(0, "1.25".to_string())
@@ -2485,9 +2608,9 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         let dir = tempfile::tempdir().expect("temp dir");
         let conf_path = dir.path().join("monitors.conf");
         let mut model = toggle_model(&conf_path);
-        assert!(model.laptop_toggle_available(0));
+        assert!(view(&model, 0).laptop_toggle_available());
         assert!(
-            model.laptop_enabled(0),
+            view(&model, 0).laptop_enabled(),
             "the load probe reports the panel on"
         );
 
@@ -2500,7 +2623,10 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         model
             .toggle_laptop(0, false, &runner)
             .expect("a toggle the re-read confirms succeeds");
-        assert!(!model.laptop_enabled(0), "the switch shows the read state");
+        assert!(
+            !view(&model, 0).laptop_enabled(),
+            "the switch shows the read state"
+        );
         let recorded = runner.recorded();
         assert_eq!(recorded, toggle_sequence());
         assert!(
@@ -2517,7 +2643,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         model
             .toggle_laptop(0, true, &runner)
             .expect("a toggle the re-read confirms succeeds");
-        assert!(model.laptop_enabled(0));
+        assert!(view(&model, 0).laptop_enabled());
         assert_eq!(runner.recorded(), toggle_sequence());
 
         assert!(!model.is_dirty(), "the runtime toggle never stages");
@@ -2559,7 +2685,10 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             error.to_string(),
             "the panel is still on after running the toggle script"
         );
-        assert!(model.laptop_enabled(0), "the switch stays on, as read");
+        assert!(
+            view(&model, 0).laptop_enabled(),
+            "the switch stays on, as read"
+        );
         assert_eq!(runner.recorded(), toggle_sequence());
     }
 
@@ -2579,7 +2708,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         model
             .toggle_laptop(0, false, &runner)
             .expect("the panel switched, so the toggle succeeded");
-        assert!(!model.laptop_enabled(0));
+        assert!(!view(&model, 0).laptop_enabled());
 
         let runner = MockCommandRunner::with_outcomes([
             probe_reply(&hyprctl_laptop_disabled()),
@@ -2609,7 +2738,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             "the panel is still off after running the toggle script; the toggle script \
              exited with status 2: jq: command not found"
         );
-        assert!(!model.laptop_enabled(0));
+        assert!(!view(&model, 0).laptop_enabled());
     }
 
     #[test]
@@ -2634,7 +2763,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
                 probe_reply(&hyprctl_laptop_disabled()),
             ]);
             outcome = Some(model.toggle_laptop(0, false, &runner));
-            enabled = Some(model.laptop_enabled(0));
+            enabled = Some(view(&model, 0).laptop_enabled());
             assert_eq!(runner.recorded(), toggle_sequence());
         });
 
@@ -2661,13 +2790,13 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         // the pre-read catches that, nothing runs, and the switch catches up.
         let dir = tempfile::tempdir().expect("temp dir");
         let mut model = toggle_model(&dir.path().join("monitors.conf"));
-        assert!(model.laptop_enabled(0));
+        assert!(view(&model, 0).laptop_enabled());
         let runner = MockCommandRunner::with_outcomes([probe_reply(&hyprctl_laptop_disabled())]);
 
         model
             .toggle_laptop(0, false, &runner)
             .expect("the requested state already holds");
-        assert!(!model.laptop_enabled(0));
+        assert!(!view(&model, 0).laptop_enabled());
         assert_eq!(
             runner.recorded(),
             vec![Command::new("hyprctl").args(["monitors", "all", "-j"])],
@@ -2695,7 +2824,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         );
         assert!(error.to_string().contains("toggle script was not run"));
         assert_eq!(runner.recorded().len(), 1, "the script must not run");
-        assert!(model.laptop_enabled(0), "the state is unchanged");
+        assert!(view(&model, 0).laptop_enabled(), "the state is unchanged");
 
         // A reply that does not list the panel is just as unreadable.
         let runner = MockCommandRunner::with_outcomes([probe_reply("[]")]);
@@ -2734,7 +2863,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             "got {error:?}"
         );
         assert!(
-            model.laptop_enabled(0),
+            view(&model, 0).laptop_enabled(),
             "the switch keeps the state read before the script"
         );
         assert_eq!(runner.recorded(), toggle_sequence());
@@ -2747,8 +2876,8 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         // file-backed controls stay.
         let dir = tempfile::tempdir().expect("temp dir");
         let mut model = laptop_model(dir.path());
-        assert!(model.is_laptop(0));
-        assert!(!model.laptop_toggle_available(0));
+        assert!(view(&model, 0).is_laptop());
+        assert!(!view(&model, 0).laptop_toggle_available());
         assert!(
             model.records_editable(),
             "the mode/scale rows are unaffected"
@@ -2778,8 +2907,8 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             ));
         });
         let model = model.expect("built");
-        assert!(model.is_laptop(0));
-        assert!(!model.laptop_toggle_available(0));
+        assert!(view(&model, 0).is_laptop());
+        assert!(!view(&model, 0).laptop_toggle_available());
         assert!(
             model.records_editable(),
             "the mode/scale rows are unaffected"
@@ -2864,18 +2993,18 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         let hyprctl = r#"[{"name":"DP-1","description":"Ext","width":3840,"height":2160,"refreshRate":60.0,"x":0,"y":0,"scale":1.0,"disabled":false,"availableModes":["3840x2160@60.00Hz","2560x1440@144.00Hz","2560x1440@120.00Hz"]}]"#;
         let mut model =
             DisplayModel::from_sources(Some(conf), hyprctl, dir.path().join("monitors.conf"), None);
-        assert_eq!(model.effective_resolution(0), "3840x2160");
-        assert_eq!(model.effective_refresh(0), Some("60".to_string()));
+        assert_eq!(view(&model, 0).effective_resolution(), "3840x2160");
+        assert_eq!(view(&model, 0).effective_refresh(), Some("60".to_string()));
 
         // 60 is not offered for 2560x1440 (which offers 144 and 120), so the first
         // available (144) is chosen.
         model
             .stage_resolution(0, "2560x1440".to_string())
             .expect("the edit stages");
-        assert_eq!(model.effective_resolution(0), "2560x1440");
-        assert_eq!(model.effective_refresh(0), Some("144".to_string()));
+        assert_eq!(view(&model, 0).effective_resolution(), "2560x1440");
+        assert_eq!(view(&model, 0).effective_refresh(), Some("144".to_string()));
         assert_eq!(
-            model.refresh_rate_options(0),
+            view(&model, 0).refresh_rate_options(),
             vec!["144".to_string(), "120".to_string()]
         );
     }
@@ -2898,11 +3027,11 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         let dir = tempfile::tempdir().expect("temp dir");
         let model = laptop_model(dir.path());
         // The configured scale is first (preselected), followed by the curated set.
-        let scales = model.scale_options(0);
+        let scales = view(&model, 0).scale_options();
         assert_eq!(scales[0], "1.066667");
         assert!(scales.contains(&"1.333333".to_string()));
         // The configured position ("auto") is present; the curated set adds "0x0".
-        let positions = model.position_options(0);
+        let positions = view(&model, 0).position_options();
         assert!(positions.contains(&"auto".to_string()));
         assert!(positions.contains(&"0x0".to_string()));
     }
@@ -2920,10 +3049,10 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             DisplayModel::from_sources(Some(conf), hyprctl, dir.path().join("monitors.conf"), None);
 
         // The baseline comes from the live state (no record to read).
-        assert_eq!(model.effective_resolution(0), "1920x1080");
-        assert_eq!(model.effective_refresh(0), Some("60".to_string()));
-        assert_eq!(model.effective_scale(0), "1");
-        assert!(model.effective_enabled(0));
+        assert_eq!(view(&model, 0).effective_resolution(), "1920x1080");
+        assert_eq!(view(&model, 0).effective_refresh(), Some("60".to_string()));
+        assert_eq!(view(&model, 0).effective_scale(), "1");
+        assert!(view(&model, 0).effective_enabled());
 
         // Editing appends a specific DP-5 record after the last monitor= line, leaving
         // the catch-all and eDP lines untouched.
@@ -2949,13 +3078,13 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         let hyprctl = r#"[{"name":"DP-2","description":"Ext Vendor Model","width":3440,"height":1440,"refreshRate":100.0,"x":0,"y":0,"scale":1.0,"disabled":true,"availableModes":["3440x1440@100.00Hz"]}]"#;
         let mut model =
             DisplayModel::from_sources(Some(conf), hyprctl, dir.path().join("monitors.conf"), None);
-        assert!(!model.is_laptop(0));
+        assert!(!view(&model, 0).is_laptop());
         assert!(
-            !model.effective_enabled(0),
+            !view(&model, 0).effective_enabled(),
             "with no record, the live disabled flag reads as off"
         );
-        assert_eq!(model.effective_resolution(0), "3440x1440");
-        assert_eq!(model.effective_scale(0), "1");
+        assert_eq!(view(&model, 0).effective_resolution(), "3440x1440");
+        assert_eq!(view(&model, 0).effective_scale(), "1");
 
         // Enabling writes a full record sourced from those live values.
         model.stage_enabled(0, true).expect("the edit stages");
@@ -2995,5 +3124,67 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             "the second edit edits the appended record in place, not appends again:\n{emitted}"
         );
         assert!(emitted.contains("monitor=DP-7,1920x1080@60,0x0,1.5"));
+    }
+
+    #[test]
+    fn a_stale_monitor_index_yields_no_view_and_every_stage_refuses_it() {
+        // Task 9.24: an index held across a model rebuild that dropped a monitor
+        // must never panic. The view accessor answers `None`; every `stage_*`
+        // refuses with `UnknownMonitor` — even for a value its own check would
+        // reject, since the index is checked first — logs the refusal at `warn`,
+        // and leaves the model clean.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut model = laptop_model(dir.path());
+        let stale = model.monitor_count();
+        assert_eq!(stale, 1, "the laptop fixture lists one monitor");
+        assert!(model.monitor(stale).is_none());
+        assert!(model.monitor(usize::MAX).is_none());
+
+        let mut results = Vec::new();
+        let events = crate::testing::capture_logs(|| {
+            // `capture_logs` runs the action twice; keep only the second run.
+            results.clear();
+            results.push(model.stage_resolution(stale, "2560x1440".to_string()));
+            results.push(model.stage_refresh(stale, "60.01".to_string()));
+            results.push(model.stage_scale(stale, "1.25".to_string()));
+            results.push(model.stage_scale(stale, "not a number".to_string()));
+            results.push(model.stage_position(stale, "0x0".to_string()));
+            results.push(model.stage_enabled(stale, true));
+        });
+        for result in &results {
+            assert!(
+                matches!(result, Err(StageRefusal::UnknownMonitor { index }) if *index == stale),
+                "{result:?}"
+            );
+        }
+        let refusals = events
+            .iter()
+            .filter(|event| event.message == "refusing a monitor edit (R8.3)")
+            .inspect(|event| assert_eq!(event.level, tracing::Level::WARN))
+            .count();
+        assert_eq!(refusals, results.len(), "every refusal is logged");
+        assert!(!model.is_dirty(), "nothing was staged");
+        assert_eq!(view(&model, 0).effective_scale(), "1.066667");
+    }
+
+    #[test]
+    fn a_stale_monitor_index_runs_no_laptop_toggle() {
+        // Task 9.24: with the script detected, a toggle on an index past the end is
+        // `Unavailable` and issues no command — not a panic, and not a toggle of
+        // whichever panel happens to be listed.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut model = toggle_model(&dir.path().join("monitors.conf"));
+        assert!(view(&model, 0).laptop_toggle_available());
+
+        let runner = MockCommandRunner::new();
+        assert!(matches!(
+            model.toggle_laptop(model.monitor_count(), false, &runner),
+            Err(LaptopToggleError::Unavailable)
+        ));
+        assert!(runner.recorded().is_empty());
+        assert!(
+            view(&model, 0).laptop_enabled(),
+            "the panel state is untouched"
+        );
     }
 }
