@@ -195,12 +195,9 @@ struct BuiltinGtkTheme {
 ///    in steps of 2 to 14, then `gtk-3.0`. A `<name>/gtk-3.0/` directory without a
 ///    `gtk.css` — a keybinding-only package such as `Default` or `Emacs`, which ships
 ///    nothing but `gtk-keys.css` — is not a theme to this step. The app's scan mirrors
-///    the step with [`has_gtk3_stylesheet`] (task 9.30). The app's R3.3 theme roots
-///    ([`ThemeRoots::gtk_theme_dirs`], filled by `core::load::theme_roots`) cover only
-///    `~/.themes`, `$XDG_DATA_HOME/themes` and `/usr/share/themes`, not the other
-///    `$XDG_DATA_DIRS` entries GTK walks: a theme installed under another data
-///    directory is invisible to the scan (backlog task 10.6), so the Theme page's
-///    one-sided note can be a false positive there;
+///    the step with [`has_gtk3_stylesheet`] (task 9.30), over the same folders in the
+///    same order ([`ThemeRoots::gtk_theme_dirs`], filled by
+///    `core::load::theme_roots_from`, task 10.6);
 /// 3. failing both, the same name without the variant, and then the default theme
 ///    (`DEFAULT_THEME_NAME`, the light `Adwaita` built-in).
 ///
@@ -242,16 +239,18 @@ fn builtin_gtk_theme(name: &str) -> Option<&'static BuiltinGtkTheme> {
 /// `/usr/share/...`).
 #[derive(Clone, Debug)]
 pub struct ThemeRoots {
-    /// Directories that hold GTK theme directories (`~/.themes`,
-    /// `~/.local/share/themes`, `/usr/share/themes`). A subdirectory is a GTK theme
+    /// Directories that hold GTK theme directories, in GTK's own lookup order
+    /// (`~/.local/share/themes`, `~/.themes`, each `$XDG_DATA_DIRS` entry's `themes/`,
+    /// `/usr/share/themes`; see `core::load::theme_roots_from`). A subdirectory is a GTK theme
     /// when it carries a stylesheet for either GTK version — a `gtk.css` inside a
     /// `gtk-3.<N>/` or the `gtk-4.0/` subdirectory (R3.3, task 9.30); a subdirectory
     /// holding only keybindings (`gtk-keys.css`) does not count.
     ///
     /// They are also the only places the GTK 4 theme links may point into (task
     /// 11.16): a theme's `gtk-4.0/` directory is linked from the first of these roots
-    /// that has one, and only when it — and each entry linked — still resolves inside
-    /// one of these roots.
+    /// whose copy of the theme has a `gtk-4.0/gtk.css` — the copy GTK 4 itself loads,
+    /// which is why the order must be GTK's (task 10.6) — and only when it, and each
+    /// entry linked, still resolves inside one of these roots.
     pub gtk_theme_dirs: Vec<PathBuf>,
     /// Directories that hold icon and cursor theme directories (`~/.icons`,
     /// `~/.local/share/icons`, `/usr/share/icons`). A subdirectory with a `cursors/`
@@ -1434,11 +1433,12 @@ impl ThemesModel {
     ///   touched and a `warn` says so: a real file there is the user's own override —
     ///   like a set `GTK_THEME`, the app does not fight it — and changing only some of
     ///   the three would mix two themes. The `settings.ini`/gsettings writes still land.
-    /// - When the theme has a `gtk-4.0/` directory under a theme root
-    ///   ([`ThemeRoots::gtk_theme_dirs`]), each link is pointed at the entry of the same
-    ///   name inside it; an entry the theme does not ship is not linked (an existing
-    ///   link is removed rather than left on the old theme, and never made dangling).
-    /// - When no theme root has a `gtk-4.0/` directory for it — a GTK 3-only theme, or
+    /// - When the theme has a `gtk-4.0/gtk.css` under a theme root
+    ///   ([`ThemeRoots::gtk_theme_dirs`]; the first such root in GTK's lookup order),
+    ///   each link is pointed at the entry of the same name in that `gtk-4.0/`; an
+    ///   entry the theme does not ship is not linked (an existing link is removed
+    ///   rather than left on the old theme, and never made dangling).
+    /// - When no theme root has a `gtk-4.0/gtk.css` for it — a GTK 3-only theme, or
     ///   a built-in like Adwaita that has no theme directory — the links are removed,
     ///   so GTK 4 and libadwaita apps use their default look (the page says so, see
     ///   [`Self::gtk4_links_note`]).
@@ -1449,6 +1449,19 @@ impl ThemesModel {
     ///
     /// A link that already points where it should is not planned again, so a no-op
     /// theme change leaves the links untouched.
+    ///
+    /// **A symlinked `~/.config/gtk-4.0`** (task 10.6). When the directory itself is a
+    /// symbolic link to a directory — say into the dotfiles repo — the three links are
+    /// created and re-pointed *inside the directory it points to*, and the directory
+    /// link is never touched: only the last path component of each link is handled
+    /// without following ([`point_symlink`](crate::system::writer::point_symlink)),
+    /// the parent is reached the ordinary way. That is deliberate and matches how the
+    /// app treats every other deployed path (it writes through a dotfiles symlink to
+    /// the real target and keeps the link, architecture §3 "Write safety"): GTK 4 resolves
+    /// `~/.config/gtk-4.0/gtk.css` through the directory link too, so links placed in
+    /// the target are exactly the ones GTK reads, and `setup.sh` would place its links
+    /// there as well. The rollback of a created link likewise removes it from the
+    /// target directory and leaves the directory link alone.
     fn plan_gtk4_links(&self) -> Vec<LinkWrite> {
         let (Some(theme), Some(dir)) = (self.gtk_theme.effective(), self.gtk4_links_dir()) else {
             return Vec::new();
@@ -1468,7 +1481,7 @@ impl ThemesModel {
             Gtk4ThemeSource::Missing => {
                 tracing::info!(
                     theme,
-                    "the GTK theme has no gtk-4.0 directory under any theme root; \
+                    "the GTK theme has no gtk-4.0/gtk.css under any theme root; \
                      removing the GTK 4 theme links"
                 );
                 [None, None, None]
@@ -2222,7 +2235,7 @@ fn resolved_theme_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
 /// (task 11.16).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Gtk4ThemeSource {
-    /// The theme has a `gtk-4.0/` directory inside a theme root. Holds the link target
+    /// The theme has a `gtk-4.0/gtk.css` inside a theme root. Holds the link target
     /// for each of [`GTK4_THEME_LINKS`], in order, or `None` for an entry the theme
     /// does not ship. Every target is `<resolved root>/<theme>/gtk-4.0/<entry>` and has
     /// been checked to resolve inside a theme root.
@@ -2230,8 +2243,8 @@ enum Gtk4ThemeSource {
         /// The link targets, aligned with [`GTK4_THEME_LINKS`].
         targets: [Option<PathBuf>; 3],
     },
-    /// No theme root has a `gtk-4.0/` directory for the theme (a GTK 3-only theme or
-    /// a built-in theme).
+    /// No theme root has a `gtk-4.0/gtk.css` for the theme (a GTK 3-only theme, a
+    /// `gtk-4.0/` holding no stylesheet, or a built-in theme).
     Missing,
     /// The name is not a single plain directory name (it holds a `/`, is `..`, …), so
     /// it is never joined onto a root. Only a hand-edited `settings.ini` can hold one.
@@ -2249,20 +2262,23 @@ enum Gtk4ThemeSource {
 /// Finds the GTK 4 part of `theme` under the theme roots `roots` (task 11.16; R3.3).
 ///
 /// Each root is canonicalized first ([`resolved_theme_roots`]; a root that does not
-/// exist is skipped), and the
-/// first root in the given order holding a `<theme>/gtk-4.0/` directory is used — the
-/// same "first theme directory that has it wins" order GTK applies when it looks a
-/// theme up. The link targets are built from the *resolved* root, so they are
-/// lexically inside it by construction: the theme name must be one plain path
+/// exist is skipped), and the first root in the given order whose `<theme>` directory
+/// carries a GTK 4 stylesheet ([`has_gtk4_stylesheet`], `gtk-4.0/gtk.css`) is used.
+/// That is GTK 4's own rule (`_gtk_css_find_theme` in `gtk/gtkcssprovider.c` takes the
+/// first root, in the order `core::load::theme_roots_from` reproduces, where the
+/// stylesheet file exists — a root whose `gtk-4.0/` lacks it does not shadow a later
+/// one, task 10.6), so the links point into the very copy GTK 4 would load; and it is
+/// the predicate the theme scan uses, so scan and link step never disagree on whether
+/// a theme has a GTK 4 part. The link targets are built from the *resolved* root, so
+/// they are lexically inside it by construction: the theme name must be one plain path
 /// component ([`is_single_directory_name`]: no `/`, not `.` or `..`), which a name read
 /// from the user's `settings.ini` is not guaranteed to be — anything else is
 /// [`Gtk4ThemeSource::InvalidName`]. A name staged through the Theme page has already
 /// been held to the same rule (task 9.27). On top of that lexical rule, the `gtk-4.0/`
-/// directory and
-/// each entry linked must still resolve inside one of the resolved roots, so a theme
-/// directory that is itself a symlink to somewhere else is never linked to (the task's
-/// "never follow a link outside the theme roots"). An entry the theme does not ship —
-/// or a dangling one — gets no target.
+/// directory and each entry linked must still resolve inside one of the resolved
+/// roots, so a theme directory that is itself a symlink to somewhere else is never
+/// linked to (the task's "never follow a link outside the theme roots"). An entry the
+/// theme does not ship — or a dangling one — gets no target.
 fn resolve_gtk4_theme(roots: &[PathBuf], theme: &str) -> Gtk4ThemeSource {
     let roots = resolved_theme_roots(roots);
     if roots.is_empty() {
@@ -2277,10 +2293,10 @@ fn resolve_gtk4_theme(roots: &[PathBuf], theme: &str) -> Gtk4ThemeSource {
         Err(_) => Err(path.to_path_buf()),
     };
     for root in &roots {
-        let gtk4 = root.join(theme).join(GTK4_THEME_SUBDIR);
-        if !gtk4.is_dir() {
+        if !has_gtk4_stylesheet(&root.join(theme)) {
             continue;
         }
+        let gtk4 = root.join(theme).join(GTK4_THEME_SUBDIR);
         if let Err(resolved) = inside_a_root(&gtk4) {
             return Gtk4ThemeSource::OutsideRoots { resolved };
         }
@@ -2439,9 +2455,10 @@ fn is_gtk3_subdir_name(name: &str) -> bool {
 /// GTK 4 itself also probes version-suffixed `gtk-4.<N>/` directories, but only
 /// `gtk-4.0/` is checked here: it is the directory this desktop's GTK 4 setup links
 /// from `~/.config/gtk-4.0` (task 11.16), and no theme installed on the target host
-/// carries its GTK 4 stylesheet anywhere else. The predicate thus agrees with
-/// [`resolve_gtk4_theme`] on what the GTK 4 stylesheet is — `gtk-4.0/gtk.css`, the
-/// first of the entries that function links.
+/// carries its GTK 4 stylesheet anywhere else. [`resolve_gtk4_theme`] picks the root
+/// it links from with this same predicate (task 10.6), so the scan and the link step
+/// agree on what the GTK 4 stylesheet is — `gtk-4.0/gtk.css`, the first of the
+/// entries that function links.
 fn has_gtk4_stylesheet(theme_dir: &Path) -> bool {
     theme_dir
         .join(GTK4_THEME_SUBDIR)
@@ -4957,6 +4974,56 @@ export XCURSOR_SIZE=16
                 ]
             }
         );
+    }
+
+    #[test]
+    fn a_theme_installed_twice_links_the_copy_gtk_loads() {
+        // Task 10.6: with the roots built by the startup loader's own function (in
+        // GTK's lookup order), the link step picks the copy GTK 4 would load. All
+        // roots are temporary: $GTK_DATA_PREFIX and $XDG_DATA_DIRS point into the temp
+        // tree so the real /usr/share/themes is never consulted.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let base = fs::canonicalize(tmp.path()).expect("canonicalize the temp dir");
+        let home = base.join("home");
+        let data_home = base.join("data-home");
+        let (sys1, sys2) = (base.join("sys1"), base.join("sys2"));
+        let joined = std::env::join_paths([&sys1, &sys2]).expect("join the data dirs");
+        let roots = crate::core::load::theme_roots_from(&crate::core::load::ThemeRootsEnv {
+            home: Some(home.clone()),
+            xdg_data_home: Some(data_home.clone().into_os_string()),
+            xdg_data_dirs: Some(joined),
+            gtk_data_prefix: Some(base.join("prefix").into_os_string()),
+        })
+        .gtk_theme_dirs;
+        let all = ["gtk.css", "gtk-dark.css", "assets"];
+        let targets_in = |gtk4: &Path| Gtk4ThemeSource::Found {
+            targets: all.map(|entry| Some(gtk4.join(entry))),
+        };
+
+        // ~/.themes and a data dir both carry the theme; the data-home copy has a
+        // gtk-4.0/ without a stylesheet, which GTK skips — so must the link step.
+        let shadow = gtk4_theme(&data_home.join("themes"), "Twice", &["assets"]);
+        let user = gtk4_theme(&home.join(".themes"), "Twice", &all);
+        let system = gtk4_theme(&sys1.join("themes"), "Twice", &all);
+        gtk4_theme(&sys2.join("themes"), "Twice", &all);
+        assert_eq!(resolve_gtk4_theme(&roots, "Twice"), targets_in(&user));
+        assert!(
+            scan_gtk_themes(&roots)
+                .offered
+                .contains(&"Twice".to_string())
+        );
+
+        // Once the data-home copy gains its stylesheet it wins: GTK searches
+        // $XDG_DATA_HOME/themes before ~/.themes.
+        fs::write(shadow.join("gtk.css"), "/* data home */\n").expect("write gtk.css");
+        fs::write(shadow.join("gtk-dark.css"), "/* data home */\n").expect("write css");
+        assert_eq!(resolve_gtk4_theme(&roots, "Twice"), targets_in(&shadow));
+
+        // Without the two home copies, the first $XDG_DATA_DIRS entry wins over the
+        // second.
+        fs::remove_dir_all(data_home.join("themes/Twice")).expect("remove");
+        fs::remove_dir_all(home.join(".themes/Twice")).expect("remove");
+        assert_eq!(resolve_gtk4_theme(&roots, "Twice"), targets_in(&system));
     }
 
     #[test]

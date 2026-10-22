@@ -1657,6 +1657,78 @@ mod tests {
     }
 
     #[test]
+    fn link_steps_through_a_symlinked_gtk4_directory_land_in_its_target() {
+        // Task 10.6: `~/.config/gtk-4.0` deployed as a link to a directory (say into
+        // the dotfiles repo). Creating, re-pointing and removing a theme link all
+        // happen inside the directory it points to, every rollback undoes exactly that
+        // there, and the directory link itself is never replaced, removed or re-aimed.
+        let tmp = tempfile::tempdir().expect("temp dir should be creatable");
+        let themes = tmp.path().join("themes");
+        let old = theme_gtk4_dir(&themes, "Old");
+        let new = theme_gtk4_dir(&themes, "New");
+        let repo_dir = tmp.path().join("repo").join("gtk-4.0");
+        fs::create_dir_all(&repo_dir).expect("create the repo directory");
+        let config = tmp.path().join("config");
+        fs::create_dir(&config).expect("create the config dir");
+        let live_dir = config.join("gtk-4.0");
+        symlink(&repo_dir, &live_dir).expect("link the gtk-4.0 directory");
+        let assert_dir_link_kept = || {
+            assert!(
+                fs::symlink_metadata(&live_dir)
+                    .expect("lstat")
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(fs::read_link(&live_dir).expect("read link"), repo_dir);
+        };
+
+        // Created where nothing was: the link appears in the repo directory.
+        let created =
+            point_symlink(&live_dir.join("gtk.css"), &old.join("gtk.css")).expect("create");
+        assert_eq!(
+            fs::read_link(repo_dir.join("gtk.css")).expect("the link is in the target"),
+            old.join("gtk.css")
+        );
+        assert_eq!(entries(&repo_dir), vec!["gtk.css".to_string()]);
+        assert_eq!(entries(&config), vec!["gtk-4.0".to_string()]);
+        assert_dir_link_kept();
+
+        // Re-pointed in place (the temporary link lives and is renamed in the target).
+        let repointed =
+            point_symlink(&live_dir.join("gtk.css"), &new.join("gtk.css")).expect("re-point");
+        assert_eq!(
+            fs::read_link(repo_dir.join("gtk.css")).expect("read link"),
+            new.join("gtk.css")
+        );
+        assert_eq!(entries(&repo_dir), vec!["gtk.css".to_string()], "no temp");
+        assert_dir_link_kept();
+
+        // Rolled back newest first: the old target, then nothing — and the directory
+        // link (not created by any call) is still there.
+        repointed.restore().expect("undo the re-point");
+        assert_eq!(
+            fs::read_link(repo_dir.join("gtk.css")).expect("read link"),
+            old.join("gtk.css")
+        );
+        created.restore().expect("undo the creation");
+        assert!(entries(&repo_dir).is_empty());
+        assert_dir_link_kept();
+
+        // Removing goes through the directory link the same way.
+        symlink(old.join("assets"), repo_dir.join("assets")).expect("deploy a link");
+        let removed = remove_symlink(&live_dir.join("assets")).expect("remove");
+        assert!(entries(&repo_dir).is_empty());
+        assert_dir_link_kept();
+        removed.restore().expect("undo the removal");
+        assert_eq!(
+            fs::read_link(repo_dir.join("assets")).expect("read link"),
+            old.join("assets")
+        );
+        assert_eq!(fs::read(old.join("gtk.css")).expect("old"), b"/* Old */\n");
+        assert_eq!(fs::read(new.join("gtk.css")).expect("new"), b"/* New */\n");
+    }
+
+    #[test]
     fn link_steps_never_replace_a_real_file_or_directory() {
         // A real `gtk.css` (or a real `assets/` directory) is a user-managed override:
         // neither primitive may replace or delete it.

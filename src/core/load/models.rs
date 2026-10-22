@@ -7,6 +7,7 @@
 //! stay off the main thread and inside the R8.1 cold-start budget (architecture §8). See
 //! the parent module for how this half fits into the whole load.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use super::{config_home, input_lua_path};
@@ -224,30 +225,168 @@ pub fn load_themes(capabilities: &Capabilities) -> Option<ThemesModel> {
     )
 }
 
-/// The XDG roots scanned for installed GTK, icon, and cursor themes (R3.3/R3.4).
+/// The XDG roots scanned for installed GTK, icon, and cursor themes (R3.3/R3.4), read
+/// from this process's environment.
 ///
-/// GTK themes live under `~/.themes`, `$XDG_DATA_HOME/themes`, and
-/// `/usr/share/themes`; icon and cursor themes under `~/.icons`,
-/// `$XDG_DATA_HOME/icons`, and `/usr/share/icons`. `$XDG_DATA_HOME` falls back to
-/// `~/.local/share`. A root that does not exist is simply skipped by the scan, so a
-/// missing `~/.themes` is harmless.
+/// A thin wrapper: [`ThemeRootsEnv::from_process`] reads the variables and
+/// [`theme_roots_from`] — a pure function, so tests pin the order without touching the
+/// process environment — builds the list. See there for the order and why it matters.
 pub fn theme_roots() -> ThemeRoots {
-    let data_home = data_home();
-    let home = home_dir();
-    let mut gtk_theme_dirs = Vec::new();
-    let mut icon_dirs = Vec::new();
-    if let Some(home) = &home {
-        gtk_theme_dirs.push(home.join(".themes"));
-        icon_dirs.push(home.join(".icons"));
+    theme_roots_from(&ThemeRootsEnv::from_process())
+}
+
+/// The environment values the theme-root lookup depends on (task 10.6).
+///
+/// Collected in one place so [`theme_roots_from`] stays a pure function of its input:
+/// production fills it from the process environment ([`Self::from_process`]), tests
+/// build it by hand. Every field is the raw variable value; empty and relative values
+/// are dealt with by [`theme_roots_from`], not here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThemeRootsEnv {
+    /// The home directory (`$HOME`, see [`home_dir`]), or `None` when unknown — then
+    /// the home-based roots (`~/.themes`, `~/.icons`, the default data home) are left
+    /// out rather than resolved against the working directory.
+    pub home: Option<PathBuf>,
+    /// `$XDG_DATA_HOME` as set, or `None` when unset.
+    pub xdg_data_home: Option<OsString>,
+    /// `$XDG_DATA_DIRS` as set (a `:`-separated list), or `None` when unset.
+    pub xdg_data_dirs: Option<OsString>,
+    /// `$GTK_DATA_PREFIX` as set, or `None` when unset — GTK's override of the prefix
+    /// its built-in theme directory lives under.
+    pub gtk_data_prefix: Option<OsString>,
+}
+
+impl ThemeRootsEnv {
+    /// Reads the four values from this process's environment.
+    ///
+    /// The app inherits the session environment that GTK apps started from the same
+    /// session also see, so the roots it computes are the ones those apps search.
+    pub fn from_process() -> Self {
+        ThemeRootsEnv {
+            home: home_dir(),
+            xdg_data_home: std::env::var_os("XDG_DATA_HOME"),
+            xdg_data_dirs: std::env::var_os("XDG_DATA_DIRS"),
+            gtk_data_prefix: std::env::var_os("GTK_DATA_PREFIX"),
+        }
     }
-    gtk_theme_dirs.push(data_home.join("themes"));
-    gtk_theme_dirs.push(PathBuf::from("/usr/share/themes"));
-    icon_dirs.push(data_home.join("icons"));
+}
+
+/// `$XDG_DATA_DIRS` when it is unset or empty — the default of the XDG Base Directory
+/// Specification, and the literal GLib's `g_build_system_data_dirs` falls back to.
+const DEFAULT_XDG_DATA_DIRS: &str = "/usr/local/share/:/usr/share/";
+
+/// The prefix of GTK's built-in theme directory (`<prefix>/share/themes`) when
+/// `$GTK_DATA_PREFIX` is unset: the install prefix GTK was compiled with, which is
+/// `/usr` for a distribution-packaged GTK. The app cannot ask the library for it, so
+/// this is the one assumed value in the lookup; with the default `$XDG_DATA_DIRS` the
+/// same directory is already searched through `/usr/share`.
+const GTK_DEFAULT_DATA_PREFIX: &str = "/usr";
+
+/// Builds the theme roots from the environment values `env` (R3.3/R3.4, task 10.6).
+///
+/// **GTK theme roots** are listed in exactly the order GTK 4 searches for a theme
+/// name, because the order is load-bearing: the GTK 4 theme-link step
+/// (`resolve_gtk4_theme` in `core::theme`, task 11.16) links the first root that has
+/// the theme, so for a theme installed in two places the app must pick the copy GTK
+/// itself would load, or `~/.config/gtk-4.0` would point GTK 4 apps at a different
+/// copy than the one GTK 3 apps load for the same `gtk-theme-name`. The order, from
+/// `_gtk_css_find_theme` in GTK 4.24.1's `gtk/gtkcssprovider.c` (also stated in that
+/// file's `GtkCssProvider` class documentation; GTK 3.24 searches the same way), is:
+///
+/// 1. `$XDG_DATA_HOME/themes` — `g_get_user_data_dir()`, which is `$XDG_DATA_HOME`
+///    when set and non-empty, else `$HOME/.local/share`;
+/// 2. `$HOME/.themes` — still searched, though GTK 4 logs it as deprecated;
+/// 3. `<dir>/themes` for each `$XDG_DATA_DIRS` entry in order —
+///    `g_get_system_data_dirs()`, which falls back to `/usr/local/share/:/usr/share/`
+///    when the variable is unset or empty;
+/// 4. GTK's built-in theme directory `$GTK_DATA_PREFIX/share/themes`, or
+///    `<compiled prefix>/share/themes` when unset — taken to be `/usr`, the
+///    prefix of a distribution-packaged GTK.
+///
+/// (The GLib side was read in GLib 2.90.1's `glib/gutils.c`; both sources match the
+/// libraries installed on the target system, GTK 4.24.1 and GLib 2.90.1.)
+///
+/// Four deliberate departures, none of which changes the order of real roots:
+///
+/// - An empty or relative `$XDG_DATA_HOME`, and empty or relative `$XDG_DATA_DIRS`
+///   entries (`/usr/share::share`), are skipped, as the XDG Base Directory
+///   Specification asks ("a relative path … should be considered invalid and
+///   ignored"). GLib keeps them and GTK then probes paths relative to each app's own
+///   working directory — nothing a settings app can reproduce. An `$XDG_DATA_HOME`
+///   skipped this way falls back to `$HOME/.local/share`, like an unset one.
+/// - A root equal to an earlier one is listed once: with the default
+///   `$XDG_DATA_DIRS`, the built-in `/usr/share/themes` is already step 3's last root,
+///   and a later duplicate could never win.
+/// - Without a known home directory (unset, empty or relative `$HOME`) the
+///   home-based roots are left out instead of being resolved against the working
+///   directory (GLib would ask the password database).
+/// - An empty or relative `$GTK_DATA_PREFIX` counts as unset, so the built-in root
+///   stays `/usr/share/themes`. GTK's `_gtk_get_theme_dir` checks only whether the
+///   variable is set, so for an empty value it would probe the relative
+///   `share/themes` against each app's working directory — the same unreproducible
+///   case as a relative XDG value above.
+///
+/// Only the GTK 4 `gtk-4.0/` subdirectory decides which root wins in the link step;
+/// GTK additionally probes version-suffixed `gtk-4.<N>/` directories in each root,
+/// which the app deliberately does not (task 9.30, recorded under task 10.6).
+///
+/// **Icon and cursor theme roots** stay `~/.icons`, `$XDG_DATA_HOME/icons` and
+/// `/usr/share/icons` (R3.4). They feed only the name scan, which merges names from
+/// all roots, so their order picks nothing.
+///
+/// A root that does not exist is simply skipped by the scan, so a missing `~/.themes`
+/// is harmless.
+pub fn theme_roots_from(env: &ThemeRootsEnv) -> ThemeRoots {
+    let home = env.home.as_deref().filter(|home| home.is_absolute());
+    let data_home = absolute_dir(env.xdg_data_home.as_deref())
+        .or_else(|| home.map(|home| home.join(".local").join("share")));
+
+    let mut gtk_theme_dirs = Vec::new();
+    gtk_theme_dirs.extend(data_home.as_ref().map(|data_home| data_home.join("themes")));
+    gtk_theme_dirs.extend(home.map(|home| home.join(".themes")));
+    let data_dirs = env
+        .xdg_data_dirs
+        .as_deref()
+        .filter(|dirs| !dirs.is_empty())
+        .unwrap_or(OsStr::new(DEFAULT_XDG_DATA_DIRS));
+    gtk_theme_dirs.extend(
+        std::env::split_paths(data_dirs)
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join("themes")),
+    );
+    let gtk_prefix = absolute_dir(env.gtk_data_prefix.as_deref())
+        .unwrap_or_else(|| PathBuf::from(GTK_DEFAULT_DATA_PREFIX));
+    gtk_theme_dirs.push(gtk_prefix.join("share").join("themes"));
+    let gtk_theme_dirs = without_repeats(gtk_theme_dirs);
+
+    let mut icon_dirs = Vec::new();
+    icon_dirs.extend(home.map(|home| home.join(".icons")));
+    icon_dirs.extend(data_home.map(|data_home| data_home.join("icons")));
     icon_dirs.push(PathBuf::from("/usr/share/icons"));
     ThemeRoots {
         gtk_theme_dirs,
         icon_dirs,
     }
+}
+
+/// `value` as a directory path when it is set, non-empty and absolute — the XDG Base
+/// Directory Specification's rule for a usable variable value — else `None`.
+fn absolute_dir(value: Option<&OsStr>) -> Option<PathBuf> {
+    value.map(PathBuf::from).filter(|path| path.is_absolute())
+}
+
+/// `paths` with every path that equals an earlier one removed, order kept.
+///
+/// `Path` equality compares components, so `/usr/share/themes` built from
+/// `/usr/share/` and from `/usr` count as equal; no filesystem access is made.
+fn without_repeats(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut kept: Vec<PathBuf> = Vec::with_capacity(paths.len());
+    for path in paths {
+        if !kept.contains(&path) {
+            kept.push(path);
+        }
+    }
+    kept
 }
 
 /// The live paths of the files a theme/cursor change writes (R8.5).
@@ -291,20 +430,6 @@ pub fn themes_paths(capabilities: &Capabilities) -> ThemesPaths {
         cursor_fallback_theme,
         dotfiles_repo: capabilities.dotfiles_repo_root().map(Path::to_path_buf),
         home: home_dir(),
-    }
-}
-
-/// The XDG data base directory: `$XDG_DATA_HOME`, else `$HOME/.local/share`, else a
-/// bare `.local/share` relative path (which simply misses on scan).
-fn data_home() -> PathBuf {
-    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
-        if !data_home.is_empty() {
-            return PathBuf::from(data_home);
-        }
-    }
-    match home_dir() {
-        Some(home) => home.join(".local").join("share"),
-        None => PathBuf::from(".local").join("share"),
     }
 }
 
@@ -382,6 +507,142 @@ mod tests {
         assert!(
             load_wallpaper(&caps).is_none(),
             "no hyprpaper -> no wallpaper model -> wallpaper section hidden"
+        );
+    }
+
+    // --- Task 10.6: the theme roots in GTK's lookup order -----------------------------
+
+    /// A [`ThemeRootsEnv`] with home `/home/u` and the given variable values.
+    fn roots_env(
+        xdg_data_home: Option<&str>,
+        xdg_data_dirs: Option<&str>,
+        gtk_data_prefix: Option<&str>,
+    ) -> ThemeRootsEnv {
+        ThemeRootsEnv {
+            home: Some(PathBuf::from("/home/u")),
+            xdg_data_home: xdg_data_home.map(OsString::from),
+            xdg_data_dirs: xdg_data_dirs.map(OsString::from),
+            gtk_data_prefix: gtk_data_prefix.map(OsString::from),
+        }
+    }
+
+    /// The GTK theme roots for `env`, as strings for readable assertions.
+    fn gtk_roots(env: &ThemeRootsEnv) -> Vec<String> {
+        theme_roots_from(env)
+            .gtk_theme_dirs
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn gtk_theme_roots_follow_gtks_lookup_order_with_the_defaults() {
+        // GTK 4's `_gtk_css_find_theme` (gtkcssprovider.c): $XDG_DATA_HOME/themes
+        // (default ~/.local/share), then ~/.themes, then each $XDG_DATA_DIRS entry
+        // (default /usr/local/share/:/usr/share/), then <prefix>/share/themes — here the
+        // same /usr/share/themes as the last data dir, so it is listed once.
+        let expected = [
+            "/home/u/.local/share/themes",
+            "/home/u/.themes",
+            "/usr/local/share/themes",
+            "/usr/share/themes",
+        ];
+        assert_eq!(gtk_roots(&roots_env(None, None, None)), expected);
+        // Set-but-empty variables count as unset: as GLib does for the two XDG
+        // variables; for GTK_DATA_PREFIX it is a deliberate departure (GTK would probe
+        // a relative `share/themes`).
+        assert_eq!(
+            gtk_roots(&roots_env(Some(""), Some(""), Some(""))),
+            expected
+        );
+    }
+
+    #[test]
+    fn gtk_theme_roots_follow_a_custom_data_home_and_data_dirs_in_order() {
+        // A custom $XDG_DATA_HOME comes first and replaces ~/.local/share; the data
+        // dirs keep their own order (a flatpak-style export before /usr/share); empty
+        // and relative entries are skipped (XDG Base Directory Specification); the
+        // trailing-slash /usr/share/ repeat and the built-in /usr/share/themes are not
+        // listed twice; GTK_DATA_PREFIX moves the built-in root to the end of the list.
+        let env = roots_env(
+            Some("/data/home"),
+            Some(
+                "/var/lib/flatpak/exports/share::relative/share:/usr/share:/opt/x/share/:/usr/share/",
+            ),
+            Some("/opt/gtk"),
+        );
+        assert_eq!(
+            gtk_roots(&env),
+            [
+                "/data/home/themes",
+                "/home/u/.themes",
+                "/var/lib/flatpak/exports/share/themes",
+                "/usr/share/themes",
+                "/opt/x/share/themes",
+                "/opt/gtk/share/themes",
+            ]
+        );
+        // Without GTK_DATA_PREFIX the built-in root is /usr/share/themes, already listed.
+        let env = roots_env(Some("/data/home"), Some("/opt/x/share"), None);
+        assert_eq!(
+            gtk_roots(&env),
+            [
+                "/data/home/themes",
+                "/home/u/.themes",
+                "/opt/x/share/themes",
+                "/usr/share/themes",
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_or_missing_home_values_never_yield_relative_roots() {
+        // A relative $XDG_DATA_HOME is invalid per the XDG spec and falls back to the
+        // home default; without a usable home the home-based roots are left out, and
+        // the system roots remain. No root is ever relative to the working directory.
+        assert_eq!(
+            gtk_roots(&roots_env(Some("rel/data"), None, None))[0],
+            "/home/u/.local/share/themes"
+        );
+        for home in [None, Some(PathBuf::from("relative/home"))] {
+            let homeless = ThemeRootsEnv {
+                home,
+                ..ThemeRootsEnv::default()
+            };
+            let roots = theme_roots_from(&homeless);
+            assert_eq!(
+                gtk_roots(&homeless),
+                ["/usr/local/share/themes", "/usr/share/themes"]
+            );
+            assert_eq!(roots.icon_dirs, [PathBuf::from("/usr/share/icons")]);
+            let with_data_home = ThemeRootsEnv {
+                xdg_data_home: Some(OsString::from("/data")),
+                ..homeless
+            };
+            assert_eq!(gtk_roots(&with_data_home)[0], "/data/themes");
+            let data_home_roots = theme_roots_from(&with_data_home);
+            assert!(
+                data_home_roots
+                    .gtk_theme_dirs
+                    .iter()
+                    .chain(&data_home_roots.icon_dirs)
+                    .all(|root| root.is_absolute())
+            );
+        }
+    }
+
+    #[test]
+    fn icon_roots_are_unchanged_by_the_gtk_order() {
+        // R3.4: the icon/cursor scan merges names from every root, so its list stays
+        // ~/.icons, $XDG_DATA_HOME/icons, /usr/share/icons.
+        let roots = theme_roots_from(&roots_env(Some("/data/home"), Some("/opt/x/share"), None));
+        assert_eq!(
+            roots.icon_dirs,
+            [
+                PathBuf::from("/home/u/.icons"),
+                PathBuf::from("/data/home/icons"),
+                PathBuf::from("/usr/share/icons"),
+            ]
         );
     }
 }

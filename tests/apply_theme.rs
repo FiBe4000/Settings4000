@@ -35,7 +35,10 @@
 //! theme with a `gtk-4.0/` directory re-points all three, one without removes
 //! them (with a page note), a plain file at any of them blocks the step with a
 //! `warn` while the INI and gsettings writes land, and a failure after — or in —
-//! the link step rolls the links and the INI writes back together.
+//! the link step rolls the links and the INI writes back together. Task 10.6
+//! adds the layout where `~/.config/gtk-4.0` is itself a link into the repo: the
+//! links are created (and rolled back) inside the directory it points to, and
+//! the directory link is kept.
 //!
 //! Like Display, these models own their files' freshness (R5.6): the window
 //! checks `check_conflict()` and aborts before building the plan, so the
@@ -2020,6 +2023,153 @@ fn a_gtk4_link_to_a_user_folder_is_left_alone() {
         fs::read(custom.join("gtk.css")).expect("read"),
         b"/* mine */\n"
     );
+}
+
+/// Replaces the fixture's live `~/.config/gtk-4.0` directory (a plain directory of
+/// deployment links) with one symbolic link to the repo's `config/gtk-4.0`, the layout
+/// of a dotfiles setup that links whole directories (task 10.6). The repo directory
+/// then holds only `settings.ini` and no GTK 4 theme links. Returns the repo directory.
+fn link_whole_gtk4_dir_into_repo(fx: &FixtureDotfiles) -> PathBuf {
+    let live = fx.config_path("gtk-4.0");
+    let repo_dir = fx.repo_path("config/gtk-4.0");
+    // `remove_dir_all` removes the links inside, never what they point to.
+    fs::remove_dir_all(&live).expect("remove the live gtk-4.0 directory");
+    std::os::unix::fs::symlink(&repo_dir, &live).expect("link the gtk-4.0 directory");
+    assert_eq!(dir_names(&repo_dir), ["settings.ini"]);
+    repo_dir
+}
+
+/// The sorted entry names of `dir`.
+fn dir_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .expect("read the directory")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Asserts that `~/.config/gtk-4.0` is still the very symlink into `repo_dir`.
+fn assert_gtk4_dir_link_kept(fx: &FixtureDotfiles, repo_dir: &Path) {
+    let live = fx.config_path("gtk-4.0");
+    assert!(
+        fs::symlink_metadata(&live)
+            .expect("lstat")
+            .file_type()
+            .is_symlink(),
+        "~/.config/gtk-4.0 is still a link"
+    );
+    assert_eq!(fs::read_link(&live).expect("read link"), repo_dir);
+}
+
+#[test]
+fn a_symlinked_gtk4_directory_gets_the_links_inside_its_target() {
+    // Task 10.6: when `~/.config/gtk-4.0` is itself a link to a directory, the GTK
+    // 4 theme links are created inside the directory it points to (here the dotfiles
+    // repo), exactly where GTK 4 finds them through the directory link, and the
+    // directory link itself is left as it is — the app writes through a deployed
+    // symlink like it does for every other dotfiles path.
+    let fx = FixtureDotfiles::install();
+    let repo_dir = link_whole_gtk4_dir_into_repo(&fx);
+    let themes_before = theme_root_snapshot(&fx);
+
+    let mut themes = load_themes_with_system_root(&fx);
+    assert_eq!(
+        themes.gtk4_links_note(),
+        None,
+        "absent links are no override"
+    );
+    themes
+        .stage_gtk_theme(FIXTURE_GTK4_THEME)
+        .expect("the value passes the stage-time check");
+    let contribution = themes.apply_contribution().expect("dirty");
+    assert!(
+        contribution
+            .links
+            .iter()
+            .all(|link| matches!(link.action, LinkAction::PointAt(_))),
+        "three links to create"
+    );
+    assert_eq!(contribution.links.len(), 3);
+    let runner = MockCommandRunner::new();
+    let outcome = apply::run(
+        &plan_with_themes(contribution),
+        &FreshnessTracker::new(),
+        &Capabilities::for_tests(&[Binary::Gsettings], &[], false),
+        &runner,
+        &MockProcessSignaller::new(),
+    );
+    let (_, written) = expect_applied(outcome);
+    assert_eq!(written.len(), 2, "both settings.ini files are written");
+    assert!(
+        fs::read_to_string(repo_dir.join("settings.ini"))
+            .expect("read the repo settings.ini")
+            .contains(&format!("gtk-theme-name={FIXTURE_GTK4_THEME}")),
+        "the settings.ini behind the directory link is written"
+    );
+    assert_eq!(
+        runner.recorded(),
+        vec![gsettings_gtk_theme(FIXTURE_GTK4_THEME)]
+    );
+
+    let targets: Vec<Option<PathBuf>> = GTK4_THEME_LINK_NAMES
+        .iter()
+        .map(|name| fs::read_link(repo_dir.join(name)).ok())
+        .collect();
+    assert_eq!(targets, targets_into(&fx, FIXTURE_GTK4_THEME));
+    assert_eq!(
+        dir_names(&repo_dir),
+        ["assets", "gtk-dark.css", "gtk.css", "settings.ini"],
+        "the three links, beside settings.ini, and no temporary entry"
+    );
+    assert_gtk4_dir_link_kept(&fx, &repo_dir);
+    assert_eq!(theme_root_snapshot(&fx), themes_before);
+    themes.commit();
+    assert_eq!(themes.gtk4_links_note(), None);
+}
+
+#[test]
+fn a_rolled_back_apply_clears_the_links_from_a_symlinked_gtk4_directory() {
+    // The rollback of the case above (a palette switch whose generator fails after
+    // the link step): the links created in the repo directory are removed again, the
+    // repo is byte-identical to before, and `~/.config/gtk-4.0` is still the link.
+    let fx = FixtureDotfiles::install();
+    let repo_dir = link_whole_gtk4_dir_into_repo(&fx);
+    let before = repo_snapshot(&fx);
+
+    let mut themes = load_themes_with_system_root(&fx);
+    themes
+        .stage_gtk_theme(FIXTURE_GTK4_THEME)
+        .expect("the value passes the stage-time check");
+    let mut palette = load_palette(&fx);
+    palette.stage("nord");
+    let mut plan = plan_with_themes(themes.apply_contribution().expect("dirty"));
+    plan.palette = palette.apply_contribution();
+
+    let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake(1))]);
+    let outcome = apply::run(
+        &plan,
+        &FreshnessTracker::new(),
+        &Capabilities::for_tests(&[Binary::Gsettings, Binary::Hyprctl], &[], true),
+        &runner,
+        &MockProcessSignaller::new(),
+    );
+    match outcome {
+        ApplyOutcome::WriteFailed(failure) => {
+            assert!(failure.rollback_failures.is_empty(), "{failure:?}");
+            assert_eq!(failure.rolled_back.len(), 5, "three links, two INI files");
+        }
+        other => panic!("expected WriteFailed, got {other:?}"),
+    }
+    assert_eq!(dir_names(&repo_dir), ["settings.ini"]);
+    assert_gtk4_dir_link_kept(&fx, &repo_dir);
+    assert_repo_untouched_except(&fx, &before, &[]);
 }
 
 #[test]

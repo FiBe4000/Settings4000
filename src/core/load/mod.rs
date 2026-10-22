@@ -37,7 +37,8 @@
 //! - submodule `models` — the bespoke page models and write helpers built from the
 //!   detected capabilities ([`load_display`], [`load_input`], [`load_palette`],
 //!   [`load_themes`], [`load_wallpaper`], [`load_power`], [`load_notifd_config_from`])
-//!   and the theme paths they read ([`theme_roots`], [`themes_paths`]);
+//!   and the theme paths they read ([`theme_roots`] over [`theme_roots_from`] and
+//!   [`ThemeRootsEnv`], [`themes_paths`]);
 //! - this file — [`StartupLoad`], the [`load`] orchestration over both, the refresh
 //!   adoption rule for bespoke models ([`adopt_refreshed_model`]), and the XDG
 //!   config-directory resolution every loader shares.
@@ -108,8 +109,9 @@ pub use files::{
     merge_refreshed_files,
 };
 pub use models::{
-    load_display, load_input, load_input_from, load_notifd_config_from, load_palette, load_power,
-    load_themes, load_wallpaper, theme_roots, themes_paths,
+    ThemeRootsEnv, load_display, load_input, load_input_from, load_notifd_config_from,
+    load_palette, load_power, load_themes, load_wallpaper, theme_roots, theme_roots_from,
+    themes_paths,
 };
 
 /// The product of one startup worker pass: detected capabilities plus the backing
