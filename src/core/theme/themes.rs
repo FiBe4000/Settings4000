@@ -192,7 +192,10 @@ struct BuiltinGtkTheme {
 ///    each `$XDG_DATA_DIRS` entry's `themes/` and GTK's own `<prefix>/share/themes`,
 ///    `_gtk_css_find_theme_dir` probes `<base>/<name>/gtk-3.<N>/gtk.css` (or
 ///    `gtk-<variant>.css`) with `N` running from the library's minor version (24) down
-///    in steps of 2 to 14, then `gtk-3.0`. The app's R3.3 theme roots
+///    in steps of 2 to 14, then `gtk-3.0`. A `<name>/gtk-3.0/` directory without a
+///    `gtk.css` — a keybinding-only package such as `Default` or `Emacs`, which ships
+///    nothing but `gtk-keys.css` — is not a theme to this step. The app's scan mirrors
+///    the step with [`has_gtk3_stylesheet`] (task 9.30). The app's R3.3 theme roots
 ///    ([`ThemeRoots::gtk_theme_dirs`], filled by `core::load::theme_roots`) cover only
 ///    `~/.themes`, `$XDG_DATA_HOME/themes` and `/usr/share/themes`, not the other
 ///    `$XDG_DATA_DIRS` entries GTK walks: a theme installed under another data
@@ -209,8 +212,9 @@ enum Gtk3Resolution {
     /// GTK 3 has the name compiled in (step 1), so it resolves the same with or without
     /// a directory.
     BuiltIn,
-    /// GTK 3 has no compiled-in theme of this name, so it uses the name only when a
-    /// `<name>/gtk-3.0/` directory is installed (step 2) and otherwise falls back.
+    /// GTK 3 has no compiled-in theme of this name, so it uses the name only when an
+    /// installed `<name>` directory carries a GTK 3 stylesheet (step 2,
+    /// [`has_gtk3_stylesheet`]) and otherwise falls back.
     NeedsDirectory {
         /// What GTK 3 apps show instead, phrased to complete the Theme page's sentence
         /// "GTK 3 apps will use …".
@@ -240,7 +244,9 @@ fn builtin_gtk_theme(name: &str) -> Option<&'static BuiltinGtkTheme> {
 pub struct ThemeRoots {
     /// Directories that hold GTK theme directories (`~/.themes`,
     /// `~/.local/share/themes`, `/usr/share/themes`). A subdirectory is a GTK theme
-    /// when it contains a `gtk-3.0/` or `gtk-4.0/` subdirectory (R3.3).
+    /// when it carries a stylesheet for either GTK version — a `gtk.css` inside a
+    /// `gtk-3.<N>/` or the `gtk-4.0/` subdirectory (R3.3, task 9.30); a subdirectory
+    /// holding only keybindings (`gtk-keys.css`) does not count.
     ///
     /// They are also the only places the GTK 4 theme links may point into (task
     /// 11.16): a theme's `gtk-4.0/` directory is linked from the first of these roots
@@ -566,11 +572,11 @@ impl ThemeRenderRecord {
 pub struct ThemesModel {
     /// The GTK theme drop-down.
     gtk_theme: Selection,
-    /// The GTK theme names the scan found a `gtk-3.0/` directory for, on any root
-    /// ([`GtkThemeScan::with_gtk3_dir`]). Decides [`Self::one_sided_gtk_theme_note`]
-    /// (task 9.29); [`Self::reload`] scans again, so it follows the roots on a
-    /// conflict reload.
-    gtk_themes_with_gtk3_dir: BTreeSet<String>,
+    /// The GTK theme names the scan found a GTK 3 stylesheet for, on any root
+    /// ([`GtkThemeScan::with_gtk3_stylesheet`]). Decides
+    /// [`Self::one_sided_gtk_theme_note`] (task 9.29); [`Self::reload`] scans again,
+    /// so it follows the roots on a conflict reload.
+    gtk_themes_with_gtk3_stylesheet: BTreeSet<String>,
     /// The icon theme drop-down.
     icon_theme: Selection,
     /// The cursor theme drop-down.
@@ -755,7 +761,7 @@ impl ThemesModel {
 
         ThemesModel {
             gtk_theme: Selection::new(gtk_scan.offered, current_gtk),
-            gtk_themes_with_gtk3_dir: gtk_scan.with_gtk3_dir,
+            gtk_themes_with_gtk3_stylesheet: gtk_scan.with_gtk3_stylesheet,
             icon_theme: Selection::new(icon_themes, current_icon),
             cursor_theme: Selection::new(cursor_themes, current_cursor),
             cursor_size: Selection::new(curated_sizes, current_size),
@@ -994,8 +1000,9 @@ impl ThemesModel {
     ///
     /// That happens for a built-in name (`BUILTIN_GTK_THEMES`) GTK 3 does not have
     /// compiled in (`Gtk3Resolution::NeedsDirectory` — today `Adwaita-dark`) when the
-    /// theme scan found no `<name>/gtk-3.0/` directory under any theme root: GTK 4 apps
-    /// then use the name's built-in look while GTK 3 apps fall back to a different one,
+    /// theme scan found no `<name>` directory carrying a GTK 3 stylesheet (a `gtk.css`
+    /// inside a `gtk-3.<N>/` directory, task 9.30) under any theme root: GTK 4 apps then
+    /// use the name's built-in look while GTK 3 apps fall back to a different one,
     /// although both `settings.ini` files hold the same name. The app writes the name all the
     /// same — it is a valid choice, and making the copies differ to compensate would
     /// break R3.3's "identical everywhere" — so this is information, never a refusal:
@@ -1017,7 +1024,7 @@ impl ThemesModel {
         else {
             return None;
         };
-        if self.gtk_themes_with_gtk3_dir.contains(theme) {
+        if self.gtk_themes_with_gtk3_stylesheet.contains(theme) {
             return None;
         }
         Some(format!(
@@ -2330,39 +2337,45 @@ struct GtkThemeScan {
     /// The names the GTK-theme drop-down offers: every installed theme plus the
     /// [`BUILTIN_GTK_THEMES`], de-duplicated and sorted.
     offered: Vec<String>,
-    /// The names that have a `gtk-3.0/` directory under at least one root — the
-    /// directories GTK 3 itself would load (see [`Gtk3Resolution`]). Kept so the model
-    /// can tell, without touching the filesystem again, whether a built-in name GTK 3
-    /// does not have compiled in is still installed for it (task 9.29). GTK 3 itself
-    /// looks for a stylesheet file inside a `gtk-3.<N>/` directory (see
-    /// [`Gtk3Resolution`]); the app approximates that with the existence of `gtk-3.0/`
-    /// until task 9.30 tightens this predicate and the theme predicate together.
-    with_gtk3_dir: BTreeSet<String>,
+    /// The names whose directory carries a GTK 3 stylesheet ([`has_gtk3_stylesheet`])
+    /// under at least one root — the directories GTK 3 itself would load (step 2 of
+    /// [`Gtk3Resolution`]). Kept so the model can tell, without touching the filesystem
+    /// again, whether a built-in name GTK 3 does not have compiled in is still
+    /// installed for it (task 9.29).
+    with_gtk3_stylesheet: BTreeSet<String>,
 }
 
 /// Scans for the GTK themes the drop-down offers: those installed under `dirs`, plus
 /// GTK's built-in ones (R3.3).
 ///
-/// A subdirectory is a GTK theme when it contains a `gtk-3.0/` or `gtk-4.0/`
-/// subdirectory. The [`BUILTIN_GTK_THEMES`] names are added unconditionally because they
+/// A subdirectory is a GTK theme when it carries a stylesheet for either GTK version
+/// ([`has_gtk3_stylesheet`] or [`has_gtk4_stylesheet`]). Either one qualifies (R3.3):
+/// themes differ in which version they style, and a GTK 3-only theme is still a valid
+/// `gtk-theme-name`. A `gtk-*` subdirectory alone is not enough — keybinding packages
+/// such as `Default` and `Emacs` ship a `gtk-3.0/` holding only `gtk-keys.css`, and
+/// offering them would write a theme name that styles nothing (task 9.30). The
+/// [`BUILTIN_GTK_THEMES`] names are added unconditionally because they
 /// are selectable without any theme directory (see that constant for why). Names are
 /// de-duplicated (a theme in `~/.themes` shadows a system one of the same name, and a
 /// scanned `Adwaita` directory collapses with the built-in entry — only the name
 /// matters, since that is what `gsettings`/`settings.ini` store) and returned sorted for
 /// a stable drop-down, built-ins and scan results interleaved in one order.
 ///
-/// The same pass records which names have a `gtk-3.0/` directory on some root
-/// ([`GtkThemeScan::with_gtk3_dir`]). That is deliberately narrower than "installed": a
-/// directory holding only `gtk-4.0/` is a theme for the drop-down but nothing GTK 3 can
-/// load, so it does not make a GTK 4-only built-in name work on GTK 3 (task 9.29).
+/// The same pass records which names carry a GTK 3 stylesheet on some root
+/// ([`GtkThemeScan::with_gtk3_stylesheet`]). That is deliberately narrower than
+/// "installed": a directory with only a GTK 4 stylesheet is a theme for the drop-down
+/// but nothing GTK 3 can load, so it does not make a GTK 4-only built-in name work on
+/// GTK 3 (task 9.29). Because both sets come from the same predicate, a
+/// keybinding-only `gtk-3.0/` can neither add a name to the drop-down nor silence the
+/// one-sided note.
 fn scan_gtk_themes(dirs: &[PathBuf]) -> GtkThemeScan {
     let mut offered = BTreeSet::new();
-    let mut with_gtk3_dir = BTreeSet::new();
+    let mut with_gtk3_stylesheet = BTreeSet::new();
     for (name, path) in theme_dir_entries(dirs) {
-        if path.join("gtk-3.0").is_dir() {
-            with_gtk3_dir.insert(name.clone());
+        if has_gtk3_stylesheet(&path) {
+            with_gtk3_stylesheet.insert(name.clone());
             offered.insert(name);
-        } else if path.join("gtk-4.0").is_dir() {
+        } else if has_gtk4_stylesheet(&path) {
             offered.insert(name);
         }
     }
@@ -2374,8 +2387,66 @@ fn scan_gtk_themes(dirs: &[PathBuf]) -> GtkThemeScan {
     );
     GtkThemeScan {
         offered: offered.into_iter().collect(),
-        with_gtk3_dir,
+        with_gtk3_stylesheet,
     }
+}
+
+/// The file name of a theme's main stylesheet, which both GTK versions look for
+/// inside the theme's version subdirectory (`gtk-dark.css` is only the dark variant
+/// of it, never loaded without it).
+const THEME_STYLESHEET: &str = "gtk.css";
+
+/// Whether the installed theme directory `theme_dir` carries a stylesheet GTK 3 can
+/// load: a regular file `gtk.css` inside a `gtk-3.<N>/` subdirectory (task 9.30;
+/// R3.3).
+///
+/// GTK 3.24 probes `<theme>/gtk-3.<N>/gtk.css` with `N` from its own minor version
+/// down in steps of 2 to 14, then `gtk-3.0` (step 2 of [`Gtk3Resolution`]), so a
+/// theme may carry its CSS under a version-suffixed directory such as `gtk-3.20/`
+/// and none under `gtk-3.0/`. Every `gtk-3.<digits>` directory counts here rather
+/// than the exact list one GTK 3 build probes: the GTK 3 minor version differs
+/// between hosts and this GTK 4 program has no GTK 3 library to ask. The cost is a
+/// slight over-approximation — a directory named for a version GTK 3 skips (an odd
+/// minor, or one newer than the installed library) would count — which no theme
+/// installed on the target host exercises. A `gtk-3.0/` holding only `gtk-keys.css`
+/// (a keybinding package) does not count.
+///
+/// Symlinks are followed, for the subdirectory and the stylesheet alike, as
+/// [`theme_dir_entries`] does for the theme directory: GTK opens the path, so a
+/// linked stylesheet is as good as a copied one. An unreadable directory carries no
+/// stylesheet as far as the scan can tell.
+fn has_gtk3_stylesheet(theme_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(theme_dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry.file_name().to_str().is_some_and(is_gtk3_subdir_name)
+            && entry.path().join(THEME_STYLESHEET).is_file()
+    })
+}
+
+/// Whether `name` is a GTK 3 version subdirectory name, `gtk-3.` followed by a
+/// decimal minor version (`gtk-3.0`, `gtk-3.20`, …) — the shape of every directory
+/// GTK 3 probes (see [`has_gtk3_stylesheet`]).
+fn is_gtk3_subdir_name(name: &str) -> bool {
+    name.strip_prefix("gtk-3.")
+        .is_some_and(|minor| !minor.is_empty() && minor.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Whether the installed theme directory `theme_dir` carries a GTK 4 stylesheet: a
+/// regular file `gtk-4.0/gtk.css`, symlinks followed (task 9.30; R3.3).
+///
+/// GTK 4 itself also probes version-suffixed `gtk-4.<N>/` directories, but only
+/// `gtk-4.0/` is checked here: it is the directory this desktop's GTK 4 setup links
+/// from `~/.config/gtk-4.0` (task 11.16), and no theme installed on the target host
+/// carries its GTK 4 stylesheet anywhere else. The predicate thus agrees with
+/// [`resolve_gtk4_theme`] on what the GTK 4 stylesheet is — `gtk-4.0/gtk.css`, the
+/// first of the entries that function links.
+fn has_gtk4_stylesheet(theme_dir: &Path) -> bool {
+    theme_dir
+        .join(GTK4_THEME_SUBDIR)
+        .join(THEME_STYLESHEET)
+        .is_file()
 }
 
 /// Scans `dirs` for installed icon and cursor themes in a single pass (R3.4).
@@ -2647,18 +2718,30 @@ export XCURSOR_SIZE=16
         icons
     }
 
+    /// Installs a GTK theme the scan accepts: `<root>/<theme>/<subdir>/gtk.css`, where
+    /// `subdir` names the GTK version it styles (`gtk-3.0`, `gtk-3.24`, `gtk-4.0`).
+    /// Since task 9.30 a bare `gtk-*` directory is no longer a theme, so every fixture
+    /// that needs a theme offered goes through here.
+    fn install_gtk_theme(root: &Path, theme: &str, subdir: &str) {
+        let dir = root.join(theme).join(subdir);
+        fs::create_dir_all(&dir).expect("create the theme's version subdirectory");
+        fs::write(dir.join("gtk.css"), format!("/* {theme} {subdir} */\n"))
+            .expect("write the theme stylesheet");
+    }
+
     #[test]
     fn scan_finds_gtk_themes_in_fixture_roots() {
         // Accept criterion (R3.3): the theme scan unit-tested against a fixture tree
-        // with injectable roots. A GTK theme is a dir with gtk-3.0/ or gtk-4.0/.
+        // with injectable roots. A GTK theme is a dir whose gtk-3.<N>/ or gtk-4.0/ carries
+        // a gtk.css (task 9.30).
         let tmp = tempfile::tempdir().expect("temp dir");
         let themes = tmp.path().join("themes");
-        fs::create_dir_all(themes.join("Everforest-Green-Dark").join("gtk-4.0")).unwrap();
+        install_gtk_theme(&themes, "Everforest-Green-Dark", "gtk-4.0");
         // Named Arc rather than Adwaita so this still proves the gtk-3.0 branch found it:
         // the built-in variants are merged in regardless of what the scan returns.
-        fs::create_dir_all(themes.join("Arc").join("gtk-3.0")).unwrap();
+        install_gtk_theme(&themes, "Arc", "gtk-3.0");
         fs::create_dir_all(themes.join("NotATheme")).unwrap(); // no gtk-*/ -> skipped
-        fs::create_dir_all(themes.join(".hidden").join("gtk-4.0")).unwrap(); // dotfile skipped
+        install_gtk_theme(&themes, ".hidden", "gtk-4.0"); // dotfile skipped
 
         let gtk = scan_gtk_themes(std::slice::from_ref(&themes)).offered;
         assert_eq!(
@@ -2669,7 +2752,8 @@ export XCURSOR_SIZE=16
                 "Arc".to_string(),
                 "Everforest-Green-Dark".to_string()
             ],
-            "GTK themes are the dirs with a gtk-3.0/ or gtk-4.0/ plus the built-ins, sorted; \
+            "GTK themes are the dirs whose gtk-3.<N>/ or gtk-4.0/ carries a gtk.css, plus the \
+             built-ins, sorted; \
              dotfiles/non-themes skipped"
         );
     }
@@ -2712,8 +2796,8 @@ export XCURSOR_SIZE=16
         // Deliberately not named Adwaita: the built-in variants are merged into every
         // result, so a fixture using those names would still pass even if the directory
         // scan returned nothing at all.
-        fs::create_dir_all(system.join("Nordic").join("gtk-4.0")).unwrap();
-        fs::create_dir_all(user.join("Nordic").join("gtk-4.0")).unwrap();
+        install_gtk_theme(&system, "Nordic", "gtk-4.0");
+        install_gtk_theme(&user, "Nordic", "gtk-4.0");
         let gtk = scan_gtk_themes(&[user, system]).offered;
         assert_eq!(
             gtk,
@@ -2736,7 +2820,7 @@ export XCURSOR_SIZE=16
 
         // A root with an unrelated theme and deliberately no Adwaita directory.
         let without = tmp.path().join("without-adwaita");
-        fs::create_dir_all(without.join("Nordic").join("gtk-3.0")).unwrap();
+        install_gtk_theme(&without, "Nordic", "gtk-3.0");
         assert_eq!(
             scan_gtk_themes(std::slice::from_ref(&without)).offered,
             vec![
@@ -2756,10 +2840,10 @@ export XCURSOR_SIZE=16
         // must still yield each name once, not twice.
         let tmp = tempfile::tempdir().expect("temp dir");
         let without = tmp.path().join("without-adwaita");
-        fs::create_dir_all(without.join("Nordic").join("gtk-3.0")).unwrap();
+        install_gtk_theme(&without, "Nordic", "gtk-3.0");
         let with = tmp.path().join("with-adwaita");
-        fs::create_dir_all(with.join("Adwaita").join("gtk-3.0")).unwrap();
-        fs::create_dir_all(with.join("Adwaita-dark").join("gtk-3.0")).unwrap();
+        install_gtk_theme(&with, "Adwaita", "gtk-3.0");
+        install_gtk_theme(&with, "Adwaita-dark", "gtk-3.0");
         let scanned = scan_gtk_themes(&[with, without]).offered;
         assert_eq!(
             scanned,
@@ -2999,7 +3083,7 @@ export XCURSOR_SIZE=16
         fs::create_dir_all(&config).unwrap();
         let paths = write_backing_fixture(&config, UWSM_ENV);
         let themes = tmp.path().join("themes");
-        fs::create_dir_all(themes.join("Adwaita").join("gtk-4.0")).unwrap();
+        install_gtk_theme(&themes, "Adwaita", "gtk-4.0");
         let roots = ThemeRoots {
             gtk_theme_dirs: vec![themes],
             icon_dirs: Vec::new(),
@@ -3481,8 +3565,8 @@ export XCURSOR_SIZE=16
         fs::create_dir_all(&config).unwrap();
         let paths = write_backing_fixture(&config, UWSM_ENV);
         let themes = tmp.join("themes");
-        fs::create_dir_all(themes.join("Adwaita").join("gtk-4.0")).unwrap();
-        fs::create_dir_all(themes.join("Everforest-Green-Dark").join("gtk-4.0")).unwrap();
+        install_gtk_theme(&themes, "Adwaita", "gtk-4.0");
+        install_gtk_theme(&themes, "Everforest-Green-Dark", "gtk-4.0");
         let roots = ThemeRoots {
             gtk_theme_dirs: vec![themes],
             icon_dirs: Vec::new(),
@@ -3768,7 +3852,7 @@ export XCURSOR_SIZE=16
         let config = tmp.path().join("config");
         let paths = write_backing_fixture(&config, UWSM_ENV);
         let themes = tmp.path().join("themes");
-        fs::create_dir_all(themes.join("Adwaita").join("gtk-4.0")).unwrap();
+        install_gtk_theme(&themes, "Adwaita", "gtk-4.0");
         let roots = ThemeRoots {
             gtk_theme_dirs: vec![themes],
             icon_dirs: Vec::new(),
@@ -4305,7 +4389,7 @@ export XCURSOR_SIZE=16
         let tmp = tempfile::tempdir().expect("temp dir");
         let paths = write_backing_fixture(&tmp.path().join("config"), UWSM_ENV);
         let themes = tmp.path().join("themes");
-        fs::create_dir_all(themes.join("Adwaita").join("gtk-4.0")).unwrap();
+        install_gtk_theme(&themes, "Adwaita", "gtk-4.0");
         let roots = ThemeRoots {
             gtk_theme_dirs: vec![themes],
             icon_dirs: Vec::new(),
@@ -4832,11 +4916,13 @@ export XCURSOR_SIZE=16
     // --- Task 11.16: the GTK 4 theme links ---------------------------------------
 
     /// Creates `<root>/<theme>/gtk-4.0/` with the given entries (`assets` as a
-    /// directory, the rest as files) plus a `gtk-3.0/`, returning the `gtk-4.0` dir.
+    /// directory, the rest as files) plus a GTK 3 part (`gtk-3.0/gtk.css`), returning
+    /// the `gtk-4.0` dir. The GTK 3 stylesheet keeps the theme offered by the scan
+    /// even when `entries` leaves out the GTK 4 `gtk.css` (task 9.30).
     fn gtk4_theme(root: &Path, theme: &str, entries: &[&str]) -> PathBuf {
         let gtk4 = root.join(theme).join("gtk-4.0");
         fs::create_dir_all(&gtk4).expect("create gtk-4.0");
-        fs::create_dir_all(root.join(theme).join("gtk-3.0")).expect("create gtk-3.0");
+        install_gtk_theme(root, theme, "gtk-3.0");
         for entry in entries {
             if *entry == "assets" {
                 fs::create_dir_all(gtk4.join(entry)).expect("create assets");
@@ -4855,7 +4941,7 @@ export XCURSOR_SIZE=16
         let tmp = tempfile::tempdir().expect("temp dir");
         let user = tmp.path().join("user-themes");
         let system = tmp.path().join("system-themes");
-        fs::create_dir_all(user.join("Shared/gtk-3.0")).expect("a GTK 3-only shadow");
+        install_gtk_theme(&user, "Shared", "gtk-3.0"); // a GTK 3-only shadow
         let gtk4 = gtk4_theme(&system, "Shared", &["gtk.css", "assets"]);
         let missing_root = tmp.path().join("does-not-exist");
 
@@ -4936,7 +5022,7 @@ export XCURSOR_SIZE=16
         let all = ["gtk.css", "gtk-dark.css", "assets"];
         let old = gtk4_theme(&root, "Old", &all);
         let new = gtk4_theme(&root, "New", &all);
-        fs::create_dir_all(root.join("Plain/gtk-3.0")).expect("a GTK 3-only theme");
+        install_gtk_theme(&root, "Plain", "gtk-3.0"); // a GTK 3-only theme
         let paths = write_backing_fixture(&tmp.join("config"), UWSM_ENV);
         let links_dir = paths.gtk4_settings.parent().expect("dir").to_path_buf();
         for name in all {
@@ -5201,17 +5287,21 @@ export XCURSOR_SIZE=16
 
     /// Two GTK theme roots under `tmp` laid out like a real host — a user root
     /// `<tmp>/home/.themes` (empty) and a system root `<tmp>/usr/share/themes` holding an
-    /// ordinary installed theme, `Nordic` — plus, when `adwaita_dark_subdir` is given,
-    /// an `Adwaita-dark/<subdir>/` directory on the *second* (system) root, so a test
-    /// proves any root counts, not only the first.
-    fn one_sided_roots(tmp: &Path, adwaita_dark_subdir: Option<&str>) -> ThemeRoots {
+    /// ordinary installed theme, `Nordic` — plus, when `adwaita_dark_file` is given, an
+    /// `Adwaita-dark` directory on the *second* (system) root holding that one file
+    /// (a path relative to the theme directory, such as `gtk-3.0/gtk.css`), so a test
+    /// proves any root counts, not only the first, and chooses exactly what the
+    /// directory ships.
+    fn one_sided_roots(tmp: &Path, adwaita_dark_file: Option<&str>) -> ThemeRoots {
         let user = tmp.join("home/.themes");
         let system = tmp.join("usr/share/themes");
         fs::create_dir_all(&user).expect("create the user theme root");
-        fs::create_dir_all(system.join("Nordic/gtk-3.0")).expect("create Nordic");
-        if let Some(subdir) = adwaita_dark_subdir {
-            fs::create_dir_all(system.join("Adwaita-dark").join(subdir))
+        install_gtk_theme(&system, "Nordic", "gtk-3.0");
+        if let Some(file) = adwaita_dark_file {
+            let path = system.join("Adwaita-dark").join(file);
+            fs::create_dir_all(path.parent().expect("a file inside the theme"))
                 .expect("create an Adwaita-dark theme directory");
+            fs::write(&path, "/* Adwaita-dark */\n").expect("write the Adwaita-dark file");
         }
         ThemeRoots {
             gtk_theme_dirs: vec![user, system],
@@ -5221,27 +5311,27 @@ export XCURSOR_SIZE=16
 
     /// A model over [`write_backing_fixture`]'s files (current GTK theme
     /// `Everforest-Green-Dark`) and the [`one_sided_roots`] under `tmp`.
-    fn one_sided_model(tmp: &Path, adwaita_dark_subdir: Option<&str>) -> ThemesModel {
-        let roots = one_sided_roots(&tmp.join("roots"), adwaita_dark_subdir);
+    fn one_sided_model(tmp: &Path, adwaita_dark_file: Option<&str>) -> ThemesModel {
+        let roots = one_sided_roots(&tmp.join("roots"), adwaita_dark_file);
         let paths = write_backing_fixture(&tmp.join("config"), UWSM_ENV);
         ThemesModel::load(&roots, paths, false, None)
     }
 
     #[test]
     fn scan_records_which_names_gtk3_can_load_from_a_directory() {
-        // Only a gtk-3.0/ directory is something GTK 3 loads; a gtk-4.0-only theme is
+        // Only a GTK 3 stylesheet is something GTK 3 loads; a gtk-4.0-only theme is
         // offered but not recorded, and a name is recorded whichever root holds it.
         let tmp = tempfile::tempdir().expect("temp dir");
         let first = tmp.path().join("first");
         let second = tmp.path().join("second");
-        fs::create_dir_all(first.join("Gtk4Only/gtk-4.0")).unwrap();
-        fs::create_dir_all(first.join("Both/gtk-4.0")).unwrap();
-        fs::create_dir_all(second.join("Both/gtk-3.0")).unwrap();
-        fs::create_dir_all(second.join("Gtk3Only/gtk-3.0")).unwrap();
+        install_gtk_theme(&first, "Gtk4Only", "gtk-4.0");
+        install_gtk_theme(&first, "Both", "gtk-4.0");
+        install_gtk_theme(&second, "Both", "gtk-3.0");
+        install_gtk_theme(&second, "Gtk3Only", "gtk-3.0");
 
         let scan = scan_gtk_themes(&[first, second]);
         assert_eq!(
-            scan.with_gtk3_dir.into_iter().collect::<Vec<_>>(),
+            scan.with_gtk3_stylesheet.into_iter().collect::<Vec<_>>(),
             vec!["Both".to_string(), "Gtk3Only".to_string()]
         );
         assert!(scan.offered.contains(&"Gtk4Only".to_string()));
@@ -5266,9 +5356,9 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn a_scanned_gtk3_dir_makes_the_builtin_two_sided() {
+    fn a_scanned_gtk3_stylesheet_makes_the_builtin_two_sided() {
         let tmp = tempfile::tempdir().expect("temp dir");
-        let mut model = one_sided_model(tmp.path(), Some("gtk-3.0"));
+        let mut model = one_sided_model(tmp.path(), Some("gtk-3.0/gtk.css"));
         model
             .stage_gtk_theme("Adwaita-dark")
             .expect("the value passes the stage-time check");
@@ -5283,7 +5373,7 @@ export XCURSOR_SIZE=16
     fn a_gtk4_only_dir_leaves_the_builtin_one_sided() {
         // An Adwaita-dark directory with only gtk-4.0/ is nothing GTK 3 can load.
         let tmp = tempfile::tempdir().expect("temp dir");
-        let mut model = one_sided_model(tmp.path(), Some("gtk-4.0"));
+        let mut model = one_sided_model(tmp.path(), Some("gtk-4.0/gtk.css"));
         model
             .stage_gtk_theme("Adwaita-dark")
             .expect("the value passes the stage-time check");
@@ -5321,7 +5411,7 @@ export XCURSOR_SIZE=16
         let paths = write_backing_fixture(&without_dir.path().join("config"), UWSM_ENV);
         let load = |roots: &ThemeRoots| ThemesModel::load(roots, paths.clone(), false, None);
         let mut one_sided = load(&one_sided_roots(without_dir.path(), None));
-        let mut two_sided = load(&one_sided_roots(with_dir.path(), Some("gtk-3.0")));
+        let mut two_sided = load(&one_sided_roots(with_dir.path(), Some("gtk-3.0/gtk.css")));
 
         one_sided
             .stage_gtk_theme("Adwaita-dark")
@@ -5382,7 +5472,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn a_current_one_sided_theme_is_noted_until_a_gtk3_dir_appears() {
+    fn a_current_one_sided_theme_is_noted_until_a_gtk3_stylesheet_appears() {
         // The value already on disk counts too, and a conflict reload scans again, so
         // installing the directory clears the note on the next rebuild.
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -5408,8 +5498,7 @@ export XCURSOR_SIZE=16
             Some(ADWAITA_DARK_NOTE)
         );
 
-        fs::create_dir_all(roots.gtk_theme_dirs[0].join("Adwaita-dark/gtk-3.0"))
-            .expect("install Adwaita-dark for GTK 3");
+        install_gtk_theme(&roots.gtk_theme_dirs[0], "Adwaita-dark", "gtk-3.0");
         assert_eq!(model.reload().one_sided_gtk_theme_note(), None);
     }
 
@@ -5440,5 +5529,160 @@ export XCURSOR_SIZE=16
                 .is_some(),
             "the same files without the override are noted"
         );
+    }
+
+    // --- Task 9.30: a theme needs a stylesheet, not just a gtk-* directory ----------
+
+    /// Writes `<root>/<theme>/<relative>` with placeholder contents, creating its
+    /// directories — for theme directories that ship something other than a
+    /// `gtk.css` ([`install_gtk_theme`]).
+    fn write_theme_file(root: &Path, theme: &str, relative: &str) {
+        let path = root.join(theme).join(relative);
+        fs::create_dir_all(path.parent().expect("a file inside the theme"))
+            .expect("create the theme subdirectory");
+        fs::write(&path, "/* fixture */\n").expect("write the theme file");
+    }
+
+    #[test]
+    fn scan_offers_only_directories_that_carry_a_stylesheet() {
+        // The accept criterion (R3.3): over one fixture root, a keybinding-only package
+        // and a theme with empty gtk-3.0/ and gtk-4.0/ directories are skipped, while a
+        // stylesheet in gtk-3.0/, in gtk-4.0/ or in a version-suffixed gtk-3.<N>/ alone
+        // is enough.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let themes = tmp.path().join("themes");
+        write_theme_file(&themes, "Emacs", "gtk-3.0/gtk-keys.css");
+        install_gtk_theme(&themes, "Gtk3Only", "gtk-3.0");
+        install_gtk_theme(&themes, "Gtk4Only", "gtk-4.0");
+        install_gtk_theme(&themes, "Versioned", "gtk-3.24");
+        fs::create_dir_all(themes.join("Empty/gtk-3.0")).unwrap();
+        fs::create_dir_all(themes.join("Empty/gtk-4.0")).unwrap();
+
+        let scan = scan_gtk_themes(std::slice::from_ref(&themes));
+        assert_eq!(
+            scan.offered,
+            vec![
+                "Adwaita".to_string(),
+                "Adwaita-dark".to_string(),
+                "Gtk3Only".to_string(),
+                "Gtk4Only".to_string(),
+                "Versioned".to_string()
+            ],
+            "Emacs (keybindings only) and Empty (no stylesheet) are not themes"
+        );
+        assert_eq!(
+            scan.with_gtk3_stylesheet.into_iter().collect::<Vec<_>>(),
+            vec!["Gtk3Only".to_string(), "Versioned".to_string()],
+            "a gtk-3.24/gtk.css is a GTK 3 stylesheet; a gtk-4.0 one is not"
+        );
+    }
+
+    #[test]
+    fn only_a_gtk_css_file_is_a_stylesheet() {
+        // Neither the dark variant alone nor a directory that happens to be called
+        // gtk.css is what GTK loads as a theme's stylesheet.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let root = tmp.path();
+        write_theme_file(root, "DarkOnly", "gtk-4.0/gtk-dark.css");
+        write_theme_file(root, "DarkOnly", "gtk-3.0/gtk-dark.css");
+        fs::create_dir_all(root.join("CssDir/gtk-3.0/gtk.css")).unwrap();
+        fs::create_dir_all(root.join("CssDir/gtk-4.0/gtk.css")).unwrap();
+        for theme in ["DarkOnly", "CssDir"] {
+            assert!(!has_gtk3_stylesheet(&root.join(theme)), "{theme}");
+            assert!(!has_gtk4_stylesheet(&root.join(theme)), "{theme}");
+        }
+    }
+
+    #[test]
+    fn gtk3_version_directories_are_gtk_3_dot_a_number() {
+        for name in ["gtk-3.0", "gtk-3.20", "gtk-3.24"] {
+            assert!(is_gtk3_subdir_name(name), "{name}");
+        }
+        for name in [
+            "gtk-3.",
+            "gtk-3",
+            "gtk-3.x",
+            "gtk-30",
+            "gtk-3.24-old",
+            "gtk-4.0",
+            "gtk-2.0",
+        ] {
+            assert!(!is_gtk3_subdir_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_gtk4_stylesheet_counts_only_in_gtk_4_0() {
+        // GTK 4 also probes gtk-4.<N>/, but the app's GTK 4 side is the gtk-4.0/
+        // directory the link step points into, so the two predicates agree on it.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        install_gtk_theme(tmp.path(), "Suffixed", "gtk-4.12");
+        assert!(!has_gtk4_stylesheet(&tmp.path().join("Suffixed")));
+        assert!(!has_gtk3_stylesheet(&tmp.path().join("Suffixed")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_stylesheet_counts_and_a_dangling_one_does_not() {
+        // GTK opens the path, so a stylesheet linked in from elsewhere styles the
+        // theme exactly like a copy; a link to nothing styles nothing.
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let shared = tmp.path().join("shared.css");
+        fs::write(&shared, "/* shared */\n").unwrap();
+        let themes = tmp.path().join("themes");
+        for (theme, target) in [
+            ("Linked", shared.clone()),
+            ("Dangling", tmp.path().join("missing.css")),
+        ] {
+            for subdir in ["gtk-3.0", "gtk-4.0"] {
+                let dir = themes.join(theme).join(subdir);
+                fs::create_dir_all(&dir).unwrap();
+                symlink(&target, dir.join("gtk.css")).unwrap();
+            }
+        }
+        // A whole version directory linked in counts too.
+        fs::create_dir_all(themes.join("LinkedDir")).unwrap();
+        fs::create_dir_all(tmp.path().join("real-gtk-3.0")).unwrap();
+        fs::write(tmp.path().join("real-gtk-3.0/gtk.css"), "/* real */\n").unwrap();
+        symlink(
+            tmp.path().join("real-gtk-3.0"),
+            themes.join("LinkedDir/gtk-3.0"),
+        )
+        .unwrap();
+
+        assert!(has_gtk3_stylesheet(&themes.join("Linked")));
+        assert!(has_gtk4_stylesheet(&themes.join("Linked")));
+        assert!(!has_gtk3_stylesheet(&themes.join("Dangling")));
+        assert!(!has_gtk4_stylesheet(&themes.join("Dangling")));
+        assert!(has_gtk3_stylesheet(&themes.join("LinkedDir")));
+    }
+
+    #[test]
+    fn a_keybinding_only_gtk3_dir_leaves_the_builtin_one_sided() {
+        // The 9.29 hand-off: an Adwaita-dark directory whose gtk-3.0/ holds only
+        // keybindings gives GTK 3 nothing to load, so the note must stay.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut model = one_sided_model(tmp.path(), Some("gtk-3.0/gtk-keys.css"));
+        model
+            .stage_gtk_theme("Adwaita-dark")
+            .expect("the value passes the stage-time check");
+        assert_eq!(
+            model.one_sided_gtk_theme_note().as_deref(),
+            Some(ADWAITA_DARK_NOTE)
+        );
+    }
+
+    #[test]
+    fn a_version_suffixed_gtk3_stylesheet_makes_the_builtin_two_sided() {
+        // GTK 3.24 probes gtk-3.24/ before gtk-3.0/, so a theme that ships its CSS
+        // only there is still loaded by GTK 3.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut model = one_sided_model(tmp.path(), Some("gtk-3.24/gtk.css"));
+        model
+            .stage_gtk_theme("Adwaita-dark")
+            .expect("the value passes the stage-time check");
+        assert_eq!(model.one_sided_gtk_theme_note(), None);
     }
 }

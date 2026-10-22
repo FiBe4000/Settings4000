@@ -340,9 +340,8 @@ fn a_gtk_theme_change_writes_both_settings_ini_identically() {
     // index.theme are cursor copies only) — then applies it live with one `gsettings set`.
     let fx = FixtureDotfiles::install();
     // Install a GTK theme the scan finds so the drop-down offers it, as on a real
-    // machine (a directory with a gtk-3.0/ subdirectory under ~/.themes).
-    fs::create_dir_all(fx.home().join(".themes/Fixture-Theme/gtk-3.0"))
-        .expect("create the fixture GTK theme");
+    // machine (a theme with a gtk-3.0/gtk.css stylesheet under ~/.themes).
+    fx.install_user_gtk3_theme("Fixture-Theme");
     let before = repo_snapshot(&fx);
 
     let mut themes = load_themes(&fx);
@@ -1061,8 +1060,7 @@ fn a_generate_colors_failure_rolls_back_the_theme_writes() {
     // Fixture-Theme ships only gtk-3.0, so the plan also removes the three GTK 4
     // theme links (task 11.16); the rollback re-creates them.
     let fx = FixtureDotfiles::install();
-    fs::create_dir_all(fx.home().join(".themes/Fixture-Theme/gtk-3.0"))
-        .expect("create the fixture GTK theme");
+    fx.install_user_gtk3_theme("Fixture-Theme");
     let before = repo_snapshot(&fx);
 
     let mut themes = load_themes_with_system_root(&fx);
@@ -1203,8 +1201,7 @@ fn an_external_settings_ini_edit_trips_the_conflict_guard() {
     // files' freshness is model-owned, so the window's guard is `check_conflict()`
     // before the plan is built. An external edit after load must trip it.
     let fx = FixtureDotfiles::install();
-    fs::create_dir_all(fx.home().join(".themes/Fixture-Theme/gtk-3.0"))
-        .expect("create the fixture GTK theme");
+    fx.install_user_gtk3_theme("Fixture-Theme");
 
     let mut themes = load_themes(&fx);
     themes
@@ -1283,8 +1280,7 @@ fn a_de_linked_gtk4_settings_ini_is_reported_yet_written() {
     // Apply still writes the live plain file (it is what GTK reads) while the repo
     // copy stays untouched; the still-linked gtk-3.0 copy is written through its link.
     let fx = FixtureDotfiles::install();
-    fs::create_dir_all(fx.home().join(".themes/Fixture-Theme/gtk-3.0"))
-        .expect("create the fixture GTK theme");
+    fx.install_user_gtk3_theme("Fixture-Theme");
     let live_gtk4 = fx.config_path("gtk-4.0/settings.ini");
     fx.replace_link_with_plain_copy(&live_gtk4);
     let before = repo_snapshot(&fx);

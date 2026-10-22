@@ -331,8 +331,7 @@ fn the_bespoke_models_compose_into_one_plan() {
     // writes with their reload parameters, and the wallpaper writes with theirs — and the
     // two reload-parameter sets merge instead of overwriting each other.
     let fx = FixtureDotfiles::install();
-    fs::create_dir_all(fx.home().join(".themes/Fixture-Theme/gtk-3.0"))
-        .expect("create a GTK theme the scan finds");
+    fx.install_user_gtk3_theme("Fixture-Theme");
     let new_wallpaper = fx.home().join("Pictures/wallpaper/next.png");
     fs::write(&new_wallpaper, b"fixture next wallpaper").expect("create the new image");
 
@@ -446,8 +445,7 @@ fn no_assembled_write_ever_targets_a_generated_file() {
     // wallpaper — and prove no planned write resolves to any generator output, and
     // that applying the plan (generator mocked) leaves every one byte-identical.
     let fx = FixtureDotfiles::install();
-    fs::create_dir_all(fx.home().join(".themes/Fixture-Theme/gtk-3.0"))
-        .expect("create a GTK theme the scan finds");
+    fx.install_user_gtk3_theme("Fixture-Theme");
     fs::create_dir_all(fx.home().join(".icons/Fixture-Cursors/cursors"))
         .expect("create a cursor theme the scan finds");
     let new_wallpaper = fx.home().join("Pictures/wallpaper/next.png");
@@ -588,8 +586,7 @@ fn a_stale_theme_or_wallpaper_file_aborts_naming_its_model() {
     // fixed order and each maps to a different recovery in the window (which model to
     // reload); a copy-paste that reported the wrong one would be invisible otherwise.
     let fx = FixtureDotfiles::install();
-    fs::create_dir_all(fx.home().join(".themes/Fixture-Theme/gtk-3.0"))
-        .expect("create a GTK theme the scan finds");
+    fx.install_user_gtk3_theme("Fixture-Theme");
     let store = loaded_store(&fx);
 
     let mut themes = themes_model(&fx);

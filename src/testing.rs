@@ -108,9 +108,9 @@ pub const GTK4_THEME_LINK_NAMES: [&str; 3] = ["gtk.css", "gtk-dark.css", "assets
 /// ├── .zsh_colors -> .dotfiles/zsh/colors.zsh
 /// └── Pictures/wallpaper/18.jpg          — stub the configs' `~/…` paths name
 /// <temp>/usr/share/themes/               — stand-in for the system theme root
-/// ├── Everforest-Green-Dark/{gtk-3.0,gtk-4.0/{gtk.css,gtk-dark.css,assets/}}
-/// ├── Fixture-Gtk4/{gtk-3.0,gtk-4.0/{gtk.css,gtk-dark.css,assets/}}
-/// └── Fixture-Gtk3-Only/gtk-3.0
+/// ├── Everforest-Green-Dark/{gtk-3.0/gtk.css,gtk-4.0/{gtk.css,gtk-dark.css,assets/}}
+/// ├── Fixture-Gtk4/{gtk-3.0/gtk.css,gtk-4.0/{gtk.css,gtk-dark.css,assets/}}
+/// └── Fixture-Gtk3-Only/gtk-3.0/gtk.css
 /// ```
 ///
 /// plus the three GTK 4 theme links `<home>/.config/gtk-4.0/{gtk.css,gtk-dark.css,
@@ -240,6 +240,21 @@ impl FixtureDotfiles {
     /// [`Self::system_themes_root`] — what the GTK 4 theme links point into.
     pub fn system_theme_gtk4_dir(&self, theme: &str) -> PathBuf {
         self.system_themes_root.join(theme).join("gtk-4.0")
+    }
+
+    /// Installs a GTK 3-only theme named `theme` under the user theme root
+    /// `<home>/.themes`, as a real theme package would: a `gtk-3.0/gtk.css`
+    /// stylesheet, which is what the Theme page's scan requires before it offers a
+    /// name (task 9.30) — a bare `gtk-3.0/` directory would not be offered.
+    pub fn install_user_gtk3_theme(&self, theme: &str) {
+        let stylesheet = self
+            .home
+            .join(".themes")
+            .join(theme)
+            .join("gtk-3.0/gtk.css");
+        create_parent_dirs(&stylesheet);
+        fs::write(&stylesheet, format!("/* {theme} gtk-3.0 */\n"))
+            .unwrap_or_else(|e| panic!("failed to write {}: {e}", stylesheet.display()));
     }
 
     /// The fake `$XDG_CONFIG_HOME` (`<home>/.config`) holding the deployment

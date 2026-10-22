@@ -665,9 +665,18 @@ fn the_gtk4_theme_fixture_is_deployed() {
         assert!(gtk4.join("gtk.css").is_file(), "{theme}");
         assert!(gtk4.join("gtk-dark.css").is_file(), "{theme}");
         assert!(gtk4.join("assets").is_dir(), "{theme}");
-        assert!(root.join(theme).join("gtk-3.0").is_dir(), "{theme}");
+        assert!(
+            root.join(theme).join("gtk-3.0/gtk.css").is_file(),
+            "{theme}"
+        );
     }
-    assert!(root.join(FIXTURE_GTK3_ONLY_THEME).join("gtk-3.0").is_dir());
+    // Each theme carries a real stylesheet, which the Theme page's scan requires
+    // before it offers the name (task 9.30); a bare directory would be skipped.
+    assert!(
+        root.join(FIXTURE_GTK3_ONLY_THEME)
+            .join("gtk-3.0/gtk.css")
+            .is_file()
+    );
     assert!(!root.join(FIXTURE_GTK3_ONLY_THEME).join("gtk-4.0").exists());
 
     let active = fx.system_theme_gtk4_dir(FIXTURE_ACTIVE_GTK_THEME);
