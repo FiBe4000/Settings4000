@@ -5,6 +5,8 @@
 > `hyprctl reload`. Since 11.4 the file is `input.lua` (same dotted paths, Lua
 > literals) and an Input write reloads with `hyprctl reload config-only`. The
 > audit's conclusions are unaffected; a re-capture is due after task 11.11.
+> Task 9.23 (2026-10-22) also reworded a few messages ("discovered" → "detected",
+> "enumerated" → "scanned"); field names are unchanged.
 
 An audit of the app's `tracing` coverage against **R7.3** (what must be logged,
 at which level) and a confirmation of **R8.2** (no root, writes only under the

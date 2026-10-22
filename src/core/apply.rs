@@ -66,7 +66,7 @@
 //!    before it, and a later failure rolls the link steps back too (see [`LinkWrite`]
 //!    for why this is a write step and not a best-effort reload).
 //! 4. **Palette generator, last** (the palette gotcha): if the change is a
-//!    color-scheme switch, run the discovered `scripts/generate-colors <scheme>`
+//!    color-scheme switch, run the detected `scripts/generate-colors <scheme>`
 //!    as the **last** write step. A non-zero exit — which also covers a
 //!    missing/incomplete `theme/fonts`, since the generator aborts on it — is a
 //!    write failure and triggers the same rollback of the earlier app-written
@@ -109,7 +109,7 @@
 //!   the write's values are among the `validations` above (read only by the
 //!   plan-drift guard, [`warn_on_missing_validations`]).
 //! - **`palette`**: `Some` only for a color-scheme switch, carrying the scheme
-//!   name and the `scripts/generate-colors` path discovered from the capabilities
+//!   name and the `scripts/generate-colors` path detected from the capabilities
 //!   palette source (R8.5). A v1 palette switch edits no file directly — it runs
 //!   the generator, which regenerates the read-only color files — so it appears
 //!   here rather than in `writes`.
@@ -274,7 +274,7 @@ pub enum WriteValidation {
     /// This write carries nothing for step 1 to check, so its absence from `validations`
     /// is correct rather than a bug. Two cases exist today, both documented where they
     /// are declared: a change confined to values chosen from a list the app itself
-    /// discovered or defined (the GTK/icon/cursor theme names and sizes — see task 9.27,
+    /// scanned or defined (the GTK/icon/cursor theme names and sizes — see task 9.27,
     /// which will give those validations of their own — and the wallpaper fit mode).
     NotNeeded,
 }
@@ -291,7 +291,7 @@ pub enum WriteValidation {
 pub struct PaletteSwitch {
     /// The scheme name passed to the generator (e.g. `nord`).
     pub scheme: String,
-    /// The discovered `scripts/generate-colors` path (from the capabilities palette
+    /// The detected `scripts/generate-colors` path (from the capabilities palette
     /// source, R8.5). Run as `generate-colors <scheme>` through the
     /// [`CommandRunner`] — no shell.
     pub generate_colors: PathBuf,

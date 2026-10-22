@@ -322,7 +322,7 @@ pub fn assemble_apply_plan(sources: ApplySources<'_>) -> Result<AssembledPlan, P
     }
 
     // The palette switch (task 6.3): it writes no file directly — the pipeline runs the
-    // discovered `generate-colors <scheme>` as its last write step, then the palette
+    // detected `generate-colors <scheme>` as its last write step, then the palette
     // reload chain — because v1 never edits `colors/<scheme>`.
     if let Some(switch) = sources.palette.and_then(PaletteModel::apply_contribution) {
         plan.palette = Some(switch);

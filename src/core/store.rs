@@ -310,8 +310,8 @@ impl SettingsStore {
     /// parsed values into the store's originals.
     ///
     /// Shared by the initial [`load_file`](Self::load_file) and the conflict
-    /// [`reload_file`](Self::reload_file) so both baseline and ingest a file the same
-    /// way. On a first load a setting is inserted with no staged edit; on a reload an
+    /// [`refresh_file`](Self::refresh_file) so both baseline and ingest a file the same
+    /// way. On a first load a setting is inserted with no staged edit; on a refresh an
     /// existing setting keeps its pending staged edit while its `original` is refreshed
     /// — so an external change updates the baseline without discarding the user's
     /// in-progress work (that decision is surfaced to the user by the refresh report,
@@ -655,7 +655,7 @@ impl SettingsStore {
         for conflict in self.freshness.check_conflicts() {
             let path = conflict.path().to_path_buf();
             match conflict.reason() {
-                ConflictReason::ContentChanged => match self.reload_file(&path) {
+                ConflictReason::ContentChanged => match self.refresh_file(&path) {
                     Ok(()) => {
                         tracing::info!(
                             path = %path.display(),
@@ -692,7 +692,7 @@ impl SettingsStore {
     ///
     /// Returns an error if no reader is registered for the path (a programming error)
     /// or if the reader itself fails to read/parse the file.
-    fn reload_file(&mut self, path: &Path) -> io::Result<()> {
+    fn refresh_file(&mut self, path: &Path) -> io::Result<()> {
         let reader = self.reloaders.get(path).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,

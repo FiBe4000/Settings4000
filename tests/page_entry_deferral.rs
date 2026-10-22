@@ -89,11 +89,11 @@ struct Page {
 /// with each page's own functions (see the module docs).
 const SHARED_WIDGETS: &str = include_str!("../src/ui/widgets.rs");
 
-/// The Sound page: `pw-dump` / `wpctl status` enumeration (task 9.4).
+/// The Sound page: the `pw-dump` / `wpctl status` device load (task 9.4).
 const SOUND: Page = Page {
     file: "src/ui/sound.rs",
     source: include_str!("../src/ui/sound.rs"),
-    read_markers: &["enumerate"],
+    read_markers: &["sound::load("],
     build_helper: "note",
 };
 
@@ -101,7 +101,7 @@ const SOUND: Page = Page {
 const NETWORK: Page = Page {
     file: "src/ui/network.rs",
     source: include_str!("../src/ui/network.rs"),
-    read_markers: &["read_status"],
+    read_markers: &["network::load("],
     build_helper: "note",
 };
 
@@ -301,7 +301,7 @@ fn assert_deferred(page: &Page) {
 }
 
 #[test]
-fn the_sound_page_defers_its_enumeration() {
+fn the_sound_page_defers_its_device_load() {
     assert_deferred(&SOUND);
 }
 

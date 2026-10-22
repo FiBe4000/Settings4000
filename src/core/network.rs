@@ -7,7 +7,7 @@
 //! NetworkManager connections are currently active and offers exactly one action —
 //! an "Open Network Settings" button that hands deep management to the proper
 //! NetworkManager tool. This module is the headless half: it reads and parses the
-//! connection status ([`read_status`]) and decides and builds the launcher command
+//! connection status ([`load`]) and decides and builds the launcher command
 //! ([`launcher`], [`open_settings`]). The bespoke GTK glue in [`crate::ui::network`]
 //! renders the status rows and the button from what this module returns.
 //!
@@ -102,7 +102,7 @@ impl ActiveConnection {
     }
 }
 
-/// The Network page's read-only status: what [`read_status`] found.
+/// The Network page's read-only status: what [`load`] found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NetworkStatus {
     /// `nmcli` ran successfully and reported these active connections (possibly
@@ -115,13 +115,13 @@ pub enum NetworkStatus {
     Unavailable,
 }
 
-/// Reads the current connection status from NetworkManager (R3.1).
+/// Loads the current connection status from NetworkManager (R3.1).
 ///
 /// Runs [`status_command`] and parses its terse output; run on page entry and on a
 /// manual status refresh. Any failure — `nmcli` missing (it gates the page, but it
 /// can disappear between detection and now), a non-zero exit (NetworkManager daemon
 /// not running) — degrades to [`NetworkStatus::Unavailable`], never a panic.
-pub fn read_status(runner: &dyn CommandRunner) -> NetworkStatus {
+pub fn load(runner: &dyn CommandRunner) -> NetworkStatus {
     match runner.run(&status_command()) {
         Ok(output) if output.success() => NetworkStatus::Connections(parse_active_connections(
             &String::from_utf8_lossy(output.stdout()),
@@ -376,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn read_status_parses_a_successful_nmcli_run() {
+    fn load_parses_a_successful_nmcli_run() {
         // Accept criterion (status renders, via the mock runner, R6.1): a successful
         // nmcli run yields the parsed connections, and exactly the one pinned query
         // was issued.
@@ -385,7 +385,7 @@ mod tests {
             NMCLI_ACTIVE,
             "",
         ))]);
-        let status = read_status(&runner);
+        let status = load(&runner);
         match status {
             NetworkStatus::Connections(connections) => assert_eq!(connections.len(), 3),
             NetworkStatus::Unavailable => panic!("a successful nmcli run must yield connections"),
@@ -394,16 +394,16 @@ mod tests {
     }
 
     #[test]
-    fn read_status_degrades_to_unavailable_on_failure() {
+    fn load_degrades_to_unavailable_on_failure() {
         // nmcli exits non-zero (NetworkManager daemon not running).
         let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake(8))]);
-        assert_eq!(read_status(&runner), NetworkStatus::Unavailable);
+        assert_eq!(load(&runner), NetworkStatus::Unavailable);
 
         // nmcli cannot be spawned at all.
         let runner = MockCommandRunner::with_outcomes([Err(CommandError::Spawn(
             std::io::Error::from(std::io::ErrorKind::NotFound),
         ))]);
-        assert_eq!(read_status(&runner), NetworkStatus::Unavailable);
+        assert_eq!(load(&runner), NetworkStatus::Unavailable);
     }
 
     #[test]

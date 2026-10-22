@@ -209,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_rebuilds_a_model_when_its_capability_appears_or_disappears() {
+    fn refresh_loads_a_model_when_its_capability_appears_or_disappears() {
         // The task-9.3 accept scenario at the capability seam: hypridle is installed
         // between startup and a Refresh. The startup pass built no Power & Idle model
         // (category hidden, R4.2); the refresh pass runs the *same* loader against the

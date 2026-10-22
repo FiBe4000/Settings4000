@@ -428,7 +428,7 @@ impl WallpaperModel {
     /// Whether `hyprpaper.conf` needs writing — a wallpaper path or fit-mode change,
     /// and the file is editable.
     fn hyprpaper_write_needed(&self) -> bool {
-        self.wallpaper_editable() && (self.wallpaper.is_changed() || self.fit.is_changed())
+        self.wallpaper_editable() && (self.wallpaper.is_dirty() || self.fit.is_dirty())
     }
 
     /// The image path that should be written to `hyprlock.conf`: the override path when
@@ -591,7 +591,7 @@ impl WallpaperModel {
         let mut changed_keys = Vec::new();
         let mut written = WrittenWallpaperValues::default();
 
-        if self.wallpaper.is_changed() {
+        if self.wallpaper.is_dirty() {
             if let Some(path) = self.wallpaper.effective() {
                 match file.set_value(&KeyPath::at(&[WALLPAPER_SECTION], WALLPAPER_PATH_KEY), path) {
                     Ok(()) => {
@@ -604,7 +604,7 @@ impl WallpaperModel {
                 }
             }
         }
-        if self.fit.is_changed() {
+        if self.fit.is_dirty() {
             if let Some(fit) = self.fit.effective() {
                 match file.set_value(&KeyPath::at(&[WALLPAPER_SECTION], WALLPAPER_FIT_KEY), fit) {
                     Ok(()) => {
@@ -720,7 +720,7 @@ impl WallpaperModel {
     fn validations(&self) -> Vec<(SettingId, Value)> {
         let home = self.paths.home.as_deref();
         let mut validations = Vec::new();
-        if self.wallpaper.is_changed() {
+        if self.wallpaper.is_dirty() {
             if let Some(path) = self.wallpaper.effective() {
                 validations.push((
                     SettingId::WallpaperPath,
@@ -1578,7 +1578,7 @@ label {
             "the wallpaper baseline still matches what is on disk"
         );
         assert!(
-            model.wallpaper.is_changed() && model.is_dirty(),
+            model.wallpaper.is_dirty() && model.is_dirty(),
             "the rejected wallpaper path stays staged and the page stays dirty"
         );
     }

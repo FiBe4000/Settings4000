@@ -17,7 +17,7 @@
 //!
 //! The runtime laptop toggle (task 11.8) is covered here too, from detection
 //! onwards: the fixture repo's `scripts/hypr-toggle-laptop-display` stub is
-//! discovered behind the deployed symlinks (R8.5) and run — through the mock
+//! detected behind the deployed symlinks (R8.5) and run — through the mock
 //! runner only, never for real — and a tree without it hides the toggle (R4.2).
 
 use std::fs;
@@ -386,7 +386,7 @@ fn an_external_edit_trips_the_models_conflict_guard_before_any_write() {
 }
 
 /// Runs real capability detection over the installed tree, with no binaries,
-/// daemons or compositor — only the filesystem-backed repo discovery matters to
+/// daemons or compositor — only the filesystem-backed repo detection matters to
 /// the laptop toggle (R8.5).
 fn detect(fx: &FixtureDotfiles) -> Capabilities {
     Capabilities::detect(&DetectionInputs {

@@ -6,7 +6,7 @@
 //! The Display page edits per-monitor resolution/refresh/scale/position (staged to
 //! `config/hypr/monitors.conf`, applied on **Apply**) and offers a runtime-only
 //! laptop-display toggle (applied immediately, R5.2). Unlike every other setting in
-//! the app, monitors are **discovered at runtime** — their names, count, and the
+//! the app, monitors are **known only at runtime** — their names, count, and the
 //! modes they support come from `hyprctl monitors all -j` — so they do not fit the
 //! fixed, fieldless [`SettingId`](crate::core::model::SettingId) enum the
 //! [`SettingsStore`](crate::core::store) is keyed by.
@@ -614,7 +614,7 @@ impl DisplayModel {
     /// Runs `hyprctl monitors all -j` through `runner` (`all` so a currently-disabled
     /// output still appears) and reads `monitors_conf_path`. Returns `None` when the
     /// probe cannot be run or reports failure — i.e. there is no live compositor to
-    /// enumerate — so the Display page degrades to a placeholder (R4.2). A readable
+    /// query — so the Display page degrades to a placeholder (R4.2). A readable
     /// probe with an unreadable `monitors.conf` still yields a model (the file-backed
     /// controls are then hidden, R4.4).
     ///
@@ -734,7 +734,7 @@ impl DisplayModel {
         }
     }
 
-    /// The number of monitors discovered.
+    /// The number of monitors the model holds.
     pub fn monitor_count(&self) -> usize {
         self.monitors.len()
     }
@@ -790,9 +790,9 @@ impl DisplayModel {
     /// selected resolution: the refresh rates the compositor reports for that
     /// resolution, plus the configured refresh when set and not among them. Empty for
     /// a special mode token (`preferred`), whose refresh is Hyprland's choice.
-    pub fn refresh_options(&self, index: usize) -> Vec<String> {
+    pub fn refresh_rate_options(&self, index: usize) -> Vec<String> {
         let resolution = self.effective_resolution(index);
-        self.refresh_options_for(index, &resolution)
+        self.refresh_rate_options_for(index, &resolution)
     }
 
     /// The scale drop-down options for monitor `index`: the configured scale (first,
@@ -903,7 +903,7 @@ impl DisplayModel {
     ) -> Result<(), StageRefusal> {
         let refresh = {
             let current = self.effective_refresh(index);
-            let available = self.refresh_options_for(index, &resolution);
+            let available = self.refresh_rate_options_for(index, &resolution);
             match current {
                 Some(refresh) if available.contains(&refresh) => Some(refresh),
                 _ => available.into_iter().next(),
@@ -1066,7 +1066,7 @@ impl DisplayModel {
     /// refreshes the compositor reports for it, plus the configured refresh when the
     /// selected resolution is the configured one and it is not otherwise listed. Empty
     /// for a special mode token.
-    fn refresh_options_for(&self, index: usize, resolution: &str) -> Vec<String> {
+    fn refresh_rate_options_for(&self, index: usize, resolution: &str) -> Vec<String> {
         if is_special_mode(resolution) {
             return Vec::new();
         }
@@ -1799,7 +1799,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
 
         // Available modes come from the live probe.
         assert_eq!(model.resolution_options(0), vec!["2560x1440".to_string()]);
-        assert_eq!(model.refresh_options(0), vec!["60.01".to_string()]);
+        assert_eq!(model.refresh_rate_options(0), vec!["60.01".to_string()]);
         assert!(!model.is_dirty());
     }
 
@@ -2875,7 +2875,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         assert_eq!(model.effective_resolution(0), "2560x1440");
         assert_eq!(model.effective_refresh(0), Some("144".to_string()));
         assert_eq!(
-            model.refresh_options(0),
+            model.refresh_rate_options(0),
             vec!["144".to_string(), "120".to_string()]
         );
     }

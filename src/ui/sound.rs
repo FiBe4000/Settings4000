@@ -16,8 +16,8 @@
 //!
 //! # Render-from-state, apply-immediately
 //!
-//! On page entry the page enumerates the live audio devices
-//! ([`sound::enumerate`](crate::core::sound::enumerate) — `pw-dump` JSON, falling back
+//! On page entry the page loads the live audio devices
+//! ([`sound::load`](crate::core::sound::load) — `pw-dump` JSON, falling back
 //! to `wpctl status`) and renders one section per output/input: a device drop-down, a
 //! volume slider, and a mute switch, reflecting the *default* device of that kind.
 //! Driving any control runs the matching `wpctl` command at once
@@ -25,19 +25,19 @@
 //! [`set_volume`](crate::core::sound::set_volume) /
 //! [`set_mute`](crate::core::sound::set_mute)) through the real system runner.
 //!
-//! Switching the default device re-enumerates and rebuilds, so the volume/mute controls
-//! then target the newly-default device; volume/mute changes do not rebuild (a slider
-//! drag must not tear down the widget it is driving). A "Rescan devices" button and the
-//! window re-showing the page both re-enumerate, so external volume changes are picked
-//! up. Each control sets its widget value **before** connecting the change handler, so a
-//! programmatic render never masquerades as a user edit (the same discipline the Display
-//! page follows).
+//! Switching the default device refreshes the page (load again, then rebuild), so the
+//! volume/mute controls then target the newly-default device; volume/mute changes do
+//! not rebuild (a slider drag must not tear down the widget it is driving). A "Rescan
+//! devices" button and the window re-showing the page both refresh it, so external
+//! volume changes are picked up. Each control sets its widget value **before**
+//! connecting the change handler, so a programmatic render never masquerades as a user
+//! edit (the same discipline the Display page follows).
 //!
-//! # The first enumeration is deferred to first page entry (deliberate)
+//! # The first load is deferred to first page entry (deliberate)
 //!
 //! [`build`] runs no `pw-dump`/`wpctl` at all (task 9.4) — the page starts with a
-//! placeholder and the first enumeration happens when it first becomes the visible stack
-//! child, through the same window hook that re-enumerates on every later entry, which
+//! placeholder and the first load happens when it first becomes the visible stack
+//! child, through the same window hook that refreshes it on every later entry, which
 //! runs it from the GTK idle queue. The Network page ([`super::network`]) defers its first
 //! read the same way, for the same reason: the page is built inside the window's populate
 //! pass on the GTK main thread, and a wedged PipeWire/WirePlumber would hold a synchronous
@@ -50,7 +50,7 @@
 //! ([`super::window`]), whose docs spell out what the idle callback re-checks.
 //!
 //! Deferring also keeps a manual detection refresh (R4.3), which rebuilds all pages, from
-//! re-enumerating a page nobody is looking at. It costs nothing: the placeholder is
+//! refreshing a page nobody is looking at. It costs nothing: the placeholder is
 //! visible at most for the instant before the idle callback runs. Nothing is lost by
 //! rebuilding into it either — the page is entirely runtime-only, so it holds no staged
 //! edit a repopulate could discard (R5.2).
@@ -95,7 +95,7 @@ const VOLUME_PERCENT_MAX: f64 = 100.0;
 const VOLUME_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// The mounted Sound page: the scrollable root plus the handle the window uses to
-/// enumerate it whenever the page is shown.
+/// refresh it whenever the page is shown.
 pub(crate) struct SoundPage {
     /// The scrollable widget mounted in the window's stack.
     root: ScrolledWindow,
@@ -111,12 +111,12 @@ impl SoundPage {
         &self.root
     }
 
-    /// Enumerates the audio devices and rebuilds the controls — called by the window
+    /// Re-loads the audio devices and rebuilds the controls — called by the window
     /// whenever the Sound page becomes the visible stack child, which covers both the
-    /// deferred *first* enumeration (see the module docs) and picking up a volume/device
+    /// deferred *first* load (see the module docs) and picking up a volume/device
     /// change made elsewhere while the app sat on another page (R3.1).
     pub(crate) fn refresh(&self) {
-        self.inner.reenumerate();
+        self.inner.refresh();
     }
 }
 
@@ -126,16 +126,16 @@ impl SoundPage {
 /// (owned via `content`) never forms a reference cycle with the closures mounted inside
 /// it.
 struct Inner {
-    /// The vertical box holding the rescan button and one section per device kind,
+    /// The vertical box holding the refresh button and one section per device kind,
     /// rebuilt in place.
     content: GtkBox,
-    /// The last-enumerated audio state, the single source of truth the controls render
-    /// from. Refreshed by [`Self::reenumerate`]; it is not the store — the Sound page
+    /// The last-loaded audio state, the single source of truth the controls render
+    /// from. Refreshed by [`Self::refresh`]; it is not the store — the Sound page
     /// stages nothing (R5.2).
     ///
     /// It starts out empty and is never *rendered* in that state: [`build`] shows a
-    /// placeholder instead and the first enumeration happens on first page entry (see the
-    /// module docs), so [`Self::rebuild`] only ever runs on enumerated state.
+    /// placeholder instead and the first load happens on first page entry (see the
+    /// module docs), so [`Self::rebuild`] only ever runs on loaded state.
     state: RefCell<SoundState>,
     /// The pending, debounced volume-apply timer, if a slider was moved within the last
     /// [`VOLUME_DEBOUNCE`]. Held so a subsequent movement can cancel and re-arm it,
@@ -144,27 +144,27 @@ struct Inner {
 }
 
 impl Inner {
-    /// Enumerates the live audio devices and rebuilds the controls (R3.1).
+    /// Re-loads the live audio devices and rebuilds the controls (R3.1).
     ///
     /// The only place the page probes PipeWire, and thus the only place it spawns a
     /// subprocess for reading state: page entry, the "Rescan devices" button, and a
     /// default-device switch all come through here. [`build`] deliberately does not (see
     /// the module docs).
-    fn reenumerate(self: &Rc<Self>) {
+    fn refresh(self: &Rc<Self>) {
         // Drop any pending debounced volume apply: the sliders are about to be rebuilt
         // from fresh state, so a stale in-flight apply would fight the new values.
         self.cancel_volume_timeout();
-        let state = sound::enumerate(&SystemCommandRunner::new());
+        let state = sound::load(&SystemCommandRunner::new());
         *self.state.borrow_mut() = state;
         self.rebuild();
     }
 
-    /// Rebuilds the page: a rescan button and the output/input sections (R3.1).
+    /// Rebuilds the page: a refresh button and the output/input sections (R3.1).
     fn rebuild(self: &Rc<Self>) {
         while let Some(child) = self.content.first_child() {
             self.content.remove(&child);
         }
-        self.content.append(&self.build_rescan_button());
+        self.content.append(&self.build_refresh_button());
 
         let state = self.state.borrow();
         self.content
@@ -173,14 +173,14 @@ impl Inner {
             .append(&self.build_device_section("Input", state.inputs()));
     }
 
-    /// The "Rescan devices" button that re-enumerates on demand.
-    fn build_rescan_button(self: &Rc<Self>) -> Button {
+    /// The "Rescan devices" button that refreshes the page on demand.
+    fn build_refresh_button(self: &Rc<Self>) -> Button {
         let button = Button::with_label("Rescan devices");
         button.set_halign(Align::Start);
         let weak = Rc::downgrade(self);
         button.connect_clicked(move |_| {
             if let Some(inner) = weak.upgrade() {
-                inner.reenumerate();
+                inner.refresh();
             }
         });
         button
@@ -274,11 +274,11 @@ impl Inner {
         labelled_row("Muted", &switch)
     }
 
-    /// Switches the default device to `id` immediately (R5.2), then re-enumerates and
-    /// rebuilds so the volume/mute rows target the newly-default device.
+    /// Switches the default device to `id` immediately (R5.2), then refreshes the
+    /// page so the volume/mute rows target the newly-default device.
     ///
     /// This is called from the device drop-down's `selected` handler, so the
-    /// `reenumerate` → `rebuild` here removes the very `DropDown` that is mid-emission.
+    /// `refresh` → `rebuild` here removes the very `DropDown` that is mid-emission.
     /// That re-entrant teardown is **intentional and safe**: GTK4 keeps the emitting
     /// widget alive for the duration of the signal emission (the handler holds only a
     /// `Weak`, and the widget is dropped only after the emission unwinds), and it is
@@ -286,7 +286,7 @@ impl Inner {
     /// use-after-free — the Display page (task 6.1) relies on the same pattern.
     fn set_default(self: &Rc<Self>, id: u32) {
         sound::set_default(&SystemCommandRunner::new(), id);
-        self.reenumerate();
+        self.refresh();
     }
 
     /// (Re)arms the debounced volume-apply timer for device `id` at the `wpctl`-scale
@@ -327,7 +327,7 @@ impl Inner {
 /// Builds the Sound page (task 6.2).
 ///
 /// Deliberately runs **no** `pw-dump`/`wpctl` here — the page starts with a placeholder
-/// and the first enumeration happens when it first becomes the visible stack child (see
+/// and the first load happens when it first becomes the visible stack child (see
 /// the module docs for the R8.1 startup-budget rationale). The returned [`SoundPage`] must
 /// be kept alive by the window: it owns the strong reference to the render state whose
 /// handlers keep the controls wired. The window mounts [`SoundPage::root`] in the stack
@@ -339,7 +339,7 @@ pub(crate) fn build() -> SoundPage {
     content.set_margin_start(PAGE_MARGIN);
     content.set_margin_end(PAGE_MARGIN);
 
-    // The placeholder content, replaced wholesale by the first enumeration, which the
+    // The placeholder content, replaced wholesale by the first load, which the
     // window's page-entry hook triggers the moment the page becomes visible.
     content.append(&note("Reading the audio devices…"));
 

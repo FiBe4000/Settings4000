@@ -906,7 +906,7 @@ fn eval_reply_excerpt(stdout: &[u8]) -> String {
 /// kitty re-reads its config on SIGUSR1, so this is how a palette change reaches it
 /// in v1. An empty PID set is not a failure — it means kitty is no longer running (a
 /// race against detection), logged and treated as a no-op. A genuine inability to
-/// enumerate processes is a [`ReloadError::Signal`].
+/// scan processes is a [`ReloadError::Signal`].
 fn reload_kitty(signaller: &dyn ProcessSignaller) -> Result<(), ReloadError> {
     match signaller.signal_all(KITTY_PROCESS, Signal::SIGUSR1) {
         Ok(pids) if pids.is_empty() => {
@@ -1008,7 +1008,7 @@ pub enum ReloadError {
         /// Its exit code, or `None` if it was terminated by a signal.
         code: Option<i32>,
     },
-    /// A signal-based reload could not enumerate its target processes.
+    /// A signal-based reload could not scan for its target processes.
     Signal(io::Error),
     /// A `hyprctl eval` call ran but Hyprland did not answer `ok` (see
     /// [`HyprlandEval::run`]), so the live change was not applied.
@@ -2124,15 +2124,15 @@ mod tests {
     }
 
     #[test]
-    fn kitty_reload_surfaces_a_signal_enumeration_failure() {
-        // When process enumeration itself fails (not merely "no kitty running"), the
+    fn kitty_reload_surfaces_a_signal_scan_failure() {
+        // When the process scan itself fails (not merely "no kitty running"), the
         // kitty reload surfaces a ReloadError::Signal (R5.5).
         let runner = MockCommandRunner::new();
         let signaller = MockProcessSignaller::failing(io::ErrorKind::PermissionDenied);
 
         let error = ReloadAction::KittyColors
             .execute(&runner, &signaller)
-            .expect_err("a signal-enumeration failure must be surfaced");
+            .expect_err("a signal-scan failure must be surfaced");
         assert!(matches!(error, ReloadError::Signal(_)));
     }
 
@@ -2237,14 +2237,14 @@ mod tests {
 
     #[test]
     fn hypridle_restart_surfaces_a_kill_signal_failure() {
-        // If enumerating hypridle to terminate it fails, the fallback surfaces a
+        // If scanning for hypridle to terminate it fails, the fallback surfaces a
         // ReloadError::Signal and never reaches the respawn.
         let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake(3))]);
         let signaller = MockProcessSignaller::failing(io::ErrorKind::PermissionDenied);
 
         let error = ReloadAction::HypridleRestart
             .execute(&runner, &signaller)
-            .expect_err("a signal-enumeration failure must be surfaced");
+            .expect_err("a signal-scan failure must be surfaced");
         assert!(matches!(error, ReloadError::Signal(_)));
         assert_eq!(
             runner.recorded(),

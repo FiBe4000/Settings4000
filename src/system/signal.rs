@@ -48,12 +48,12 @@ pub trait ProcessSignaller {
     /// `process_name`, returning the PIDs that were signalled.
     ///
     /// Matching a *process name* rather than taking explicit PIDs keeps the caller
-    /// (the reload table) free of PID discovery: "reload all kitty instances" is
+    /// (the reload table) free of PID lookup: "reload all kitty instances" is
     /// exactly `signal_all("kitty", SIGUSR1)`. The returned PIDs are for logging and
     /// test assertions (R7.3). An empty result is not an error — it means no
     /// matching process is running (e.g. a race where the daemon exited between
     /// detection and reload); the `Err` case is reserved for a genuine inability to
-    /// enumerate processes at all.
+    /// scan processes at all.
     fn signal_all(&self, process_name: &str, signal: Signal) -> io::Result<Vec<i32>>;
 }
 
@@ -75,7 +75,7 @@ impl SystemProcessSignaller {
 
 impl ProcessSignaller for SystemProcessSignaller {
     fn signal_all(&self, process_name: &str, signal: Signal) -> io::Result<Vec<i32>> {
-        let pids = running_pids_named(process_name)?;
+        let pids = scan_pids_named(process_name)?;
         let mut signalled = Vec::new();
         for pid in pids {
             // `kill` here is `nix::sys::signal::kill`, a thin wrapper over the
@@ -112,11 +112,11 @@ impl ProcessSignaller for SystemProcessSignaller {
 ///
 /// Reads `/proc/<pid>/cmdline` for each numeric `/proc` entry and compares the
 /// basename of `argv[0]` (the untruncated executable name — see the module docs).
-/// Enumeration failing outright (`/proc` unreadable) is surfaced as an `Err` so the
+/// The scan failing outright (`/proc` unreadable) is surfaced as an `Err` so the
 /// caller can report the reload could not be attempted; a single process that exits
 /// mid-scan, or one with an empty/non-UTF-8 `cmdline`, is simply skipped (a benign
 /// race, not an error).
-fn running_pids_named(process_name: &str) -> io::Result<Vec<i32>> {
+fn scan_pids_named(process_name: &str) -> io::Result<Vec<i32>> {
     let mut pids = Vec::new();
     for entry in std::fs::read_dir("/proc")?.flatten() {
         let file_name = entry.file_name();
@@ -178,7 +178,7 @@ struct MockSignalState {
     running: std::collections::BTreeMap<String, Vec<i32>>,
     /// When set, every [`ProcessSignaller::signal_all`] call fails with a fresh
     /// [`io::Error`] of this kind instead of returning PIDs — so the reload
-    /// executor's `ReloadError::Signal` path (process enumeration failing) can be
+    /// executor's `ReloadError::Signal` path (the process scan failing) can be
     /// exercised. Stored as a [`io::ErrorKind`] rather than an [`io::Error`] because
     /// the latter is not `Clone`.
     fail_with: Option<io::ErrorKind>,
@@ -234,7 +234,7 @@ impl MockProcessSignaller {
     }
 
     /// Creates a recorder whose every [`ProcessSignaller::signal_all`] call fails
-    /// with an [`io::Error`] of `kind`, standing in for a process-enumeration
+    /// with an [`io::Error`] of `kind`, standing in for a process-scan
     /// failure so the reload executor's `ReloadError::Signal` path can be tested.
     pub fn failing(kind: io::ErrorKind) -> Self {
         Self {

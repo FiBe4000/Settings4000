@@ -172,13 +172,13 @@ fn wallpaper_paths() -> WallpaperPaths {
 
 /// Builds the Theme page's palette-scheme model on the worker thread (task 6.3).
 ///
-/// Only builds when detection discovered the dotfiles palette source (R3.2/R8.5): its
+/// Only builds when detection found the dotfiles palette source (R3.2/R8.5): its
 /// [`PaletteSource`](crate::core::detect::PaletteSource) supplies the `colors/`
-/// directory to enumerate and the `scripts/generate-colors` path the Apply pipeline
+/// directory to scan and the `scripts/generate-colors` path the Apply pipeline
 /// runs. When it is absent — no dotfiles repo behind the config, or an incomplete one —
 /// this returns `None` and the Theme palette section is hidden (R4.2/R4.4). The active
 /// scheme is read from the deployed generated `~/.config/hypr/colors.conf` header (task
-/// 3.7, R3.2), at its live XDG path. Running the enumeration here keeps its file reads
+/// 3.7, R3.2), at its live XDG path. Running the scan here keeps its file reads
 /// off the main thread and inside the R8.1 cold-start budget (architecture §8).
 pub fn load_palette(capabilities: &Capabilities) -> Option<PaletteModel> {
     let source = capabilities.palette_source()?;
@@ -195,17 +195,17 @@ pub fn load_palette(capabilities: &Capabilities) -> Option<PaletteModel> {
 ///
 /// Only builds when `gsettings` is present — the whole GTK/icon/cursor feature applies
 /// its changes with `gsettings set`, so without it the controls are hidden and logged
-/// at `info` (R4.2). When present, it discovers installed themes under the XDG theme
+/// at `info` (R4.2). When present, it scans for installed themes under the XDG theme
 /// roots (`~/.themes`, the data dirs, `/usr/share/...`), reads the backing config
 /// (both `settings.ini`, `hyprland.lua`, `uwsm/env`, `~/.icons/default/index.theme`),
 /// gates the live-restyle claim on
 /// the settings portal (R2.2), and passes the app's own `GTK_THEME` environment value
 /// so an override disables the GTK-theme drop-down (R3.3). It also hands the model the
-/// discovered dotfiles repo root and whether `xsettingsd` runs, for the Theme page's
+/// detected dotfiles repo root and whether `xsettingsd` runs, for the Theme page's
 /// two "another program may rewrite GTK settings" notes (task 11.12), and the notifd
 /// status, for the note that a notifd too old to reload shows a new icon theme only
 /// after its next start (task 11.14). Running the
-/// discovery here, on the startup worker, keeps its filesystem scans off the main
+/// scans here, on the startup worker, keeps its filesystem scans off the main
 /// thread and inside the R8.1 cold-start budget (architecture §8).
 pub fn load_themes(capabilities: &Capabilities) -> Option<ThemesModel> {
     if !capabilities.has_binary(Binary::Gsettings) {
@@ -229,7 +229,7 @@ pub fn load_themes(capabilities: &Capabilities) -> Option<ThemesModel> {
 /// GTK themes live under `~/.themes`, `$XDG_DATA_HOME/themes`, and
 /// `/usr/share/themes`; icon and cursor themes under `~/.icons`,
 /// `$XDG_DATA_HOME/icons`, and `/usr/share/icons`. `$XDG_DATA_HOME` falls back to
-/// `~/.local/share`. A root that does not exist is simply skipped by discovery, so a
+/// `~/.local/share`. A root that does not exist is simply skipped by the scan, so a
 /// missing `~/.themes` is harmless.
 pub fn theme_roots() -> ThemeRoots {
     let data_home = data_home();
@@ -311,7 +311,7 @@ fn data_home() -> PathBuf {
 /// Builds the Display page's model on the worker thread (task 6.1).
 ///
 /// Only probes when Hyprland is reloadable (`hyprctl` on `$PATH` plus a live IPC
-/// socket) — otherwise there is no compositor to enumerate, so it returns `None` and
+/// socket) — otherwise there is no compositor to query, so it returns `None` and
 /// the Display page shows a placeholder (R4.2). Running the `hyprctl monitors -j`
 /// probe here, on the startup worker, keeps it off the main thread and inside the
 /// R8.1 cold-start budget (architecture §8). The merge itself is the GTK-free

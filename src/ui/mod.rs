@@ -29,11 +29,11 @@
 //!   where the window applies it.
 //! - [`display`] — the Display page's bespoke glue (task 6.1): per-monitor
 //!   resolution/refresh/scale/position drop-downs and a per-monitor enable switch
-//!   rendered from the runtime-discovered [`crate::core::display`] model, plus the
+//!   rendered from the live [`crate::core::display`] model, plus the
 //!   runtime-only laptop-display toggle. It is bespoke rather than declarative because
 //!   monitors are dynamic and the laptop toggle bypasses staging (R5.2).
 //! - [`sound`] — the Sound page's bespoke glue (task 6.2): output/input device
-//!   drop-downs, volume sliders, and mute switches rendered from the runtime-enumerated
+//!   drop-downs, volume sliders, and mute switches rendered from the runtime-loaded
 //!   [`crate::core::sound`] state. It is bespoke rather than declarative because every
 //!   control is runtime-only — it applies a `wpctl` command immediately and bypasses
 //!   staging entirely (R3.1/R5.2).
@@ -66,6 +66,30 @@
 //!
 //! Every category page above is mounted into the window shell, which builds each one
 //! from its category's builder — a bespoke page, the declarative framework, or both.
+//!
+//! # Naming conventions
+//!
+//! The UI uses the vocabulary of [`crate::core`]'s naming conventions (dirty, scan,
+//! detect, load, refresh) plus four verbs for bringing widgets up to date, each with
+//! one meaning:
+//!
+//! - **render** — `render(value)` sets one bound control to a given value with its
+//!   change signal blocked, so the programmatic set is never taken for a user edit
+//!   (`ui::page`). It is the per-control step every repaint of a framework page uses.
+//! - **rerender** — repaint a page from the state it already holds (the store or its
+//!   model) after something outside the page changed that state: a Reset, a committed
+//!   Apply, a conflict refresh. It never queries a source. The window's
+//!   `MountedPages::rerender_*` helpers, `PageMsg::Rerender` and each bespoke page's
+//!   `rerender` follow it.
+//! - **rebuild** — tear down a container's children and build new widgets from state,
+//!   for content whose *set* of widgets depends on that state (one section per monitor
+//!   or audio device, one row per list item). A page may implement its `rerender` as a
+//!   rebuild.
+//! - **refresh** — query the source again (a model's `load`, `reload` or `refresh`),
+//!   then rerender or rebuild from the result. The runtime pages' page-entry hook and
+//!   in-page refresh buttons, the window's Refresh button (R4.3) and the conflict path
+//!   are all refreshes. A user-visible button label may still say "Rescan devices" or
+//!   "Check again"; the code behind it is a `refresh`.
 
 pub mod app;
 mod category;

@@ -35,7 +35,7 @@
 //!
 //! When the daemon is installed but not running (it starts with the first notification
 //! an application sends) the page says so, offers a "Check again" button beside the
-//! status line (like the Sound page's rescan) and makes the controls insensitive,
+//! status line (like the Sound page's refresh button) and makes the controls insensitive,
 //! because every call would fail until it starts. A failed action shows its reason
 //! under the status line, not only in the journal. That is not the "greyed-out stub" R4.2
 //! forbids: R4.2 is about a *missing* application, which hides the whole page (the
@@ -145,11 +145,12 @@ impl Inner {
     fn refresh(&self) {
         self.model.borrow_mut().refresh(&SystemCommandRunner::new());
         self.last_error.replace(None);
-        self.render();
+        self.rerender();
     }
 
-    /// Renders every widget from the model's current view.
-    fn render(&self) {
+    /// Re-renders every widget from the model's current view without querying the daemon
+    /// (that is [`Self::refresh`]); [`build`] calls it once to paint the not-yet-read state.
+    fn rerender(&self) {
         let view = self.model.borrow().view();
         self.status.set_text(&status_text(view));
         self.check_again
@@ -183,7 +184,7 @@ impl Inner {
         }
     }
 
-    /// Records an action's outcome for [`Self::render`]: a failure's text, or nothing.
+    /// Records an action's outcome for [`Self::rerender`]: a failure's text, or nothing.
     fn record(&self, what: &str, result: Result<(), NotifdActionError>) {
         self.last_error
             .replace(result.err().map(|error| action_error_text(what, &error)));
@@ -198,7 +199,7 @@ impl Inner {
             .borrow_mut()
             .set_dnd(&SystemCommandRunner::new(), active);
         self.record("Do Not Disturb was not changed", result);
-        self.render();
+        self.rerender();
     }
 
     /// The user asked to open the notification center.
@@ -208,7 +209,7 @@ impl Inner {
             .borrow_mut()
             .open_center(&SystemCommandRunner::new());
         self.record("The notification center was not opened", result);
-        self.render();
+        self.rerender();
     }
 
     /// The user answered the confirmation dialog: clear on "Clear all", forget the
@@ -217,14 +218,14 @@ impl Inner {
     fn answer_clear(&self, confirmed: bool) {
         if !confirmed {
             self.model.borrow_mut().cancel_clear();
-            self.render();
+            self.rerender();
             return;
         }
         let runner = SystemCommandRunner::new();
         let result = self.model.borrow_mut().confirm_clear(&runner);
         self.model.borrow_mut().refresh(&runner);
         self.record("The notifications were not cleared", result);
-        self.render();
+        self.rerender();
     }
 }
 
@@ -405,7 +406,7 @@ pub(crate) fn build(staged: Option<&Widget>) -> NotificationsPage {
         count_value,
         inhibited_value,
     });
-    inner.render();
+    inner.rerender();
 
     let weak = Rc::downgrade(&inner);
     let handler = dnd_switch.connect_active_notify(move |switch| {

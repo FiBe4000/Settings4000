@@ -39,9 +39,9 @@
 //!   app must distinguish a commented-out `#export GTK_THEME=…` (inactive,
 //!   drop-down stays enabled) from an uncommented one (active override).
 //!   [`EnvFile::gtk_theme_override`] reports exactly that. The app's *own
-//!   process* environment is the other place an override can come from
-//!   (`scripts/launchhyprland.sh` exports it uncommented, analysis §6.3); that
-//!   check belongs to the page, not this file-only parser.
+//!   process* environment is the other place an override can come from (a
+//!   wrapper or a shell export; the dotfiles set it nowhere today, analysis §7.7);
+//!   that check belongs to the page, not this file-only parser.
 //!
 //! # Lossless, surgical editing
 //!

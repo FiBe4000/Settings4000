@@ -72,8 +72,8 @@
 //! it is [`assemble_apply_plan`](crate::core::assemble::assemble_apply_plan) in the
 //! GTK-free [`core::assemble`](crate::core::assemble) module, so those decisions are
 //! testable without a display (R6.2; task 9.16). What stays with the window is the part
-//! that needs widgets or side effects: running the pipeline, reloading a model whose
-//! files changed on disk ([`Shell::reload_conflicted_source`]), committing the sources
+//! that needs widgets or side effects: running the pipeline, refreshing a model whose
+//! files changed on disk ([`Shell::refresh_conflicted_source`]), committing the sources
 //! the assembler reports as having contributed ([`Shell::commit_applied`]), and showing
 //! the dialog or toast.
 //!
@@ -159,7 +159,7 @@ const LOADING_PAGE_NAME: &str = "__loading";
 ///
 /// - **Staging sources** (`display`, `palette`, `themes`, `wallpaper`) hold staged edits
 ///   of their own, beside the shared [`SettingsStore`], because their values are not
-///   store settings (monitors are discovered at runtime; a palette switch runs
+///   store settings (monitors are known only at runtime; a palette switch runs
 ///   `generate-colors`; the theme and wallpaper changes are multi-file writes). Each one
 ///   feeds its dirty state into the same Apply/Reset chrome ([`Self::display_dirty`],
 ///   [`Self::theme_dirty`]), is cleared by Reset ([`Self::reset_staged`]), is committed
@@ -179,7 +179,7 @@ const LOADING_PAGE_NAME: &str = "__loading";
 /// field is an `Rc`, so a clone shares the models.
 #[derive(Clone, Default)]
 struct PageModels {
-    /// The Display page's runtime-discovered monitors (task 6.1); a staging source whose
+    /// The Display page's live monitors (task 6.1); a staging source whose
     /// `monitors.conf` write joins the Apply plan. `None` without a live compositor.
     display: Rc<RefCell<Option<DisplayModel>>>,
     /// The Theme page's palette scheme (task 6.3); a staging source whose switch joins the
@@ -277,7 +277,7 @@ struct MountedPages {
     /// `None` while the category shows a placeholder (no Theme model at all).
     theme: Rc<RefCell<Option<ThemePage>>>,
     /// The runtime-only Sound page (task 6.2), probed on every page entry — including
-    /// its deferred first enumeration (task 9.4).
+    /// its deferred first load (task 9.4).
     sound: Rc<RefCell<Option<SoundPage>>>,
     /// The Notifications page (task 11.7), whose notifd daemon state is read on every
     /// page entry (the first read included, task 9.26). Its staged notifd rows are a
@@ -826,8 +826,8 @@ impl Shell {
     /// Builds the Display category's page (task 6.1).
     ///
     /// Display is bespoke rather than a framework page because its per-monitor controls
-    /// are discovered at runtime and its laptop-display toggle is runtime-only (R5.2).
-    /// When a runtime-discovered [`DisplayModel`] is available, mounts the bespoke
+    /// are known only at runtime and its laptop-display toggle is runtime-only (R5.2).
+    /// When a live [`DisplayModel`] is available, mounts the bespoke
     /// [`display`] page (rendering from the shared model and reporting staged edits
     /// through `update_chrome`) and registers its dirty marker under
     /// [`Category::Display`]. When there is no live monitor data — `hyprctl` is present
@@ -927,13 +927,13 @@ impl Shell {
     /// Builds the Sound category's page (task 6.2).
     ///
     /// Sound is bespoke because every control is runtime-only (R5.2), so nothing is staged
-    /// in the store. Mounts the bespoke [`sound`] page, which enumerates the live PipeWire
+    /// in the store. Mounts the bespoke [`sound`] page, which loads the live PipeWire
     /// devices and renders the runtime-only output/input controls. No dirty marker is registered: the
     /// page stages nothing and never feeds the Apply/Reset chrome (R5.2). The category is
     /// only reached here when the Sound gate found `wpctl` present (task 5.1), so the
-    /// enumeration and controls have their client.
+    /// device load and controls have their client.
     ///
-    /// Building runs no `pw-dump`/`wpctl`: the first enumeration is deferred to the page's
+    /// Building runs no `pw-dump`/`wpctl`: the first load is deferred to the page's
     /// first entry (the [`Self::wire_page_entries`] hook, which runs it from the idle
     /// queue), so a wedged PipeWire can never stall populate — and with it every
     /// category's appearance — against the R8.1 startup budget (task 9.4). As on the
@@ -980,7 +980,7 @@ impl Shell {
     /// runs `generate-colors`, and the theme and wallpaper changes are multi-file writes
     /// owned by their models. The page hosts three independent sections, each present when its model was built
     /// by the worker: the palette-scheme section when the dotfiles palette source was
-    /// discovered (R3.2/R8.5), the GTK/icon/cursor appearance section when `gsettings`
+    /// detected (R3.2/R8.5), the GTK/icon/cursor appearance section when `gsettings`
     /// is present (R3.3/R3.4/R4.2), and the wallpaper section when hyprpaper is present
     /// (task 6.5, R4.2). The bespoke [`theme`] page is mounted whenever *any* model
     /// exists (rendering from the shared models and reporting staged changes through
@@ -1026,7 +1026,7 @@ impl Shell {
     /// nobody is viewing: [`Self::populate`] rebuilds it in its placeholder state and the
     /// hook reads when the user next opens it. Per page:
     ///
-    /// - **Sound** re-enumerates the PipeWire devices, volumes and mute state (R3.1).
+    /// - **Sound** loads the PipeWire devices, volumes and mute state (R3.1).
     /// - **Notifications** reads the notifd daemon's state — do-not-disturb, count,
     ///   inhibited — including a daemon that started since the page was last shown (R5.2,
     ///   the rule task 9.26 asked for).
@@ -1066,7 +1066,7 @@ impl Shell {
     ///   dirty settings as validations (R8.3) plus each page's rendered file writes — or
     ///   refuses to plan the Apply at all, in which case nothing is written, every staged
     ///   edit is kept, and the reason is surfaced through [`chrome::assembly_warning`];
-    ///   for a conflict (R5.6) that happens after [`Self::reload_conflicted_source`] has
+    ///   for a conflict (R5.6) that happens after [`Self::refresh_conflicted_source`] has
     ///   adopted what is now on disk.
     /// - [`apply::run`] is given the **store's** freshness tracker, so its own step-2
     ///   conflict check measures the store's files against the baselines the startup load
@@ -1114,7 +1114,7 @@ impl Shell {
                     // re-apply against the new contents; a write that could not be
                     // prepared changed nothing at all, so there is nothing to reload.
                     if let PrepareFailure::Conflict(source) = failure {
-                        shell.reload_conflicted_source(source, &runner);
+                        shell.refresh_conflicted_source(source, &runner);
                     }
                     let warning = chrome::assembly_warning(&failure);
                     chrome::show_warning(&shell.window, &warning.heading, &warning.detail);
@@ -1195,8 +1195,9 @@ impl Shell {
         (self.update_chrome)();
     }
 
-    /// Reloads the staging model whose backing files changed on disk, re-renders its page,
-    /// and re-derives the chrome (R5.6).
+    /// Refreshes the staging model whose backing files changed on disk — replacing it with
+    /// the model's own `reload` of the same sources — re-renders its page, and re-derives
+    /// the chrome (R5.6).
     ///
     /// Called when [`assemble_apply_plan`] refuses to plan an Apply because a file a
     /// model owns was changed by another program since the model read it: rather than
@@ -1210,7 +1211,7 @@ impl Shell {
     /// (the compositor went away — the same state as a cold start without one), while the
     /// two Theme models only re-read files and always produce a model. The Display model
     /// also drives its own page, whereas both Theme models share the Theme page.
-    fn reload_conflicted_source(&self, source: ConflictedSource, runner: &dyn CommandRunner) {
+    fn refresh_conflicted_source(&self, source: ConflictedSource, runner: &dyn CommandRunner) {
         match source {
             ConflictedSource::Display => {
                 let reloaded = self

@@ -5,7 +5,7 @@
 //!
 //! Every other §6 page is a list of fixed [`RowDescriptor`](super::row::RowDescriptor)s
 //! rendered by the declarative framework ([`super::page`]). The Display page cannot
-//! use it for two reasons: its controls are **per-monitor and discovered at runtime**
+//! use it for two reasons: its controls are **per-monitor and known only at runtime**
 //! (the descriptor framework is a fixed list keyed by the fieldless
 //! [`SettingId`](crate::core::model::SettingId)), and the laptop enable control is
 //! **runtime-only** (R5.2) — the framework renders from `store.value(id)` and
@@ -215,9 +215,9 @@ impl Inner {
         // disabled or unwritable output.
         if model.records_editable() && model.effective_enabled(index) {
             section.append(&self.build_resolution_row(model, index));
-            let refresh_options = model.refresh_options(index);
-            if !refresh_options.is_empty() {
-                section.append(&self.build_refresh_row(model, index, refresh_options));
+            let refresh_rate_options = model.refresh_rate_options(index);
+            if !refresh_rate_options.is_empty() {
+                section.append(&self.build_refresh_rate_row(model, index, refresh_rate_options));
             }
             section.append(&self.build_scale_row(model, index));
             section.append(&self.build_position_row(model, index));
@@ -292,7 +292,7 @@ impl Inner {
 
     /// The refresh-rate drop-down row (built only when the resolution has refresh
     /// options).
-    fn build_refresh_row(
+    fn build_refresh_rate_row(
         self: &Rc<Self>,
         model: &DisplayModel,
         index: usize,

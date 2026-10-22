@@ -105,7 +105,7 @@ fn display_model(fx: &FixtureDotfiles) -> DisplayModel {
         .expect("a successful probe yields a model")
 }
 
-/// The palette model, its source discovered by real detection canonicalizing the deployed
+/// The palette model, its source found by real detection canonicalizing the deployed
 /// `colors.conf` symlink into the fixture repo (R3.2/R8.5) — the same route the startup
 /// worker takes.
 fn palette_model(fx: &FixtureDotfiles) -> PaletteModel {
@@ -332,7 +332,7 @@ fn the_bespoke_models_compose_into_one_plan() {
     // two reload-parameter sets merge instead of overwriting each other.
     let fx = FixtureDotfiles::install();
     fs::create_dir_all(fx.home().join(".themes/Fixture-Theme/gtk-3.0"))
-        .expect("create a discoverable GTK theme");
+        .expect("create a GTK theme the scan finds");
     let new_wallpaper = fx.home().join("Pictures/wallpaper/next.png");
     fs::write(&new_wallpaper, b"fixture next wallpaper").expect("create the new image");
 
@@ -437,9 +437,9 @@ fn no_assembled_write_ever_targets_a_generated_file() {
     // that applying the plan (generator mocked) leaves every one byte-identical.
     let fx = FixtureDotfiles::install();
     fs::create_dir_all(fx.home().join(".themes/Fixture-Theme/gtk-3.0"))
-        .expect("create a discoverable GTK theme");
+        .expect("create a GTK theme the scan finds");
     fs::create_dir_all(fx.home().join(".icons/Fixture-Cursors/cursors"))
-        .expect("create a discoverable cursor theme");
+        .expect("create a cursor theme the scan finds");
     let new_wallpaper = fx.home().join("Pictures/wallpaper/next.png");
     fs::write(&new_wallpaper, b"fixture next wallpaper").expect("create the new image");
     let before = repo_snapshot(&fx);
@@ -573,7 +573,7 @@ fn a_stale_theme_or_wallpaper_file_aborts_naming_its_model() {
     // reload); a copy-paste that reported the wrong one would be invisible otherwise.
     let fx = FixtureDotfiles::install();
     fs::create_dir_all(fx.home().join(".themes/Fixture-Theme/gtk-3.0"))
-        .expect("create a discoverable GTK theme");
+        .expect("create a GTK theme the scan finds");
     let store = loaded_store(&fx);
 
     let mut themes = themes_model(&fx);
@@ -956,7 +956,7 @@ fn an_assembled_theme_apply_runs_the_follow_up_reloads_in_order_and_once() {
     // `Reload()` once, last.
     let fx = FixtureDotfiles::install();
     let icons = fx.home().join(".icons/Fixture-Icons");
-    fs::create_dir_all(icons.join("48x48")).expect("create a discoverable icon theme");
+    fs::create_dir_all(icons.join("48x48")).expect("create an icon theme the scan finds");
     fs::write(icons.join("index.theme"), b"[Icon Theme]\n").expect("write its index");
     let new_wallpaper = fx.home().join("Pictures/wallpaper/next.png");
     fs::write(&new_wallpaper, b"fixture next wallpaper").expect("create the new image");

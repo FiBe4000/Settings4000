@@ -37,7 +37,7 @@ use crate::core::detect::{Binary, Capabilities, HyprConfigProvider};
 /// (requirements §3, architecture §7).
 ///
 /// This is the UI's notion of a sidebar page, and it is intentionally distinct from
-/// [`crate::core::model::Category`], which enumerates only the *file-backed* pages
+/// [`crate::core::model::Category`], which lists only the *file-backed* pages
 /// that carry staged, dirty-tracked values. Sound and Network appear here because the
 /// sidebar still shows them, but they are runtime-only (R3.1/R5.2) and so have no
 /// counterpart in the store's dirty model. Notifications has both kinds of control: its
@@ -130,11 +130,11 @@ impl SidebarCategory {
             // Display edits `monitors.conf` and applies via `hyprctl reload`; with no
             // `hyprctl` there is nothing to drive it (§6.1).
             SidebarCategory::Display => capabilities.has_binary(Binary::Hyprctl),
-            // Sound is runtime-only. Its enumeration (`pw-dump`, falling back to
+            // Sound is runtime-only. Its device load (`pw-dump`, falling back to
             // `wpctl status`) and all its controls speak only `wpctl`/`pw-dump`, so it
             // is gated on `wpctl` specifically — not the broader `audio_available`
             // (wpctl OR pactl). A `pactl`-only host would render a dead, inert page
-            // (no devices, a dead rescan button), which R4.2 forbids; `pactl`-only
+            // (no devices, a dead refresh button), which R4.2 forbids; `pactl`-only
             // support is out of v1 scope (§6.2, R3.1).
             SidebarCategory::Sound => capabilities.has_binary(Binary::Wpctl),
             // Theme aggregates four independent features: palette switching (the

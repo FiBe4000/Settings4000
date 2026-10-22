@@ -31,8 +31,8 @@
 //!   file — degrades to [`ActiveScheme::Unknown`] rather than an error or panic,
 //!   so a machine without this dotfiles setup never breaks detection.
 //! - **Per-scheme swatch parse.** Given the contents of a `colors/<scheme>` source
-//!   file (located via the repo root discovered from a deployed config symlink,
-//!   R8.5 — that discovery is task 4.3's job, so this module simply accepts the
+//!   file (located via the repo root detected from a deployed config symlink,
+//!   R8.5 — that detection is task 4.3's job, so this module simply accepts the
 //!   contents or a path), [`parse_scheme_swatch`] reuses the task-3.1 palette
 //!   parser ([`super::palette::PaletteFile`]) to read the schema colors (18
 //!   today, whatever the given [`PaletteSchema`] lists) for swatch previews in
@@ -57,7 +57,7 @@ use super::palette::{PaletteFile, PaletteSchema, SchemaValidation};
 /// (analysis §8.3). Each is headed `… Generated from colors/<scheme> …`, so any
 /// of them names the active scheme; the app reads only `config/hypr/colors.conf`
 /// for that (R3.2), because it is the one with a stable deployed path the
-/// palette-source discovery already relies on.
+/// palette-source detection already relies on.
 ///
 /// `config/hypr/colors.lua` is the Lua-provider copy of the palette
 /// (`hyprland.lua` loads it with `dofile`, analysis §7.6). It sits beside
@@ -276,7 +276,7 @@ impl SwatchColor {
 /// writes the file.
 pub fn parse_scheme_swatch(scheme_contents: &str, schema: &PaletteSchema) -> SchemeSwatch {
     // This parse is used both for the active scheme and to *probe* arbitrary files
-    // while enumerating schemes (task 6.3), so the warnings are never surfaced at
+    // while scanning schemes (task 6.3), so the warnings are never surfaced at
     // `warn` (a non-palette file such as a README would otherwise log one per line).
     // The palette parser returns warnings rather than logging them (like the sibling
     // parsers); a swatch only needs the readable values plus the schema report. Since
@@ -316,7 +316,7 @@ pub fn parse_scheme_swatch(scheme_contents: &str, schema: &PaletteSchema) -> Sch
 /// cannot be read.
 ///
 /// The theme page (task 6.3) calls this per scheme once the repo root has been
-/// discovered (task 4.3). A `None` means the file was absent, permission-denied,
+/// detected (task 4.3). A `None` means the file was absent, permission-denied,
 /// or not valid UTF-8 — treated as "no swatch for this scheme" rather than an
 /// error, consistent with how missing sources degrade elsewhere (R4, R8.5). Only
 /// the path is logged, never the file contents (R7.3).

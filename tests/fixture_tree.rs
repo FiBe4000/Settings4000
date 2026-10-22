@@ -3,7 +3,7 @@
 //! [`FixtureDotfiles::install`] is the shared foundation of the integration
 //! suites (the end-to-end Apply suites of task 7.2 build on it), so this file
 //! proves the installed tree itself is sound: the deployment symlinks resolve
-//! into the repo, repo-root discovery (R8.5) finds the palette source behind
+//! into the repo, repo-root detection (R8.5) finds the palette source behind
 //! them, every parser family reads its fixture file at the *deployed* path
 //! (through the symlink, exactly as the app does) with the expected values and
 //! byte-identical round-trips, and per-test installs are isolated. Deeper
@@ -89,7 +89,7 @@ fn no_fixture_file_names_an_absolute_home_path() {
 }
 
 /// Every deployed config path must be a symlink resolving to the matching file
-/// inside the repo — the layout both the repo-root discovery (R8.5) and the
+/// inside the repo — the layout both the repo-root detection (R8.5) and the
 /// symlink-following atomic writer (R5.4) depend on.
 #[test]
 fn deployed_config_paths_are_symlinks_into_the_repo() {
@@ -152,11 +152,11 @@ fn deployed_config_paths_are_symlinks_into_the_repo() {
 }
 
 /// Real capability detection over the installed tree: canonicalizing the
-/// deployed `hypr/colors.conf` symlink must discover the fixture repo root and
+/// deployed `hypr/colors.conf` symlink must find the fixture repo root and
 /// its palette source (R3.2/R8.5), and the deployed configs must read as
 /// readable (R4.4).
 #[test]
-fn detection_discovers_the_palette_source_behind_the_deployed_symlink() {
+fn detection_finds_the_palette_source_behind_the_deployed_symlink() {
     let fx = FixtureDotfiles::install();
 
     let input_lua = fx.config_path("hypr/input.lua");

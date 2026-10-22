@@ -598,7 +598,7 @@ fn a_mid_plan_write_failure_rolls_back_the_earlier_input_write() {
     // file itself stays readable, so the pipeline genuinely reaches the write phase.
     let fx = FixtureDotfiles::install();
     fs::create_dir_all(fx.home().join(".themes/Fixture-Theme/gtk-3.0"))
-        .expect("create a discoverable GTK theme");
+        .expect("create a GTK theme the scan finds");
     let before = repo_snapshot(&fx);
     let (mut store, model) = store_and_model(&fx);
     store

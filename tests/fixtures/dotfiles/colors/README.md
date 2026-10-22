@@ -10,5 +10,5 @@ Every scheme must define exactly these 18 keys (the `NAMES=(…)` list in
 `scripts/generate-colors <scheme>` validates key presence and templates the
 palette into the generated per-app partials. Never hand-edit generated files.
 
-This README deliberately lives inside `colors/` so scheme enumeration must
+This README deliberately lives inside `colors/` so the scheme scan must
 skip non-palette files (it is part of the test fixture's coverage).

@@ -37,7 +37,7 @@ Every other file is the `8a5b20b` content byte for byte.
 
 - `colors/` — the two palette schemes (`everforest`, `nord`, verbatim
   `8a5b20b`: **18 keys**, `shadow` last) plus a short stand-in `README.md`,
-  which scheme enumeration must skip.
+  which the scheme scan must skip.
 - `scripts/generate-colors` — an executable stub that exits 2 on its first
   command, so an accidental real invocation fails loudly (tests drive the
   generator through `MockCommandRunner`; detection only checks presence).

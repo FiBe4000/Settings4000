@@ -49,7 +49,7 @@
 //! [`BUILT_IN_PALETTE_KEYS`] fallback, and always labelled with its
 //! [`SchemaSource`] so a validation report can say which list it applied
 //! (R8.3). This module only parses text it is given; finding and reading the
-//! script (via the palette source discovered per R8.5) happens in
+//! script (via the palette source detected per R8.5) happens in
 //! [`crate::core::theme`].
 
 use std::fmt;
@@ -306,7 +306,7 @@ pub struct PaletteFile {
 /// "malformed lines surfaced as parse warnings, not panics"). [`PaletteFile::parse`]
 /// **returns** the collected warnings for the caller to log or ignore — it does not
 /// log them itself (mirroring the sibling parsers), so a caller that probes arbitrary
-/// files while enumerating palette schemes can drop them without flooding the journal.
+/// files while scanning palette schemes can drop them without flooding the journal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseWarning {
     /// 1-based line number the warning concerns, for human-readable diagnostics.
@@ -478,7 +478,7 @@ impl PaletteFile {
     /// Unlike the sibling parsers, which also log each warning at `warn`, this one
     /// only **returns** its warnings, for the caller to log or ignore. That
     /// distinction matters because the same parse is used both to read the user's
-    /// actual scheme file *and* to probe arbitrary files while enumerating the
+    /// actual scheme file *and* to probe arbitrary files while scanning the
     /// palette schemes (task 6.3, via [`crate::parsers::generated::parse_scheme_swatch`]):
     /// a non-palette file such as a `README.md` would otherwise emit a `warn` for
     /// every line it holds. The probe drops the warnings; a future per-key editor can

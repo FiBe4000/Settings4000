@@ -36,7 +36,7 @@
 //! of writing a file (see the `palette` submodule for that argument in full), or one
 //! whose two files hold a derived rather than an edited value.
 //!
-//! Everything here lives in `core/` so enumeration, staging, the multi-file writes, and
+//! Everything here lives in `core/` so scanning, staging, the multi-file writes, and
 //! the reload decisions are headlessly testable (R6.2) — the layering guard in
 //! `tests/module_boundaries.rs` forbids any `gtk`/`relm4` import. Every path the models
 //! read or write is injected, so tests drive them against temporary fixture trees with no
@@ -53,7 +53,7 @@ mod wallpaper;
 
 pub use palette::{PaletteModel, Scheme, load_palette_schema};
 pub use themes::{
-    CursorCopy, GtkThemeOverrideSource, ThemeRoots, ThemesApply, ThemesModel, ThemesPaths,
+    CursorCopy, GtkOverrideOrigin, ThemeRoots, ThemesApply, ThemesModel, ThemesPaths,
 };
 pub use wallpaper::{WallpaperApply, WallpaperModel, WallpaperPaths};
 
@@ -106,7 +106,7 @@ impl Staged {
     }
 
     /// Whether an edit differing from the current value is pending.
-    fn is_changed(&self) -> bool {
+    fn is_dirty(&self) -> bool {
         self.staged.is_some()
     }
 
@@ -132,7 +132,7 @@ impl Staged {
 #[derive(Clone, Debug)]
 struct Selection {
     /// The drop-down's candidate values, in display order. Always includes the current
-    /// value (prepended when discovery did not surface it) so it stays selectable.
+    /// value (prepended when the scan did not surface it) so it stays selectable.
     options: Vec<String>,
     /// The selected value's staging state.
     value: Staged,
@@ -141,7 +141,7 @@ struct Selection {
 impl Selection {
     /// Builds a selection over `options`, ensuring `original` is selectable.
     ///
-    /// If the current value is not among the discovered options (e.g. a theme
+    /// If the current value is not among the scanned options (e.g. a theme
     /// installed somewhere unusual, or a config value with no matching installed
     /// theme), it is prepended so the drop-down can still preselect it — the same
     /// "keep the configured value selectable" rule the Display page's scale/position
@@ -178,8 +178,8 @@ impl Selection {
     }
 
     /// Whether a switch differing from the current value is pending.
-    fn is_changed(&self) -> bool {
-        self.value.is_changed()
+    fn is_dirty(&self) -> bool {
+        self.value.is_dirty()
     }
 
     /// Discards the pending switch.

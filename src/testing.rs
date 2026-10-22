@@ -13,7 +13,7 @@
 //! from the anonymized snapshot in `tests/fixtures/dotfiles/` into a fresh
 //! [`tempfile::TempDir`] per test, so every test gets an isolated, writable
 //! tree it can stage edits against and apply to, with the symlink-following
-//! write path (R5.4/R8.5) and repo-root discovery (R3.2) behaving as they do
+//! write path (R5.4/R8.5) and repo-root detection (R3.2) behaving as they do
 //! on the real machine.
 //!
 //! Tests do not point the app at the tree via environment variables (mutating
@@ -139,7 +139,7 @@ impl FixtureDotfiles {
     /// 2. symlink every file under the repo's `config/` from `<home>/.config`,
     ///    per file, exactly like the real `setup.sh` deployment (analysis §1) —
     ///    so e.g. `<home>/.config/hypr/colors.conf` is a symlink the repo-root
-    ///    discovery (R8.5) can canonicalize and the atomic writer follows (R5.4);
+    ///    detection (R8.5) can canonicalize and the atomic writer follows (R5.4);
     /// 3. create the home-level deployment links in [`HOME_LINKS`]
     ///    (`<home>/.zsh_colors`, `<home>/.icons/default/index.theme`), which
     ///    live outside `$XDG_CONFIG_HOME`;
@@ -164,7 +164,7 @@ impl FixtureDotfiles {
         let temp = TempDir::new().unwrap_or_else(|e| panic!("failed to create temp dir: {e}"));
         // Canonicalize once so every path the handle exposes is already fully
         // resolved: tests compare these against `fs::canonicalize` outputs (the
-        // repo-root discovery canonicalizes, R8.5), and a symlinked system temp
+        // repo-root detection canonicalizes, R8.5), and a symlinked system temp
         // directory must not make those comparisons fail.
         let temp_root = fs::canonicalize(temp.path())
             .unwrap_or_else(|e| panic!("failed to canonicalize temp dir: {e}"));
@@ -223,7 +223,7 @@ impl FixtureDotfiles {
     }
 
     /// The dotfiles repo root (`<home>/.dotfiles`), i.e. what repo-root
-    /// discovery (R8.5) resolves from a deployed config symlink.
+    /// detection (R8.5) resolves from a deployed config symlink.
     pub fn repo_root(&self) -> &Path {
         &self.repo_root
     }

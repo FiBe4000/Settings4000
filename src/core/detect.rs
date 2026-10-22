@@ -12,7 +12,7 @@
 //! reload table (task 4.4) consults to skip a reload for a component that is not
 //! running, and that the Apply pipeline (task 4.5) consults for the palette
 //! source's repo root (R8.5). Two results only inform the user and gate nothing:
-//! the discovered repo root, which the Theme page compares each live `settings.ini`
+//! the detected repo root, which the Theme page compares each live `settings.ini`
 //! with, and whether `xsettingsd` — the trace of an external GTK-settings writer —
 //! runs (task 11.12, analysis §7.7).
 //!
@@ -327,7 +327,7 @@ impl fmt::Display for HyprConfigProvider {
     }
 }
 
-/// The repo-relative path of the config file used to discover the dotfiles repo
+/// The repo-relative path of the config file used to detect the dotfiles repo
 /// root (R8.5).
 ///
 /// The deployed `~/.config/hypr/colors.conf` symlink resolves to
@@ -354,7 +354,7 @@ const BAR_TEXT_TONE_SCRIPT_RELATIVE: &[&str] = &["eww", "scripts", "bar-text-ton
 /// R8.5).
 ///
 /// Its presence gates the palette switcher (task 6.3); its [`repo_root`](Self::repo_root)
-/// is the anchor tasks 3.7/6.3 use to enumerate schemes and task 4.5 uses to run
+/// is the anchor tasks 3.7/6.3 use to scan schemes and task 4.5 uses to run
 /// the generator. All three paths are held resolved so consumers never re-derive
 /// them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -362,7 +362,7 @@ pub struct PaletteSource {
     /// The dotfiles repository root (the canonicalized directory the deployed
     /// config symlink resolves into).
     repo_root: PathBuf,
-    /// The `colors/` directory holding one file per scheme (task 6.3 enumerates
+    /// The `colors/` directory holding one file per scheme (task 6.3 scans
     /// it; task 3.7 reads a scheme's swatch from it).
     colors_dir: PathBuf,
     /// The `scripts/generate-colors` generator the Apply pipeline runs on a
@@ -410,7 +410,7 @@ pub struct DetectionInputs {
     /// `None` when it cannot be located from the environment. Its existence is
     /// checked against the real filesystem.
     pub hyprland_socket: Option<PathBuf>,
-    /// The deployed config path used to discover the dotfiles repo root (R8.5),
+    /// The deployed config path used to detect the dotfiles repo root (R8.5),
     /// conventionally `~/.config/hypr/colors.conf`. It must be a symlink into the
     /// repo for the repo-only sources — the palette source and the laptop-display
     /// toggle script (task 11.8) — to be considered present.
@@ -544,7 +544,7 @@ impl Capabilities {
     /// This is the pure, re-runnable routine: a manual refresh (R4.3) re-gathers
     /// [`DetectionInputs`] and calls it again. It performs the binary scan, daemon
     /// and Hyprland liveness checks, the config-provider resolution, the
-    /// settings-portal probe, palette-source discovery, and config-readability
+    /// settings-portal probe, palette-source detection, and config-readability
     /// checks, logging absent page-gating items at `info` and unreadable configs at
     /// `warn` (R4.2/R4.4/R7.3), then returns the plain [`Capabilities`]. It never
     /// fails: every probe degrades to "absent".
@@ -552,7 +552,7 @@ impl Capabilities {
         let present_binaries = scan_binaries(inputs.path.as_deref());
         log_binary_results(&present_binaries);
 
-        let live_daemons = scan_daemons(&inputs.running_processes);
+        let live_daemons = detect_daemons(&inputs.running_processes);
         if live_daemons.contains(&Daemon::Xsettingsd) {
             // Not a hidden feature but a user-visible note on the Theme page, so it
             // earns an `info` like the live-restyle downgrade below (R7.3).
@@ -597,7 +597,7 @@ impl Capabilities {
 
         let bar_text_tone_script = detect_bar_text_tone_script(&inputs.bar_text_tone_script);
 
-        let unreadable_configs = check_configs(&inputs.config_paths);
+        let unreadable_configs = detect_unreadable_configs(&inputs.config_paths);
 
         let notifd =
             NotifdStatus::resolve(&inputs.notifd_replies, inputs.notifd_unit_file.exists());
@@ -658,7 +658,7 @@ impl Capabilities {
     /// PulseAudio's `pactl` (R3.1).
     ///
     /// This is the general "is there some audio client at all" query. Note the v1
-    /// Sound page (task 6.2) does **not** gate on this: its enumeration (`pw-dump`,
+    /// Sound page (task 6.2) does **not** gate on this: its device load (`pw-dump`,
     /// falling back to `wpctl status`) and its controls speak only `wpctl`/`pw-dump`,
     /// so it is gated on [`Binary::Wpctl`] specifically — a `pactl`-only host would
     /// otherwise render a dead, inert page, which R4.2 forbids. `pactl`-only support is
@@ -726,7 +726,7 @@ impl Capabilities {
         self.repo_root.as_deref()
     }
 
-    /// The discovered dotfiles palette source, or `None` when the palette switcher
+    /// The detected dotfiles palette source, or `None` when the palette switcher
     /// must be hidden (R3.2, R8.5).
     pub fn palette_source(&self) -> Option<&PaletteSource> {
         self.palette_source.as_ref()
@@ -871,7 +871,7 @@ impl Capabilities {
     /// need the palette-gated path — such as the Theme category's `palette_source`
     /// arm (task 5.1) — without building a real symlinked-repo filesystem fixture.
     ///
-    /// The paths are placeholders: a test that needs the *real* discovery logic
+    /// The paths are placeholders: a test that needs the *real* detection logic
     /// exercises [`Capabilities::detect`] against a temp-dir fixture instead. It is
     /// builder-style so it chains onto [`Self::for_tests`], keeping that constructor's
     /// signature (and its "absent" defaults) unchanged.
@@ -1070,8 +1070,9 @@ fn log_notifd_status(status: NotifdStatus) {
     }
 }
 
-/// Determines which [`Daemon`]s are running from a list of process names.
-fn scan_daemons(running: &[String]) -> BTreeSet<Daemon> {
+/// Detects which [`Daemon`]s are running from an already-scanned list of process names
+/// (the walk itself is [`scan_procfs_process_names`]).
+fn detect_daemons(running: &[String]) -> BTreeSet<Daemon> {
     Daemon::ALL
         .iter()
         .copied()
@@ -1176,7 +1177,7 @@ fn resolve_repo_root(anchor: &Path) -> Option<PathBuf> {
     repo_root
 }
 
-/// Discovers the dotfiles palette source under `repo_root` (R3.2, R8.5).
+/// Detects the dotfiles palette source under `repo_root` (R3.2, R8.5).
 ///
 /// The source is present only when both `colors/` and `scripts/generate-colors`
 /// exist under the root resolved by [`resolve_repo_root`]; an incomplete repo hides
@@ -1187,7 +1188,7 @@ fn detect_palette_source(repo_root: Option<&Path>) -> Option<PaletteSource> {
     let colors_dir = repo_root.join("colors");
     let generate_colors = repo_root.join("scripts").join("generate-colors");
     if colors_dir.is_dir() && generate_colors.is_file() {
-        tracing::debug!(repo_root = %repo_root.display(), "palette source discovered");
+        tracing::debug!(repo_root = %repo_root.display(), "palette source detected");
         Some(PaletteSource {
             repo_root: repo_root.to_path_buf(),
             colors_dir,
@@ -1203,7 +1204,7 @@ fn detect_palette_source(repo_root: Option<&Path>) -> Option<PaletteSource> {
     }
 }
 
-/// Discovers the dotfiles' laptop-display toggle script under `repo_root` (task
+/// Detects the dotfiles' laptop-display toggle script under `repo_root` (task
 /// 11.8; R4.2, R8.5; analysis §7.3).
 ///
 /// The Display page's laptop-panel switch runs this script rather than
@@ -1228,7 +1229,7 @@ fn detect_laptop_toggle_script(repo_root: Option<&Path>) -> Option<PathBuf> {
         );
         None
     } else if is_executable_file(&script) {
-        tracing::debug!(script = %script.display(), "laptop-display toggle script discovered");
+        tracing::debug!(script = %script.display(), "laptop-display toggle script detected");
         Some(script)
     } else {
         tracing::info!(
@@ -1267,7 +1268,7 @@ fn detect_bar_text_tone_script(script: &Path) -> Option<PathBuf> {
         );
         None
     } else {
-        tracing::debug!(script = %script.display(), "eww bar-text-tone script discovered");
+        tracing::debug!(script = %script.display(), "eww bar-text-tone script detected");
         Some(script.to_path_buf())
     }
 }
@@ -1279,7 +1280,7 @@ fn detect_bar_text_tone_script(script: &Path) -> Option<PathBuf> {
 /// Only the path and OS error are logged, never the file's contents (R7.3). The
 /// full bytes are read (config files are tiny) but discarded; structural
 /// parseability is validated later by the page's own parser.
-fn check_configs(paths: &[PathBuf]) -> BTreeSet<PathBuf> {
+fn detect_unreadable_configs(paths: &[PathBuf]) -> BTreeSet<PathBuf> {
     let mut unreadable = BTreeSet::new();
     for path in paths {
         match std::fs::read(path) {
@@ -1758,7 +1759,7 @@ mod tests {
     #[test]
     fn the_repo_root_is_exposed_even_when_the_palette_source_is_incomplete() {
         // Task 11.12: the Theme page compares settings.ini with its repo copy under
-        // the discovered root, which must not depend on the palette source being
+        // the detected root, which must not depend on the palette source being
         // complete (a repo without colors/ or the generator still has its configs).
         let root = tempfile::tempdir().expect("temp dir");
         let (anchor, repo) = build_repo_with_symlinked_anchor(root.path(), false, false);

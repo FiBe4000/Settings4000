@@ -5,7 +5,7 @@
 //! 6.3–6.5), and this suite drives each against the installed fixture tree
 //! (task 7.1):
 //!
-//! - the **palette** switch, whose source is discovered by *real* detection
+//! - the **palette** switch, whose source is found by *real* detection
 //!   through the deployed `colors.conf` symlink (R8.5) and which runs
 //!   `generate-colors <scheme>` as the LAST write step followed by the reload
 //!   chain — including the rollback proof that a failed palette apply never
@@ -71,14 +71,14 @@ use settings4000::testing::{
 };
 
 /// Builds the palette model exactly as the startup worker does (task 6.3): the
-/// palette source is discovered by real detection canonicalizing the deployed
+/// palette source is found by real detection canonicalizing the deployed
 /// `colors.conf` symlink into the fixture repo (R3.2/R8.5), and the active scheme
 /// is read from that generated file's header.
 fn load_palette(fx: &FixtureDotfiles) -> PaletteModel {
     let anchor = fx.config_path("hypr/colors.conf");
     let inputs = DetectionInputs {
         // Only the filesystem probes matter here; binaries/daemons are irrelevant
-        // to source discovery.
+        // to source detection.
         path: None,
         running_processes: Vec::new(),
         hyprland_socket: None,
@@ -269,7 +269,7 @@ fn empty_plan() -> ApplyPlan {
 #[test]
 fn a_palette_switch_runs_generate_colors_then_the_reload_chain() {
     // The palette happy path (R5.3, task 6.3): switching everforest -> nord runs
-    // the fixture's discovered `generate-colors nord` (as the only write step —
+    // the fixture's detected `generate-colors nord` (as the only write step —
     // v1 edits no file directly), then the apply-theme reload chain in order,
     // with kitty reloaded by SIGUSR1. The mock runner intercepts the generator,
     // so no repo file — generated partials included — may change.
@@ -303,7 +303,7 @@ fn a_palette_switch_runs_generate_colors_then_the_reload_chain() {
         "a palette switch writes no file directly"
     );
 
-    // The exact command sequence: the discovered generator path (inside the
+    // The exact command sequence: the detected generator path (inside the
     // fixture repo, no shell) with the scheme argument, then the three-step reload
     // chain of `scripts/apply-theme` — `hyprctl reload config-only` (task 11.11),
     // `eww reload` and (below) SIGUSR1 to kitty. There is no notification-daemon
@@ -339,7 +339,7 @@ fn a_gtk_theme_change_writes_both_settings_ini_identically() {
     // settings.ini duplicates — and nothing else (uwsm/env, hyprland.lua and
     // index.theme are cursor copies only) — then applies it live with one `gsettings set`.
     let fx = FixtureDotfiles::install();
-    // Install a discoverable GTK theme so the drop-down offers it, as on a real
+    // Install a GTK theme the scan finds so the drop-down offers it, as on a real
     // machine (a directory with a gtk-3.0/ subdirectory under ~/.themes).
     fs::create_dir_all(fx.home().join(".themes/Fixture-Theme/gtk-3.0"))
         .expect("create the fixture GTK theme");
@@ -663,8 +663,8 @@ fn a_cursor_change_creates_a_missing_xcursor_fallback_theme() {
     );
 }
 
-/// Installs a discoverable icon theme named `name` under the fixture home's
-/// `.icons` (an `index.theme` plus a size directory, which is what discovery
+/// Installs an icon theme the scan finds, named `name` under the fixture home's
+/// `.icons` (an `index.theme` plus a size directory, which is what the scan
 /// requires of an icon theme) and returns a themes model that offers it.
 fn themes_with_icon_theme(fx: &FixtureDotfiles, name: &str) -> ThemesModel {
     let theme = fx.home().join(".icons").join(name);

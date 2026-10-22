@@ -13,7 +13,7 @@
 //! # Render-from-status, delegate management
 //!
 //! On page entry (and on the "Refresh status" button) the page reads the active
-//! connections via [`network::read_status`](crate::core::network::read_status) and
+//! connections via [`network::load`](crate::core::network::load) and
 //! renders one row per connection — name, type, device — or a plain note when there
 //! are none or NetworkManager cannot be read (R4.4-style degradation, never an
 //! error). Only the status frame's *contents* are rebuilt on a refresh; the two
@@ -39,7 +39,7 @@
 //! makes it visible and fires the entry hook synchronously, so for the first visible
 //! category an immediate read would still land inside populate (see
 //! `wire_page_entry` in [`super::window`]). The Sound page defers its first
-//! `pw-dump` enumeration the same way (task 9.4). Deferring costs nothing: the
+//! `pw-dump` load the same way (task 9.4). Deferring costs nothing: the
 //! placeholder is visible at most for the instant before the idle callback runs.
 //!
 //! `tests/page_entry_deferral.rs` guards this at the source level for this page and
@@ -106,7 +106,7 @@ impl Inner {
     /// Re-reads the live connection status and re-renders the status frame's
     /// contents from it (R3.1). Nothing outside the frame is touched.
     fn refresh(&self) {
-        let status = network::read_status(&SystemCommandRunner::new());
+        let status = network::load(&SystemCommandRunner::new());
         self.status_frame
             .set_child(Some(&build_status_contents(&status)));
     }

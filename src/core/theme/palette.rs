@@ -11,7 +11,7 @@
 //! gotcha — the app never edits `colors/<scheme>` in v1, requirements §9). This
 //! module is the GTK-free staging model behind that control:
 //!
-//! - it **enumerates** the switchable schemes from the discovered `colors/`
+//! - it **scans** the switchable schemes from the detected `colors/`
 //!   directory (skipping dotfiles, subdirectories, and non-palette files so a
 //!   `state/active-scheme`-style marker or a `README.md` never appears as a scheme);
 //! - it **detects the active scheme** from the deployed generated `colors.conf`
@@ -42,7 +42,7 @@
 //!
 //! A scheme is only offered when `generate-colors` would accept it, and the
 //! generator decides that with its own `NAMES=(…)` key list. The model therefore
-//! reads that list from the discovered script at load ([`load_palette_schema`]) and
+//! reads that list from the detected script at load ([`load_palette_schema`]) and
 //! validates every `colors/` entry against it, falling back to the built-in 18-key
 //! list when the script cannot be read or understood. The schema that applied —
 //! keys and source — is kept on the model ([`PaletteModel::schema`]) and logged, so
@@ -63,7 +63,7 @@ use crate::parsers::palette::PaletteSchema;
 /// Reads the palette schema from the `generate-colors` script at `generate_colors`
 /// (R8.3, R8.5; analysis §7.6).
 ///
-/// The path is the one detection discovered behind the deployed config symlink
+/// The path is the one detection found behind the deployed config symlink
 /// ([`PaletteSource::generate_colors`](crate::core::detect::PaletteSource::generate_colors)),
 /// so the schema is the list the very generator an Apply will run checks. The
 /// script's `NAMES=(…)` line is parsed by
@@ -106,7 +106,7 @@ pub fn load_palette_schema(generate_colors: &Path) -> PaletteSchema {
     }
 }
 
-/// One discovered, switchable palette scheme.
+/// One scanned, switchable palette scheme.
 ///
 /// A scheme is one schema-valid palette file in the `colors/` directory. Its
 /// [`preview`](Self::preview) colors are parsed once at load from the file's swatch
@@ -136,11 +136,11 @@ impl Scheme {
 
 /// The palette-scheme staging model for the Theme page (task 6.3).
 ///
-/// Built by [`PaletteModel::load`] from the discovered palette source and folded into
+/// Built by [`PaletteModel::load`] from the detected palette source and folded into
 /// the window's Apply/Reset chrome as a second staging source (see the module docs).
 #[derive(Clone, Debug)]
 pub struct PaletteModel {
-    /// The switchable schemes discovered in `colors/`, sorted by name for a stable
+    /// The switchable schemes scanned from `colors/`, sorted by name for a stable
     /// drop-down order.
     schemes: Vec<Scheme>,
     /// The active scheme detected from the deployed generated `colors.conf` header
@@ -150,7 +150,7 @@ pub struct PaletteModel {
     /// scheme that differs from [`active`](Self::active), so `staged.is_some()` is
     /// exactly the dirty condition.
     staged: Option<String>,
-    /// The discovered `scripts/generate-colors` path (R8.5), passed verbatim into the
+    /// The detected `scripts/generate-colors` path (R8.5), passed verbatim into the
     /// Apply contribution so the pipeline runs it with no shell.
     generate_colors: PathBuf,
     /// The key list the `colors/` entries were validated against — read from
@@ -159,10 +159,10 @@ pub struct PaletteModel {
 }
 
 impl PaletteModel {
-    /// Builds the model by enumerating `colors_dir` and detecting the active scheme
+    /// Builds the model by scanning `colors_dir` and detecting the active scheme
     /// from `active_scheme_source` (task 6.3; R3.2, R8.5).
     ///
-    /// `colors_dir` and `generate_colors` come from the discovered
+    /// `colors_dir` and `generate_colors` come from the detected
     /// [`PaletteSource`](crate::core::detect::PaletteSource); `active_scheme_source` is
     /// the deployed generated color file (`~/.config/hypr/colors.conf`) whose header
     /// names the active scheme (task 3.7). All three are injected so the model can be
@@ -177,7 +177,7 @@ impl PaletteModel {
         generate_colors: PathBuf,
     ) -> PaletteModel {
         let schema = load_palette_schema(&generate_colors);
-        let schemes = enumerate_schemes(colors_dir, &schema);
+        let schemes = scan_schemes(colors_dir, &schema);
         let active = generated::read_active_scheme(active_scheme_source)
             .name()
             .map(str::to_string);
@@ -198,13 +198,13 @@ impl PaletteModel {
     }
 
     /// The schema the schemes were validated against, with its
-    /// [source](crate::parsers::palette::SchemaSource): the discovered generator's
+    /// [source](crate::parsers::palette::SchemaSource): the detected generator's
     /// `NAMES` line, or the built-in fallback (R8.3).
     pub fn schema(&self) -> &PaletteSchema {
         &self.schema
     }
 
-    /// The discovered schemes, in drop-down order.
+    /// The scanned schemes, in drop-down order.
     pub fn schemes(&self) -> &[Scheme] {
         &self.schemes
     }
@@ -232,7 +232,7 @@ impl PaletteModel {
     /// The index of the [`selected`](Self::selected) scheme within
     /// [`schemes`](Self::schemes), for preselecting the drop-down.
     ///
-    /// `None` when the selected scheme is not among the enumerated schemes — e.g. the
+    /// `None` when the selected scheme is not among the scanned schemes — e.g. the
     /// active scheme's file is malformed or absent while others exist — in which case
     /// the UI leaves the drop-down at its default and stages nothing.
     pub fn selected_index(&self) -> Option<usize> {
@@ -246,14 +246,14 @@ impl PaletteModel {
     ///
     /// Re-selecting the active scheme clears any pending switch (so the page is not
     /// dirty), matching the store's rule that re-choosing the current value is not an
-    /// edit. A name that is not among the enumerated schemes is ignored — the drop-down
+    /// edit. A name that is not among the scanned schemes is ignored — the drop-down
     /// only offers real schemes, so this is a defensive guard against an out-of-band
     /// caller.
     pub fn stage(&mut self, name: &str) {
         if !self.schemes.iter().any(|scheme| scheme.name == name) {
             tracing::warn!(
                 scheme = name,
-                "ignoring a palette scheme that is not in the discovered set"
+                "ignoring a palette scheme that is not in the scanned set"
             );
             return;
         }
@@ -300,7 +300,7 @@ impl PaletteModel {
     /// staged (task 4.5; R3.2, R8.5).
     ///
     /// The window folds this into [`ApplyPlan::palette`](crate::core::apply::ApplyPlan),
-    /// so the pipeline runs the discovered `generate-colors <scheme>` as its last write
+    /// so the pipeline runs the detected `generate-colors <scheme>` as its last write
     /// step and then the palette reload chain. It carries no file write: a v1 palette
     /// switch edits no file directly.
     pub fn apply_contribution(&self) -> Option<PaletteSwitch> {
@@ -311,7 +311,7 @@ impl PaletteModel {
     }
 }
 
-/// Enumerates the switchable schemes in `colors_dir`, skipping non-scheme entries
+/// Scans for the switchable schemes in `colors_dir`, skipping non-scheme entries
 /// (R3.2, R8.5).
 ///
 /// An entry is a scheme only when it is (1) not a dotfile, (2) a regular file
@@ -322,7 +322,7 @@ impl PaletteModel {
 /// when `schema` came from its `NAMES` line, so every scheme offered here is one it
 /// would accept. The result is sorted by name for a deterministic drop-down order
 /// regardless of the directory's iteration order.
-fn enumerate_schemes(colors_dir: &Path, schema: &PaletteSchema) -> Vec<Scheme> {
+fn scan_schemes(colors_dir: &Path, schema: &PaletteSchema) -> Vec<Scheme> {
     let mut schemes = Vec::new();
     let entries = match std::fs::read_dir(colors_dir) {
         Ok(entries) => entries,
@@ -330,7 +330,7 @@ fn enumerate_schemes(colors_dir: &Path, schema: &PaletteSchema) -> Vec<Scheme> {
             tracing::info!(
                 dir = %colors_dir.display(),
                 %error,
-                "palette colors/ directory could not be read; no schemes enumerated (R4.4)"
+                "palette colors/ directory could not be read; no schemes scanned (R4.4)"
             );
             return schemes;
         }
@@ -464,7 +464,7 @@ shadow=0a0c0d
 ";
 
     /// Writes a `colors/` directory with the given scheme files, plus the non-scheme
-    /// entries the enumeration must skip, and returns the directory path.
+    /// entries the scan must skip, and returns the directory path.
     ///
     /// Every named scheme is written as a complete valid palette. In addition it
     /// writes a `README.md` (a non-palette file), a `.hidden` dotfile (whose *content*
@@ -501,7 +501,7 @@ shadow=0a0c0d
     }
 
     #[test]
-    fn enumeration_skips_dotfiles_subdirs_and_non_palette_files() {
+    fn scan_skips_dotfiles_subdirs_and_non_palette_files() {
         // Accept criterion: the scheme list is exactly the two palette files, with the
         // README, the dotfile, the state-marker, and the subdirectory all skipped —
         // so a marker never appears as a scheme.
@@ -509,7 +509,7 @@ shadow=0a0c0d
         let colors = dir.path().join("colors");
         write_colors_dir(&colors, &["everforest", "nord"]);
 
-        let schemes = enumerate_schemes(&colors, &PaletteSchema::built_in());
+        let schemes = scan_schemes(&colors, &PaletteSchema::built_in());
         let names: Vec<&str> = schemes.iter().map(Scheme::name).collect();
         assert_eq!(
             names,
@@ -526,7 +526,7 @@ shadow=0a0c0d
         let colors = dir.path().join("colors");
         write_colors_dir(&colors, &["nord"]);
 
-        let schemes = enumerate_schemes(&colors, &PaletteSchema::built_in());
+        let schemes = scan_schemes(&colors, &PaletteSchema::built_in());
         let nord = schemes.iter().find(|s| s.name() == "nord").expect("nord");
         assert_eq!(
             nord.preview().len(),
@@ -594,7 +594,7 @@ shadow=0a0c0d
     #[test]
     fn an_active_scheme_absent_from_colors_preselects_nothing() {
         // Degraded path: the generated header names a scheme
-        // that is not among the enumerated `colors/` files (e.g. its source file was
+        // that is not among the scanned `colors/` files (e.g. its source file was
         // deleted or renamed). The active name is still reported, but it maps to no
         // drop-down index, so the UI preselects nothing rather than the first scheme.
         let dir = tempfile::tempdir().expect("temp dir");
@@ -835,7 +835,7 @@ shadow=0a0c0d
         assert_eq!(
             model.schema().source(),
             &SchemaSource::Generator(generator),
-            "the discovered generator's NAMES line applied"
+            "the detected generator's NAMES line applied"
         );
         assert_eq!(model.schema().keys().len(), 18);
         let names: Vec<&str> = model.schemes().iter().map(Scheme::name).collect();
@@ -925,7 +925,7 @@ shadow=0a0c0d
 
         let mut names = Vec::new();
         let events = crate::testing::capture_logs(|| {
-            names = enumerate_schemes(&colors, &PaletteSchema::built_in())
+            names = scan_schemes(&colors, &PaletteSchema::built_in())
                 .iter()
                 .map(|scheme| scheme.name().to_string())
                 .collect();

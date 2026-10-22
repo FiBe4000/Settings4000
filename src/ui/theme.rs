@@ -86,9 +86,7 @@ use gtk4::{
     Frame, Image, Label, Orientation, ScrolledWindow, Switch, Window,
 };
 
-use crate::core::theme::{
-    GtkThemeOverrideSource, PaletteModel, Scheme, ThemesModel, WallpaperModel,
-};
+use crate::core::theme::{GtkOverrideOrigin, PaletteModel, Scheme, ThemesModel, WallpaperModel};
 use crate::ui::widgets::{
     PAGE_MARGIN, ROW_SPACING, SECTION_SPACING, build_dropdown, labelled_row, note,
 };
@@ -231,7 +229,7 @@ impl Inner {
                     section.append(&swatch_strip(preview));
                 }
             } else {
-                // The active scheme could not be matched to an enumerated scheme —
+                // The active scheme could not be matched to a scanned scheme —
                 // either its generated header degraded to unknown or it names a
                 // scheme absent from `colors/` (see `PaletteModel::selected_index`).
                 // GTK silently defaults an unset drop-down selection to index 0,
@@ -316,8 +314,8 @@ impl Inner {
         }
 
         // R3.3: a live GTK_THEME override — show a banner and disable the GTK drop-down.
-        if let Some(source) = model.gtk_override() {
-            section.append(&override_banner(source));
+        if let Some(origin) = model.gtk_override() {
+            section.append(&override_banner(origin));
         }
 
         // Task 11.12 (analysis §7.7): say when another program is likely to rewrite the
@@ -763,7 +761,7 @@ fn basename(path: &str) -> String {
 /// system theme's `dialog-warning-symbolic` icon), so the `tests/no_custom_css.rs`
 /// guard still passes. It tells the user the GTK theme is forced and cannot be changed
 /// here, and where the override comes from, so the disabled drop-down is not mysterious.
-fn override_banner(source: &GtkThemeOverrideSource) -> Frame {
+fn override_banner(origin: &GtkOverrideOrigin) -> Frame {
     let frame = Frame::new(None);
     let row = GtkBox::new(Orientation::Horizontal, ROW_SPACING);
     row.set_margin_top(ROW_SPACING);
@@ -775,7 +773,7 @@ fn override_banner(source: &GtkThemeOverrideSource) -> Frame {
     icon.set_valign(Align::Start);
     row.append(&icon);
 
-    let label = Label::new(Some(&source.banner_message()));
+    let label = Label::new(Some(&origin.banner_message()));
     label.set_halign(Align::Start);
     label.set_hexpand(true);
     label.set_wrap(true);

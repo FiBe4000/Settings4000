@@ -6,21 +6,21 @@
 //! The Sound page is **entirely runtime-only** (R3.1/R5.2): PipeWire/WirePlumber keep
 //! no dotfile in this setup (analysis §3), so every control applies *immediately* by
 //! running a `wpctl` command — nothing is staged, nothing is dirty, and there is no
-//! Apply/Reset involvement. This module is the headless half: it enumerates the current
+//! Apply/Reset involvement. This module is the headless half: it loads the current
 //! audio devices and builds the exact `wpctl` argument vectors the controls run. The
 //! bespoke GTK glue in [`crate::ui::sound`] renders the drop-downs/sliders/switches from
-//! the enumerated [`SoundState`] and calls the command builders here on each change.
+//! the loaded [`SoundState`] and calls the command builders here on each change.
 //!
 //! Because it is runtime-only it deliberately does **not** touch the
 //! [`SettingsStore`](crate::core::store): it holds no `SettingId`, stages nothing, and
-//! never marks anything dirty. It stays GTK-free so the enumeration parsing and the
+//! never marks anything dirty. It stays GTK-free so the device parsing and the
 //! command building are unit-tested headlessly against a
 //! [`MockCommandRunner`](crate::system::command::MockCommandRunner) (R6.2); the layering
 //! guard in `tests/module_boundaries.rs` forbids any `gtk`/`relm4` import here.
 //!
-//! # Enumeration: `pw-dump` JSON, falling back to `wpctl status`
+//! # Loading: `pw-dump` JSON, falling back to `wpctl status`
 //!
-//! [`enumerate`] discovers the output (sink) and input (source) devices, which one is
+//! [`load`] reads the output (sink) and input (source) devices, which one is
 //! the current default of each kind, and each device's volume and mute state. It first
 //! runs `pw-dump` and parses the PipeWire object dump (the precise, structured source);
 //! if `pw-dump` is absent, fails, or emits unparseable output it falls back to parsing
@@ -41,7 +41,7 @@
 //!
 //! # The command set
 //!
-//! All three controls run `wpctl` with a node id resolved during enumeration:
+//! All three controls run `wpctl` with a node id resolved during [`load`]:
 //! [`set_default_command`] (`wpctl set-default ID`) switches the default output/input,
 //! [`set_volume_command`] (`wpctl set-volume ID V`) sets a device's volume, and
 //! [`set_mute_command`] (`wpctl set-mute ID 1|0`) mutes/unmutes it. They are built as
@@ -110,16 +110,16 @@ impl SoundDevice {
     }
 }
 
-/// The enumerated PipeWire audio state: the output (sink) and input (source) devices,
+/// The loaded PipeWire audio state: the output (sink) and input (source) devices,
 /// each with its default flag, volume, and mute state.
 ///
-/// Produced by [`enumerate`] on page entry (and on a manual rescan). A default value is
+/// Produced by [`load`] on page entry (and on a manual refresh). A default value is
 /// the empty state used when no audio source could be read.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SoundState {
-    /// The audio output (sink) devices, in enumeration order.
+    /// The audio output (sink) devices, in the order PipeWire lists them.
     outputs: Vec<SoundDevice>,
-    /// The audio input (source/microphone) devices, in enumeration order.
+    /// The audio input (source/microphone) devices, in the order PipeWire lists them.
     inputs: Vec<SoundDevice>,
 }
 
@@ -135,27 +135,27 @@ impl SoundState {
     }
 }
 
-/// Enumerates the current audio devices, defaults, volumes, and mute states (R3.1).
+/// Loads the current audio devices, defaults, volumes, and mute states (R3.1).
 ///
-/// Runs on page entry (and on a manual rescan). It prefers `pw-dump`'s structured JSON
+/// Runs on page entry (and on a manual refresh). It prefers `pw-dump`'s structured JSON
 /// and falls back to parsing `wpctl status` when `pw-dump` is unavailable or emits
 /// output that cannot be parsed; if neither can be read it returns an empty
 /// [`SoundState`]. It never panics — a missing binary, a non-zero exit, or garbled
 /// output each degrade to the next source, then to empty.
-pub fn enumerate(runner: &dyn CommandRunner) -> SoundState {
-    if let Some(state) = enumerate_pw_dump(runner) {
+pub fn load(runner: &dyn CommandRunner) -> SoundState {
+    if let Some(state) = load_from_pw_dump(runner) {
         return state;
     }
-    enumerate_wpctl_status(runner)
+    load_from_wpctl_status(runner)
 }
 
-/// Runs `pw-dump` and parses it, or returns `None` so [`enumerate`] falls back.
+/// Runs `pw-dump` and parses it, or returns `None` so [`load`] falls back.
 ///
 /// `None` means the structured source could not be used at all — `pw-dump` is absent,
 /// exited non-zero, or produced output that is not a JSON array. A successfully parsed
 /// dump (even one with no audio nodes) returns `Some`, since that is an authoritative
 /// "there are no audio devices" answer rather than a failure to read.
-fn enumerate_pw_dump(runner: &dyn CommandRunner) -> Option<SoundState> {
+fn load_from_pw_dump(runner: &dyn CommandRunner) -> Option<SoundState> {
     let output = match runner.run(&Command::new("pw-dump")) {
         Ok(output) if output.success() => output,
         Ok(_) => {
@@ -182,7 +182,7 @@ fn enumerate_pw_dump(runner: &dyn CommandRunner) -> Option<SoundState> {
 /// This is the fallback when `pw-dump` is unusable. `wpctl status` is always parsed into
 /// *some* state (possibly empty); a failure to run it at all degrades to the empty state
 /// so the page renders "no devices" rather than erroring (R4.4-style degradation).
-fn enumerate_wpctl_status(runner: &dyn CommandRunner) -> SoundState {
+fn load_from_wpctl_status(runner: &dyn CommandRunner) -> SoundState {
     match runner.run(&Command::new("wpctl").arg("status")) {
         Ok(output) if output.success() => {
             parse_wpctl_status(&String::from_utf8_lossy(output.stdout()))
@@ -199,9 +199,9 @@ fn enumerate_wpctl_status(runner: &dyn CommandRunner) -> SoundState {
 }
 
 /// Parses a `pw-dump` JSON array into the audio [`SoundState`] — the structured,
-/// precise enumeration path, unit-tested against a canned dump (R6.2).
+/// precise load path, unit-tested against a canned dump (R6.2).
 ///
-/// Returns `None` when the input is not a JSON array (so [`enumerate`] falls back to
+/// Returns `None` when the input is not a JSON array (so [`load`] falls back to
 /// `wpctl status`). Otherwise it walks the objects: the `default` metadata object names
 /// the current default sink/source (by `node.name`), and each `Audio/Sink`/`Audio/Source`
 /// node becomes a [`SoundDevice`] with its label, volume (cube-rooted from the stored
@@ -359,7 +359,7 @@ fn cubic_to_linear(stored: f64) -> f64 {
     stored.max(0.0).cbrt().clamp(0.0, 1.0)
 }
 
-/// Parses `wpctl status` text into the audio [`SoundState`] — the fallback enumeration
+/// Parses `wpctl status` text into the audio [`SoundState`] — the fallback source
 /// path when `pw-dump` is unusable, unit-tested against a canned status dump (R6.2).
 ///
 /// `wpctl status` is a tree: top-level `Audio`/`Video`/`Settings` sections, each with
@@ -738,12 +738,12 @@ Settings
     }
 
     #[test]
-    fn enumerate_does_not_fall_back_when_pw_dump_reports_no_audio() {
+    fn load_does_not_fall_back_when_pw_dump_reports_no_audio() {
         // The authoritative empty answer must NOT trigger the wpctl status fallback:
         // only pw-dump is run.
         let runner =
             MockCommandRunner::with_outcomes([Ok(CommandOutput::fake_with_streams(0, "[]", ""))]);
-        let state = enumerate(&runner);
+        let state = load(&runner);
         assert!(state.outputs().is_empty() && state.inputs().is_empty());
         assert_eq!(
             runner.recorded(),
@@ -753,8 +753,8 @@ Settings
     }
 
     #[test]
-    fn parse_pw_dump_rejects_non_array_so_enumerate_falls_back() {
-        // A non-array (or unparseable) dump yields None, which is what makes `enumerate`
+    fn parse_pw_dump_rejects_non_array_so_load_falls_back() {
+        // A non-array (or unparseable) dump yields None, which is what makes `load`
         // fall back to `wpctl status`.
         assert!(parse_pw_dump("not json").is_none());
         assert!(
@@ -796,12 +796,12 @@ Settings
     }
 
     #[test]
-    fn enumerate_prefers_pw_dump() {
-        // With a parseable pw-dump, `enumerate` uses it and never runs `wpctl status`.
+    fn load_prefers_pw_dump() {
+        // With a parseable pw-dump, `load` uses it and never runs `wpctl status`.
         let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake_with_streams(
             0, PW_DUMP, "",
         ))]);
-        let state = enumerate(&runner);
+        let state = load(&runner);
         assert_eq!(state.outputs().len(), 2);
         assert_eq!(state.inputs().len(), 1);
         assert_eq!(
@@ -812,7 +812,7 @@ Settings
     }
 
     #[test]
-    fn enumerate_falls_back_to_wpctl_status_when_pw_dump_fails_to_run() {
+    fn load_falls_back_to_wpctl_status_when_pw_dump_fails_to_run() {
         // pw-dump absent (spawn error) -> fall back to `wpctl status`.
         let runner = MockCommandRunner::with_outcomes([
             Err(crate::system::command::CommandError::Spawn(
@@ -820,7 +820,7 @@ Settings
             )),
             Ok(CommandOutput::fake_with_streams(0, WPCTL_STATUS, "")),
         ]);
-        let state = enumerate(&runner);
+        let state = load(&runner);
         assert_eq!(
             state.outputs().len(),
             2,
@@ -834,18 +834,14 @@ Settings
     }
 
     #[test]
-    fn enumerate_falls_back_when_pw_dump_output_is_garbled() {
+    fn load_falls_back_when_pw_dump_output_is_garbled() {
         // pw-dump runs but emits non-JSON -> fall back to `wpctl status`.
         let runner = MockCommandRunner::with_outcomes([
             Ok(CommandOutput::fake_with_streams(0, "<<< not json >>>", "")),
             Ok(CommandOutput::fake_with_streams(0, WPCTL_STATUS, "")),
         ]);
-        let state = enumerate(&runner);
-        assert_eq!(
-            state.inputs().len(),
-            1,
-            "the fallback still enumerates the mic"
-        );
+        let state = load(&runner);
+        assert_eq!(state.inputs().len(), 1, "the fallback still lists the mic");
         assert_eq!(
             runner.recorded(),
             vec![Command::new("pw-dump"), Command::new("wpctl").arg("status"),],
@@ -853,13 +849,13 @@ Settings
     }
 
     #[test]
-    fn enumerate_degrades_to_empty_when_both_sources_fail() {
+    fn load_degrades_to_empty_when_both_sources_fail() {
         // Neither source usable -> empty state, no panic.
         let runner = MockCommandRunner::with_outcomes([
             Ok(CommandOutput::fake(1)),
             Ok(CommandOutput::fake(1)),
         ]);
-        let state = enumerate(&runner);
+        let state = load(&runner);
         assert!(state.outputs().is_empty() && state.inputs().is_empty());
     }
 

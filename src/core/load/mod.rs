@@ -54,7 +54,7 @@
 //! # Refresh re-runs the same pass (R4.3)
 //!
 //! The manual Refresh button re-runs [`load`] on the worker too — detection *and* the
-//! backing files *and* the bespoke page models must all be rebuilt together, or the
+//! backing files *and* the bespoke page models must all be loaded again together, or the
 //! refreshed capabilities and the rendered content diverge (e.g. installing hyprpaper
 //! and clicking Refresh must make the wallpaper section appear, not wait for an app
 //! restart). What differs from startup is how the result is merged into live state:
@@ -125,9 +125,9 @@ pub struct StartupLoad {
     /// The backing files that loaded, in a fixed order; each is applied to the store.
     /// A file that was missing/unreadable/unparseable is simply absent here.
     pub files: Vec<LoadedFile>,
-    /// The Display page's runtime-discovered model (task 6.1), built by probing
+    /// The Display page's live model (task 6.1), built by probing
     /// `hyprctl monitors -j` and reading `monitors.conf`, or `None` when there is no
-    /// live compositor to enumerate (the Display page then shows a placeholder, R4.2).
+    /// live compositor to query (the Display page then shows a placeholder, R4.2).
     pub display: Option<DisplayModel>,
     /// The Input page's helper (tasks 6.6, 11.4): the `input.lua` path and XKB layout
     /// candidates, or `None` when the page cannot be offered — `hyprctl` is absent,
@@ -148,12 +148,12 @@ pub struct StartupLoad {
     /// renders the store's dirty dim/lock/DPMS timeouts and lock command into the
     /// `hypridle.conf` write on Apply, which the pipeline follows with a hypridle restart.
     pub power: Option<PowerModel>,
-    /// The Theme page's palette-scheme model (task 6.3), built by enumerating the
-    /// discovered `colors/` directory and detecting the active scheme, or `None` when
+    /// The Theme page's palette-scheme model (task 6.3), built by scanning the
+    /// detected `colors/` directory and detecting the active scheme, or `None` when
     /// there is no dotfiles palette source (the Theme palette section is then hidden,
     /// R4.2/R8.5).
     pub palette: Option<PaletteModel>,
-    /// The Theme page's GTK/icon/cursor theme model (task 6.4), built by discovering
+    /// The Theme page's GTK/icon/cursor theme model (task 6.4), built by scanning for
     /// installed themes and reading the backing config, or `None` when `gsettings` is
     /// absent (the appearance section is then hidden, R4.2).
     pub themes: Option<ThemesModel>,
@@ -296,7 +296,7 @@ mod tests {
             model.dirty
         }
 
-        // Clean -> the fresh rebuild wins, so external source changes are reflected.
+        // Clean -> the fresh load wins, so external source changes are reflected.
         let mut current = Some(Staging {
             label: "stale",
             dirty: false,
@@ -311,7 +311,7 @@ mod tests {
         );
         assert_eq!(current.as_ref().map(|m| m.label), Some("fresh"));
 
-        // Dirty -> the user's staged edits are kept; the rebuild is discarded (R5.6).
+        // Dirty -> the user's staged edits are kept; the fresh load is discarded (R5.6).
         let mut current = Some(Staging {
             label: "dirty",
             dirty: true,
@@ -335,7 +335,7 @@ mod tests {
     fn a_real_wallpaper_model_keeps_its_staged_edit_across_a_refresh() {
         // The dirty-keep rule on a real staging model (not a stand-in): a staged
         // fit-mode edit on a fixture-backed WallpaperModel must survive adoption of
-        // the clean model a refresh pass rebuilds from the same sources — this is the
+        // the clean model a refresh pass loads from the same sources — this is the
         // exact wiring `apply_refresh_load` runs for the four staging models.
         let dir = tempfile::tempdir().expect("temp dir");
         let hyprpaper_conf = dir.path().join("hyprpaper.conf");
@@ -361,7 +361,7 @@ mod tests {
         let mut current = Some(model);
 
         // Refresh: adoption must keep the dirty model so the staged edit is not
-        // silently discarded (R5.6), discarding the clean rebuild.
+        // silently discarded (R5.6), discarding the clean fresh load.
         adopt_refreshed_model(
             &mut current,
             Some(WallpaperModel::load(paths(), false)),

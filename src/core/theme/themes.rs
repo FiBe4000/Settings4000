@@ -133,12 +133,12 @@ const CURATED_CURSOR_SIZES: &[&str] = &["16", "24", "32", "48", "64"];
 ///   (R3.3); it is GTK, not this app, that decides how a name resolves.
 ///
 /// Kept sorted here for readability only; ordering in the drop-down comes from the
-/// sorted set the discovery scan builds.
+/// sorted set the theme scan builds.
 const BUILTIN_GTK_THEMES: &[&str] = &["Adwaita", "Adwaita-dark"];
 
 /// The filesystem roots scanned for installed themes (R3.3/R3.4).
 ///
-/// Injected rather than hardcoded so discovery is unit-tested against a fixture tree
+/// Injected rather than hardcoded so the scan is unit-tested against a fixture tree
 /// (the accept criterion): a test points these at temporary directories. The window's
 /// startup loader fills them from the XDG environment (`~/.themes`, the data dirs,
 /// `/usr/share/...`).
@@ -192,7 +192,7 @@ pub struct ThemesPaths {
     /// `[Icon Theme]`, analysis §8.4) — created by the cursor write when absent — or
     /// `None` when the home directory is unknown.
     pub cursor_fallback_theme: Option<PathBuf>,
-    /// The dotfiles repository root discovered behind the deployed config (R8.5,
+    /// The dotfiles repository root detected behind the deployed config (R8.5,
     /// [`Capabilities::dotfiles_repo_root`](crate::core::detect::Capabilities::dotfiles_repo_root)),
     /// or `None` when there is no repo. Nothing under it is ever read or written by
     /// this model: it is only used to notice a `settings.ini` that is a plain file
@@ -247,40 +247,44 @@ impl CursorCopy {
 /// Where an active `GTK_THEME` override was found, so the UI can name it in the banner
 /// (R3.3).
 ///
+/// Not to be confused with [`GtkThemeOverride`], the parser's view of the one
+/// `GTK_THEME` line in `uwsm/env` (active, commented out, or absent). This type is the
+/// resolved answer across both places an override can come from — the app's own
+/// environment and `uwsm/env` — and exists only when an override is in effect.
+///
 /// A set `GTK_THEME` overrides GTK's theme choice entirely, so the app must never
 /// fight it: whenever this is `Some`, the Theme page shows a banner and disables the
 /// GTK-theme drop-down. The icon and cursor drop-downs stay enabled — `GTK_THEME`
 /// overrides only the GTK theme.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum GtkThemeOverrideSource {
-    /// `GTK_THEME` is set in the app's own process environment. On the target this
-    /// happens because `scripts/launchhyprland.sh` exports it uncommented when it
-    /// starts the session (analysis §6.3), so the app itself inherits it — the copy
-    /// that actually overrides *this* app's theme.
+pub enum GtkOverrideOrigin {
+    /// `GTK_THEME` is set in the app's own process environment — the copy that
+    /// actually overrides *this* app's theme. It would come from whatever started the
+    /// app, e.g. a wrapper script or a shell export; the dotfiles set it nowhere today
+    /// (analysis §7.7), so on the target this variant is not expected.
     AppEnvironment(String),
     /// `GTK_THEME` is uncommented (active) in `uwsm/env`, so it overrides the theme for
     /// the session's apps (analysis §6.3).
     UwsmEnv(String),
 }
 
-impl GtkThemeOverrideSource {
+impl GtkOverrideOrigin {
     /// The override value (the theme name `GTK_THEME` is set to).
     fn value(&self) -> &str {
         match self {
-            GtkThemeOverrideSource::AppEnvironment(value)
-            | GtkThemeOverrideSource::UwsmEnv(value) => value,
+            GtkOverrideOrigin::AppEnvironment(value) | GtkOverrideOrigin::UwsmEnv(value) => value,
         }
     }
 
     /// A human-readable banner message naming the override and where it comes from, so
     /// the user understands why the GTK-theme drop-down is disabled (R3.3).
     pub fn banner_message(&self) -> String {
-        let source = match self {
-            GtkThemeOverrideSource::AppEnvironment(_) => "the GTK_THEME environment variable",
-            GtkThemeOverrideSource::UwsmEnv(_) => "GTK_THEME in uwsm/env",
+        let origin = match self {
+            GtkOverrideOrigin::AppEnvironment(_) => "the GTK_THEME environment variable",
+            GtkOverrideOrigin::UwsmEnv(_) => "GTK_THEME in uwsm/env",
         };
         format!(
-            "The GTK theme is forced to \u{201c}{}\u{201d} by {source}, so it cannot be changed \
+            "The GTK theme is forced to \u{201c}{}\u{201d} by {origin}, so it cannot be changed \
              here. Unset it to choose a theme.",
             self.value()
         )
@@ -396,14 +400,14 @@ impl ThemeRenderRecord {
 
 /// The GTK/icon/cursor theme staging model (task 6.4).
 ///
-/// Built by [`ThemesModel::load`] from the discovered [`ThemeRoots`] and the backing
+/// Built by [`ThemesModel::load`] from the scanned [`ThemeRoots`] and the backing
 /// [`ThemesPaths`]. It owns the four drop-downs' [`Selection`]s, the backing config
 /// texts, the `GTK_THEME` override state, and a freshness baseline for conflict
 /// detection (R5.6). Its file edits reach the shared Apply pipeline through
 /// [`Self::apply_contribution`]; the window folds them into the same
 /// [`apply::run`](crate::core::apply::run) it drives for the store and Display model.
 ///
-/// It stays GTK-free so discovery, staging, the multi-file write, the override
+/// It stays GTK-free so scanning, staging, the multi-file write, the override
 /// decision, and the live-restyle gating are all unit-tested headlessly (R6.2); the
 /// layering guard in `tests/module_boundaries.rs` forbids any `gtk`/`relm4` import.
 pub struct ThemesModel {
@@ -431,11 +435,11 @@ pub struct ThemesModel {
     /// The active `GTK_THEME` override (app environment preferred over `uwsm/env`), or
     /// `None`. When `Some`, the GTK-theme drop-down is disabled and a banner shown
     /// (R3.3).
-    gtk_override: Option<GtkThemeOverrideSource>,
+    gtk_override: Option<GtkOverrideOrigin>,
     /// Whether a live theme-restyle path (settings portal or dconf) is available, so
     /// the UI may claim a live GTK-theme restyle rather than "next launch" (R2.2).
     live_restyle: bool,
-    /// The theme roots, kept so [`Self::reload`] can re-discover on a conflict reload.
+    /// The theme roots, kept so [`Self::reload`] can scan again on a conflict reload.
     roots: ThemeRoots,
     /// The backing paths, kept so [`Self::reload`] can re-read the files.
     paths: ThemesPaths,
@@ -491,7 +495,7 @@ pub struct ThemesApply {
 }
 
 impl ThemesModel {
-    /// Builds the model by discovering installed themes and reading the backing config
+    /// Builds the model by scanning for installed themes and reading the backing config
     /// (task 6.4; R3.3, R3.4, R4.4, R2.2).
     ///
     /// `roots` and `paths` are injected (see their docs) so this is exercised against a
@@ -548,8 +552,8 @@ impl ThemesModel {
             .or_else(|| env_value(copies.uwsm.as_ref(), ENV_CURSOR_SIZE))
             .or_else(|| lua_env_value(copies.hyprland_lua.as_ref(), ENV_CURSOR_SIZE));
 
-        let gtk_themes = discover_gtk_themes(&roots.gtk_theme_dirs);
-        let (icon_themes, cursor_themes) = discover_icon_and_cursor_themes(&roots.icon_dirs);
+        let gtk_themes = scan_gtk_themes(&roots.gtk_theme_dirs);
+        let (icon_themes, cursor_themes) = scan_icon_and_cursor_themes(&roots.icon_dirs);
 
         // The app's own environment takes precedence: a GTK_THEME in it overrides this
         // very app, regardless of what uwsm/env says (R3.3).
@@ -561,7 +565,7 @@ impl ThemesModel {
             .map(|s| (*s).to_string())
             .collect();
 
-        let unlinked_gtk_settings = find_unlinked_gtk_settings(&paths);
+        let unlinked_gtk_settings = detect_unlinked_gtk_settings(&paths);
 
         tracing::info!(
             gtk_themes = gtk_themes.len(),
@@ -789,7 +793,7 @@ impl ThemesModel {
 
     /// The active `GTK_THEME` override, or `None` (R3.3). When `Some`, the GTK-theme
     /// drop-down is disabled and a banner shown.
-    pub fn gtk_override(&self) -> Option<&GtkThemeOverrideSource> {
+    pub fn gtk_override(&self) -> Option<&GtkOverrideOrigin> {
         self.gtk_override.as_ref()
     }
 
@@ -837,10 +841,10 @@ impl ThemesModel {
     /// Whether any theme/cursor value has a pending change — the page's dirty state,
     /// which the window folds into the global Apply/Reset chrome (R5.1).
     pub fn is_dirty(&self) -> bool {
-        self.gtk_theme.is_changed()
-            || self.icon_theme.is_changed()
-            || self.cursor_theme.is_changed()
-            || self.cursor_size.is_changed()
+        self.gtk_theme.is_dirty()
+            || self.icon_theme.is_dirty()
+            || self.cursor_theme.is_dirty()
+            || self.cursor_size.is_dirty()
     }
 
     /// Discards every staged theme/cursor change (R5.1).
@@ -986,7 +990,7 @@ impl ThemesModel {
         ))
     }
 
-    /// Re-reads the backing files and re-discovers themes, returning a fresh model with
+    /// Re-reads the backing files and scans the themes again, returning a fresh model with
     /// a new freshness baseline (R5.6 "warn and re-load").
     ///
     /// Called after [`Self::check_conflict`] detects an external edit: the fresh model
@@ -1185,7 +1189,7 @@ impl ThemesModel {
     ///   files lie outside the theme folders is not linked. A built-in theme (Adwaita)
     ///   gets no note: the default look is then exactly what was chosen, and neither
     ///   does a name that is not a theme name at all (it cannot come from the
-    ///   drop-down's discovered list, only from a hand-edited `settings.ini`).
+    ///   drop-down's scanned list, only from a hand-edited `settings.ini`).
     ///
     /// Derived from the filesystem on every call, so it reflects the state after an
     /// Apply or an external change without a reload; it never logs (the Apply logs
@@ -1268,15 +1272,14 @@ impl ThemesModel {
     fn render_writes(&self) -> (Vec<FileWrite>, ThemeRenderRecord) {
         // Which files are involved is decided here; *which keys* each file receives is
         // decided by the per-render functions, which read the same per-value dirty flags.
-        let cursor_changed = self.cursor_theme.is_changed() || self.cursor_size.is_changed();
-        let any_changed =
-            self.gtk_theme.is_changed() || self.icon_theme.is_changed() || cursor_changed;
+        let cursor_dirty = self.cursor_theme.is_dirty() || self.cursor_size.is_dirty();
+        let any_dirty = self.gtk_theme.is_dirty() || self.icon_theme.is_dirty() || cursor_dirty;
 
         let mut writes = Vec::new();
         let mut record = ThemeRenderRecord::default();
 
         // Every theme/cursor key lives in settings.ini, so any change writes both files.
-        if any_changed {
+        if any_dirty {
             for backing in [self.gtk3(), self.gtk4()].into_iter().flatten() {
                 let (write, file_record) = self.render_settings_ini(backing);
                 record.merge(file_record);
@@ -1287,7 +1290,7 @@ impl ThemesModel {
         // The cursor is additionally duplicated in hyprland.lua's hl.env lines,
         // uwsm/env and the XCursor fallback theme; write the identical value there
         // whenever the cursor changed (R3.4).
-        if cursor_changed {
+        if cursor_dirty {
             if let Some(backing) = self.hyprland_lua() {
                 let (write, file_record) = self.render_hyprland_lua(backing);
                 record.merge(file_record);
@@ -1337,7 +1340,7 @@ impl ThemesModel {
                 }
             }
         };
-        if self.gtk_theme.is_changed() {
+        if self.gtk_theme.is_dirty() {
             set(
                 ThemeValue::GtkTheme,
                 KEY_GTK_THEME,
@@ -1345,7 +1348,7 @@ impl ThemesModel {
                 "GTK theme",
             );
         }
-        if self.icon_theme.is_changed() {
+        if self.icon_theme.is_dirty() {
             set(
                 ThemeValue::IconTheme,
                 KEY_ICON_THEME,
@@ -1353,7 +1356,7 @@ impl ThemesModel {
                 "icon theme",
             );
         }
-        if self.cursor_theme.is_changed() {
+        if self.cursor_theme.is_dirty() {
             set(
                 ThemeValue::CursorTheme,
                 KEY_CURSOR_THEME,
@@ -1361,7 +1364,7 @@ impl ThemesModel {
                 "cursor theme",
             );
         }
-        if self.cursor_size.is_changed() {
+        if self.cursor_size.is_dirty() {
             set(
                 ThemeValue::CursorSize,
                 KEY_CURSOR_SIZE,
@@ -1382,7 +1385,7 @@ impl ThemesModel {
                 changed_keys,
                 backing: BackingFile::GtkSettings,
                 // Task 9.10: every value here is a theme name or cursor size chosen from
-                // a list this model discovered on disk (or the fixed size list), and
+                // a list this model scanned on disk (or the fixed size list), and
                 // `ThemesApply` carries no validations at all — so this write is
                 // validation-free by design. Task 9.27 will give these values their own
                 // validations; this declaration becomes `InPlan` when it does.
@@ -1453,7 +1456,7 @@ impl ThemesModel {
                 }
             }
         };
-        if self.cursor_theme.is_changed() {
+        if self.cursor_theme.is_dirty() {
             set(
                 ThemeValue::CursorTheme,
                 ENV_CURSOR_THEME,
@@ -1461,7 +1464,7 @@ impl ThemesModel {
                 "cursor theme (hyprland.lua hl.env)",
             );
         }
-        if self.cursor_size.is_changed() {
+        if self.cursor_size.is_dirty() {
             set(
                 ThemeValue::CursorSize,
                 ENV_CURSOR_SIZE,
@@ -1479,7 +1482,7 @@ impl ThemesModel {
                 contents: file.emit().into_bytes(),
                 changed_keys,
                 backing: BackingFile::HyprlandLua,
-                // The cursor copy of the same discovered values as the `settings.ini`
+                // The cursor copy of the same scanned values as the `settings.ini`
                 // write above, so validation-free by design for the same reason.
                 validation: WriteValidation::NotNeeded,
                 mode: WriteMode::Replace,
@@ -1506,7 +1509,7 @@ impl ThemesModel {
     /// disagrees, so it is merely skipped.
     fn render_cursor_fallback(&self) -> (Option<FileWrite>, ThemeRenderRecord) {
         let mut record = ThemeRenderRecord::default();
-        if !self.cursor_theme.is_changed() {
+        if !self.cursor_theme.is_dirty() {
             return (None, record);
         }
         let Some(theme) = self.cursor_theme.effective() else {
@@ -1542,7 +1545,7 @@ impl ThemesModel {
                 contents: ini.emit().into_bytes(),
                 changed_keys: vec!["cursor theme (index.theme Inherits)".to_string()],
                 backing: BackingFile::CursorFallbackTheme,
-                // The same discovered cursor theme as every other copy, so
+                // The same scanned cursor theme as every other copy, so
                 // validation-free by design for the same reason.
                 validation: WriteValidation::NotNeeded,
                 mode,
@@ -1576,7 +1579,7 @@ impl ThemesModel {
                 }
             }
         };
-        if self.cursor_theme.is_changed() {
+        if self.cursor_theme.is_dirty() {
             set(
                 ThemeValue::CursorTheme,
                 ENV_CURSOR_THEME,
@@ -1584,7 +1587,7 @@ impl ThemesModel {
                 "cursor theme (uwsm/env)",
             );
         }
-        if self.cursor_size.is_changed() {
+        if self.cursor_size.is_dirty() {
             set(
                 ThemeValue::CursorSize,
                 ENV_CURSOR_SIZE,
@@ -1602,7 +1605,7 @@ impl ThemesModel {
                 contents: file.emit().into_bytes(),
                 changed_keys,
                 backing: BackingFile::UwsmEnv,
-                // The `uwsm/env` copy of the same discovered cursor values, so
+                // The `uwsm/env` copy of the same scanned cursor values, so
                 // validation-free by design for the same reason.
                 validation: WriteValidation::NotNeeded,
                 mode: WriteMode::Replace,
@@ -1616,7 +1619,7 @@ impl ThemesModel {
     /// only for those. The cursor value carries the effective theme *and* size (both
     /// are needed for `hyprctl setcursor`), so it is present when either changed.
     fn reload_params(&self) -> ReloadParams {
-        let cursor = if self.cursor_theme.is_changed() || self.cursor_size.is_changed() {
+        let cursor = if self.cursor_theme.is_dirty() || self.cursor_size.is_dirty() {
             match (
                 self.cursor_theme.effective(),
                 self.cursor_size.effective().and_then(parse_cursor_size),
@@ -1644,12 +1647,12 @@ impl ThemesModel {
             cursor,
             gtk_theme: self
                 .gtk_theme
-                .is_changed()
+                .is_dirty()
                 .then(|| self.gtk_theme.effective().map(str::to_string))
                 .flatten(),
             icon_theme: self
                 .icon_theme
-                .is_changed()
+                .is_dirty()
                 .then(|| self.icon_theme.effective().map(str::to_string))
                 .flatten(),
         }
@@ -1718,10 +1721,10 @@ fn fallback_inherits(ini: Option<&IniFile>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Finds the live `settings.ini` files that are plain files beside a repo copy (task
+/// Detects the live `settings.ini` files that are plain files beside a repo copy (task
 /// 11.12) — see [`ThemesModel::unlinked_gtk_settings`] for what counts and why — and
 /// logs each at `warn`, naming the paths only (R7.3: never file contents).
-fn find_unlinked_gtk_settings(paths: &ThemesPaths) -> Vec<UnlinkedSettingsIni> {
+fn detect_unlinked_gtk_settings(paths: &ThemesPaths) -> Vec<UnlinkedSettingsIni> {
     let Some(repo) = paths.dotfiles_repo.as_deref() else {
         return Vec::new();
     };
@@ -1938,25 +1941,25 @@ fn parse_cursor_size(size: &str) -> Option<u32> {
 /// Resolves the active `GTK_THEME` override, preferring the app's own environment over
 /// `uwsm/env` (R3.3).
 ///
-/// The app-environment copy is what actually overrides *this* app's theme (the target
-/// starts the session via `scripts/launchhyprland.sh`, which exports it uncommented),
-/// so it takes precedence; a commented-out `uwsm/env` line is not an override and is
-/// ignored. Returns `None` when neither is active, in which case the GTK-theme
-/// drop-down stays enabled.
+/// The app-environment copy is what actually overrides *this* app's theme (inherited
+/// from whatever started the app, e.g. a wrapper or a shell export — the dotfiles set
+/// it nowhere today), so it takes precedence; a commented-out `uwsm/env` line is not
+/// an override and is ignored. Returns `None` when neither is active, in which case
+/// the GTK-theme drop-down stays enabled.
 fn resolve_gtk_override(
     app_env: Option<String>,
     uwsm: Option<&GtkThemeOverride>,
-) -> Option<GtkThemeOverrideSource> {
+) -> Option<GtkOverrideOrigin> {
     if let Some(value) = app_env.filter(|value| !value.is_empty()) {
-        return Some(GtkThemeOverrideSource::AppEnvironment(value));
+        return Some(GtkOverrideOrigin::AppEnvironment(value));
     }
     if let Some(GtkThemeOverride::Active { value }) = uwsm {
-        return Some(GtkThemeOverrideSource::UwsmEnv(value.clone()));
+        return Some(GtkOverrideOrigin::UwsmEnv(value.clone()));
     }
     None
 }
 
-/// Discovers the GTK themes the drop-down offers: those installed under `dirs`, plus
+/// Scans for the GTK themes the drop-down offers: those installed under `dirs`, plus
 /// GTK's built-in ones (R3.3).
 ///
 /// A subdirectory is a GTK theme when it contains a `gtk-3.0/` or `gtk-4.0/`
@@ -1966,8 +1969,8 @@ fn resolve_gtk_override(
 /// scanned `Adwaita` directory collapses with the built-in entry — only the name
 /// matters, since that is what `gsettings`/`settings.ini` store) and returned sorted for
 /// a stable drop-down, built-ins and scan results interleaved in one order.
-fn discover_gtk_themes(dirs: &[PathBuf]) -> Vec<String> {
-    let mut found = collect_theme_dirs(dirs, |path| {
+fn scan_gtk_themes(dirs: &[PathBuf]) -> Vec<String> {
+    let mut found = scan_theme_dirs(dirs, |path| {
         path.join("gtk-3.0").is_dir() || path.join("gtk-4.0").is_dir()
     });
     // The set both de-duplicates against the scan and keeps the single sort order.
@@ -1975,7 +1978,7 @@ fn discover_gtk_themes(dirs: &[PathBuf]) -> Vec<String> {
     found.into_iter().collect()
 }
 
-/// Discovers installed icon and cursor themes under `dirs` in a single scan (R3.4).
+/// Scans `dirs` for installed icon and cursor themes in a single pass (R3.4).
 ///
 /// The two classifications are **independent** — a directory can be both — which is a
 /// deliberate deviation from R3.4's literal "cursor = has `cursors/`, the rest are
@@ -1993,7 +1996,7 @@ fn discover_gtk_themes(dirs: &[PathBuf]) -> Vec<String> {
 /// icon list: Bibata-style cursor packs ship an `index.theme` and a `cursors/` dir but
 /// no size directories, so they classify as cursor-only. Both lists are de-duplicated
 /// by name across the roots and returned sorted.
-fn discover_icon_and_cursor_themes(dirs: &[PathBuf]) -> (Vec<String>, Vec<String>) {
+fn scan_icon_and_cursor_themes(dirs: &[PathBuf]) -> (Vec<String>, Vec<String>) {
     let mut icons = BTreeSet::new();
     let mut cursors = BTreeSet::new();
     for dir in dirs {
@@ -2053,7 +2056,7 @@ fn has_non_cursor_subdir(path: &Path) -> bool {
 ///
 /// Shared by the GTK theme scan; `metadata` follows symlinks so a symlinked theme
 /// directory counts, and dotfiles are skipped.
-fn collect_theme_dirs(dirs: &[PathBuf], is_theme: impl Fn(&Path) -> bool) -> BTreeSet<String> {
+fn scan_theme_dirs(dirs: &[PathBuf], is_theme: impl Fn(&Path) -> bool) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     for dir in dirs {
         let entries = match std::fs::read_dir(dir) {
@@ -2211,7 +2214,7 @@ export XCURSOR_SIZE=16
             .collect()
     }
 
-    /// A loaded model over `paths` with the icon fixture's cursor themes discoverable.
+    /// A loaded model over `paths` whose scanned icon roots hold the fixture's cursor themes.
     fn load_with_cursors(tmp: &Path, paths: &ThemesPaths) -> ThemesModel {
         let roots = ThemeRoots {
             gtk_theme_dirs: Vec::new(),
@@ -2246,8 +2249,8 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn discovery_finds_gtk_icon_and_cursor_themes_from_fixture_roots() {
-        // Accept criterion (R3.3/R3.4): discovery unit-tested against a fixture tree
+    fn scan_finds_gtk_icon_and_cursor_themes_from_fixture_roots() {
+        // Accept criterion (R3.3/R3.4): the theme scan unit-tested against a fixture tree
         // with injectable roots. A GTK theme is a dir with gtk-3.0/ or gtk-4.0/; a
         // cursor theme has a cursors/ subdir; an icon theme has index.theme and no
         // cursors/.
@@ -2260,7 +2263,7 @@ export XCURSOR_SIZE=16
         fs::create_dir_all(themes.join("NotATheme")).unwrap(); // no gtk-*/ -> skipped
         fs::create_dir_all(themes.join(".hidden").join("gtk-4.0")).unwrap(); // dotfile skipped
 
-        let gtk = discover_gtk_themes(std::slice::from_ref(&themes));
+        let gtk = scan_gtk_themes(std::slice::from_ref(&themes));
         assert_eq!(
             gtk,
             vec![
@@ -2275,7 +2278,7 @@ export XCURSOR_SIZE=16
 
         let icons = write_icon_root(tmp.path());
         let (icon_themes, cursor_themes) =
-            discover_icon_and_cursor_themes(std::slice::from_ref(&icons));
+            scan_icon_and_cursor_themes(std::slice::from_ref(&icons));
         assert_eq!(
             icon_themes,
             vec!["Adwaita".to_string(), "Papirus".to_string()],
@@ -2295,7 +2298,7 @@ export XCURSOR_SIZE=16
     }
 
     #[test]
-    fn discovery_dedups_names_across_multiple_roots() {
+    fn scan_dedups_names_across_multiple_roots() {
         // A theme of the same name in two roots (a user override shadowing a system
         // theme) appears once — only the name matters, since that is what
         // gsettings/settings.ini store.
@@ -2307,7 +2310,7 @@ export XCURSOR_SIZE=16
         // scan returned nothing at all.
         fs::create_dir_all(system.join("Nordic").join("gtk-4.0")).unwrap();
         fs::create_dir_all(user.join("Nordic").join("gtk-4.0")).unwrap();
-        let gtk = discover_gtk_themes(&[user, system]);
+        let gtk = scan_gtk_themes(&[user, system]);
         assert_eq!(
             gtk,
             vec![
@@ -2331,7 +2334,7 @@ export XCURSOR_SIZE=16
         let without = tmp.path().join("without-adwaita");
         fs::create_dir_all(without.join("Nordic").join("gtk-3.0")).unwrap();
         assert_eq!(
-            discover_gtk_themes(std::slice::from_ref(&without)),
+            scan_gtk_themes(std::slice::from_ref(&without)),
             vec![
                 "Adwaita".to_string(),
                 "Adwaita-dark".to_string(),
@@ -2346,7 +2349,7 @@ export XCURSOR_SIZE=16
         let with = tmp.path().join("with-adwaita");
         fs::create_dir_all(with.join("Adwaita").join("gtk-3.0")).unwrap();
         fs::create_dir_all(with.join("Adwaita-dark").join("gtk-3.0")).unwrap();
-        let scanned = discover_gtk_themes(&[with, without]);
+        let scanned = scan_gtk_themes(&[with, without]);
         assert_eq!(
             scanned,
             vec![
@@ -2657,7 +2660,7 @@ export XCURSOR_SIZE=16
 
         let mut model = ThemesModel::load(&roots, paths.clone(), false, None);
         // The configured icon theme is not one the fixture roots offer, so it is prepended
-        // to the discovered names — the drop-down must always be able to preselect the
+        // to the scanned names — the drop-down must always be able to preselect the
         // value the config actually holds.
         assert_eq!(
             model.icon_themes(),
@@ -2666,7 +2669,7 @@ export XCURSOR_SIZE=16
                 "Adwaita".to_string(),
                 "Papirus".to_string()
             ],
-            "the icon drop-down offers the discovered themes plus the configured value"
+            "the icon drop-down offers the scanned themes plus the configured value"
         );
         assert_eq!(
             model.selected_icon_index(),
@@ -2902,7 +2905,7 @@ export XCURSOR_SIZE=16
         // is not an override; a commented-out uwsm line is not an override.
         assert_eq!(
             resolve_gtk_override(Some("Foo".to_string()), None),
-            Some(GtkThemeOverrideSource::AppEnvironment("Foo".to_string()))
+            Some(GtkOverrideOrigin::AppEnvironment("Foo".to_string()))
         );
         assert_eq!(
             resolve_gtk_override(
@@ -2911,7 +2914,7 @@ export XCURSOR_SIZE=16
                     value: "Bar".to_string()
                 })
             ),
-            Some(GtkThemeOverrideSource::AppEnvironment("Foo".to_string())),
+            Some(GtkOverrideOrigin::AppEnvironment("Foo".to_string())),
             "the app environment takes precedence over uwsm/env"
         );
         assert_eq!(
@@ -2921,7 +2924,7 @@ export XCURSOR_SIZE=16
                     value: "Bar".to_string()
                 })
             ),
-            Some(GtkThemeOverrideSource::UwsmEnv("Bar".to_string())),
+            Some(GtkOverrideOrigin::UwsmEnv("Bar".to_string())),
             "an empty app-env value falls through to uwsm/env"
         );
         assert_eq!(
@@ -2958,7 +2961,7 @@ export XCURSOR_SIZE=16
         );
         assert!(model.gtk_dropdown_disabled());
         let source = model.gtk_override().expect("override present");
-        assert!(matches!(source, GtkThemeOverrideSource::AppEnvironment(_)));
+        assert!(matches!(source, GtkOverrideOrigin::AppEnvironment(_)));
         assert!(
             source.banner_message().contains("Nordic-bluish-accent"),
             "the banner names the override value"
@@ -2989,7 +2992,7 @@ export XCURSOR_SIZE=16
         assert!(model.gtk_dropdown_disabled());
         assert_eq!(
             model.gtk_override(),
-            Some(&GtkThemeOverrideSource::UwsmEnv("Nordic".to_string()))
+            Some(&GtkOverrideOrigin::UwsmEnv("Nordic".to_string()))
         );
     }
 
@@ -3278,7 +3281,7 @@ export XCURSOR_SIZE=16
     fn a_skipped_settings_ini_key_leaves_only_that_selection_dirty() {
         // Task 9.6 accept criterion: a failed render leaves the affected selection dirty.
         // A theme name containing a newline is a legal directory name on Linux (only `/`
-        // and NUL are forbidden), so discovery can surface one — but the settings.ini
+        // and NUL are forbidden), so the scan can surface one — but the settings.ini
         // writer rejects it, because writing it would split the `key=value` line. That
         // one key is skipped while the other is still written, and commit must promote
         // only the key that reached a file: promoting the skipped one would leave the
@@ -3336,7 +3339,7 @@ export XCURSOR_SIZE=16
             "the icon baseline still matches what is on disk"
         );
         assert!(
-            model.icon_theme.is_changed(),
+            model.icon_theme.is_dirty(),
             "the skipped icon selection stays staged"
         );
         assert!(
@@ -3353,7 +3356,7 @@ export XCURSOR_SIZE=16
         );
         model.commit();
         assert!(
-            model.icon_theme.is_changed() && model.is_dirty(),
+            model.icon_theme.is_dirty() && model.is_dirty(),
             "a commit with no rendered write promotes nothing"
         );
     }
@@ -3364,7 +3367,7 @@ export XCURSOR_SIZE=16
         // the Lua writer additionally rejects `"` (it would end the string literal and
         // break hyprland.lua), while the settings.ini, uwsm/env and index.theme writers
         // accept it. A cursor theme directory named `Nord"ic` is legal on Linux and
-        // discovery offers it, so the cursor theme can reach four of its five copies
+        // the scan offers it, so the cursor theme can reach four of its five copies
         // while hyprland.lua's hl.env line keeps the old one. The copies on disk then
         // genuinely differ, so the change must NOT be promoted: the page stays dirty
         // rather than looking applied while one copy lags behind.
@@ -3382,7 +3385,7 @@ export XCURSOR_SIZE=16
         let mut model = ThemesModel::load(&roots, paths.clone(), false, None);
         assert!(
             model.cursor_themes().contains(&"Nord\"ic".to_string()),
-            "discovery surfaces the quote-named cursor theme, so the drop-down offers it"
+            "the scan surfaces the quote-named cursor theme, so the drop-down offers it"
         );
         model.stage_cursor_theme("Nord\"ic");
 
@@ -3407,7 +3410,7 @@ export XCURSOR_SIZE=16
             "the cursor baseline is not promoted while one existing copy holds the old value"
         );
         assert!(
-            model.cursor_theme.is_changed() && model.is_dirty(),
+            model.cursor_theme.is_dirty() && model.is_dirty(),
             "the page stays dirty, so the user is not told a half-written change is applied"
         );
     }
@@ -3766,7 +3769,7 @@ export XCURSOR_SIZE=16
         );
     }
 
-    /// Theme roots with nothing to discover, for tests that only look at the backing
+    /// Theme roots with nothing to scan, for tests that only look at the backing
     /// files.
     fn no_theme_roots() -> ThemeRoots {
         ThemeRoots {
