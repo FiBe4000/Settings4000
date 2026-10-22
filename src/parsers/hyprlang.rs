@@ -146,6 +146,8 @@
 
 use std::fmt;
 
+use super::line::{self, RawLine, strip_terminator};
+
 /// A parsed hyprlang file that can re-emit itself byte-for-byte and edit
 /// individual values in place.
 ///
@@ -169,6 +171,12 @@ struct Line {
     raw: String,
     /// How this line was classified during parsing.
     kind: LineKind,
+}
+
+impl RawLine for Line {
+    fn raw(&self) -> &str {
+        &self.raw
+    }
 }
 
 /// The classification of a single line.
@@ -486,11 +494,7 @@ impl HyprlangFile {
         let mut lines = Vec::new();
         let mut warnings = Vec::new();
 
-        // `split_inclusive` keeps each line's terminator attached and yields the
-        // final unterminated line as-is, so re-joining the pieces is exactly the
-        // input. An empty input yields no pieces, so an empty file round-trips to
-        // empty. This is what makes emission byte-for-byte lossless.
-        for (index, raw) in input.split_inclusive('\n').enumerate() {
+        for (index, raw) in line::split_raw_lines(input).enumerate() {
             let line_number = index + 1;
             let kind = classify_line(raw, line_number, &mut warnings);
             lines.push(Line {
@@ -518,11 +522,7 @@ impl HyprlangFile {
     /// After edits, the output is identical to the input except within the edited
     /// value spans and any lines appended by [`set_value`](Self::set_value).
     pub fn emit(&self) -> String {
-        let mut out = String::new();
-        for line in &self.lines {
-            out.push_str(&line.raw);
-        }
-        out
+        line::emit(&self.lines)
     }
 
     /// Returns the current value of the key addressed by `path`, if it exists.
@@ -926,7 +926,7 @@ impl HyprlangFile {
             },
         };
 
-        let terminator = self.line_terminator();
+        let terminator = line::terminator_if_any_crlf(&self.lines);
         let raw = format!("{indent}{key}{separator}{value}{terminator}");
         let key_start = indent.len();
         let value_start = key_start + key.len() + separator.len();
@@ -945,25 +945,11 @@ impl HyprlangFile {
             // Ensure the current final line is terminated so the new assignment
             // starts on its own line.
             if let Some(last) = self.lines.last_mut() {
-                if !last.raw.ends_with('\n') {
-                    last.raw.push_str(terminator);
-                }
+                line::ensure_terminated(&mut last.raw, terminator);
             }
             self.lines.push(new_line);
         } else {
             self.lines.insert(plan.insert_index, new_line);
-        }
-    }
-
-    /// The line terminator to use for appended lines: `\r\n` if the file uses
-    /// Windows endings anywhere, otherwise `\n`. The app's real targets are LF,
-    /// so this mainly keeps an all-CRLF file internally consistent when a key is
-    /// appended.
-    fn line_terminator(&self) -> &'static str {
-        if self.lines.iter().any(|line| line.raw.ends_with("\r\n")) {
-            "\r\n"
-        } else {
-            "\n"
         }
     }
 }
@@ -1050,7 +1036,7 @@ fn value_portion(value: &str) -> Option<(usize, usize)> {
 /// is the settings model's job (task 4.1), not this byte-level structural guard
 /// (R8.3).
 fn reject_unsafe_value(value: &str) -> Result<(), EditError> {
-    if value.chars().any(|c| matches!(c, '\n' | '\r' | '#')) {
+    if line::find_forbidden(value, &['\n', '\r', '#']).is_some() {
         Err(EditError::InvalidValue(value.to_string()))
     } else {
         Ok(())
@@ -1172,13 +1158,6 @@ fn collect_brace_warnings(lines: &[Line], warnings: &mut Vec<ParseWarning>) {
             kind: ParseWarningKind::UnclosedSection { name },
         });
     }
-}
-
-/// Returns `content` with a trailing `\n` or `\r\n` removed, so token and
-/// value-span computation never runs into the line terminator.
-fn strip_terminator(raw: &str) -> &str {
-    let without_lf = raw.strip_suffix('\n').unwrap_or(raw);
-    without_lf.strip_suffix('\r').unwrap_or(without_lf)
 }
 
 #[cfg(test)]

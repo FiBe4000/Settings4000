@@ -84,6 +84,8 @@
 
 use std::fmt;
 
+use super::line::{self, LINE_BREAKS, RawLine, strip_terminator};
+
 /// A parsed `uwsm/env` file that can re-emit itself byte-for-byte, edit the value
 /// of an assignment in place, and report whether a `GTK_THEME` override is
 /// present.
@@ -112,6 +114,12 @@ struct Line {
     raw: String,
     /// How this line was classified during parsing.
     kind: LineKind,
+}
+
+impl RawLine for Line {
+    fn raw(&self) -> &str {
+        &self.raw
+    }
 }
 
 /// The classification of a single line.
@@ -321,11 +329,7 @@ impl EnvFile {
         let mut lines = Vec::new();
         let mut warnings = Vec::new();
 
-        // `split_inclusive` keeps each line's terminator attached and yields the
-        // final unterminated line as-is, so re-joining the pieces is exactly the
-        // input. An empty input yields no pieces, so an empty file round-trips to
-        // empty. This is what makes emission byte-for-byte lossless.
-        for (index, raw) in input.split_inclusive('\n').enumerate() {
+        for (index, raw) in line::split_raw_lines(input).enumerate() {
             let line_number = index + 1;
             let kind = classify_line(raw, line_number, &mut warnings);
             lines.push(Line {
@@ -350,11 +354,7 @@ impl EnvFile {
     /// input except within edited value spans and any line appended by a new
     /// assignment.
     pub fn emit(&self) -> String {
-        let mut out = String::new();
-        for line in &self.lines {
-            out.push_str(&line.raw);
-        }
-        out
+        line::emit(&self.lines)
     }
 
     /// Returns the current value of the variable `key`, if present.
@@ -498,29 +498,15 @@ impl EnvFile {
     /// Ensures the current final line ends with a terminator first, so the new
     /// export starts on its own line even when the file lacked a trailing newline.
     fn append_export(&mut self, key: &str, value: &str) {
-        let terminator = self.line_terminator().to_string();
-
+        let terminator = line::terminator_if_any_crlf(&self.lines);
         if let Some(last) = self.lines.last_mut() {
-            if !last.raw.ends_with('\n') {
-                last.raw.push_str(&terminator);
-            }
+            line::ensure_terminated(&mut last.raw, terminator);
         }
 
         let raw = format!("export {key}={value}{terminator}");
         let mut discard = Vec::new();
         let kind = classify_line(&raw, 0, &mut discard);
         self.lines.push(Line { raw, kind });
-    }
-
-    /// The line terminator to use for an appended line: `\r\n` if the file uses
-    /// Windows endings anywhere, otherwise `\n`. The app's real target is LF; this
-    /// mainly keeps an all-CRLF file internally consistent.
-    fn line_terminator(&self) -> &'static str {
-        if self.lines.iter().any(|line| line.raw.ends_with("\r\n")) {
-            "\r\n"
-        } else {
-            "\n"
-        }
     }
 }
 
@@ -673,16 +659,6 @@ fn skip_ascii_ws(content: &str, mut pos: usize) -> usize {
     pos
 }
 
-/// Returns `content` with a trailing `\n` or `\r\n` removed, so value-span
-/// computation never runs into the line terminator.
-///
-/// The terminator is only stripped for locating tokens; the caller keeps the full
-/// `raw` (terminator included) for lossless emission.
-fn strip_terminator(raw: &str) -> &str {
-    let without_lf = raw.strip_suffix('\n').unwrap_or(raw);
-    without_lf.strip_suffix('\r').unwrap_or(without_lf)
-}
-
 /// Whether `key` is a valid POSIX-shell variable identifier: non-empty, a first
 /// character that is an ASCII letter or `_`, and remaining characters that are
 /// ASCII alphanumeric or `_`.
@@ -704,7 +680,7 @@ fn is_shell_identifier(key: &str) -> bool {
 /// shell-safe tokens) is a higher-level concern (task 4.1); the app only ever
 /// writes bare cursor tokens through this path.
 fn reject_unsafe_value(value: &str) -> Result<(), EditError> {
-    if value.chars().any(|c| matches!(c, '\n' | '\r')) {
+    if line::find_forbidden(value, &LINE_BREAKS).is_some() {
         Err(EditError::InvalidValue(value.to_string()))
     } else {
         Ok(())

@@ -158,6 +158,8 @@
 
 use std::fmt;
 
+use super::line::{self, RawLine, strip_newline};
+
 /// Lua 5.4's reserved words, which are not valid table keys in the bare
 /// `key = value` form the app writes (a reserved word would need the
 /// `["key"] = value` form, which the app never emits).
@@ -450,6 +452,12 @@ struct Line {
     /// `hl.config` table. An opaque line inside a table counts against that table
     /// (and every table enclosing it) in [`LuaConfigFile::table_status`].
     table: Option<usize>,
+}
+
+impl RawLine for Line {
+    fn raw(&self) -> &str {
+        &self.raw
+    }
 }
 
 /// The classification of one line. Byte offsets are relative to [`Line::raw`].
@@ -750,9 +758,7 @@ impl LuaConfigFile {
     /// line number only — never file contents (R7.3). Opaque lines are normal in
     /// `hyprland.lua` and are not logged.
     pub fn parse(input: &str) -> Self {
-        // `split_inclusive` keeps each terminator attached and yields a final
-        // unterminated line as-is, so re-joining the pieces is exactly the input.
-        let raws = input.split_inclusive('\n').map(str::to_string).collect();
+        let raws = line::split_raw_lines(input).map(str::to_string).collect();
         let file = analyze(raws);
         if let Some(error) = &file.structure_error {
             tracing::warn!(
@@ -766,7 +772,7 @@ impl LuaConfigFile {
     /// Re-emits the file, byte-for-byte identical to the parsed input when no
     /// edit has been made (round-trip identity).
     pub fn emit(&self) -> String {
-        self.lines.iter().map(|line| line.raw.as_str()).collect()
+        line::emit(&self.lines)
     }
 
     /// The first structural problem found while parsing, if any. When this is
@@ -1001,11 +1007,7 @@ impl LuaConfigFile {
             _ => None,
         });
 
-        let terminator = if self.lines.iter().any(|line| line.raw.ends_with("\r\n")) {
-            "\r\n"
-        } else {
-            "\n"
-        };
+        let terminator = line::terminator_if_any_crlf(&self.lines);
         if let Some((index, code_end)) = comma_at {
             self.lines[index].raw.insert(code_end, ',');
         }
@@ -1134,13 +1136,6 @@ fn leading_whitespace(raw: &str) -> &str {
     &raw[..raw.len() - raw.trim_start_matches([' ', '\t']).len()]
 }
 
-/// The line's content without its terminator (`\n` or `\r\n`).
-fn strip_terminator(raw: &str) -> &str {
-    raw.strip_suffix("\r\n")
-        .or_else(|| raw.strip_suffix('\n'))
-        .unwrap_or(raw)
-}
-
 // ---------------------------------------------------------------------------
 // Line analysis
 // ---------------------------------------------------------------------------
@@ -1198,7 +1193,7 @@ fn analyze(raws: Vec<String>) -> LuaConfigFile {
     let mut error = None;
 
     for (index, raw) in raws.iter().enumerate() {
-        match analyzer.line(index, strip_terminator(raw)) {
+        match analyzer.line(index, strip_newline(raw)) {
             Ok((kind, table)) => lines.push(Line {
                 raw: raw.clone(),
                 kind,
@@ -1221,7 +1216,7 @@ fn analyze(raws: Vec<String>) -> LuaConfigFile {
         let lines = raws
             .into_iter()
             .map(|raw| {
-                let kind = if strip_terminator(&raw).trim().is_empty() {
+                let kind = if strip_newline(&raw).trim().is_empty() {
                     LineKind::Blank
                 } else {
                     LineKind::Opaque

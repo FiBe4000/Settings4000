@@ -107,6 +107,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use super::line::{self, RawLine, strip_terminator};
+
 /// The characters that may never appear inside a written value. A comma would
 /// split the value into an extra positional field, a `#` starts a comment that
 /// both downstream parsers strip to end of line, and a line break would split
@@ -148,6 +150,12 @@ struct Line {
     raw: String,
     /// How this line was classified during parsing.
     kind: LineKind,
+}
+
+impl RawLine for Line {
+    fn raw(&self) -> &str {
+        &self.raw
+    }
 }
 
 /// The classification of a single line.
@@ -400,10 +408,7 @@ impl std::error::Error for GrammarViolation {}
 /// can only be caught here: once written, it is indistinguishable from a field
 /// separator.
 pub fn check_value(value: &str) -> Result<(), GrammarRule> {
-    match value
-        .chars()
-        .find(|c| FORBIDDEN_VALUE_CHARACTERS.contains(c))
-    {
+    match line::find_forbidden(value, &FORBIDDEN_VALUE_CHARACTERS) {
         Some(character) => Err(GrammarRule::ForbiddenCharacter { character }),
         None => Ok(()),
     }
@@ -528,12 +533,7 @@ impl MonitorsFile {
     /// at `warn`; it is not an error and does not stop parsing. Warnings carry
     /// only line numbers and counts, never file contents (R7.3).
     pub fn parse(input: &str) -> (Self, Vec<ParseWarning>) {
-        // `split_inclusive` keeps each line's terminator attached and yields the
-        // final unterminated line as-is, so re-joining the pieces is exactly the
-        // input. An empty input yields no pieces, so an empty file round-trips to
-        // empty. This is what makes emission byte-for-byte lossless.
-        let lines = input
-            .split_inclusive('\n')
+        let lines = line::split_raw_lines(input)
             .map(|raw| Line {
                 raw: raw.to_string(),
                 kind: classify_line(raw),
@@ -562,11 +562,7 @@ impl MonitorsFile {
     /// After edits, the output is identical to the input except within the edited
     /// field spans and any record appended by [`set_record`](Self::set_record).
     pub fn emit(&self) -> String {
-        let mut out = String::new();
-        for line in &self.lines {
-            out.push_str(&line.raw);
-        }
-        out
+        line::emit(&self.lines)
     }
 
     /// Every rule of the frozen grammar the file's records break, in line order
@@ -879,7 +875,7 @@ impl MonitorsFile {
     /// `monitor=` line (or at end-of-file when there is none), matching the last
     /// record's `monitor=` prefix style, and returns the new line's index.
     fn append_record(&mut self, name: &str, body: &str) -> usize {
-        let terminator = self.line_terminator().to_string();
+        let terminator = line::terminator_if_any_crlf(&self.lines);
         let last_record = self.last_record_index();
 
         // Copy the leading `monitor` + separator (e.g. `monitor=` or `monitor = `)
@@ -904,32 +900,17 @@ impl MonitorsFile {
             Some(index) => {
                 // Guarantee the line we insert after ends with a terminator, so
                 // the new record does not run onto it.
-                if !self.lines[index].raw.ends_with('\n') {
-                    self.lines[index].raw.push_str(&terminator);
-                }
+                line::ensure_terminated(&mut self.lines[index].raw, terminator);
                 self.lines.insert(index + 1, new_line);
                 index + 1
             }
             None => {
                 if let Some(last) = self.lines.last_mut() {
-                    if !last.raw.ends_with('\n') {
-                        last.raw.push_str(&terminator);
-                    }
+                    line::ensure_terminated(&mut last.raw, terminator);
                 }
                 self.lines.push(new_line);
                 self.lines.len() - 1
             }
-        }
-    }
-
-    /// The line terminator to use for appended lines: `\r\n` if the file uses
-    /// Windows endings anywhere, otherwise `\n`. The app's real target is LF, so
-    /// this mainly keeps an all-CRLF file internally consistent.
-    fn line_terminator(&self) -> &'static str {
-        if self.lines.iter().any(|line| line.raw.ends_with("\r\n")) {
-            "\r\n"
-        } else {
-            "\n"
         }
     }
 }
@@ -1061,13 +1042,6 @@ fn trim_span(code: &str, start: usize, end: usize) -> (usize, usize) {
     let trimmed = segment.trim();
     let trimmed_start = start + leading;
     (trimmed_start, trimmed_start + trimmed.len())
-}
-
-/// Returns `content` with a trailing `\n` or `\r\n` removed, so token and
-/// field-span computation never runs into the line terminator.
-fn strip_terminator(raw: &str) -> &str {
-    let without_lf = raw.strip_suffix('\n').unwrap_or(raw);
-    without_lf.strip_suffix('\r').unwrap_or(without_lf)
 }
 
 #[cfg(test)]

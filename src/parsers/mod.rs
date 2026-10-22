@@ -12,6 +12,12 @@
 //! `relm4` — parsers are pure, display-free, and independently testable
 //! (enforced by `tests/module_boundaries.rs`).
 
+// Format-invariant helpers shared by every line-based parser below (task 9.18):
+// lossless splitting and re-joining, terminator stripping and choice, and the
+// forbidden-character scan. Private: it is an implementation detail of the
+// parsers, and each parser keeps its own line classification and error types.
+mod line;
+
 // The shared lossless line model for flat `key=value` files (tasks 3.1, 11.15): bare
 // assignments, `#` comment lines and blank lines, no inline comments. The palette
 // parser (`palette`) and notifd's settings file (`core::notifd_config`) both build on

@@ -48,6 +48,8 @@
 
 use std::fmt;
 
+use super::line::{self, LINE_BREAKS, RawLine, strip_terminator};
+
 /// A parsed `key=value` file that re-emits itself byte-for-byte and edits values in
 /// place (see the module docs).
 #[derive(Clone, Debug)]
@@ -66,6 +68,12 @@ struct Line {
     raw: String,
     /// How the line was classified.
     kind: LineKind,
+}
+
+impl RawLine for Line {
+    fn raw(&self) -> &str {
+        &self.raw
+    }
 }
 
 /// The classification of one stored line.
@@ -184,11 +192,7 @@ impl KvFile {
     /// Lines are split on `\n`; a `\r` right before it is treated as part of the
     /// terminator, so CRLF files read and round-trip correctly.
     pub fn parse(input: &str) -> KvFile {
-        // `split_inclusive` keeps each terminator attached and yields a final
-        // unterminated line as-is, so re-joining the pieces is exactly the input; an
-        // empty input yields no pieces and round-trips to empty.
-        let lines = input
-            .split_inclusive('\n')
+        let lines = line::split_raw_lines(input)
             .map(|raw| Line {
                 raw: raw.to_string(),
                 kind: classify(raw),
@@ -199,7 +203,7 @@ impl KvFile {
 
     /// The file as text — byte-for-byte the parsed input when nothing was edited.
     pub fn emit(&self) -> String {
-        self.lines.iter().map(|line| line.raw.as_str()).collect()
+        line::emit(&self.lines)
     }
 
     /// Every line with its 1-based number, in file order.
@@ -288,22 +292,9 @@ impl KvFile {
         }
         check_value(value)?;
 
-        let terminator = self
-            .lines
-            .iter()
-            .rev()
-            .find(|line| line.raw.ends_with('\n'))
-            .map_or("\n", |line| {
-                if line.raw.ends_with("\r\n") {
-                    "\r\n"
-                } else {
-                    "\n"
-                }
-            });
+        let terminator = line::terminator_of_last_terminated_line(&self.lines);
         if let Some(last) = self.lines.last_mut() {
-            if !last.raw.ends_with('\n') {
-                last.raw.push_str(terminator);
-            }
+            line::ensure_terminated(&mut last.raw, terminator);
         }
         let raw = format!("{key}={value}{terminator}");
         let kind = classify(&raw);
@@ -367,15 +358,9 @@ fn classify(raw: &str) -> LineKind {
     }
 }
 
-/// `raw` without a trailing `\n` or `\r\n`.
-fn strip_terminator(raw: &str) -> &str {
-    let without_lf = raw.strip_suffix('\n').unwrap_or(raw);
-    without_lf.strip_suffix('\r').unwrap_or(without_lf)
-}
-
 /// Refuses a value that would not survive being written and read back as written.
 fn check_value(value: &str) -> Result<(), KvEditError> {
-    if value.contains(['\n', '\r']) || value.trim() != value {
+    if line::find_forbidden(value, &LINE_BREAKS).is_some() || value.trim() != value {
         return Err(KvEditError::UnsafeValue(value.to_string()));
     }
     Ok(())

@@ -65,6 +65,8 @@
 
 use std::fmt;
 
+use super::line::{self, LINE_BREAKS, RawLine, strip_terminator};
+
 /// A parsed GTK `settings.ini` that can re-emit itself byte-for-byte and edit
 /// individual values in place.
 ///
@@ -92,6 +94,12 @@ struct Line {
     raw: String,
     /// How this line was classified during parsing.
     kind: LineKind,
+}
+
+impl RawLine for Line {
+    fn raw(&self) -> &str {
+        &self.raw
+    }
 }
 
 /// The classification of a single line.
@@ -275,11 +283,7 @@ impl IniFile {
         let mut lines = Vec::new();
         let mut warnings = Vec::new();
 
-        // `split_inclusive` keeps each line's terminator attached and yields the
-        // final unterminated line as-is, so re-joining the pieces is exactly the
-        // input. An empty input yields no pieces, so an empty file round-trips to
-        // empty. This is what makes emission byte-for-byte lossless.
-        for (index, raw) in input.split_inclusive('\n').enumerate() {
+        for (index, raw) in line::split_raw_lines(input).enumerate() {
             let line_number = index + 1;
             let kind = classify_line(raw, line_number, &mut warnings);
             lines.push(Line {
@@ -314,11 +318,7 @@ impl IniFile {
     /// input except within edited value spans and any lines appended by a new
     /// key or a created section.
     pub fn emit(&self) -> String {
-        let mut out = String::new();
-        for line in &self.lines {
-            out.push_str(&line.raw);
-        }
-        out
+        line::emit(&self.lines)
     }
 
     /// Returns the current value of `key` within `section`, if present.
@@ -451,7 +451,7 @@ impl IniFile {
     /// separates it from a following section). If the body is empty it goes
     /// directly after the header.
     fn append_entry(&mut self, body_start: usize, body_end: usize, key: &str, value: &str) {
-        let terminator = self.line_terminator().to_string();
+        let terminator = line::terminator_if_any_crlf(&self.lines);
         let content = self.entry_line_content(body_start, body_end, key, value);
         let raw = format!("{content}{terminator}");
 
@@ -466,9 +466,7 @@ impl IniFile {
         // Ensure the line we insert after ends with a terminator, so the new line
         // does not run onto it (only an unterminated final line can lack one).
         if let Some(prev) = insert_at.checked_sub(1).and_then(|i| self.lines.get_mut(i)) {
-            if !prev.raw.ends_with('\n') {
-                prev.raw.push_str(&terminator);
-            }
+            line::ensure_terminated(&mut prev.raw, terminator);
         }
 
         let mut discard = Vec::new();
@@ -522,14 +520,12 @@ impl IniFile {
     /// section reads as its own block. Starting from [`empty`](Self::empty) there
     /// is no content, so the result is exactly `[section]\nkey=value\n`.
     fn create_section(&mut self, section: &str, key: &str, value: &str) {
-        let terminator = self.line_terminator().to_string();
+        let terminator = line::terminator_if_any_crlf(&self.lines);
 
         // Guarantee the current final line ends with a terminator so the new
         // section starts on its own line.
         if let Some(last) = self.lines.last_mut() {
-            if !last.raw.ends_with('\n') {
-                last.raw.push_str(&terminator);
-            }
+            line::ensure_terminated(&mut last.raw, terminator);
         }
 
         let has_content = self
@@ -541,7 +537,7 @@ impl IniFile {
             .last()
             .is_some_and(|line| matches!(line.kind, LineKind::Blank));
         if has_content && !ends_blank {
-            self.push_classified(terminator.clone());
+            self.push_classified(terminator.to_string());
         }
 
         self.push_classified(format!("[{section}]{terminator}"));
@@ -555,17 +551,6 @@ impl IniFile {
         let mut discard = Vec::new();
         let kind = classify_line(&raw, 0, &mut discard);
         self.lines.push(Line { raw, kind });
-    }
-
-    /// The line terminator to use for appended lines: `\r\n` if the file uses
-    /// Windows endings anywhere, otherwise `\n`. The app's real target is LF, so
-    /// this mainly keeps an all-CRLF file internally consistent.
-    fn line_terminator(&self) -> &'static str {
-        if self.lines.iter().any(|line| line.raw.ends_with("\r\n")) {
-            "\r\n"
-        } else {
-            "\n"
-        }
     }
 }
 
@@ -643,21 +628,11 @@ fn classify_line(raw: &str, line_number: usize, warnings: &mut Vec<ParseWarning>
     }
 }
 
-/// Returns `content` with a trailing `\n` or `\r\n` removed, so value-span
-/// computation never runs into the line terminator.
-///
-/// The terminator is only stripped for locating tokens; the caller keeps the
-/// full `raw` (terminator included) for lossless emission.
-fn strip_terminator(raw: &str) -> &str {
-    let without_lf = raw.strip_suffix('\n').unwrap_or(raw);
-    without_lf.strip_suffix('\r').unwrap_or(without_lf)
-}
-
 /// Rejects a value that would split the `key=value` line: a newline or carriage
 /// return. Any other character (including `#`) is allowed, since GLib key files
 /// do not treat `#` as an inline comment inside a value.
 fn reject_unsafe_value(value: &str) -> Result<(), EditError> {
-    if value.chars().any(|c| matches!(c, '\n' | '\r')) {
+    if line::find_forbidden(value, &LINE_BREAKS).is_some() {
         Err(EditError::InvalidValue(value.to_string()))
     } else {
         Ok(())
@@ -668,7 +643,7 @@ fn reject_unsafe_value(value: &str) -> Result<(), EditError> {
 /// `key=value` assignment: empty, or containing a newline, carriage return, or
 /// `=`.
 fn reject_unsafe_key(key: &str) -> Result<(), EditError> {
-    if key.is_empty() || key.chars().any(|c| matches!(c, '\n' | '\r' | '=')) {
+    if key.is_empty() || line::find_forbidden(key, &['\n', '\r', '=']).is_some() {
         Err(EditError::InvalidKey(key.to_string()))
     } else {
         Ok(())
@@ -678,11 +653,7 @@ fn reject_unsafe_key(key: &str) -> Result<(), EditError> {
 /// Rejects a section name that could not be written as a `[name]` header: empty,
 /// or containing a newline, carriage return, `[`, or `]`.
 fn reject_unsafe_section(section: &str) -> Result<(), EditError> {
-    if section.is_empty()
-        || section
-            .chars()
-            .any(|c| matches!(c, '\n' | '\r' | '[' | ']'))
-    {
+    if section.is_empty() || line::find_forbidden(section, &['\n', '\r', '[', ']']).is_some() {
         Err(EditError::InvalidSection(section.to_string()))
     } else {
         Ok(())
