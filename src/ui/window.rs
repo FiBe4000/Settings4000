@@ -33,15 +33,14 @@
 //! detection or config parsing (architecture §8). [`build`] returns a fully assembled
 //! shell whose stack shows only a lightweight loading placeholder, having handed the
 //! slow work — detection (task 4.3) and parsing every backing config file (§3 parsers)
-//! — to a worker thread via [`super::startup::load`]. The parsed
-//! [`StartupLoad`](super::startup::StartupLoad) is delivered back to the main thread
-//! over a channel and applied by [`Shell::apply_startup_load`]: it populates the shared
-//! store from the real config files (establishing the true `original` values and
-//! freshness baselines) and rebuilds the stack pages from the detected
-//! [`Capabilities`]. A missing binary/daemon, an unreadable/unparseable config, or an
-//! absent repo never blocks or crashes startup — detection degrades to absent and the
-//! loader skips the file (R4.3/R4.4) — so the window always comes up with whatever is
-//! available.
+//! — to a worker thread via [`spawn_load`], which runs [`crate::core::load::load`]. The
+//! parsed [`StartupLoad`] is delivered back to the main thread over a channel and
+//! applied by [`Shell::apply_startup_load`]: it populates the shared store from the
+//! real config files (establishing the true `original` values and freshness
+//! baselines) and rebuilds the stack pages from the detected [`Capabilities`]. A
+//! missing binary/daemon, an unreadable/unparseable config, or an absent repo never
+//! blocks or crashes startup — detection degrades to absent and the loader skips the
+//! file (R4.3/R4.4) — so the window always comes up with whatever is available.
 //!
 //! # One shared store drives the chrome (task 5.3)
 //!
@@ -105,6 +104,7 @@ use crate::core::assemble::{
 use crate::core::detect::Capabilities;
 use crate::core::display::DisplayModel;
 use crate::core::input::InputModel;
+use crate::core::load::{LoadedFile, StartupLoad, adopt_refreshed_model, merge_refreshed_files};
 use crate::core::model::Category;
 use crate::core::notifd_config::NotifdConfigModel;
 use crate::core::power::PowerModel;
@@ -120,7 +120,7 @@ use crate::ui::network::{self, NetworkPage};
 use crate::ui::notifications::{self, NotificationsPage};
 use crate::ui::page::{self, PageMsg, PagePlan, SettingsPage};
 use crate::ui::sound::{self, SoundPage};
-use crate::ui::startup::{self, LoadedFile, StartupLoad};
+use crate::ui::startup::spawn_load;
 use crate::ui::theme::{self, ThemePage};
 use crate::ui::widgets::{PAGE_MARGIN, SECTION_SPACING};
 
@@ -151,8 +151,9 @@ const LOADING_PAGE_NAME: &str = "__loading";
 ///
 /// Every field starts `None` and is filled by the startup worker ([`spawn_load`]) — and
 /// replaced or kept on each manual refresh, see [`Shell::apply_refresh_load`] — or stays
-/// `None` when the machine cannot back it (the reason is logged by `startup::load`); the
-/// page that renders from it then hides the affected section, page, or category (R4.2).
+/// `None` when the machine cannot back it (the reason is logged by `core::load::load`);
+/// the page that renders from it then hides the affected section, page, or category
+/// (R4.2).
 ///
 /// The models come in two kinds, and the difference decides how the window treats them:
 ///
@@ -165,7 +166,7 @@ const LOADING_PAGE_NAME: &str = "__loading";
 ///   on its own after an Apply ([`Shell::commit_applied`]), and is kept wholesale on a
 ///   refresh while it holds staged edits *and the refresh still produced a replacement*
 ///   (a dirty model whose app or source went away is dropped; see
-///   `startup::adopt_refreshed_model`).
+///   [`adopt_refreshed_model`]).
 /// - **Write helpers** (`input`, `notifd_config`, `power`) are *not* separate staging
 ///   sources: every setting of their page is staged in the shared store as an ordinary
 ///   framework row, so they feed neither the dirty rollup nor a bespoke commit and are
@@ -193,13 +194,14 @@ struct PageModels {
     /// The Input page's write helper (tasks 6.6, 11.4): the keyboard-layout candidates
     /// and the `input.lua` write. `None` — and the Input page hidden — without `hyprctl`,
     /// on a hyprlang host, or when `input.lua` is missing or not fully understood (see
-    /// `startup::load_input_from`).
+    /// [`load_input_from`](crate::core::load::load_input_from)).
     input: Rc<RefCell<Option<InputModel>>>,
     /// The Notifications page's write helper for the staged notifd settings (task
     /// 11.15), whose file write the pipeline follows with notifd's `Reload()`. `None`
     /// when notifd is not running at version 1.1 or later, or its file is missing or not
-    /// understood (see `startup::load_notifd_config_from`); the page then shows only its
-    /// runtime controls.
+    /// understood (see
+    /// [`load_notifd_config_from`](crate::core::load::load_notifd_config_from)); the page
+    /// then shows only its runtime controls.
     notifd_config: Rc<RefCell<Option<NotifdConfigModel>>>,
     /// The Power & Idle page's write helper (task 6.8): the `hypridle.conf` write for the
     /// store-backed timeouts and lock command, followed by a hypridle restart. `None` when
@@ -535,28 +537,6 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     shell.start_load();
 
     window
-}
-
-/// Runs one full [`startup::load`] pass — detection, backing-file parsing, and the
-/// bespoke page models — on relm4's blocking pool, handing the result to `on_done` on
-/// the main thread (architecture §8).
-///
-/// Shared by the cold-start load (task 5.4) and the manual Refresh (R4.3), which must
-/// run the *same* loader path so refreshed capabilities and rebuilt models never
-/// diverge; only what each does with the result differs. GTK is single-threaded, so
-/// the worker only gathers data — `on_done` is where widgets may be touched. It
-/// receives `None` when the worker finished without delivering a result (the window
-/// closed while it ran), which every caller treats as harmless.
-fn spawn_load(on_done: impl FnOnce(Option<StartupLoad>) + 'static) {
-    let (sender, receiver) = relm4::channel::<StartupLoad>();
-    relm4::spawn_blocking(move || {
-        // A send failure only means the receiver was dropped — the window closed
-        // before the load finished, which is harmless, so it is not an error.
-        if sender.send(startup::load()).is_err() {
-            tracing::debug!("load discarded; window closed before it completed");
-        }
-    });
-    relm4::spawn_local(async move { on_done(receiver.recv().await) });
 }
 
 /// Connects a page-entry hook that runs `probe` on the page currently held in `page`
@@ -1322,11 +1302,11 @@ impl Shell {
     ///
     /// The refresh counterpart of [`Shell::apply_startup_load`], differing in what it
     /// must preserve. The store keeps its pending staged edits:
-    /// [`startup::merge_refreshed_files`] reloads externally-changed tracked files
+    /// [`merge_refreshed_files`] reloads externally-changed tracked files
     /// through [`SettingsStore::refresh`] (reporting them for the warning below) and
     /// only *newly appeared* files are loaded fresh. The staging models (Display,
     /// palette, GTK/icon/cursor themes, wallpaper) go through
-    /// [`startup::adopt_refreshed_model`], which keeps a model holding staged edits
+    /// [`adopt_refreshed_model`], which keeps a model holding staged edits
     /// rather than clobbering in-progress work. The Input/Notifications/Power helpers
     /// hold no staged state (their settings stage in the shared store), so they are
     /// simply replaced.
@@ -1345,13 +1325,13 @@ impl Shell {
 
         // R5.6: reload externally-changed tracked files (keeping pending edits) and
         // start tracking files that appeared since the last load.
-        let report = startup::merge_refreshed_files(&mut self.store.borrow_mut(), files);
+        let report = merge_refreshed_files(&mut self.store.borrow_mut(), files);
 
         // R4.3: adopt the refreshed capabilities and models before `populate` rebuilds
         // the pages from them.
         *self.capabilities.borrow_mut() = capabilities;
         let models = &self.models;
-        startup::adopt_refreshed_model(
+        adopt_refreshed_model(
             &mut models.display.borrow_mut(),
             display,
             DisplayModel::is_dirty,
@@ -1359,17 +1339,17 @@ impl Shell {
         *models.input.borrow_mut() = input;
         *models.notifd_config.borrow_mut() = notifications;
         *models.power.borrow_mut() = power;
-        startup::adopt_refreshed_model(
+        adopt_refreshed_model(
             &mut models.palette.borrow_mut(),
             palette,
             PaletteModel::is_dirty,
         );
-        startup::adopt_refreshed_model(
+        adopt_refreshed_model(
             &mut models.themes.borrow_mut(),
             themes,
             ThemesModel::is_dirty,
         );
-        startup::adopt_refreshed_model(
+        adopt_refreshed_model(
             &mut models.wallpaper.borrow_mut(),
             wallpaper,
             WallpaperModel::is_dirty,

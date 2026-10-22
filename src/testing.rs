@@ -405,8 +405,8 @@ fn create_parent_dirs(path: &Path) {
 /// The end-to-end Apply suites must load the [`SettingsStore`] **exactly as the app
 /// does** — the same `SettingId` ↔ file-key mapping, the same re-reader registered
 /// for conflict reloads — so instead of re-implementing the mapping (which would
-/// drift), these thin wrappers hand the suites the crate-private loader functions
-/// from [`crate::ui::startup`]. Each has the plain-`fn` shape a
+/// drift), these thin wrappers hand the suites the loader functions from
+/// [`crate::core::load`] under short names. Each has the plain-`fn` shape a
 /// [`FileReader`](crate::core::store::FileReader) needs, so a suite can pass the
 /// same function as both the initial load and the store's re-reader, mirroring the
 /// startup wiring.
@@ -418,24 +418,25 @@ pub mod loaders {
 
     /// The app's `~/.config/hypr/input.lua` loader (Input page, tasks 6.6, 11.4).
     pub fn input_lua(path: &Path) -> io::Result<FileValues> {
-        crate::ui::startup::load_input_lua(path)
+        crate::core::load::load_input_lua(path)
     }
 
     /// The app's `~/.config/hypr/hypridle.conf` loader (Power & Idle page, task 6.8).
     pub fn hypridle_conf(path: &Path) -> io::Result<FileValues> {
-        crate::ui::startup::load_hypridle_conf(path)
+        crate::core::load::load_hypridle_conf(path)
     }
 
     /// The app's `~/.config/notifd/config` loader (Notifications page, task 11.15).
     pub fn notifd_config(path: &Path) -> io::Result<FileValues> {
-        crate::ui::startup::load_notifd_config(path)
+        crate::core::load::load_notifd_config(path)
     }
 }
 
 /// The startup load's decision whether the Notifications page gets its staged notifd
-/// rows (task 11.15), and the rows it would then show — the crate-private pieces the
-/// window uses, re-exposed so an integration suite can check the visibility rule (and
-/// its `info` log, via [`capture_logs`]) against the fixture tree rather than a copy.
+/// rows (task 11.15), and the rows it would then show — the pieces the window uses (the
+/// row list itself is crate-private), re-exposed so an integration suite can check the
+/// visibility rule (and its `info` log, via [`capture_logs`]) against the fixture tree
+/// rather than a copy.
 pub mod notifications {
     use std::path::PathBuf;
 
@@ -446,7 +447,7 @@ pub mod notifications {
     /// The startup load's helper decision for `capabilities` and the file at `path`:
     /// `Some` exactly when the staged rows are shown.
     pub fn offer(capabilities: &Capabilities, path: PathBuf) -> Option<NotifdConfigModel> {
-        crate::ui::startup::load_notifd_config_from(capabilities, path)
+        crate::core::load::load_notifd_config_from(capabilities, path)
     }
 
     /// The settings of the staged rows the page shows for `model` — empty when there is
@@ -461,7 +462,7 @@ pub mod notifications {
 
 /// Loads one backing file into `store` through the given app loader, registering the
 /// same loader as the file's conflict re-reader — the exact wiring the startup path
-/// performs per [`LoadedFile`](crate::ui::startup) (task 5.4/7.2).
+/// performs per [`LoadedFile`](crate::core::load::LoadedFile) (task 5.4/7.2).
 ///
 /// Panics on a load failure: the suites always load a fixture file that exists, so a
 /// failure is a broken test setup to surface loudly (see the module docs on panics).
@@ -743,4 +744,12 @@ pub fn capture_logs(mut action: impl FnMut()) -> Vec<CapturedEvent> {
         .lock()
         .expect("log capture mutex should not be poisoned");
     events.clone()
+}
+
+/// A minimal usable `input.lua` whose `input` table holds only `sensitivity`.
+///
+/// Shared by the loader tests in `core::load` and the UI-facing startup tests in
+/// `ui::startup`, which both need the smallest file the Input loader accepts.
+pub fn input_lua_with_sensitivity(sensitivity: &str) -> String {
+    format!("hl.config({{\n    input = {{\n        sensitivity = {sensitivity},\n    }},\n}})\n")
 }

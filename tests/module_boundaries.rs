@@ -8,15 +8,13 @@
 //! and fails if any file imports or otherwise references `gtk`, `gtk4`, or
 //! `relm4` (the latter re-exports GTK and would be an equivalent backdoor).
 //!
-//! It also guards a small set of **individual files inside the otherwise-GTK
-//! `ui/` layer** that are GTK-free by design — currently `src/ui/startup.rs`,
-//! the worker-thread startup-load logic (task 5.4), which is headlessly tested
-//! (R6.2) and must stay pure so the load can be reasoned about without a
-//! display. Nothing else prevents a future edit from importing the toolkit
-//! there, so this test does. For those files the forbidden set additionally
-//! includes `glib` (the GLib bindings `gtk4` re-exports): the threading handoff
-//! belongs in `window.rs`, which owns the persistent shell, not in the pure
-//! load logic.
+//! It also holds **the startup load, `src/core/load/`, to a stricter rule**:
+//! besides being part of the `core/` scan, its files must not name `glib` (the
+//! GLib bindings `gtk4` re-exports) either. The load runs on a worker thread
+//! (task 5.4) and is headlessly tested (R6.2); the worker/main-thread handoff
+//! that glib's main context would provide belongs in the UI layer
+//! (`src/ui/startup.rs`), not in the pure load logic, and nothing but this test
+//! keeps it from creeping in.
 //!
 //! The task breakdown (`docs/tasks.md` §1.1) explicitly calls for this
 //! grep-style guard "or workspace crate split"; should the crate later be split
@@ -76,24 +74,23 @@ use lexical_guard::{rust_sources, strip_comments};
 /// supposedly headless layers just as effectively.
 const FORBIDDEN_CRATES: &[&str] = &["gtk", "gtk4", "relm4"];
 
-/// Crate roots forbidden in the individually-guarded GTK-free files under `ui/`
-/// (see [`GTK_FREE_UI_FILES`]).
+/// Crate roots forbidden in the startup-load module (see [`STARTUP_LOAD_DIR`]).
 ///
 /// Extends [`FORBIDDEN_CRATES`] with `glib`, the GLib bindings `gtk4` re-exports:
-/// `src/ui/startup.rs` is the worker-thread startup-load logic and is GTK-free by
+/// `src/core/load/` is the worker-thread startup-load logic and is GTK-free by
 /// construction (headlessly tested, R6.2), so it must not reach for glib's
-/// main-context/executor either — the threading handoff belongs in `window.rs`,
-/// which owns the persistent shell.
-const UI_FILE_FORBIDDEN_CRATES: &[&str] = &["gtk", "gtk4", "relm4", "glib"];
+/// main-context/executor either — the threading handoff belongs in
+/// `src/ui/startup.rs`, the UI layer's worker glue.
+const STARTUP_LOAD_FORBIDDEN_CRATES: &[&str] = &["gtk", "gtk4", "relm4", "glib"];
 
 /// The GTK-free layers whose source is scanned. Paths are relative to the crate
 /// root (`CARGO_MANIFEST_DIR`).
 const GTK_FREE_LAYERS: &[&str] = &["src/core", "src/parsers"];
 
-/// GTK-free source *files* that live inside the otherwise-GTK `ui/` layer and so
-/// are guarded individually rather than by directory. Paths are relative to the
-/// crate root.
-const GTK_FREE_UI_FILES: &[&str] = &["src/ui/startup.rs"];
+/// The startup-load module, scanned with the wider
+/// [`STARTUP_LOAD_FORBIDDEN_CRATES`] set on top of the `core/` layer scan. The
+/// path is relative to the crate root.
+const STARTUP_LOAD_DIR: &str = "src/core/load";
 
 #[test]
 fn core_and_parsers_are_gtk_free() {
@@ -121,28 +118,30 @@ fn core_and_parsers_are_gtk_free() {
 
 #[test]
 fn startup_load_logic_is_gtk_free() {
-    // `src/ui/startup.rs` lives under the GTK `ui/` layer but is GTK-free by
-    // design (task 5.4): its detection + config-parsing logic is headlessly
-    // tested (R6.2), so it must not import the toolkit — nor `glib`, since the
-    // worker/main-thread handoff belongs in `window.rs`, not the pure load.
+    // `src/core/load/` is the detection + config-parsing logic of the startup
+    // load (tasks 5.4, 9.21), headlessly tested (R6.2). Like all of `core/` it
+    // must not import the toolkit — and, on top of that, not `glib` either,
+    // since the worker/main-thread handoff belongs in `src/ui/startup.rs`, not
+    // in the pure load.
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
-    let files: Vec<PathBuf> = GTK_FREE_UI_FILES
-        .iter()
-        .map(|file| manifest_dir.join(file))
-        .collect();
-    for file in &files {
-        assert!(
-            file.is_file(),
-            "expected guarded GTK-free file {} to exist (task 5.4)",
-            file.display()
-        );
-    }
+    let load_dir = manifest_dir.join(STARTUP_LOAD_DIR);
+    assert!(
+        load_dir.is_dir(),
+        "expected the startup-load module {} to exist (task 9.21)",
+        load_dir.display()
+    );
+    let files = rust_sources(&load_dir);
+    assert!(
+        !files.is_empty(),
+        "expected Rust sources in the startup-load module {}",
+        load_dir.display()
+    );
 
-    let violations = scan_for_forbidden(&files, UI_FILE_FORBIDDEN_CRATES, &manifest_dir);
+    let violations = scan_for_forbidden(&files, STARTUP_LOAD_FORBIDDEN_CRATES, &manifest_dir);
     assert!(
         violations.is_empty(),
-        "the GTK-free `ui/` files must not import or reference gtk/relm4/glib \
+        "the startup-load module must not import or reference gtk/relm4/glib \
          (architecture §2, R6.2). Offending lines:\n{}",
         violations.join("\n")
     );
@@ -154,7 +153,7 @@ fn startup_load_logic_is_gtk_free() {
 /// Comments and literals are blanked first (see [`strip_comments`]) so a crate
 /// name mentioned in prose or in a string never counts — and, conversely, so no
 /// string can blank the code around it. Shared by both guards so the layer scan
-/// and the individual-file scan apply identical lexical rules, differing only in
+/// and the startup-load scan apply identical lexical rules, differing only in
 /// which crates they forbid.
 fn scan_for_forbidden(
     files: &[PathBuf],
@@ -195,8 +194,8 @@ fn scan_for_forbidden(
 ///    [`is_path_root`] for how the root is distinguished from an inner segment).
 ///
 /// The `forbidden` set is a parameter so the same lexical rules guard both the
-/// `core`/`parsers` layers and the individually-guarded `ui/` files, which forbid
-/// a slightly wider set (adding `glib`).
+/// `core`/`parsers` layers and the startup-load module, which forbids a slightly
+/// wider set (adding `glib`).
 fn forbidden_reference(line: &str, forbidden: &[&'static str]) -> Option<&'static str> {
     let trimmed = strip_visibility(line.trim());
 
@@ -438,13 +437,13 @@ fn a_rejected_occurrence_does_not_mask_a_real_one_later_on_the_line() {
 }
 
 #[test]
-fn glib_is_forbidden_only_in_the_individually_guarded_ui_files() {
-    // `src/ui/startup.rs` must not reach for glib's main context either (the
-    // worker/main-thread handoff belongs in `window.rs`), while the rest of the
-    // GTK-free layers are scanned with the narrower set.
+fn glib_is_forbidden_only_in_the_startup_load_module() {
+    // `src/core/load/` must not reach for glib's main context either (the
+    // worker/main-thread handoff belongs in `src/ui/startup.rs`), while the rest
+    // of the GTK-free layers are scanned with the narrower set.
     let line = "    let ctx = glib::MainContext::default();";
     assert_eq!(
-        forbidden_reference(line, UI_FILE_FORBIDDEN_CRATES),
+        forbidden_reference(line, STARTUP_LOAD_FORBIDDEN_CRATES),
         Some("glib")
     );
     assert_eq!(forbidden_reference(line, FORBIDDEN_CRATES), None);

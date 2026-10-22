@@ -64,7 +64,7 @@
 //! with no framework rows yet keeps its task-5.1 placeholder.
 //!
 //! The store the pages render from is populated by the worker-thread startup load
-//! (task 5.4, see [`super::startup`]): the initial values are parsed from the real
+//! (task 5.4, see [`crate::core::load`]): the initial values are parsed from the real
 //! config files, not demo constants. A setting whose backing file is missing or lacks
 //! its key simply has no store value — its control renders its default and rejects
 //! edits (`NotLoaded`) — which is the intended graceful degradation (R4.3/R4.4).
@@ -1173,7 +1173,7 @@ mod tests {
         // the right Value. (The initial values now come from the startup load's parse
         // of the real config files — task 5.4 — not a demo seed, so there is no seed
         // to cross-check here; the loader maps each setting to a value of its kind and
-        // is tested in `super::super::startup`.)
+        // is tested in `crate::core::load`.)
         for category in [SidebarCategory::PowerAndIdle] {
             let descriptors = category_rows(category);
             assert!(

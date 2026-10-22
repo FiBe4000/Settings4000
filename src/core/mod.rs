@@ -29,8 +29,8 @@ pub mod detect;
 // Home-relative (`~/…`) config values (task 11.10, R8.3): the one definition of
 // which `~` form is expanded for validation and the file chooser, and of how a
 // chosen image path is written back in the form the file already uses. Used by
-// `model`'s image-path validator and `theme`'s wallpaper model; `ui::startup`
-// takes the home directory from it.
+// `model`'s image-path validator and `theme`'s wallpaper model; the startup load
+// (`load`) takes the home directory from it.
 pub mod home_path;
 
 // The typed settings model + validators (R8.3). The SettingsStore (`store`)
@@ -122,7 +122,7 @@ pub mod notifications;
 // `parsers::kv` line model. The settings are staged in `store`; this module's
 // `NotifdConfigModel` renders the one write, which the pipeline follows with notifd's
 // `Reload()` (`reload::BackingFile::NotifdConfig`). `model` calls its range check at
-// stage time, the startup load (`ui::startup`) its reader, and the plan assembler
+// stage time, the startup load (`load`) its reader, and the plan assembler
 // (`assemble`) its write glue.
 pub mod notifd_config;
 
@@ -172,3 +172,12 @@ pub mod theme;
 // display (R6.2); the window (`ui::window`) runs the resulting plan, surfaces the outcome
 // through `ui::chrome`, and commits the sources the assembler reports as contributing.
 pub mod assemble;
+
+// The startup load (tasks 5.4, 9.21; architecture §8; R4.3, R4.4, R6.2). It runs detection
+// (`detect`), reads and parses every store-backed config file into the `store`'s originals
+// and re-readers, builds the bespoke page models (`display`, `input`, `notifd_config`,
+// `power`, `theme`) for the detected capabilities, and holds the refresh rules that merge a
+// later pass into live state. It is GTK-free so it runs on a worker thread and is tested
+// headlessly; the UI layer (`ui::startup`) only moves it onto that thread, and the window
+// (`ui::window`) applies its `StartupLoad` on the main thread.
+pub mod load;

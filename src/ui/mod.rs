@@ -23,9 +23,10 @@
 //!   apply-outcome→toast/dialog/commit, refresh-report→conflict warning) plus the
 //!   plain-GTK toast and warning dialog (task 5.3). The decisions are headlessly
 //!   tested (R6.2).
-//! - [`startup`] — the worker-thread startup load (task 5.4): the GTK-free logic that
-//!   runs detection and parses the backing config files off the main thread, which
-//!   the window applies on completion. Headlessly tested (R6.2).
+//! - [`startup`] — the worker-thread glue of the startup load (tasks 5.4, 9.21): it runs
+//!   the GTK-free [`crate::core::load`] pass (detection plus parsing every backing
+//!   config file) on a worker thread and hands the result back to the main thread,
+//!   where the window applies it.
 //! - [`display`] — the Display page's bespoke glue (task 6.1): per-monitor
 //!   resolution/refresh/scale/position drop-downs and a per-monitor enable switch
 //!   rendered from the runtime-discovered [`crate::core::display`] model, plus the
@@ -72,19 +73,15 @@ mod chrome;
 mod display;
 mod input;
 mod network;
-// Crate-visible for the same reason as `startup` below: `crate::testing` re-exposes its
-// GTK-free staged-row list so the Notifications integration suite can check which rows
-// the page shows (task 11.15).
+// Crate-visible (not `pub`) so the test-support module (`crate::testing`, task 7.2) can
+// re-expose its GTK-free staged-row list, letting the Notifications integration suite
+// check which rows the page shows (task 11.15). Nothing outside the crate can reach it
+// directly; the public surface stays `ui::app`.
 pub(crate) mod notifications;
 mod page;
 mod row;
 mod sound;
-// `startup` and `window` are crate-visible (not `pub`) so the test-support
-// module (`crate::testing`, task 7.2) can re-expose their GTK-free pieces —
-// the backing-file loaders and the base Apply-plan builder — letting the
-// integration suites drive the exact code paths the app runs. Nothing outside
-// the crate can reach them directly; the public surface stays `ui::app`.
-pub(crate) mod startup;
+mod startup;
 mod theme;
 mod widgets;
-pub(crate) mod window;
+mod window;

@@ -38,12 +38,12 @@
 //! ([`SectionStep::nth`], §3.2). Editing one listener's `timeout` therefore rewrites
 //! only that occurrence's value span, leaving the other listener blocks byte-identical
 //! (the headline task-6.8 acceptance criterion). The assumption is documented here and
-//! pinned by [`power_key_path`], which both the read side ([`crate::ui::startup`]) and
-//! the write side share, so a value round-trips through the same address it was parsed
-//! from. A config whose listeners are in a different order would map the sliders to the
-//! wrong blocks — inherent to positional matching, and why the ordering is called out
-//! rather than inferred from each listener's `on-timeout` command (which is deliberately
-//! not editable here).
+//! pinned by [`power_key_path`], which both the read side
+//! ([`crate::core::load::load_hypridle_conf`]) and the write side share, so a value
+//! round-trips through the same address it was parsed from. A config whose listeners
+//! are in a different order would map the sliders to the wrong blocks — inherent to
+//! positional matching, and why the ordering is called out rather than inferred from
+//! each listener's `on-timeout` command (which is deliberately not editable here).
 //!
 //! # Where the lock command lives
 //!
@@ -115,8 +115,8 @@ const DPMS_LISTENER: usize = 2;
 /// the `timeout` key of a specific `listener { }` occurrence, and the lock command to
 /// `general.lock_cmd`. The grace period resolves to `general.lock_cmd` as well, because
 /// it is a token inside that value rather than a key (see the module docs). The read
-/// side ([`crate::ui::startup`]) uses this same map, so a value is parsed from and
-/// written back to the identical address.
+/// side ([`crate::core::load::load_hypridle_conf`]) uses this same map, so a value is
+/// parsed from and written back to the identical address.
 pub fn power_key_path(id: SettingId) -> Option<KeyPath> {
     match id {
         SettingId::DimTimeout => Some(listener_timeout_path(DIM_LISTENER)),
