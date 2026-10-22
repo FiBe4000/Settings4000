@@ -1,4 +1,4 @@
-//! The Display page's bespoke GTK glue (tasks 6.1, 11.8, 11.9; architecture §7;
+//! The Display page's bespoke GTK glue (tasks 6.1, 10.3, 11.8, 11.9; architecture §7;
 //! R2.3, R4.2, R4.4, R5.2, R8.3).
 //!
 //! # Why this page is bespoke, not declarative
@@ -51,32 +51,65 @@
 //! reports each
 //! through the shared `on_changed` callback so the window's Apply/Reset chrome lights
 //! up (as the declarative pages do). The laptop panel's enable control is
-//! **runtime-only**: toggling it calls [`DisplayModel::toggle_laptop`] immediately,
-//! which runs the dotfiles' `scripts/hypr-toggle-laptop-display` between two reads of
-//! the compositor's monitor list (task 11.8), never staging and never marking the
-//! page dirty. The switch is re-drawn from the state *read* afterwards, so a toggle
-//! that did not take snaps back and shows why underneath. The control exists only
-//! when detection found the script (R4.2). Its mode/scale, by contrast, are staged
-//! like any monitor's (the single-source gotcha, analysis §6.2).
+//! **runtime-only**: toggling it runs the dotfiles' `scripts/hypr-toggle-laptop-display`
+//! right away, between two reads of the compositor's monitor list (task 11.8), never
+//! staging and never marking the page dirty. The switch is re-drawn from the state
+//! *read* afterwards, so a toggle that did not take snaps back and shows why
+//! underneath. The control exists only when detection found the script (R4.2). Its
+//! mode/scale, by contrast, are staged like any monitor's (the single-source gotcha,
+//! analysis §6.2).
 //!
-//! The script runs synchronously on the GTK main thread through the real
-//! [`CommandRunner`](crate::system::command::CommandRunner), like the other runtime
-//! controls (Sound, Network, Notifications). Its 5 s timeout bounds the script
-//! itself, **not** the wait for its bar-relaunch child: on a timeout the runner
-//! kills only the script's shell and then keeps reading the captured output until
-//! the orphaned `launch-eww-bars` closes the pipes it inherited, so a slow eww
-//! restart can freeze the window for longer. Moving the toggle off the main thread
-//! is a recorded follow-up in `docs/tasks.md`.
+//! # The laptop toggle runs off the main thread (task 10.3)
+//!
+//! Unlike the other runtime controls (Sound, Network, Notifications), whose commands
+//! return quickly and run on the main thread, the toggle script can take seconds: it
+//! ends by relaunching the eww bars, which can restart the eww daemon. Its 5 s runner
+//! timeout bounds the script itself, **not** the wait for that relaunch — on a
+//! timeout the runner kills only the script's shell and then keeps reading the
+//! captured output until the orphaned `launch-eww-bars` closes the pipes it
+//! inherited. On the main thread that froze the window for the script's whole
+//! duration. So the page uses the model's three-step toggle: the request is taken
+//! from the model on the main thread, [`LaptopToggleRequest::run`] issues the
+//! commands on a worker ([`run_off_main_thread`]), and the outcome comes back to the
+//! main thread, where [`DisplayModel::finish_laptop_toggle`] stores the read state
+//! and the page rebuilds. Meanwhile the switch shows the requested position but is
+//! insensitive, with a note saying the switch is in progress, so a second toggle
+//! cannot start while the script runs.
+//!
+//! Two alternatives were rejected. Killing the script's whole process group on a
+//! timeout would SIGKILL `launch-eww-bars` mid-restart and leave the session without
+//! bars. A longer per-command timeout for the script would not help at all: the
+//! window would still be frozen while it ran, only for longer.
+//!
+//! Apply stays clickable while a toggle is in flight. A Display Apply writes
+//! `monitors.conf` and runs `hyprctl reload`, which can now interleave with the
+//! script's `hl.monitor` call and bar relaunch — impossible before, when the toggle
+//! blocked the main thread. The race is accepted rather than prevented: the switch
+//! is drawn from the second read, never from an assumed state, so it shows whatever
+//! the panel ended up as; a conflict reload that replaces the model mid-toggle is
+//! handled by storing the read by output name; and the Lua monitor loader in
+//! `hyprland.lua` keeps the docked panel state across reloads (analysis §8.1), so a
+//! reload does not undo the toggle.
+//!
+//! The in-flight flag and the last toggle's error live in a [`LaptopToggleState`] the
+//! window owns, not on the page or the model: a Refresh rebuilds this page and may
+//! replace the model while the script runs, and either would otherwise forget that a
+//! toggle is still running and offer the switch again. When the outcome arrives it
+//! is stored on whichever model is current, and whichever page is current is rebuilt.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::cell::{Cell, RefCell};
+use std::rc::{Rc, Weak};
 
 use gtk4::prelude::*;
 use gtk4::{Align, Box as GtkBox, Frame, Orientation, ScrolledWindow, Switch};
 
-use crate::core::display::{DisplayModel, MonitorView, StageRefusal};
-use crate::system::command::SystemCommandRunner;
+use crate::core::display::{
+    DisplayModel, LaptopToggleError, LaptopToggleOutcome, LaptopToggleRequest, MonitorView,
+    StageRefusal,
+};
+use crate::system::command::{CommandRunner, SystemCommandRunner};
 use crate::ui::widgets::{PAGE_MARGIN, SECTION_SPACING, build_dropdown, labelled_row, note};
+use crate::ui::worker::run_off_main_thread;
 
 /// The mounted Display page: the scrollable root plus the handle the window uses to
 /// re-render it after a Reset or a committed Apply.
@@ -99,11 +132,143 @@ impl DisplayPage {
     /// Reset or a committed Apply so the drop-downs snap to the model's values.
     pub(crate) fn rerender(&self) {
         // A Reset or Apply is unrelated to the last laptop toggle or refused edit,
-        // so their notes must not survive into the re-rendered page.
-        self.inner.laptop_error.replace(None);
+        // so their notes must not survive into the re-rendered page. A toggle still
+        // running stays marked as running: its outcome has not arrived yet.
+        self.inner.laptop.error.replace(None);
         self.inner.stage_error.replace(None);
         self.inner.rebuild();
     }
+}
+
+/// The runtime laptop toggle's state that must outlive any one Display page and any
+/// one Display model (task 10.3): whether a toggle is running on the worker, why the
+/// last one did not take, and which page to rebuild when an outcome arrives.
+///
+/// The window creates one for its whole lifetime and hands it to every page it
+/// builds ([`build`]). See the module docs for why the flag cannot live on the page
+/// or on the model.
+#[derive(Default)]
+pub(crate) struct LaptopToggleState {
+    /// The panel state the running toggle asked for (`true` for on), or `None` when
+    /// no toggle is running. While `Some`, the switch is drawn at this position and
+    /// insensitive, and a new toggle is refused.
+    ///
+    /// There is no upper bound on how long it stays `Some`: if the runner's drain of
+    /// the script's output never finishes (a grandchild keeps the inherited stdout or
+    /// stderr open), the switch stays insensitive with the "Switching…" note for the
+    /// window's lifetime, and by design neither Refresh nor Reset clears it. That is
+    /// strictly better than the frozen window it replaces; a watchdog is backlog
+    /// task 10.7 in `docs/tasks.md`.
+    pending: Cell<Option<bool>>,
+    /// Why the last laptop toggle did not take, shown under the switch until the
+    /// next toggle, Reset or Apply (R5.5), or `None` after a successful one.
+    error: RefCell<Option<String>>,
+    /// The page that currently shows the switch, rebuilt when a toggle starts or
+    /// finishes. Weak, so a page the window dropped (a Refresh rebuilds the page)
+    /// is simply skipped.
+    page: RefCell<Weak<Inner>>,
+}
+
+impl LaptopToggleState {
+    /// Starts the runtime laptop toggle of monitor `index` towards `enable` (R5.2):
+    /// takes the request from the shared `model`, marks the toggle as running and
+    /// rebuilds the page, then runs the script and its reads through `runner` on a
+    /// worker thread and returns at once. The outcome is handled by [`Self::finish`]
+    /// on the main thread.
+    ///
+    /// A toggle the model refuses outright ([`LaptopToggleError::Unavailable`]) runs
+    /// nothing and only shows why; without a model there is no switch to update. A
+    /// call while a toggle is already running is ignored — the switch is
+    /// insensitive then, so only a signal already queued could reach it — rather
+    /// than running the pure-toggle script twice at once.
+    ///
+    /// Runtime-only: it never stages or changes dirty state, so the window's
+    /// Apply/Reset chrome is not told about it.
+    fn start(
+        self: &Rc<Self>,
+        model: &Rc<RefCell<Option<DisplayModel>>>,
+        index: usize,
+        enable: bool,
+        runner: impl CommandRunner + Send + 'static,
+    ) {
+        if self.pending.get().is_some() {
+            tracing::debug!("a laptop-display toggle is already running; the new one is ignored");
+            return;
+        }
+        let request = model
+            .borrow()
+            .as_ref()
+            .map(|model| model.laptop_toggle_request(index, enable));
+        let request: LaptopToggleRequest = match request {
+            Some(Ok(request)) => request,
+            Some(Err(error)) => {
+                self.error.replace(Some(toggle_error_note(&error)));
+                self.rebuild_page();
+                return;
+            }
+            None => {
+                self.error.replace(None);
+                self.rebuild_page();
+                return;
+            }
+        };
+
+        self.pending.set(Some(request.enable()));
+        self.error.replace(None);
+        self.rebuild_page();
+
+        let state = Rc::clone(self);
+        let model = Rc::clone(model);
+        run_off_main_thread(
+            move || request.run(&runner),
+            move |outcome| state.finish(&model, outcome),
+        );
+    }
+
+    /// Handles a toggle's outcome on the main thread: stores the read state on the
+    /// current model ([`DisplayModel::finish_laptop_toggle`]), keeps any error for
+    /// the switch's note, clears the running flag and rebuilds the current page.
+    ///
+    /// `outcome` is `None` when the worker ended without one (it panicked); the
+    /// switch is then re-enabled at the last state read before the toggle, and the
+    /// loss is logged — the commands, if they ran, were logged by the runner.
+    fn finish(&self, model: &RefCell<Option<DisplayModel>>, outcome: Option<LaptopToggleOutcome>) {
+        self.pending.set(None);
+        let result = match outcome {
+            Some(outcome) => model
+                .borrow_mut()
+                .as_mut()
+                .map(|model| model.finish_laptop_toggle(outcome)),
+            None => {
+                tracing::error!(
+                    "the laptop-display toggle worker ended without a result; the switch \
+                     shows the last state read (R5.5)"
+                );
+                None
+            }
+        };
+        // The model has already logged any failure; here it is only kept for the
+        // rebuild to show under the switch.
+        self.error.replace(match result {
+            Some(Err(error)) => Some(toggle_error_note(&error)),
+            Some(Ok(())) | None => None,
+        });
+        self.rebuild_page();
+    }
+
+    /// Rebuilds the page currently showing the switch, if the window still has one.
+    fn rebuild_page(&self) {
+        // Upgrade first, so the `page` borrow is released before the rebuild runs.
+        let page = self.page.borrow().upgrade();
+        if let Some(page) = page {
+            page.rebuild();
+        }
+    }
+}
+
+/// The note shown under the laptop switch for a toggle that did not take (R5.5).
+fn toggle_error_note(error: &LaptopToggleError) -> String {
+    format!("The laptop display was not switched: {error}.")
 }
 
 /// The shared render state the page's control handlers operate on.
@@ -121,9 +286,9 @@ struct Inner {
     /// Display page's dirty marker (task 5.3). Not called for the runtime laptop
     /// toggle, which never changes dirty state.
     on_changed: Rc<dyn Fn()>,
-    /// Why the last laptop toggle did not take, shown under the switch until the
-    /// next toggle (R5.5), or `None` after a successful one.
-    laptop_error: RefCell<Option<String>>,
+    /// The window-lifetime state of the runtime laptop toggle (task 10.3): whether
+    /// one is running and why the last one failed.
+    laptop: Rc<LaptopToggleState>,
     /// The monitor index and reason of the last refused staged edit (R8.3), shown
     /// under that monitor's controls until the next edit, or `None` after an
     /// accepted one.
@@ -205,7 +370,9 @@ impl Inner {
         if view.is_laptop() {
             if view.laptop_toggle_available() {
                 section.append(&self.build_laptop_toggle(index, view));
-                if let Some(error) = self.laptop_error.borrow().as_deref() {
+                if self.laptop.pending.get().is_some() {
+                    section.append(&note("Switching the laptop display…"));
+                } else if let Some(error) = self.laptop.error.borrow().as_deref() {
                     section.append(&note(error));
                 }
             }
@@ -247,13 +414,21 @@ impl Inner {
     }
 
     /// The runtime laptop-display enable toggle (R5.2): flipping it runs the dotfiles'
-    /// toggle script (task 11.8), never staging or touching `monitors.conf`. Its
-    /// position is the panel's last *read* state.
+    /// toggle script (task 11.8) on a worker thread (task 10.3), never staging or
+    /// touching `monitors.conf`. Its position is the panel's last *read* state —
+    /// except while a toggle runs, when it shows the requested state and is
+    /// insensitive until the re-read arrives.
     fn build_laptop_toggle(self: &Rc<Self>, index: usize, view: MonitorView<'_>) -> GtkBox {
         let switch = Switch::new();
         switch.set_halign(Align::End);
         switch.set_valign(Align::Center);
-        switch.set_active(view.laptop_enabled());
+        match self.laptop.pending.get() {
+            Some(requested) => {
+                switch.set_active(requested);
+                switch.set_sensitive(false);
+            }
+            None => switch.set_active(view.laptop_enabled()),
+        }
 
         let weak = Rc::downgrade(self);
         switch.connect_active_notify(move |switch| {
@@ -392,29 +567,21 @@ impl Inner {
         self.rebuild();
     }
 
-    /// Applies the runtime laptop toggle immediately (R5.2), then rebuilds.
-    ///
-    /// Runtime-only: it does not stage or change dirty state, so it does not call
-    /// `on_changed`. The script and the reads around it run through the real system
-    /// runner; the model has already logged any failure, so here it is only kept for
-    /// the rebuild to show under the switch, which is re-drawn from the read state.
+    /// Starts the runtime laptop toggle (R5.2) through the real system runner, on a
+    /// worker thread ([`LaptopToggleState::start`], task 10.3).
     fn toggle_laptop(self: &Rc<Self>, index: usize, enable: bool) {
-        let runner = SystemCommandRunner::new();
-        let result = self
-            .model
-            .borrow_mut()
-            .as_mut()
-            .map(|model| model.toggle_laptop(index, enable, &runner));
-        self.laptop_error.replace(match result {
-            Some(Err(error)) => Some(format!("The laptop display was not switched: {error}.")),
-            Some(Ok(())) | None => None,
-        });
-        self.rebuild();
+        self.laptop
+            .start(&self.model, index, enable, SystemCommandRunner::new());
     }
 }
 
 /// Builds the Display page over the shared `model`, reporting staged edits through
 /// `on_changed` (task 6.1).
+///
+/// `laptop` is the window's long-lived laptop-toggle state (task 10.3); the new page
+/// registers itself there as the one to rebuild when a running toggle finishes, so
+/// a toggle started on a page a Refresh has since replaced still updates the switch
+/// the user sees.
 ///
 /// The returned [`DisplayPage`] must be kept alive by the window: it owns the strong
 /// reference to the render state whose handlers keep the model wired. The window
@@ -423,6 +590,7 @@ impl Inner {
 pub(crate) fn build(
     model: Rc<RefCell<Option<DisplayModel>>>,
     on_changed: Rc<dyn Fn()>,
+    laptop: Rc<LaptopToggleState>,
 ) -> DisplayPage {
     let content = GtkBox::new(Orientation::Vertical, SECTION_SPACING);
     content.set_margin_top(PAGE_MARGIN);
@@ -434,9 +602,10 @@ pub(crate) fn build(
         content: content.clone(),
         model,
         on_changed,
-        laptop_error: RefCell::new(None),
+        laptop: Rc::clone(&laptop),
         stage_error: RefCell::new(None),
     });
+    laptop.page.replace(Rc::downgrade(&inner));
     inner.rebuild();
 
     let root = ScrolledWindow::new();
@@ -453,4 +622,271 @@ fn position_of(options: &[String], value: &str) -> Option<u32> {
         .iter()
         .position(|option| option == value)
         .map(|index| index as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The page's laptop-toggle bookkeeping, exercised without widgets (task 10.3).
+    //!
+    //! Building the page needs an initialised GTK and so a display server, which the
+    //! test suite does not have; [`LaptopToggleState`] does not touch widgets unless
+    //! a page is registered, so these tests drive it directly, with their own GLib
+    //! main context standing in for the GTK main loop.
+
+    use std::cell::RefCell;
+    use std::path::Path;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::time::Duration;
+
+    use gtk4::glib::MainContext;
+
+    use super::LaptopToggleState;
+    use crate::core::display::DisplayModel;
+    use crate::system::command::{
+        Command, CommandError, CommandOutput, CommandRunner, MockCommandRunner,
+    };
+    use crate::ui::worker::drive_until;
+
+    /// A placeholder path for the detected toggle script; nothing is executed.
+    const TOGGLE_SCRIPT: &str = "/test/dotfiles/scripts/hypr-toggle-laptop-display";
+
+    /// A `hyprctl monitors all -j` reply listing one laptop panel, `eDP-1`, on or off.
+    fn monitors_json(enabled: bool) -> String {
+        format!(
+            r#"[{{"name": "eDP-1", "description": "Test panel", "width": 2560,
+                "height": 1440, "refreshRate": 60.0, "x": 0, "y": 0, "scale": 1.0,
+                "disabled": {}, "availableModes": ["2560x1440@60.00Hz"]}}]"#,
+            !enabled
+        )
+    }
+
+    /// A successful monitors reply for the panel in state `enabled`.
+    fn probe_reply(enabled: bool) -> Result<CommandOutput, CommandError> {
+        Ok(CommandOutput::fake_with_streams(
+            0,
+            &monitors_json(enabled),
+            "",
+        ))
+    }
+
+    /// The shared model the window would hold: one panel, read as on at load, with
+    /// the toggle script detected.
+    fn shared_model(dir: &Path) -> Rc<RefCell<Option<DisplayModel>>> {
+        let conf = dir.join("monitors.conf");
+        std::fs::write(&conf, "monitor=,preferred,auto,1\n").expect("write monitors.conf");
+        let load = MockCommandRunner::with_outcomes([probe_reply(true)]);
+        let model = DisplayModel::load(&load, conf, Some(TOGGLE_SCRIPT.into()))
+            .expect("the probe yields a model");
+        Rc::new(RefCell::new(Some(model)))
+    }
+
+    /// The panel's switch position as the page would draw it from `model`.
+    fn panel_enabled(model: &RefCell<Option<DisplayModel>>) -> bool {
+        model
+            .borrow()
+            .as_ref()
+            .and_then(|model| model.monitor(0).map(|view| view.laptop_enabled()))
+            .expect("the panel is listed")
+    }
+
+    /// A runner that records through a shared [`MockCommandRunner`] and then, for
+    /// the toggle script only, blocks until the test releases it — a script still
+    /// running on the worker while the test inspects the main thread.
+    struct GatedRunner {
+        /// Records every command and answers from its canned outcomes.
+        recorder: Arc<MockCommandRunner>,
+        /// Receives one message per release of the script.
+        gate: Receiver<()>,
+    }
+
+    impl CommandRunner for GatedRunner {
+        fn run(&self, command: &Command) -> Result<CommandOutput, CommandError> {
+            let output = self.recorder.run(command);
+            if command.program() == TOGGLE_SCRIPT {
+                self.gate
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("the test releases the script");
+            }
+            output
+        }
+    }
+
+    /// A gated runner answering `outcomes` in order, its recorder, and the sender
+    /// that releases the script.
+    fn gated_runner(
+        outcomes: [Result<CommandOutput, CommandError>; 3],
+    ) -> (GatedRunner, Arc<MockCommandRunner>, Sender<()>) {
+        let recorder = Arc::new(MockCommandRunner::with_outcomes(outcomes));
+        let (release, gate) = mpsc::channel();
+        let runner = GatedRunner {
+            recorder: Arc::clone(&recorder),
+            gate,
+        };
+        (runner, recorder, release)
+    }
+
+    /// The read–script–read sequence of a toggle that ran the script (task 11.8).
+    fn toggle_sequence() -> Vec<Command> {
+        vec![
+            Command::new("hyprctl").args(["monitors", "all", "-j"]),
+            Command::new(TOGGLE_SCRIPT),
+            Command::new("hyprctl").args(["monitors", "all", "-j"]),
+        ]
+    }
+
+    #[test]
+    fn the_toggle_result_arrives_through_the_main_loop_while_the_ui_thread_stays_free() {
+        // Task 10.3 acceptance: `start` returns while the script is still running
+        // on the worker; meanwhile the main thread can borrow the model mutably (no
+        // borrow is held across the run), the toggle is marked running, and a second
+        // toggle is refused without issuing a command. The result reaches the model
+        // only once the main loop delivers it, and then the switch shows the read.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let model = shared_model(dir.path());
+        let state = Rc::new(LaptopToggleState::default());
+        let (runner, recorder, release) = gated_runner([
+            probe_reply(true),
+            Ok(CommandOutput::fake(0)),
+            probe_reply(false),
+        ]);
+
+        let context = MainContext::new();
+        context
+            .with_thread_default(|| {
+                state.start(&model, 0, false, runner);
+
+                // The script is running on the worker (it has been issued and is
+                // blocked) while this thread carries on.
+                drive_until(&context, || recorder.recorded().len() == 2);
+                assert_eq!(state.pending.get(), Some(false), "the switch is disabled");
+                assert!(
+                    model.try_borrow_mut().is_ok(),
+                    "the main thread holds no model borrow while the script runs"
+                );
+                assert!(panel_enabled(&model), "nothing stored before the re-read");
+
+                // A second toggle while the first runs is ignored.
+                state.start(&model, 0, true, MockCommandRunner::new());
+                assert_eq!(state.pending.get(), Some(false));
+
+                release.send(()).expect("the script is waiting");
+                drive_until(&context, || state.pending.get().is_none());
+            })
+            .expect("the test thread owns its main context");
+
+        assert!(!panel_enabled(&model), "the switch shows the re-read state");
+        assert_eq!(*state.error.borrow(), None);
+        assert_eq!(recorder.recorded(), toggle_sequence());
+        assert!(
+            !model.borrow().as_ref().expect("model").is_dirty(),
+            "the runtime toggle never stages"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_panel_re_enables_the_switch_with_the_reason() {
+        // The 11.8 semantics survive the hop: the second read decides, so a panel
+        // still on after the script is an error shown under the re-enabled switch,
+        // which stays at the read state.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let model = shared_model(dir.path());
+        let state = Rc::new(LaptopToggleState::default());
+        let (runner, recorder, release) = gated_runner([
+            probe_reply(true),
+            Ok(CommandOutput::fake(1)),
+            probe_reply(true),
+        ]);
+        release.send(()).expect("pre-release the script");
+
+        let context = MainContext::new();
+        context
+            .with_thread_default(|| {
+                state.start(&model, 0, false, runner);
+                drive_until(&context, || state.pending.get().is_none());
+            })
+            .expect("the test thread owns its main context");
+
+        assert!(panel_enabled(&model), "the switch stays on, as read");
+        assert_eq!(
+            state.error.borrow().as_deref(),
+            Some(
+                "The laptop display was not switched: the panel is still on after running \
+                 the toggle script; the toggle script exited with status 1."
+            )
+        );
+        assert_eq!(recorder.recorded(), toggle_sequence());
+    }
+
+    #[test]
+    fn an_outcome_lands_on_the_model_that_replaced_the_one_it_started_from() {
+        // A Refresh can swap in a freshly loaded model while the script runs. The
+        // outcome is stored by output name on whichever model is current, so the
+        // rebuilt page shows the toggle's read rather than the refresh's older one.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let model = shared_model(dir.path());
+        let state = Rc::new(LaptopToggleState::default());
+        let (runner, _recorder, release) = gated_runner([
+            probe_reply(true),
+            Ok(CommandOutput::fake(0)),
+            probe_reply(false),
+        ]);
+
+        let context = MainContext::new();
+        context
+            .with_thread_default(|| {
+                state.start(&model, 0, false, runner);
+                let replacement = shared_model(dir.path()).borrow_mut().take();
+                *model.borrow_mut() = replacement;
+                assert!(
+                    panel_enabled(&model),
+                    "the replacement read the panel as on"
+                );
+                release.send(()).expect("the script is waiting");
+                drive_until(&context, || state.pending.get().is_none());
+            })
+            .expect("the test thread owns its main context");
+
+        assert!(
+            !panel_enabled(&model),
+            "the toggle's read reached the new model"
+        );
+    }
+
+    #[test]
+    fn a_toggle_the_model_refuses_runs_nothing_and_says_why() {
+        // Without a detected script the switch is hidden; a caller that tries anyway
+        // gets the refusal as a note, synchronously, with no worker and no command.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conf = dir.path().join("monitors.conf");
+        let load = MockCommandRunner::with_outcomes([probe_reply(true)]);
+        let model = Rc::new(RefCell::new(DisplayModel::load(&load, conf, None)));
+        let state = Rc::new(LaptopToggleState::default());
+        let runner = Arc::new(MockCommandRunner::new());
+
+        state.start(&model, 0, false, ArcRunner(Arc::clone(&runner)));
+
+        assert_eq!(state.pending.get(), None);
+        assert!(
+            state
+                .error
+                .borrow()
+                .as_deref()
+                .is_some_and(|note| note.contains("not available")),
+            "got {:?}",
+            state.error.borrow()
+        );
+        assert!(runner.recorded().is_empty());
+    }
+
+    /// A [`CommandRunner`] forwarding to a shared mock, so a test can move the runner
+    /// into [`LaptopToggleState::start`] and still inspect what it recorded.
+    struct ArcRunner(Arc<MockCommandRunner>);
+
+    impl CommandRunner for ArcRunner {
+        fn run(&self, command: &Command) -> Result<CommandOutput, CommandError> {
+            self.0.run(command)
+        }
+    }
 }

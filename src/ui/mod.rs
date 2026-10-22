@@ -29,6 +29,9 @@
 //!   the GTK-free [`crate::core::load`] pass (detection plus parsing every backing
 //!   config file) on a worker thread and hands the result back to the main thread,
 //!   where the window applies it.
+//! - [`worker`] — the one hop off the GTK main thread and back (tasks 5.4, 10.3): blocking
+//!   work (the startup load, the laptop-display toggle script) runs on a worker thread
+//!   and only its result returns to the main loop, so the window never freezes.
 //! - [`display`] — the Display page's bespoke glue (task 6.1): per-monitor
 //!   resolution/refresh/scale/position drop-downs and a per-monitor enable switch
 //!   rendered from the live [`crate::core::display`] model, plus the
@@ -112,3 +115,4 @@ mod startup;
 mod theme;
 mod widgets;
 mod window;
+mod worker;

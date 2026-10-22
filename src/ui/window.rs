@@ -116,7 +116,7 @@ use crate::system::signal::SystemProcessSignaller;
 use crate::ui::about::{self, AboutInfo};
 use crate::ui::category::{SidebarCategory, visible_categories};
 use crate::ui::chrome::{self, ApplyResponse, Toast};
-use crate::ui::display::{self, DisplayPage};
+use crate::ui::display::{self, DisplayPage, LaptopToggleState};
 use crate::ui::input;
 use crate::ui::network::{self, NetworkPage};
 use crate::ui::notifications::{self, NotificationsPage};
@@ -276,6 +276,12 @@ struct MountedPages {
     /// The bespoke Display page (task 6.1), re-rendered from [`PageModels::display`].
     /// `None` while the category shows a placeholder (no live monitor data).
     display: Rc<RefCell<Option<DisplayPage>>>,
+    /// The runtime laptop-display toggle's in-flight flag and last error (task 10.3).
+    /// Kept for the window's lifetime, unlike the Display page itself, and never
+    /// released by [`Self::release_bespoke`]: a Refresh repopulates the stack while
+    /// the toggle script may still be running on its worker, and the rebuilt page
+    /// must keep the switch disabled until that toggle's outcome arrives.
+    laptop_toggle: Rc<LaptopToggleState>,
     /// The bespoke Theme page (tasks 6.3–6.5), re-rendered from the three Theme models.
     /// `None` while the category shows a placeholder (no Theme model at all).
     theme: Rc<RefCell<Option<ThemePage>>>,
@@ -862,7 +868,11 @@ impl Shell {
     /// it falls back to the task-5.1 placeholder so the page degrades cleanly (R4.2).
     fn populate_display(&self, category: SidebarCategory) {
         if self.models.display.borrow().is_some() {
-            let page = display::build(self.models.display.clone(), self.update_chrome.clone());
+            let page = display::build(
+                self.models.display.clone(),
+                self.update_chrome.clone(),
+                self.pages.laptop_toggle.clone(),
+            );
             self.add_category_page(category, page.root());
             // The Display page's marker tracks its own model's dirty state, not the
             // store's (it holds no store-backed settings).

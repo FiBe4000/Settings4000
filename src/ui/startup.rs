@@ -14,6 +14,7 @@
 //! import.
 
 use crate::core::load::{self, StartupLoad};
+use crate::ui::worker::run_off_main_thread;
 
 /// Runs one full [`load::load`] pass — detection, backing-file parsing, and the
 /// bespoke page models — on relm4's blocking pool, handing the result to `on_done` on
@@ -24,17 +25,10 @@ use crate::core::load::{self, StartupLoad};
 /// diverge; only what each does with the result differs. GTK is single-threaded, so
 /// the worker only gathers data — `on_done` is where widgets may be touched. It
 /// receives `None` when the worker finished without delivering a result (the window
-/// closed while it ran), which every caller treats as harmless.
+/// closed while it ran), which every caller treats as harmless. The thread hop itself
+/// is [`run_off_main_thread`], which the laptop-display toggle uses too (task 10.3).
 pub(super) fn spawn_load(on_done: impl FnOnce(Option<StartupLoad>) + 'static) {
-    let (sender, receiver) = relm4::channel::<StartupLoad>();
-    relm4::spawn_blocking(move || {
-        // A send failure only means the receiver was dropped — the window closed
-        // before the load finished, which is harmless, so it is not an error.
-        if sender.send(load::load()).is_err() {
-            tracing::debug!("load discarded; window closed before it completed");
-        }
-    });
-    relm4::spawn_local(async move { on_done(receiver.recv().await) });
+    run_off_main_thread(load::load, on_done);
 }
 
 #[cfg(test)]

@@ -108,6 +108,12 @@
 //! and never touches `monitors.conf`. The panel's *mode and scale*, by contrast,
 //! live in the eDP `monitor=` record and are edited like any other monitor (the
 //! single-source gotcha) — only its enablement is runtime.
+//!
+//! Because the script can run for seconds, the toggle is also offered as three
+//! steps — [`DisplayModel::laptop_toggle_request`] on the model,
+//! [`LaptopToggleRequest::run`] on any thread, [`DisplayModel::finish_laptop_toggle`]
+//! back on the model — so the Display page can keep the commands off the GTK main
+//! thread while this module stays free of any threading or GTK code (task 10.3).
 
 use std::fmt;
 use std::fs;
@@ -200,9 +206,9 @@ struct Monitor {
     /// Whether the compositor last reported this output as enabled (`!disabled` in
     /// `hyprctl monitors all -j`). For a laptop panel this — not the record — drives
     /// the runtime enable switch's position (the panel's live on/off state). It is
-    /// only ever set from a read: at load, and by [`DisplayModel::toggle_laptop`]
-    /// from the reads around the toggle script, never from the state a toggle was
-    /// expected to produce.
+    /// only ever set from a read: at load, and by
+    /// [`DisplayModel::finish_laptop_toggle`] from the reads around the toggle
+    /// script, never from the state a toggle was expected to produce.
     live_enabled: bool,
     /// The `monitor=` record name that specifically configures this output (an exact
     /// name or a matched `desc:` rule), or `None` when only the catch-all/defaults
@@ -249,7 +255,8 @@ impl Monitor {
 /// See the module docs for the design. Built by [`Self::load`] (production) or
 /// [`Self::from_sources`] (tests, with canned `hyprctl` JSON). Its file-backed edits
 /// are surfaced to the Apply pipeline through [`Self::apply_contribution`]; its
-/// runtime laptop toggle is [`Self::toggle_laptop`].
+/// runtime laptop toggle is [`Self::toggle_laptop`] (or its three steps, starting
+/// at [`Self::laptop_toggle_request`]).
 pub struct DisplayModel {
     /// The merged monitors, in the order `hyprctl` reported them.
     monitors: Vec<Monitor>,
@@ -425,13 +432,13 @@ impl From<DisplayWriteError> for StageRefusal {
     }
 }
 
-/// Why [`DisplayModel::toggle_laptop`] did not leave the laptop panel in the
-/// requested state (task 11.8).
+/// Why [`DisplayModel::toggle_laptop`] (or one of its steps) did not leave the
+/// laptop panel in the requested state (task 11.8).
 ///
 /// Every variant is non-fatal (R5.5): the page shows the message next to the switch,
 /// which is re-drawn from the last *read* panel state. The script's own failure, when
 /// there was one, rides along — it explains a failed switch, but on its own does not
-/// make a switch fail (see [`DisplayModel::toggle_laptop`]).
+/// make a switch fail (see [`LaptopToggleRequest::run`]).
 #[derive(Debug)]
 pub enum LaptopToggleError {
     /// The toggle is not offered for this monitor: detection found no toggle script,
@@ -1153,7 +1160,138 @@ impl DisplayModel {
 
     /// Turns the laptop panel `index` on (`enable == true`) or off right away by
     /// running the dotfiles' toggle script (runtime-only, R5.2; task 11.8; analysis
-    /// §7.3, §8.1).
+    /// §7.3, §8.1), blocking the calling thread until the script and both reads
+    /// have finished.
+    ///
+    /// This is the three steps of the toggle protocol run back to back —
+    /// [`Self::laptop_toggle_request`], [`LaptopToggleRequest::run`],
+    /// [`Self::finish_laptop_toggle`] — and behaves exactly like them; see
+    /// [`LaptopToggleRequest::run`] for the command sequence and the rule that the
+    /// second read decides the outcome. It suits a caller that may block for the
+    /// script's whole duration (the tests that pin the protocol). The Display page
+    /// may not — the script can run past the runner's 5 s timeout, and the GTK main
+    /// thread must stay responsive meanwhile — so it runs the middle step on a
+    /// worker thread instead (task 10.3).
+    ///
+    /// This never stages, never becomes dirty, and never touches `monitors.conf`.
+    pub fn toggle_laptop(
+        &mut self,
+        index: usize,
+        enable: bool,
+        runner: &dyn CommandRunner,
+    ) -> Result<(), LaptopToggleError> {
+        let request = self.laptop_toggle_request(index, enable)?;
+        let outcome = request.run(runner);
+        self.finish_laptop_toggle(outcome)
+    }
+
+    /// Step 1 of the laptop toggle (task 10.3): checks that monitor `index` gets the
+    /// runtime toggle and captures everything the toggle needs into a
+    /// [`LaptopToggleRequest`] — the output name and the script path, owned — so the
+    /// commands can run on another thread without borrowing the model.
+    ///
+    /// Runs nothing. An `index` that names no monitor (an index left over from
+    /// before a model rebuild), a monitor that is not the output the script
+    /// switches, and a model without a detected script are all
+    /// [`LaptopToggleError::Unavailable`].
+    pub fn laptop_toggle_request(
+        &self,
+        index: usize,
+        enable: bool,
+    ) -> Result<LaptopToggleRequest, LaptopToggleError> {
+        let view = self.monitor(index).ok_or(LaptopToggleError::Unavailable)?;
+        let script = view
+            .toggle_program()
+            .ok_or(LaptopToggleError::Unavailable)?;
+        Ok(LaptopToggleRequest {
+            output: view.name().to_string(),
+            script: script.to_string(),
+            enable,
+        })
+    }
+
+    /// Step 3 of the laptop toggle (task 10.3): stores the panel state the finished
+    /// toggle last *read* — the only way [`MonitorView::laptop_enabled`] changes
+    /// after load — and returns the toggle's result for the page to show (R5.5).
+    ///
+    /// The state is stored on the monitor with the request's **output name**, not
+    /// the index the request was made for. Between steps 1 and 3 the window may
+    /// have replaced the model (a Refresh or a conflict reload rebuilds it from a
+    /// fresh probe, possibly with the monitors in another order); the read is a
+    /// fact about that output whichever model is current, so it lands on the right
+    /// monitor either way. When the current model does not list the output at all
+    /// (the compositor no longer reports it), nothing is stored — there is no
+    /// switch to draw — and the result is still returned.
+    pub fn finish_laptop_toggle(
+        &mut self,
+        outcome: LaptopToggleOutcome,
+    ) -> Result<(), LaptopToggleError> {
+        let LaptopToggleOutcome {
+            output,
+            read,
+            result,
+        } = outcome;
+        if let Some(enabled) = read {
+            match self
+                .monitors
+                .iter_mut()
+                .find(|monitor| monitor.output_name == output)
+            {
+                Some(monitor) => monitor.live_enabled = enabled,
+                None => tracing::debug!(
+                    %output,
+                    "the laptop toggle finished, but the current monitor list no longer \
+                     has its output; its read state is not stored"
+                ),
+            }
+        }
+        result
+    }
+}
+
+/// A laptop-display toggle ready to run, made by
+/// [`DisplayModel::laptop_toggle_request`] (step 1 of the toggle; task 10.3).
+///
+/// # Why the toggle is split in three steps
+///
+/// The toggle script can take seconds — past the runner's 5 s timeout when its bar
+/// relaunch restarts the eww daemon, and on a timeout the runner still waits for
+/// the orphaned bar launcher to close the output pipes it inherited — so the
+/// Display page must not run it on the GTK main thread, or the window freezes for
+/// the whole time. The model lives on the main thread (the UI shares it through
+/// non-thread-safe handles), so the toggle cannot borrow it on a worker. The
+/// request therefore owns copies of what the commands need and nothing else, and
+/// is [`Send`]: step 2 ([`Self::run`]) issues every command on whichever thread it
+/// is given, and step 3 ([`DisplayModel::finish_laptop_toggle`]) stores the read
+/// state back on the main thread.
+///
+/// Whether a toggle is *in flight* — between steps 1 and 3 — is deliberately not
+/// recorded here or on the model: the window can replace the model while a toggle
+/// runs (a Refresh adopts a freshly loaded model when nothing is staged), which
+/// would silently forget the flag and re-enable the switch under a running script.
+/// The Display page keeps that flag in state that lives as long as the window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaptopToggleRequest {
+    /// The output the script switches (`eDP-1`), whose state is read before and
+    /// after it.
+    output: String,
+    /// The detected toggle script, as the program string of a [`Command`].
+    script: String,
+    /// The state the user asked for: `true` for on.
+    enable: bool,
+}
+
+impl LaptopToggleRequest {
+    /// The panel state the user asked for (`true` for on) — what the page shows on
+    /// the switch while the toggle runs.
+    pub fn enable(&self) -> bool {
+        self.enable
+    }
+
+    /// Step 2 of the laptop toggle: runs the dotfiles' toggle script between two
+    /// reads of the compositor's monitor list and reports what was read (task
+    /// 11.8; analysis §7.3, §8.1). Blocks for as long as the commands take, so the
+    /// Display page calls it on a worker thread (task 10.3); it touches no model.
     ///
     /// `scripts/hypr-toggle-laptop-display` is a **pure toggle** — no arguments, it
     /// flips whatever state it finds — and it owns every step of a switch: the live
@@ -1177,102 +1315,118 @@ impl DisplayModel {
     /// panel, and the runner's 5 s timeout can stop it after the monitor call already
     /// went through. A changed state is success (a script failure alongside it is
     /// logged at `warn`); an unchanged state is [`LaptopToggleError::Unchanged`].
-    /// The stored state — and with it [`MonitorView::laptop_enabled`] and the
-    /// switch — is only ever updated from a read. Every failure is logged and
-    /// returned for the page to show; none is fatal (R5.5). An `index` that names no
-    /// monitor is [`LaptopToggleError::Unavailable`] and runs nothing.
-    ///
-    /// This never stages, never becomes dirty, and never touches `monitors.conf`.
-    pub fn toggle_laptop(
-        &mut self,
-        index: usize,
-        enable: bool,
-        runner: &dyn CommandRunner,
-    ) -> Result<(), LaptopToggleError> {
-        // An index that names no monitor (stale UI state) is unavailable too.
-        let Some((output, script)) = self.monitor(index).and_then(|view| {
-            let script = view.toggle_program()?;
-            Some((view.name().to_string(), script.to_string()))
-        }) else {
-            return Err(LaptopToggleError::Unavailable);
-        };
+    /// The outcome carries the last state actually *read* — after the script when
+    /// that read worked, otherwise before it — so the switch is only ever drawn
+    /// from a read. Every failure is logged here and carried in the outcome for the
+    /// page to show; none is fatal (R5.5).
+    pub fn run(self, runner: &dyn CommandRunner) -> LaptopToggleOutcome {
+        let LaptopToggleRequest {
+            output,
+            script,
+            enable,
+        } = self;
+        let (read, result) = run_laptop_toggle(runner, &output, &script, enable);
+        LaptopToggleOutcome {
+            output,
+            read,
+            result,
+        }
+    }
+}
 
-        let before = read_output_enabled(runner, &output).map_err(|error| {
+/// What a laptop-display toggle read and how it ended, produced on any thread by
+/// [`LaptopToggleRequest::run`] and stored by
+/// [`DisplayModel::finish_laptop_toggle`] (task 10.3). [`Send`], so a worker
+/// thread can hand it back to the main thread.
+#[derive(Debug)]
+pub struct LaptopToggleOutcome {
+    /// The output the toggle switched, used to find its monitor again.
+    output: String,
+    /// The panel state last read — after the script when that read worked,
+    /// otherwise before it — or `None` when not even the first read worked.
+    read: Option<bool>,
+    /// Whether the panel ended up in the requested state, and why not.
+    result: Result<(), LaptopToggleError>,
+}
+
+/// The body of [`LaptopToggleRequest::run`]: the read–script–read sequence on
+/// `output` with `script`, returning the last state read (see
+/// [`LaptopToggleOutcome::read`]) and the result.
+fn run_laptop_toggle(
+    runner: &dyn CommandRunner,
+    output: &str,
+    script: &str,
+    enable: bool,
+) -> (Option<bool>, Result<(), LaptopToggleError>) {
+    let before = match read_output_enabled(runner, output) {
+        Ok(before) => before,
+        Err(error) => {
             tracing::error!(
                 %output,
                 %error,
                 "could not read the laptop panel's state; the toggle script was not run (R5.5)"
             );
-            LaptopToggleError::ReadBefore(error)
-        })?;
-        self.set_live_enabled(index, before);
-        if before == enable {
-            tracing::info!(
-                %output,
-                enabled = before,
-                "the laptop panel is already in the requested state; the toggle script was \
-                 not run (R5.2)"
-            );
-            return Ok(());
+            return (None, Err(LaptopToggleError::ReadBefore(error)));
         }
-
-        let script_failure = run_toggle_script(runner, &script).err();
-
-        let after = match read_output_enabled(runner, &output) {
-            Ok(after) => after,
-            Err(error) => {
-                tracing::error!(
-                    %output,
-                    %error,
-                    "the laptop-display toggle script ran, but the panel's new state could \
-                     not be read (R5.5)"
-                );
-                return Err(LaptopToggleError::ReadAfter {
-                    error,
-                    script: script_failure,
-                });
-            }
-        };
-        self.set_live_enabled(index, after);
-
-        if after == before {
-            tracing::error!(
-                %output,
-                enabled = after,
-                "the laptop panel did not change state after the toggle script (R5.5)"
-            );
-            return Err(LaptopToggleError::Unchanged {
-                enabled: after,
-                script: script_failure,
-            });
-        }
-        if let Some(failure) = &script_failure {
-            tracing::warn!(
-                %output,
-                %failure,
-                "the laptop-display toggle script reported a failure, but the panel did switch"
-            );
-        }
+    };
+    if before == enable {
         tracing::info!(
             %output,
-            enabled = after,
-            "switched the laptop display with the dotfiles toggle script (R5.2)"
+            enabled = before,
+            "the laptop panel is already in the requested state; the toggle script was \
+             not run (R5.2)"
         );
-        Ok(())
+        return (Some(before), Ok(()));
     }
 
-    /// Stores the on/off state just read for monitor `index` — the only way
-    /// [`MonitorView::laptop_enabled`] changes after load.
-    ///
-    /// [`Self::toggle_laptop`] calls this only for an index its availability check
-    /// already resolved, so the monitor is always found; reaching it through
-    /// `get_mut` rather than indexing keeps the toggle free of a panic path all the
-    /// same.
-    fn set_live_enabled(&mut self, index: usize, enabled: bool) {
-        if let Some(monitor) = self.monitors.get_mut(index) {
-            monitor.live_enabled = enabled;
+    let script_failure = run_toggle_script(runner, script).err();
+
+    let after = match read_output_enabled(runner, output) {
+        Ok(after) => after,
+        Err(error) => {
+            tracing::error!(
+                %output,
+                %error,
+                "the laptop-display toggle script ran, but the panel's new state could \
+                 not be read (R5.5)"
+            );
+            return (
+                Some(before),
+                Err(LaptopToggleError::ReadAfter {
+                    error,
+                    script: script_failure,
+                }),
+            );
         }
+    };
+
+    if after == before {
+        tracing::error!(
+            %output,
+            enabled = after,
+            "the laptop panel did not change state after the toggle script (R5.5)"
+        );
+        return (
+            Some(after),
+            Err(LaptopToggleError::Unchanged {
+                enabled: after,
+                script: script_failure,
+            }),
+        );
     }
+    if let Some(failure) = &script_failure {
+        tracing::warn!(
+            %output,
+            %failure,
+            "the laptop-display toggle script reported a failure, but the panel did switch"
+        );
+    }
+    tracing::info!(
+        %output,
+        enabled = after,
+        "switched the laptop display with the dotfiles toggle script (R5.2)"
+    );
+    (Some(after), Ok(()))
 }
 
 /// A borrowed, read-only view of one monitor of a [`DisplayModel`], returned by
@@ -1401,8 +1555,8 @@ impl<'a> MonitorView<'a> {
     }
 
     /// Whether the compositor last reported the output as on (`!disabled`). Only
-    /// ever set from a read — at load, and by [`DisplayModel::toggle_laptop`] from
-    /// the reads around the toggle script — and drives the runtime laptop switch's
+    /// ever set from a read — at load, and by [`DisplayModel::finish_laptop_toggle`]
+    /// from the reads around the toggle script — and drives the runtime laptop switch's
     /// position, independent of any staged record edit.
     pub fn laptop_enabled(&self) -> bool {
         self.monitor.live_enabled
@@ -1486,7 +1640,7 @@ fn read_output_enabled(runner: &dyn CommandRunner, output: &str) -> Result<bool,
 
 /// Runs the dotfiles' toggle script `program` with no arguments (task 11.8).
 ///
-/// The failure, if any, is returned for [`DisplayModel::toggle_laptop`] to weigh
+/// The failure, if any, is returned for [`LaptopToggleRequest::run`] to weigh
 /// against its re-read; the runner has already logged the invocation (R7.3).
 fn run_toggle_script(runner: &dyn CommandRunner, program: &str) -> Result<(), ToggleScriptFailure> {
     let reply = runner
@@ -2883,6 +3037,151 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
             "the switch keeps the state read before the script"
         );
         assert_eq!(runner.recorded(), toggle_sequence());
+    }
+
+    #[test]
+    fn the_toggle_steps_run_on_another_thread_and_store_the_read_on_return() {
+        // Task 10.3: the request owns everything the commands need, so the middle
+        // step runs on a different thread with no access to the model; the read
+        // state reaches the model only through the finishing step, by output name.
+        fn assert_send<T: Send + 'static>() {}
+        assert_send::<LaptopToggleRequest>();
+        assert_send::<LaptopToggleOutcome>();
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conf_path = dir.path().join("monitors.conf");
+        let mut model = toggle_model(&conf_path);
+        let request = model
+            .laptop_toggle_request(0, false)
+            .expect("the panel gets the toggle");
+        assert!(!request.enable(), "the request carries the requested state");
+
+        let runner = std::sync::Arc::new(MockCommandRunner::with_outcomes([
+            probe_reply(HYPRCTL_LAPTOP),
+            Ok(CommandOutput::fake(0)),
+            probe_reply(&hyprctl_laptop_disabled()),
+        ]));
+        let worker_runner = std::sync::Arc::clone(&runner);
+        let outcome = std::thread::spawn(move || request.run(worker_runner.as_ref()))
+            .join()
+            .expect("the worker finishes");
+
+        assert!(
+            view(&model, 0).laptop_enabled(),
+            "running the request alone never touches the model"
+        );
+        model
+            .finish_laptop_toggle(outcome)
+            .expect("the re-read confirms the switch");
+        assert!(
+            !view(&model, 0).laptop_enabled(),
+            "the read state is stored"
+        );
+        assert_eq!(runner.recorded(), toggle_sequence());
+        assert_eq!(
+            std::fs::read_to_string(&conf_path).expect("read monitors.conf"),
+            MONITORS_CONF,
+            "the split toggle never touches monitors.conf either"
+        );
+    }
+
+    #[test]
+    fn a_finished_toggle_is_stored_by_output_name_or_not_at_all() {
+        // The model a toggle finishes on may not be the one it started from (a
+        // Refresh replaced it). The read lands on the monitor with the toggled
+        // output's name; a model that no longer lists that output stores nothing but
+        // still reports the result.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut started_from = toggle_model(&dir.path().join("monitors.conf"));
+        let request = started_from
+            .laptop_toggle_request(0, false)
+            .expect("the panel gets the toggle");
+        let outcome = request.run(&MockCommandRunner::with_outcomes([
+            probe_reply(HYPRCTL_LAPTOP),
+            Ok(CommandOutput::fake(0)),
+            probe_reply(&hyprctl_laptop_disabled()),
+        ]));
+
+        // A replacement model listing an external monitor first and the panel
+        // second: the index the toggle started from now names the external one.
+        let external = r#"{"name": "DP-1", "description": "Desk monitor", "width": 1920,
+            "height": 1080, "refreshRate": 60.0, "x": 0, "y": 0, "scale": 1.0,
+            "disabled": false, "availableModes": ["1920x1080@60.00Hz"]},"#;
+        let both = HYPRCTL_LAPTOP.replacen('[', &format!("[{external}"), 1);
+        let mut replacement = DisplayModel::from_sources(
+            Some(MONITORS_CONF),
+            &both,
+            dir.path().join("monitors.conf"),
+            Some(PathBuf::from(TOGGLE_SCRIPT)),
+        );
+        assert_eq!(view(&replacement, 0).name(), "DP-1");
+        replacement
+            .finish_laptop_toggle(outcome)
+            .expect("the toggle succeeded");
+        assert!(
+            view(&replacement, 0).laptop_enabled(),
+            "the external monitor is untouched"
+        );
+        assert!(
+            !view(&replacement, 1).laptop_enabled(),
+            "the panel, found by name, shows the read"
+        );
+
+        // A model without the panel: nothing to store, the error still comes back.
+        let request = started_from
+            .laptop_toggle_request(0, false)
+            .expect("the panel gets the toggle");
+        let outcome = request.run(&MockCommandRunner::with_outcomes([
+            probe_reply(HYPRCTL_LAPTOP),
+            Ok(CommandOutput::fake(0)),
+            probe_reply(HYPRCTL_LAPTOP),
+        ]));
+        let external_only = format!("[{}]", external.trim_end_matches(','));
+        let mut without_panel = DisplayModel::from_sources(
+            Some(MONITORS_CONF),
+            &external_only,
+            dir.path().join("monitors.conf"),
+            Some(PathBuf::from(TOGGLE_SCRIPT)),
+        );
+        assert!(matches!(
+            without_panel.finish_laptop_toggle(outcome),
+            Err(LaptopToggleError::Unchanged { enabled: true, .. })
+        ));
+        assert_eq!(without_panel.monitor_count(), 1);
+        assert!(view(&without_panel, 0).laptop_enabled());
+
+        // An outcome without any read (the first read failed) stores nothing.
+        let outcome = started_from
+            .laptop_toggle_request(0, false)
+            .expect("the panel gets the toggle")
+            .run(&MockCommandRunner::with_outcomes([Ok(
+                CommandOutput::fake(1),
+            )]));
+        assert!(matches!(
+            started_from.finish_laptop_toggle(outcome),
+            Err(LaptopToggleError::ReadBefore(_))
+        ));
+        assert!(
+            view(&started_from, 0).laptop_enabled(),
+            "the stored state is left alone"
+        );
+    }
+
+    #[test]
+    fn a_toggle_request_is_refused_for_an_index_without_the_toggle() {
+        // Step 1 runs nothing and refuses anything the toggle is not offered for: a
+        // stale index, and a model without the script.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let model = toggle_model(&dir.path().join("monitors.conf"));
+        assert!(matches!(
+            model.laptop_toggle_request(5, false),
+            Err(LaptopToggleError::Unavailable)
+        ));
+        let without_script = laptop_model(dir.path());
+        assert!(matches!(
+            without_script.laptop_toggle_request(0, false),
+            Err(LaptopToggleError::Unavailable)
+        ));
     }
 
     #[test]
