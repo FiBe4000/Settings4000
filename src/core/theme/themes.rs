@@ -113,8 +113,11 @@ const CURATED_CURSOR_SIZES: &[&str] = &["16", "24", "32", "48", "64"];
 /// works. Merging these names into the scan results keeps the promise of R3.3
 /// regardless of packaging.
 ///
-/// Why exactly these two — checked against the GTK versions on the target system
-/// (GTK 3.24 and GTK 4.22) by loading each name through GTK's named-theme CSS loader:
+/// Why exactly these two — verified when the list was written on GTK 3.24 and GTK 4.22
+/// (the release that renamed the bundled theme to `Default`) by loading each name
+/// through GTK's named-theme CSS loader, and re-checked on GTK 4.24 by inspecting the
+/// library's resource names (task 9.29); re-verify against `gtk_css_provider_load_named`
+/// if a future GTK renames the bundled theme again:
 ///
 /// - `Adwaita` is the long-standing light built-in. GTK 3 ships it as the GResource
 ///   theme `Adwaita`; GTK 4.22 renamed its bundled resource to `Default`, and loading
@@ -135,11 +138,97 @@ const CURATED_CURSOR_SIZES: &[&str] = &["16", "24", "32", "48", "64"];
 ///   do, via `gnome-themes-extra`) — in which case the scan finds it anyway and the name
 ///   collapses with the built-in entry. Either way the app writes the chosen name
 ///   verbatim to `gsettings` and both `settings.ini` files, so the copies never desync
-///   (R3.3); it is GTK, not this app, that decides how a name resolves.
+///   (R3.3); it is GTK, not this app, that decides how a name resolves. Because the
+///   result surprises — dark GTK 4 apps beside light GTK 3 apps, with both files
+///   honestly holding the same name — the Theme page says so while the name is
+///   selected and GTK 3 has no directory to load it from
+///   ([`ThemesModel::one_sided_gtk_theme_note`], task 9.29).
+///
+/// Each entry also records how GTK 3 resolves the name ([`Gtk3Resolution`]), so a
+/// built-in added here later has to be classified for that note too.
 ///
 /// Kept sorted here for readability only; ordering in the drop-down comes from the
 /// sorted set the theme scan builds.
-const BUILTIN_GTK_THEMES: &[&str] = &["Adwaita", "Adwaita-dark"];
+const BUILTIN_GTK_THEMES: &[BuiltinGtkTheme] = &[
+    // GTK 3 bundles the stylesheet as the GResource theme `Adwaita` itself.
+    BuiltinGtkTheme {
+        name: "Adwaita",
+        gtk3: Gtk3Resolution::BuiltIn,
+    },
+    // GTK 3 bundles Adwaita's dark stylesheet only as the `dark` *variant* of the
+    // `Adwaita` resource, which no theme name selects, so this name needs a directory.
+    BuiltinGtkTheme {
+        name: "Adwaita-dark",
+        gtk3: Gtk3Resolution::NeedsDirectory {
+            fallback_look: "the light Adwaita look",
+        },
+    },
+];
+
+/// One GTK theme name offered without a theme directory (see [`BUILTIN_GTK_THEMES`]).
+#[derive(Clone, Copy, Debug)]
+struct BuiltinGtkTheme {
+    /// The name as it is written to `gtk-theme-name` and `gsettings`.
+    name: &'static str,
+    /// Whether GTK 3 can load the name without a theme directory (task 9.29).
+    gtk3: Gtk3Resolution,
+}
+
+/// How GTK 3 resolves a [`BuiltinGtkTheme`] name when no theme directory of that name
+/// is installed (task 9.29).
+///
+/// Every built-in name works on GTK 4, whose loader accepts all of them as aliases of
+/// its compiled-in theme (see [`BUILTIN_GTK_THEMES`]); GTK 3 is the side that differs.
+/// GTK 3.24 looks a theme name up in this order (`_gtk_css_provider_load_named` in its
+/// `gtk/gtkcssprovider.c`, which checks the resource itself, then asks
+/// `_gtk_css_find_theme` for the theme folders, then falls back):
+///
+/// 1. a stylesheet compiled into the library as the GResource
+///    `/org/gtk/libgtk/theme/<name>/gtk.css` — the GTK 3.24 library carries three such
+///    themes: `Adwaita` (with a `dark` variant selected by
+///    `gtk-application-prefer-dark-theme`, not by a name), `HighContrast` and
+///    `HighContrastInverse`;
+/// 2. a stylesheet file in a theme folder: under `$XDG_DATA_HOME/themes`, `~/.themes`,
+///    each `$XDG_DATA_DIRS` entry's `themes/` and GTK's own `<prefix>/share/themes`,
+///    `_gtk_css_find_theme_dir` probes `<base>/<name>/gtk-3.<N>/gtk.css` (or
+///    `gtk-<variant>.css`) with `N` running from the library's minor version (24) down
+///    in steps of 2 to 14, then `gtk-3.0`. The app's R3.3 theme roots
+///    ([`ThemeRoots::gtk_theme_dirs`], filled by `core::load::theme_roots`) cover only
+///    `~/.themes`, `$XDG_DATA_HOME/themes` and `/usr/share/themes`, not the other
+///    `$XDG_DATA_DIRS` entries GTK walks: a theme installed under another data
+///    directory is invisible to the scan (backlog task 10.6), so the Theme page's
+///    one-sided note can be a false positive there;
+/// 3. failing both, the same name without the variant, and then the default theme
+///    (`DEFAULT_THEME_NAME`, the light `Adwaita` built-in).
+///
+/// (Checked against the GTK 3.24 and GTK 4 libraries on the target system: the GTK 3
+/// library's resource tree has no `Adwaita-dark` entry and the string appears nowhere
+/// in it, while the GTK 4 library names it in its theme loader.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gtk3Resolution {
+    /// GTK 3 has the name compiled in (step 1), so it resolves the same with or without
+    /// a directory.
+    BuiltIn,
+    /// GTK 3 has no compiled-in theme of this name, so it uses the name only when a
+    /// `<name>/gtk-3.0/` directory is installed (step 2) and otherwise falls back.
+    NeedsDirectory {
+        /// What GTK 3 apps show instead, phrased to complete the Theme page's sentence
+        /// "GTK 3 apps will use …".
+        fallback_look: &'static str,
+    },
+}
+
+/// Whether `name` is one of the [`BUILTIN_GTK_THEMES`].
+fn is_builtin_gtk_theme(name: &str) -> bool {
+    builtin_gtk_theme(name).is_some()
+}
+
+/// The [`BUILTIN_GTK_THEMES`] entry named `name`, if there is one.
+fn builtin_gtk_theme(name: &str) -> Option<&'static BuiltinGtkTheme> {
+    BUILTIN_GTK_THEMES
+        .iter()
+        .find(|builtin| builtin.name == name)
+}
 
 /// The filesystem roots scanned for installed themes (R3.3/R3.4).
 ///
@@ -477,6 +566,11 @@ impl ThemeRenderRecord {
 pub struct ThemesModel {
     /// The GTK theme drop-down.
     gtk_theme: Selection,
+    /// The GTK theme names the scan found a `gtk-3.0/` directory for, on any root
+    /// ([`GtkThemeScan::with_gtk3_dir`]). Decides [`Self::one_sided_gtk_theme_note`]
+    /// (task 9.29); [`Self::reload`] scans again, so it follows the roots on a
+    /// conflict reload.
+    gtk_themes_with_gtk3_dir: BTreeSet<String>,
     /// The icon theme drop-down.
     icon_theme: Selection,
     /// The cursor theme drop-down.
@@ -635,7 +729,7 @@ impl ThemesModel {
             .or_else(|| env_value(copies.uwsm.as_ref(), ENV_CURSOR_SIZE))
             .or_else(|| lua_env_value(copies.hyprland_lua.as_ref(), ENV_CURSOR_SIZE));
 
-        let gtk_themes = scan_gtk_themes(&roots.gtk_theme_dirs);
+        let gtk_scan = scan_gtk_themes(&roots.gtk_theme_dirs);
         let (icon_themes, cursor_themes) = scan_icon_and_cursor_themes(&roots.icon_dirs);
 
         // The app's own environment takes precedence: a GTK_THEME in it overrides this
@@ -651,7 +745,7 @@ impl ThemesModel {
         let unlinked_gtk_settings = detect_unlinked_gtk_settings(&paths);
 
         tracing::info!(
-            gtk_themes = gtk_themes.len(),
+            gtk_themes = gtk_scan.offered.len(),
             icon_themes = icon_themes.len(),
             cursor_themes = cursor_themes.len(),
             gtk_override = gtk_override.is_some(),
@@ -660,7 +754,8 @@ impl ThemesModel {
         );
 
         ThemesModel {
-            gtk_theme: Selection::new(gtk_themes, current_gtk),
+            gtk_theme: Selection::new(gtk_scan.offered, current_gtk),
+            gtk_themes_with_gtk3_dir: gtk_scan.with_gtk3_dir,
             icon_theme: Selection::new(icon_themes, current_icon),
             cursor_theme: Selection::new(cursor_themes, current_cursor),
             cursor_size: Selection::new(curated_sizes, current_size),
@@ -891,6 +986,44 @@ impl ThemesModel {
     /// (R2.2).
     pub fn live_restyle(&self) -> bool {
         self.live_restyle
+    }
+
+    /// The note shown beside the live-restyle note while the GTK theme the page shows
+    /// (the staged one, or the current one) works on GTK 4 but not on GTK 3, or `None`
+    /// otherwise (task 9.29; R3.3).
+    ///
+    /// That happens for a built-in name (`BUILTIN_GTK_THEMES`) GTK 3 does not have
+    /// compiled in (`Gtk3Resolution::NeedsDirectory` — today `Adwaita-dark`) when the
+    /// theme scan found no `<name>/gtk-3.0/` directory under any theme root: GTK 4 apps
+    /// then use the name's built-in look while GTK 3 apps fall back to a different one,
+    /// although both `settings.ini` files hold the same name. The app writes the name all the
+    /// same — it is a valid choice, and making the copies differ to compensate would
+    /// break R3.3's "identical everywhere" — so this is information, never a refusal:
+    /// it changes neither [`Self::stage_gtk_theme`] nor the Apply contribution.
+    ///
+    /// Decided from the scan results held by the model rather than by asking GTK how it
+    /// resolves the name, so the check stays headless (R6.2) and costs nothing per
+    /// rebuild. A built-in that GTK 3 also has compiled in (`Adwaita`) never gets the
+    /// note, nor does a name that is not a built-in (an installed theme is looked up by
+    /// both GTK versions in the same theme folders). Nothing is said while a
+    /// `GTK_THEME` override is in force: GTK then ignores the `settings.ini` name for
+    /// every app the override reaches, and the override banner already says so.
+    pub fn one_sided_gtk_theme_note(&self) -> Option<String> {
+        if self.gtk_override.is_some() {
+            return None;
+        }
+        let theme = self.gtk_theme.effective()?;
+        let Gtk3Resolution::NeedsDirectory { fallback_look } = builtin_gtk_theme(theme)?.gtk3
+        else {
+            return None;
+        };
+        if self.gtk_themes_with_gtk3_dir.contains(theme) {
+            return None;
+        }
+        Some(format!(
+            "\u{201c}{theme}\u{201d} is built into GTK 4 only; without an \u{201c}{theme}\u{201d} \
+             theme directory, GTK 3 apps will use {fallback_look}."
+        ))
     }
 
     /// Stages a GTK theme switch (ignored when a `GTK_THEME` override is in force).
@@ -1412,7 +1545,7 @@ impl ThemesModel {
         }
         let theme = self.gtk_theme.effective()?;
         match resolve_gtk4_theme(&self.roots.gtk_theme_dirs, theme) {
-            Gtk4ThemeSource::Missing if !BUILTIN_GTK_THEMES.contains(&theme) => Some(format!(
+            Gtk4ThemeSource::Missing if !is_builtin_gtk_theme(theme) => Some(format!(
                 "\u{201c}{theme}\u{201d} has no GTK 4 version, so GTK 4 and libadwaita apps \
                  fall back to the default Adwaita look."
             )),
@@ -2191,6 +2324,22 @@ fn resolve_gtk_override(
     None
 }
 
+/// What [`scan_gtk_themes`] found under the GTK theme roots.
+#[derive(Debug)]
+struct GtkThemeScan {
+    /// The names the GTK-theme drop-down offers: every installed theme plus the
+    /// [`BUILTIN_GTK_THEMES`], de-duplicated and sorted.
+    offered: Vec<String>,
+    /// The names that have a `gtk-3.0/` directory under at least one root — the
+    /// directories GTK 3 itself would load (see [`Gtk3Resolution`]). Kept so the model
+    /// can tell, without touching the filesystem again, whether a built-in name GTK 3
+    /// does not have compiled in is still installed for it (task 9.29). GTK 3 itself
+    /// looks for a stylesheet file inside a `gtk-3.<N>/` directory (see
+    /// [`Gtk3Resolution`]); the app approximates that with the existence of `gtk-3.0/`
+    /// until task 9.30 tightens this predicate and the theme predicate together.
+    with_gtk3_dir: BTreeSet<String>,
+}
+
 /// Scans for the GTK themes the drop-down offers: those installed under `dirs`, plus
 /// GTK's built-in ones (R3.3).
 ///
@@ -2201,13 +2350,32 @@ fn resolve_gtk_override(
 /// scanned `Adwaita` directory collapses with the built-in entry — only the name
 /// matters, since that is what `gsettings`/`settings.ini` store) and returned sorted for
 /// a stable drop-down, built-ins and scan results interleaved in one order.
-fn scan_gtk_themes(dirs: &[PathBuf]) -> Vec<String> {
-    let mut found = scan_theme_dirs(dirs, |path| {
-        path.join("gtk-3.0").is_dir() || path.join("gtk-4.0").is_dir()
-    });
+///
+/// The same pass records which names have a `gtk-3.0/` directory on some root
+/// ([`GtkThemeScan::with_gtk3_dir`]). That is deliberately narrower than "installed": a
+/// directory holding only `gtk-4.0/` is a theme for the drop-down but nothing GTK 3 can
+/// load, so it does not make a GTK 4-only built-in name work on GTK 3 (task 9.29).
+fn scan_gtk_themes(dirs: &[PathBuf]) -> GtkThemeScan {
+    let mut offered = BTreeSet::new();
+    let mut with_gtk3_dir = BTreeSet::new();
+    for (name, path) in theme_dir_entries(dirs) {
+        if path.join("gtk-3.0").is_dir() {
+            with_gtk3_dir.insert(name.clone());
+            offered.insert(name);
+        } else if path.join("gtk-4.0").is_dir() {
+            offered.insert(name);
+        }
+    }
     // The set both de-duplicates against the scan and keeps the single sort order.
-    found.extend(BUILTIN_GTK_THEMES.iter().map(|name| (*name).to_string()));
-    found.into_iter().collect()
+    offered.extend(
+        BUILTIN_GTK_THEMES
+            .iter()
+            .map(|builtin| builtin.name.to_string()),
+    );
+    GtkThemeScan {
+        offered: offered.into_iter().collect(),
+        with_gtk3_dir,
+    }
 }
 
 /// Scans `dirs` for installed icon and cursor themes in a single pass (R3.4).
@@ -2283,13 +2451,15 @@ fn has_non_cursor_subdir(path: &Path) -> bool {
     false
 }
 
-/// Collects the names of subdirectories of each root that satisfy `is_theme`, sorted
-/// and de-duplicated by name.
+/// Lists the candidate theme directories under each root as `(name, path)` pairs, in
+/// root order and not de-duplicated — the same name on two roots yields two entries,
+/// so a caller can test each copy.
 ///
-/// Shared by the GTK theme scan; `metadata` follows symlinks so a symlinked theme
-/// directory counts, and dotfiles are skipped.
-fn scan_theme_dirs(dirs: &[PathBuf], is_theme: impl Fn(&Path) -> bool) -> BTreeSet<String> {
-    let mut found = BTreeSet::new();
+/// Used by the GTK theme scan; `metadata` follows symlinks so a symlinked theme
+/// directory counts, and dotfiles and non-directories are skipped. A root that cannot
+/// be read contributes nothing.
+fn theme_dir_entries(dirs: &[PathBuf]) -> Vec<(String, PathBuf)> {
+    let mut found = Vec::new();
     for dir in dirs {
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
@@ -2303,11 +2473,8 @@ fn scan_theme_dirs(dirs: &[PathBuf], is_theme: impl Fn(&Path) -> bool) -> BTreeS
                 continue;
             }
             let path = entry.path();
-            if !std::fs::metadata(&path).is_ok_and(|meta| meta.is_dir()) {
-                continue;
-            }
-            if is_theme(&path) {
-                found.insert(name);
+            if std::fs::metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+                found.push((name, path));
             }
         }
     }
@@ -2493,7 +2660,7 @@ export XCURSOR_SIZE=16
         fs::create_dir_all(themes.join("NotATheme")).unwrap(); // no gtk-*/ -> skipped
         fs::create_dir_all(themes.join(".hidden").join("gtk-4.0")).unwrap(); // dotfile skipped
 
-        let gtk = scan_gtk_themes(std::slice::from_ref(&themes));
+        let gtk = scan_gtk_themes(std::slice::from_ref(&themes)).offered;
         assert_eq!(
             gtk,
             vec![
@@ -2547,7 +2714,7 @@ export XCURSOR_SIZE=16
         // scan returned nothing at all.
         fs::create_dir_all(system.join("Nordic").join("gtk-4.0")).unwrap();
         fs::create_dir_all(user.join("Nordic").join("gtk-4.0")).unwrap();
-        let gtk = scan_gtk_themes(&[user, system]);
+        let gtk = scan_gtk_themes(&[user, system]).offered;
         assert_eq!(
             gtk,
             vec![
@@ -2571,7 +2738,7 @@ export XCURSOR_SIZE=16
         let without = tmp.path().join("without-adwaita");
         fs::create_dir_all(without.join("Nordic").join("gtk-3.0")).unwrap();
         assert_eq!(
-            scan_gtk_themes(std::slice::from_ref(&without)),
+            scan_gtk_themes(std::slice::from_ref(&without)).offered,
             vec![
                 "Adwaita".to_string(),
                 "Adwaita-dark".to_string(),
@@ -2593,7 +2760,7 @@ export XCURSOR_SIZE=16
         let with = tmp.path().join("with-adwaita");
         fs::create_dir_all(with.join("Adwaita").join("gtk-3.0")).unwrap();
         fs::create_dir_all(with.join("Adwaita-dark").join("gtk-3.0")).unwrap();
-        let scanned = scan_gtk_themes(&[with, without]);
+        let scanned = scan_gtk_themes(&[with, without]).offered;
         assert_eq!(
             scanned,
             vec![
@@ -5023,5 +5190,255 @@ export XCURSOR_SIZE=16
         model.gtk_theme.stage("../x");
         assert_eq!(model.gtk4_links_note(), None);
         assert!(model.apply_contribution().expect("dirty").links.is_empty());
+    }
+
+    // --- Task 9.29: a GTK theme name only GTK 4 resolves ---------------------------
+
+    /// The note [`ThemesModel::one_sided_gtk_theme_note`] shows for `Adwaita-dark`.
+    const ADWAITA_DARK_NOTE: &str = "\u{201c}Adwaita-dark\u{201d} is built into GTK 4 only; \
+        without an \u{201c}Adwaita-dark\u{201d} theme directory, GTK 3 apps will use the \
+        light Adwaita look.";
+
+    /// Two GTK theme roots under `tmp` laid out like a real host — a user root
+    /// `<tmp>/home/.themes` (empty) and a system root `<tmp>/usr/share/themes` holding an
+    /// ordinary installed theme, `Nordic` — plus, when `adwaita_dark_subdir` is given,
+    /// an `Adwaita-dark/<subdir>/` directory on the *second* (system) root, so a test
+    /// proves any root counts, not only the first.
+    fn one_sided_roots(tmp: &Path, adwaita_dark_subdir: Option<&str>) -> ThemeRoots {
+        let user = tmp.join("home/.themes");
+        let system = tmp.join("usr/share/themes");
+        fs::create_dir_all(&user).expect("create the user theme root");
+        fs::create_dir_all(system.join("Nordic/gtk-3.0")).expect("create Nordic");
+        if let Some(subdir) = adwaita_dark_subdir {
+            fs::create_dir_all(system.join("Adwaita-dark").join(subdir))
+                .expect("create an Adwaita-dark theme directory");
+        }
+        ThemeRoots {
+            gtk_theme_dirs: vec![user, system],
+            icon_dirs: Vec::new(),
+        }
+    }
+
+    /// A model over [`write_backing_fixture`]'s files (current GTK theme
+    /// `Everforest-Green-Dark`) and the [`one_sided_roots`] under `tmp`.
+    fn one_sided_model(tmp: &Path, adwaita_dark_subdir: Option<&str>) -> ThemesModel {
+        let roots = one_sided_roots(&tmp.join("roots"), adwaita_dark_subdir);
+        let paths = write_backing_fixture(&tmp.join("config"), UWSM_ENV);
+        ThemesModel::load(&roots, paths, false, None)
+    }
+
+    #[test]
+    fn scan_records_which_names_gtk3_can_load_from_a_directory() {
+        // Only a gtk-3.0/ directory is something GTK 3 loads; a gtk-4.0-only theme is
+        // offered but not recorded, and a name is recorded whichever root holds it.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        fs::create_dir_all(first.join("Gtk4Only/gtk-4.0")).unwrap();
+        fs::create_dir_all(first.join("Both/gtk-4.0")).unwrap();
+        fs::create_dir_all(second.join("Both/gtk-3.0")).unwrap();
+        fs::create_dir_all(second.join("Gtk3Only/gtk-3.0")).unwrap();
+
+        let scan = scan_gtk_themes(&[first, second]);
+        assert_eq!(
+            scan.with_gtk3_dir.into_iter().collect::<Vec<_>>(),
+            vec!["Both".to_string(), "Gtk3Only".to_string()]
+        );
+        assert!(scan.offered.contains(&"Gtk4Only".to_string()));
+    }
+
+    #[test]
+    fn a_gtk4_only_builtin_without_a_gtk3_dir_is_noted() {
+        // The accept criterion: Adwaita-dark picked on a host whose scan found no
+        // Adwaita-dark directory is one-sided — and the choice is not blocked.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut model = one_sided_model(tmp.path(), None);
+
+        model
+            .stage_gtk_theme("Adwaita-dark")
+            .expect("a one-sided name is still accepted");
+        assert_eq!(
+            model.one_sided_gtk_theme_note().as_deref(),
+            Some(ADWAITA_DARK_NOTE)
+        );
+        let selected = model.selected_gtk_index().expect("a selection");
+        assert_eq!(model.gtk_themes()[selected], "Adwaita-dark");
+    }
+
+    #[test]
+    fn a_scanned_gtk3_dir_makes_the_builtin_two_sided() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut model = one_sided_model(tmp.path(), Some("gtk-3.0"));
+        model
+            .stage_gtk_theme("Adwaita-dark")
+            .expect("the value passes the stage-time check");
+        assert_eq!(
+            model.one_sided_gtk_theme_note(),
+            None,
+            "GTK 3 loads the installed Adwaita-dark directory"
+        );
+    }
+
+    #[test]
+    fn a_gtk4_only_dir_leaves_the_builtin_one_sided() {
+        // An Adwaita-dark directory with only gtk-4.0/ is nothing GTK 3 can load.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut model = one_sided_model(tmp.path(), Some("gtk-4.0"));
+        model
+            .stage_gtk_theme("Adwaita-dark")
+            .expect("the value passes the stage-time check");
+        assert_eq!(
+            model.one_sided_gtk_theme_note().as_deref(),
+            Some(ADWAITA_DARK_NOTE)
+        );
+    }
+
+    #[test]
+    fn adwaita_is_never_one_sided() {
+        // GTK 3 has the light Adwaita compiled in, so no directory is needed.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut model = one_sided_model(tmp.path(), None);
+        model
+            .stage_gtk_theme("Adwaita")
+            .expect("the value passes the stage-time check");
+        assert_eq!(model.one_sided_gtk_theme_note(), None);
+        model
+            .stage_gtk_theme("Nordic")
+            .expect("the value passes the stage-time check");
+        assert_eq!(
+            model.one_sided_gtk_theme_note(),
+            None,
+            "an installed theme is never one-sided"
+        );
+    }
+
+    #[test]
+    fn the_one_sided_note_changes_neither_staging_nor_the_contribution() {
+        // The same pick on a host with and without the GTK 3 directory: staging and the
+        // Apply contribution are identical, only the note differs.
+        let without_dir = tempfile::tempdir().expect("temp dir");
+        let with_dir = tempfile::tempdir().expect("temp dir");
+        let paths = write_backing_fixture(&without_dir.path().join("config"), UWSM_ENV);
+        let load = |roots: &ThemeRoots| ThemesModel::load(roots, paths.clone(), false, None);
+        let mut one_sided = load(&one_sided_roots(without_dir.path(), None));
+        let mut two_sided = load(&one_sided_roots(with_dir.path(), Some("gtk-3.0")));
+
+        one_sided
+            .stage_gtk_theme("Adwaita-dark")
+            .expect("accepted although GTK 3 cannot load it");
+        two_sided
+            .stage_gtk_theme("Adwaita-dark")
+            .expect("accepted with the GTK 3 directory installed");
+        assert!(one_sided.one_sided_gtk_theme_note().is_some());
+        assert!(two_sided.one_sided_gtk_theme_note().is_none());
+
+        let one = one_sided.apply_contribution().expect("dirty");
+        let two = two_sided.apply_contribution().expect("dirty");
+        let rendered = |apply: &ThemesApply| {
+            apply
+                .writes
+                .iter()
+                .map(|write| (write.path.clone(), write.contents.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rendered(&one), rendered(&two));
+        assert_eq!(one.writes.len(), 2, "both settings.ini files are written");
+        assert_eq!(one.links, two.links);
+        assert_eq!(one.reload_params, two.reload_params);
+        assert_eq!(one.validations, two.validations);
+        assert_eq!(one.skipped, two.skipped);
+    }
+
+    #[test]
+    fn the_one_sided_note_follows_the_staged_value() {
+        // Like the other page notes it is derived on every rebuild: it appears when the
+        // name is picked (before any Apply) and goes with Reset or another pick.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut model = one_sided_model(tmp.path(), None);
+        assert_eq!(
+            model.one_sided_gtk_theme_note(),
+            None,
+            "Everforest is current"
+        );
+
+        model
+            .stage_gtk_theme("Adwaita-dark")
+            .expect("the value passes the stage-time check");
+        assert!(model.one_sided_gtk_theme_note().is_some());
+        model.reset();
+        assert_eq!(model.one_sided_gtk_theme_note(), None, "gone after Reset");
+
+        model
+            .stage_gtk_theme("Adwaita-dark")
+            .expect("the value passes the stage-time check");
+        model
+            .stage_gtk_theme("Nordic")
+            .expect("the value passes the stage-time check");
+        assert_eq!(
+            model.one_sided_gtk_theme_note(),
+            None,
+            "gone after a new pick"
+        );
+    }
+
+    #[test]
+    fn a_current_one_sided_theme_is_noted_until_a_gtk3_dir_appears() {
+        // The value already on disk counts too, and a conflict reload scans again, so
+        // installing the directory clears the note on the next rebuild.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let roots = one_sided_roots(&tmp.path().join("roots"), None);
+        let paths = write_backing_fixture(&tmp.path().join("config"), UWSM_ENV);
+        let gtk3 = fs::read_to_string(&paths.gtk3_settings).expect("read settings.ini");
+        fs::write(
+            &paths.gtk3_settings,
+            replace_once(
+                &gtk3,
+                "gtk-theme-name=Everforest-Green-Dark",
+                "gtk-theme-name=Adwaita-dark",
+            ),
+        )
+        .expect("write settings.ini");
+        let model = ThemesModel::load(&roots, paths, false, None);
+        assert_eq!(
+            model.one_sided_gtk_theme_note().as_deref(),
+            Some(ADWAITA_DARK_NOTE)
+        );
+        assert_eq!(
+            model.reload().one_sided_gtk_theme_note().as_deref(),
+            Some(ADWAITA_DARK_NOTE)
+        );
+
+        fs::create_dir_all(roots.gtk_theme_dirs[0].join("Adwaita-dark/gtk-3.0"))
+            .expect("install Adwaita-dark for GTK 3");
+        assert_eq!(model.reload().one_sided_gtk_theme_note(), None);
+    }
+
+    #[test]
+    fn a_gtk_theme_override_silences_the_one_sided_note() {
+        // Under GTK_THEME the settings.ini name is not what GTK uses; the override
+        // banner explains the page instead.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let roots = one_sided_roots(&tmp.path().join("roots"), None);
+        let paths = write_backing_fixture(&tmp.path().join("config"), UWSM_ENV);
+        let gtk3 = fs::read_to_string(&paths.gtk3_settings).expect("read settings.ini");
+        fs::write(
+            &paths.gtk3_settings,
+            replace_once(
+                &gtk3,
+                "gtk-theme-name=Everforest-Green-Dark",
+                "gtk-theme-name=Adwaita-dark",
+            ),
+        )
+        .expect("write settings.ini");
+        let overridden =
+            ThemesModel::load(&roots, paths.clone(), false, Some("Nordic".to_string()));
+        assert!(overridden.gtk_override().is_some());
+        assert_eq!(overridden.one_sided_gtk_theme_note(), None);
+        assert!(
+            ThemesModel::load(&roots, paths, false, None)
+                .one_sided_gtk_theme_note()
+                .is_some(),
+            "the same files without the override are noted"
+        );
     }
 }

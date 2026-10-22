@@ -42,7 +42,9 @@
 //! settings (task 11.12): a `settings.ini` no longer linked to its dotfiles repo copy,
 //! and a running `xsettingsd`. Under the GTK-theme drop-down it shows when GTK 4 and
 //! libadwaita apps will not follow the chosen theme through the `~/.config/gtk-4.0`
-//! theme links (task 11.16).
+//! theme links (task 11.16), and beside the live-restyle note when the chosen name is
+//! one GTK 4 has built in but GTK 3 can only load from a theme directory that is not
+//! installed (`Adwaita-dark`, task 9.29).
 //!
 //! # Why this page is bespoke, not declarative
 //!
@@ -283,9 +285,10 @@ impl Inner {
     /// with the `GTK_THEME` override banner, the live-restyle note (task 6.4), the
     /// cursor-copy and next-login notes (task 11.5), the external-writer notes
     /// (task 11.12), the note that an older notifd shows a new icon theme only
-    /// after its next start (task 11.14), and the GTK 4 theme-link note under the
-    /// GTK-theme drop-down (task 11.16), and the note naming staged values a file
-    /// refuses (task 9.28).
+    /// after its next start (task 11.14), the GTK 4 theme-link note under the
+    /// GTK-theme drop-down (task 11.16), the note that the chosen GTK theme resolves
+    /// on GTK 4 only (task 9.29), and the note naming staged values a file refuses
+    /// (task 9.28).
     ///
     /// When `settings.ini` is unreadable the rows are hidden behind a note (R4.4); when
     /// a `GTK_THEME` override is active the GTK-theme drop-down is disabled and the
@@ -355,6 +358,13 @@ impl Inner {
             "GTK theme changes take effect the next time each app starts."
         };
         section.append(&note(restyle));
+        // Task 9.29 (R3.3): a built-in name only GTK 4 has compiled in (Adwaita-dark),
+        // chosen with no theme directory for GTK 3 to load, looks different in GTK 3
+        // and GTK 4 apps. Said as information beside the restyle note; the choice
+        // stays selectable and is written like any other.
+        if let Some(one_sided) = model.one_sided_gtk_theme_note() {
+            section.append(&note(&one_sided));
+        }
 
         // Icon theme.
         let icon_dropdown = self.theme_dropdown(
