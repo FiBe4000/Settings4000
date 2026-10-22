@@ -25,11 +25,7 @@ shape for the sake of a test. The files that still differ from `8a5b20b` are:
   `config/hypr/monitors.conf`, `config/uwsm/env`;
 - stand-ins and stubs (see "What it contains"): `colors/README.md`,
   `scripts/generate-colors`, `scripts/hypr-toggle-laptop-display`,
-  `scripts/notifctl`, `config/eww/scripts/bar-text-tone`;
-- two task-7.1 copies that were never refreshed because the app reads nothing
-  that changed in them: `config/kitty/kitty.conf` (lacks the later
-  `remember_window_size no` block; the app only sends kitty a signal) and
-  `theme/fonts` (shorter comments; identical keys and values).
+  `scripts/notifctl`, `config/eww/scripts/bar-text-tone`.
 
 Every other file is the `8a5b20b` content byte for byte.
 
@@ -172,6 +168,15 @@ lines of `hyprland.lua`, and `icons/default/index.theme`.
 
 The "Known divergences from `8a5b20b`" table that tracked the files still in
 their §6 shape is gone with this refresh: it became empty.
+
+### Refreshed to `8a5b20b` in task 10.5
+
+- `config/kitty/kitty.conf`, `theme/fonts` — the last two task-7.1 copies,
+  now verbatim. `kitty.conf` gained the `remember_window_size no` block and
+  `theme/fonts` the longer comments of the real file; the keys and values of
+  `theme/fonts` were already current. The app never reads or writes either
+  file (it only signals kitty, and `theme/fonts` is read by the real
+  `generate-colors`, which tests never run), so no test changed.
 
 ### Removed
 
