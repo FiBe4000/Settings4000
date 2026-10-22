@@ -9,6 +9,8 @@
 //!
 //! - [`app`] — the process bootstrap: the `gtk4::Application`, its single-instance
 //!   registration (R8.4), and window activation.
+//! - [`about`] — the header bar's application menu and the About window it opens (task
+//!   10.2, R2.5), whose content is a pure value built from the crate's package metadata.
 //! - [`window`] — the main window: the `GtkStackSidebar` + `GtkStack` of category
 //!   pages, and the Apply/Reset chrome, dirty markers, toast, and detection refresh
 //!   around them, driven by one shared store (tasks 5.1/5.3).
@@ -91,6 +93,7 @@
 //!   are all refreshes. A user-visible button label may still say "Rescan devices" or
 //!   "Check again"; the code behind it is a `refresh`.
 
+mod about;
 pub mod app;
 mod category;
 mod chrome;

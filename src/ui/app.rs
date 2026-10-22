@@ -41,6 +41,7 @@ use std::time::Instant;
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, gio, glib};
 
+use super::about::{self, AboutInfo};
 use super::window;
 
 /// The fixed GApplication ID that identifies Settings4000 on the session bus.
@@ -52,7 +53,7 @@ use super::window;
 /// to associate correctly under Wayland. Settings4000 has no owned internet
 /// domain, so this is an arbitrary-but-fixed identifier rooted at the project
 /// name; it can be re-based on a real domain later with no behavioral change.
-const APP_ID: &str = "org.settings4000.Settings4000";
+pub(super) const APP_ID: &str = "org.settings4000.Settings4000";
 
 /// Builds the application, registers it for single-instance behavior, and runs
 /// it, returning the process exit code.
@@ -131,6 +132,7 @@ fn on_activate(app: &Application, process_started: Option<Instant>) {
     } else {
         tracing::debug!("first activation; building the main window");
         let window = build_main_window(app);
+        install_about_action(app, &window);
         if let Some(process_started) = process_started {
             arm_first_frame_mark(&window, process_started);
         }
@@ -211,6 +213,29 @@ fn arm_first_frame_mark(window: &ApplicationWindow, process_started: Instant) {
 /// missing tool or unreadable config never blocks startup (R4.3).
 fn build_main_window(app: &Application) -> ApplicationWindow {
     window::build(app)
+}
+
+/// Registers the `app.about` action the header bar's menu item triggers (task 10.2,
+/// R2.5), opening the About window over `window`.
+///
+/// It is registered here, alongside the one main window it parents, rather than in
+/// [`run`]: only the primary instance ever builds that window, and this runs exactly
+/// once per process (the first activation), so the action can neither be registered
+/// twice nor exist without a window to attach the About window to. Registration does
+/// not touch the single-instance protocol (R8.4) — that is decided by
+/// [`gio::prelude::ApplicationExt::register`] before any activation.
+///
+/// The window is held weakly, so the action does not keep a closed window alive;
+/// once it is gone the action does nothing.
+fn install_about_action(app: &Application, window: &ApplicationWindow) {
+    let action = gio::SimpleAction::new(about::ABOUT_ACTION, None);
+    let window = window.downgrade();
+    action.connect_activate(move |_, _| {
+        if let Some(window) = window.upgrade() {
+            about::show_about(&window, &AboutInfo::from_cargo());
+        }
+    });
+    app.add_action(&action);
 }
 
 #[cfg(test)]

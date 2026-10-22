@@ -6,7 +6,8 @@
 //! # What this builds
 //!
 //! The window has a [`HeaderBar`] titlebar carrying the chrome — a **Refresh** button,
-//! a **Reset** button, and a suggested-action **Apply** button — over a content area
+//! a **Reset** button, a suggested-action **Apply** button, and the application menu
+//! with its About entry (task 10.2, R2.5) — over a content area
 //! that is a [`StackSidebar`] beside a [`Stack`] of category pages, all wrapped in an
 //! [`Overlay`] so a non-fatal [`Toast`](super::chrome::Toast) can float over it (R5.5).
 //! One stack page is added per *visible* category (see [`super::category`]); a
@@ -91,8 +92,8 @@ use std::rc::Rc;
 
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Application, ApplicationWindow, Box as GtkBox, Button, HeaderBar, Label, Orientation,
-    Overlay, ScrolledWindow, Spinner, Stack, StackSidebar, Widget, glib,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, HeaderBar, Label, MenuButton,
+    Orientation, Overlay, ScrolledWindow, Spinner, Stack, StackSidebar, Widget, glib,
 };
 use relm4::{ComponentController, Controller};
 
@@ -112,6 +113,7 @@ use crate::core::store::SettingsStore;
 use crate::core::theme::{PaletteModel, ThemesModel, WallpaperModel};
 use crate::system::command::{CommandRunner, SystemCommandRunner};
 use crate::system::signal::SystemProcessSignaller;
+use crate::ui::about::{self, AboutInfo};
 use crate::ui::category::{SidebarCategory, visible_categories};
 use crate::ui::chrome::{self, ApplyResponse, Toast};
 use crate::ui::display::{self, DisplayPage};
@@ -124,8 +126,9 @@ use crate::ui::startup::spawn_load;
 use crate::ui::theme::{self, ThemePage};
 use crate::ui::widgets::{PAGE_MARGIN, SECTION_SPACING};
 
-/// Title shown in the window's title bar and to the compositor.
-const WINDOW_TITLE: &str = "Settings4000";
+/// Title shown in the window's title bar and to the compositor, and the application
+/// name the About window displays (task 10.2), so the two cannot spell it differently.
+pub(super) const WINDOW_TITLE: &str = "Settings4000";
 
 /// Default window width in logical pixels (R2.4).
 ///
@@ -503,8 +506,20 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     overlay.set_child(Some(&content));
     overlay.add_overlay(toast.revealer());
 
+    // The application ("hamburger") menu holding the About entry (task 10.2, R2.5). Its
+    // item fires the `app.about` action that `super::app` registers on the application.
+    let menu_button = MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .menu_model(&about::menu_model(&AboutInfo::from_cargo()))
+        .tooltip_text("Main menu")
+        .build();
+
+    // `pack_end` fills from the right edge inward, so the first end-packed widget sits
+    // outermost: the menu button goes at the far right, as in GNOME applications, with
+    // Apply beside it and Reset to Apply's left.
     let header = HeaderBar::new();
     header.pack_start(&refresh_button);
+    header.pack_end(&menu_button);
     header.pack_end(&apply_button);
     header.pack_end(&reset_button);
 
