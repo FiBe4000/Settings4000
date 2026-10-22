@@ -43,22 +43,15 @@
 //!   (`scripts/launchhyprland.sh` exports it uncommented, analysis §6.3); that
 //!   check belongs to the page, not this file-only parser.
 //!
-//! # Why a surgical, lossless editor (not a serializer)
+//! # Lossless, surgical editing
 //!
 //! The file is hand-maintained: it carries comments (including the deliberately
 //! commented-out `GTK_THEME` line and "keep in sync" notes), blank-line grouping,
-//! and a chosen ordering. The architecture's hard rule for every config parser
-//! (architecture §3) is to **never regenerate a file from a model**; instead we
-//! keep a lossless line representation and, when asked to change a value, rewrite
-//! *only* that value's byte span and re-emit every other byte identically. Two
-//! guarantees follow, both covered by tests:
-//!
-//! - **Round-trip identity**: [`EnvFile::parse`] then [`EnvFile::emit`] with no
-//!   edit reproduces the input byte-for-byte, comments and ordering included.
-//! - **Single-span edits**: [`EnvFile::set_value`] on an existing assignment
-//!   touches exactly that value's bytes and leaves the `export` keyword (if
-//!   present), the key, the `=`, any surrounding whitespace, comments, and all
-//!   other lines untouched.
+//! and a chosen ordering. This module therefore follows the
+//! [parser contract](crate::parsers#the-parser-contract) shared by every config
+//! parser: [`EnvFile::parse`] then [`EnvFile::emit`] with no edit reproduces the
+//! input byte for byte, and [`EnvFile::set_value`] on an existing assignment
+//! rewrites only its value — the `export` keyword, if present, stays as written.
 //!
 //! # Quoting
 //!
@@ -77,10 +70,10 @@
 //! # Physical file creation is out of scope here
 //!
 //! `uwsm/env` is tracked in the dotfiles and symlinked into place, so on the
-//! target machine it always exists and the edit-or-append path is what runs. This
-//! module never touches the filesystem; creating an absent file on disk is a
-//! writer/Apply concern (the atomic writer, task 2.2, only rewrites existing
-//! targets — analysis §6.5), the same as for the sibling INI editor (task 3.5).
+//! target machine it always exists and the edit-or-append path is what runs. Like
+//! every parser this module never touches the filesystem
+//! ([parser contract](crate::parsers#the-parser-contract)), and the atomic writer
+//! only rewrites existing targets, so an absent file is not created (analysis §6.5).
 
 use std::fmt;
 
@@ -323,8 +316,10 @@ impl EnvFile {
     /// blanks) are returned as [`ParseWarning`]s and additionally logged at
     /// `warn`; they are *not* errors and do not stop parsing (task 3.6 acceptance).
     ///
-    /// The returned warnings carry only line numbers — never the file's contents,
-    /// which are not logged at any level (R7.3).
+    /// The warnings carry line numbers only, never file contents, as
+    /// [every parser's diagnostics][r73] do (R7.3).
+    ///
+    /// [r73]: crate::parsers#diagnostics-carry-positions-not-contents-r73
     pub fn parse(input: &str) -> (Self, Vec<ParseWarning>) {
         let mut lines = Vec::new();
         let mut warnings = Vec::new();

@@ -126,23 +126,14 @@
 //! # Committing a successful apply (the caller's responsibility)
 //!
 //! This pipeline is a **pure orchestrator** — it never touches the
-//! [`SettingsStore`](crate::core). So after an [`ApplyOutcome::Applied`] the caller
-//! (task 5.3) **must** commit the apply to the store, via
+//! [`SettingsStore`](crate::core::store::SettingsStore). So after an
+//! [`ApplyOutcome::Applied`] the caller must commit the apply to the store with
 //! [`SettingsStore::commit_apply`](crate::core::store::SettingsStore::commit_apply),
-//! which does two things the pipeline cannot:
-//!
-//! - promotes every pending staged value to its `original` (the edits are now the
-//!   on-disk truth, so the store is clean again);
-//! - re-baselines the written files' freshness from the exact bytes just written.
-//!
-//! The second is not optional: the app just rewrote those files, so their on-disk
-//! bytes no longer match the pre-apply freshness baseline. Without the re-baseline,
-//! the **next** apply's step-2 conflict check would hash the app's own just-written
-//! bytes against the stale baseline, see a mismatch, and abort the whole apply as
-//! [`Conflicted`](ApplyOutcome::Conflicted) — a spurious self-conflict. Committing
-//! after `Applied` closes that loop. It is safe to keep in the store/UI layer
-//! (rather than the pipeline) precisely because the pipeline reports `written` so
-//! the caller knows exactly which files to re-baseline.
+//! giving it the `(path, bytes)` pairs of the store-owned writes
+//! ([`AssembledPlan::store_writes`](crate::core::assemble::AssembledPlan::store_writes),
+//! a subset of the reported `written` paths); otherwise the store stays dirty and
+//! the next apply aborts on a conflict with the app's own write. That method's docs
+//! are the full statement of the contract.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -481,10 +472,10 @@ pub enum ApplyOutcome {
     /// non-fatal (R5.5) and listed here for the UI to toast; an empty list is a
     /// fully clean apply.
     ///
-    /// After this outcome the caller **must commit the apply to the store** — see
-    /// the module docs' "Committing a successful apply" section: the pipeline is a
-    /// pure orchestrator and never touches the store, so the store's dirty state
-    /// and freshness baselines are only reconciled by that commit.
+    /// After this outcome the caller **must commit the apply to the store** with
+    /// [`SettingsStore::commit_apply`](crate::core::store::SettingsStore::commit_apply):
+    /// the pipeline never touches the store, so the store's dirty state and
+    /// freshness baselines are only reconciled by that commit.
     Applied {
         /// The reloads that failed after the writes succeeded, in the order they
         /// were attempted. The writes are not rolled back for these.
@@ -590,8 +581,8 @@ pub fn run(
     // The write phase returned `Ok`, so every planned write succeeded: the written
     // files are exactly the plan's write targets. Report their live paths so the
     // caller can commit the apply to the store (promote staged→original and
-    // re-baseline these files' freshness — see the module docs). The pipeline never
-    // touches the store itself.
+    // re-baseline these files' freshness — see `SettingsStore::commit_apply`). The
+    // pipeline never touches the store itself.
     let written: Vec<PathBuf> = plan.writes.iter().map(|write| write.path.clone()).collect();
 
     tracing::info!(

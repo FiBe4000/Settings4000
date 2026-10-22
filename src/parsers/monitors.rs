@@ -27,16 +27,13 @@
 //! record is appended *after the last existing `monitor=` line* so it wins for
 //! its output (architecture §3, R5.3 item 1).
 //!
-//! # Why a surgical, lossless parser (not a serializer)
+//! # Lossless, surgical editing
 //!
-//! `monitors.conf` is hand-maintained: it carries comments, blank-line grouping,
-//! and per-machine notes. The architecture's hard rule for every config parser
-//! (architecture §3) is to **never regenerate a file from a model**; instead we
-//! keep a lossless line representation and, when asked to change a value, rewrite
-//! *only* that value's byte span and re-emit every other byte identically. The
-//! headline guarantee, covered by tests, is **round-trip identity**:
-//! [`MonitorsFile::parse`] then [`MonitorsFile::emit`] with no edit reproduces
-//! the input byte-for-byte, comments and ordering included.
+//! `monitors.conf` is hand-maintained — comments, blank-line grouping and
+//! per-machine notes — so this module follows the
+//! [parser contract](crate::parsers#the-parser-contract) shared by every config
+//! parser: [`MonitorsFile::parse`] then [`MonitorsFile::emit`] with no edit
+//! reproduces the input byte for byte, and an edit rewrites one record.
 //!
 //! # The frozen grammar and its two downstream parsers (CRITICAL)
 //!
@@ -531,7 +528,9 @@ impl MonitorsFile {
     /// grammar ([`Self::grammar_violations`]) is still parsed and kept, and
     /// reported as a [`ParseWarning`] (in line order) that is additionally logged
     /// at `warn`; it is not an error and does not stop parsing. Warnings carry
-    /// only line numbers and counts, never file contents (R7.3).
+    /// only line numbers and counts, never file contents ([R7.3][r73]).
+    ///
+    /// [r73]: crate::parsers#diagnostics-carry-positions-not-contents-r73
     pub fn parse(input: &str) -> (Self, Vec<ParseWarning>) {
         let lines = line::split_raw_lines(input)
             .map(|raw| Line {

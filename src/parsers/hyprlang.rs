@@ -24,17 +24,16 @@
 //! [`crate::parsers::lua_literal`] instead (analysis §7.1, §8.6; tasks 11.4,
 //! 11.5).
 //!
-//! # Why a surgical, lossless parser (not a serializer)
+//! # Lossless, surgical editing
 //!
 //! These files are hand-maintained: they carry header comments, inline comments
 //! that document magic numbers (`timeout = 150 # 2.5 min`), deliberate blank-line
-//! grouping, and commented-out example lines. The architecture's hard rule for
-//! every config parser (architecture §3) is to **never regenerate a file from a
-//! model**; instead we keep a lossless line/token representation and, when asked
-//! to change a value, rewrite *only* that value's byte span and re-emit every
-//! other byte identically. The headline guarantee, covered by tests, is
-//! **round-trip identity**: [`HyprlangFile::parse`] then [`HyprlangFile::emit`]
-//! with no edit reproduces the input byte-for-byte.
+//! grouping, and commented-out example lines. This module therefore follows the
+//! [parser contract](crate::parsers#the-parser-contract) shared by every config
+//! parser — [`HyprlangFile::parse`] then [`HyprlangFile::emit`] with no edit
+//! reproduces the input byte for byte, and an edit rewrites one value's bytes.
+//! What is specific to hyprlang is how a value is located: the token model and
+//! the two addressing schemes below.
 //!
 //! # Token model
 //!
@@ -85,9 +84,9 @@
 //! [`HyprlangFile::value`] and [`HyprlangFile::set_value`] therefore address the
 //! **last** matching entry inside the addressed section: the app reads the value
 //! that is actually in effect and edits the copy that decides it, instead of
-//! rewriting an earlier copy the daemon ignores (task 9.8, architecture §3). An
-//! earlier, shadowed copy is left byte-identical. The `uwsm/env` and
-//! `settings.ini` writers target the last assignment for the same reason.
+//! rewriting an earlier copy the daemon ignores — the effective-copy rule of the
+//! [parser contract](crate::parsers#the-parser-contract). An earlier, shadowed
+//! copy is left byte-identical.
 //!
 //! The **repeatable-key** scheme is unaffected by that rule and cannot conflict
 //! with it, because it addresses a different thing: repeated top-level keys such
@@ -489,7 +488,9 @@ impl HyprlangFile {
     /// a `}`/section-header imbalance, are returned as [`ParseWarning`]s (sorted
     /// by line number) and additionally logged at `warn`; they are not errors and
     /// do not stop parsing. Warnings carry only line numbers and section names,
-    /// never file contents (R7.3).
+    /// never file contents ([R7.3][r73]).
+    ///
+    /// [r73]: crate::parsers#diagnostics-carry-positions-not-contents-r73
     pub fn parse(input: &str) -> (Self, Vec<ParseWarning>) {
         let mut lines = Vec::new();
         let mut warnings = Vec::new();

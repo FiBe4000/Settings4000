@@ -21,21 +21,14 @@
 //! `colors/<scheme>` source is (analysis §2, §6.4). This module is the parser
 //! for that source.
 //!
-//! # Why a surgical, lossless parser (not a serializer)
+//! # Lossless, surgical editing
 //!
-//! The palette source is hand-maintained: it carries comments, blank-line
-//! grouping, and a deliberate ordering that a maintainer relies on. The
-//! architecture's hard rule for every config parser (architecture §3) is to
-//! **never regenerate a file from a model**; instead we keep a lossless
-//! line/token representation and, when asked to change a value, rewrite *only*
-//! that value's byte span and re-emit every other byte identically. Two
-//! guarantees follow, both covered by tests:
-//!
-//! - **Round-trip identity**: [`PaletteFile::parse`] then [`PaletteFile::emit`]
-//!   with no edit reproduces the input byte-for-byte.
-//! - **Single-span edits**: [`PaletteFile::set_value`] touches exactly the value
-//!   of the targeted key and leaves indentation, spacing around `=`, trailing
-//!   whitespace, comments, and all other lines untouched.
+//! The palette source is hand-maintained — comments, blank-line grouping and a
+//! deliberate key order — so this module follows the
+//! [parser contract](crate::parsers#the-parser-contract) shared by every config
+//! parser: [`PaletteFile::parse`] then [`PaletteFile::emit`] reproduces the input
+//! byte for byte, and [`PaletteFile::set_value`] rewrites only the targeted value.
+//! The line model itself is the flat `key=value` one of [`crate::parsers::kv`].
 //!
 //! # Scope in v1
 //!
@@ -482,15 +475,17 @@ impl PaletteFile {
     /// [`ParseWarning`]s, in line order; they are *not* errors and do not stop parsing
     /// (R6.1 acceptance).
     ///
-    /// Like the sibling parsers (hyprlang, INI, env), warnings are **returned** for
-    /// the caller to log or ignore — this parser does not log them itself. That
+    /// Unlike the sibling parsers, which also log each warning at `warn`, this one
+    /// only **returns** its warnings, for the caller to log or ignore. That
     /// distinction matters because the same parse is used both to read the user's
     /// actual scheme file *and* to probe arbitrary files while enumerating the
     /// palette schemes (task 6.3, via [`crate::parsers::generated::parse_scheme_swatch`]):
     /// a non-palette file such as a `README.md` would otherwise emit a `warn` for
     /// every line it holds. The probe drops the warnings; a future per-key editor can
     /// log them. The returned warnings carry only line numbers and, for a bad value,
-    /// the offending key/value — never the whole file's contents (R7.3).
+    /// the offending key/value — never the whole file's contents ([R7.3][r73]).
+    ///
+    /// [r73]: crate::parsers#diagnostics-carry-positions-not-contents-r73
     pub fn parse(input: &str) -> (Self, Vec<ParseWarning>) {
         let file = KvFile::parse(input);
         let warnings = file

@@ -47,7 +47,8 @@
 //!
 //! # The editor: line-oriented, deliberately not a Lua parser
 //!
-//! [`LuaConfigFile`] keeps every physical line verbatim (terminator included), so
+//! [`LuaConfigFile`] follows the [parser contract](crate::parsers#the-parser-contract)
+//! shared by every config parser: it keeps every physical line verbatim, so
 //! `parse → emit` with no edit reproduces the input byte for byte, and an edit
 //! splices only the bytes of one literal. It understands a small, fixed set of
 //! line *shapes* and nothing else:
@@ -118,10 +119,11 @@
 //! Hyprland applies `hl.config` calls (and the fields of one table constructor)
 //! top to bottom, so when a path is assigned twice the **last** assignment is the
 //! one in effect. [`LuaConfigFile::value`] and [`LuaConfigFile::set_value`] both
-//! address the last entry with the path, the same rule as the hyprlang, env and
-//! INI editors (task 9.8): editing an earlier, shadowed copy would silently have
-//! no effect. `hl.env` calls follow the same rule — a later call for the same
-//! name overwrites the variable. One case is the exception: inside a single
+//! address the last entry with the path, as the
+//! [parser contract](crate::parsers#the-parser-contract) requires of every parser
+//! (edit the copy that is in effect). `hl.env` calls follow the same rule — a
+//! later call for the same name overwrites the variable. One case is the
+//! exception: inside a single
 //! `hl.config` call a repeated *sub-table* (`input = { … }, input = { … }`)
 //! replaces the earlier table wholesale rather than merging into it, and a key
 //! used once as a sub-table and once as a scalar (`touchpad = { … }` and
@@ -152,9 +154,6 @@
 //! `end`, an unterminated string) is worse: nothing in the file can be located
 //! reliably, so [`LuaConfigFile::structure_error`] reports it and every line is
 //! treated as opaque — nothing is addressable and every edit is refused.
-//!
-//! Like every module under `parsers/`, this one never imports `gtk` (enforced by
-//! `tests/module_boundaries.rs`).
 
 use std::fmt;
 
@@ -755,8 +754,10 @@ impl LuaConfigFile {
     /// Parsing never fails and never loses a byte: [`emit`](Self::emit) always
     /// reproduces the input. A structural problem is recorded (see
     /// [`structure_error`](Self::structure_error)) and logged at `warn` with its
-    /// line number only — never file contents (R7.3). Opaque lines are normal in
-    /// `hyprland.lua` and are not logged.
+    /// line number only — never file contents ([R7.3][r73]). Opaque lines are normal
+    /// in `hyprland.lua` and are not logged.
+    ///
+    /// [r73]: crate::parsers#diagnostics-carry-positions-not-contents-r73
     pub fn parse(input: &str) -> Self {
         let raws = line::split_raw_lines(input).map(str::to_string).collect();
         let file = analyze(raws);

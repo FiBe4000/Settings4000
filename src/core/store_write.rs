@@ -87,9 +87,9 @@ pub struct RenderedEdit {
 /// implementation without hiding any of the per-file decisions inside it.
 pub struct StoreBackedFile {
     /// The file's live XDG runtime path (R8.5) — read to render an edit and named as the
-    /// write's target. Never a hardcoded `~/.dotfiles` path; the writer canonicalizes it,
-    /// so a symlink into a dotfiles repo has its real target rewritten and the link
-    /// preserved.
+    /// write's target. Never a hardcoded `~/.dotfiles` path; the
+    /// [atomic writer](crate::system::writer) canonicalizes it, so a symlink into a
+    /// dotfiles repo has its real target rewritten and the link preserved.
     pub path: PathBuf,
     /// How the file is named in the failure message the user sees, e.g. `input.lua` or
     /// `hypridle.conf`.

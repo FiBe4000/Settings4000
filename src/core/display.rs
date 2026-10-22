@@ -263,8 +263,9 @@ pub struct DisplayModel {
     /// docs for why the app does not edit around a broken record).
     records_problem: Option<GrammarViolation>,
     /// The live XDG path of `monitors.conf`, the target of the produced [`FileWrite`]
-    /// (R8.5). The writer canonicalizes it, so a symlink into a dotfiles repo has its
-    /// real target rewritten and the link preserved.
+    /// (R8.5). The [atomic writer](crate::system::writer) canonicalizes it, so a
+    /// symlink into a dotfiles repo has its real target rewritten and the link
+    /// preserved.
     monitors_conf_path: PathBuf,
     /// The dotfiles' `scripts/hypr-toggle-laptop-display`, as found by detection
     /// ([`Capabilities::laptop_toggle_script`](crate::core::detect::Capabilities::laptop_toggle_script)),

@@ -26,18 +26,15 @@
 //! rejects such a value, so a writer must never produce one (see
 //! [`KvFile::set_value`]).
 //!
-//! # Why a lossless line model (architecture §3)
+//! # Lossless, surgical editing
 //!
-//! Both files are hand-maintained: they carry explanatory comments, blank-line
-//! grouping and a deliberate order. The app's rule for every config parser is to
-//! never regenerate a file from a model. [`KvFile`] therefore keeps every line's
-//! exact bytes, classifies each, and records the byte span of each entry's value, so
-//!
-//! - **round-trip identity** holds: [`KvFile::parse`] then [`KvFile::emit`] with no
-//!   edit reproduces the input byte-for-byte; and
-//! - **single-span edits** hold: [`KvFile::set_value`] replaces only the value bytes
-//!   of one line, keeping the key, the spacing around `=`, trailing whitespace and the
-//!   line terminator, and [`KvFile::append_entry`] only adds bytes at the end.
+//! Both files are hand-maintained — explanatory comments, blank-line grouping and a
+//! deliberate order — so this module follows the
+//! [parser contract](crate::parsers#the-parser-contract) shared by every config
+//! parser. [`KvFile`] keeps every line's exact bytes, classifies each, and records
+//! the byte span of each entry's value: [`KvFile::parse`] then [`KvFile::emit`]
+//! reproduces the input byte for byte, [`KvFile::set_value`] replaces the value
+//! bytes of one line, and [`KvFile::append_entry`] only adds bytes at the end.
 //!
 //! # What this module does not decide
 //!

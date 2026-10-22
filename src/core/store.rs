@@ -31,11 +31,9 @@
 //!    reloaded from disk so a later Apply does not silently clobber those edits
 //!    (R5.6).
 //! 5. **Commit.** After the Apply pipeline ([`crate::core::apply`]) reports a
-//!    successful apply, [`SettingsStore::commit_apply`] promotes the staged values to
-//!    originals and re-baselines the written files' freshness — the pipeline is a
-//!    pure orchestrator and never touches the store, so this is what reconciles the
-//!    store with what was just written (and stops the app's own write from looking
-//!    like an external edit on the next Apply).
+//!    successful apply, the caller must call [`SettingsStore::commit_apply`], which
+//!    promotes the staged values to originals and re-baselines the written files'
+//!    freshness; its docs state that contract and why the pipeline cannot do it.
 //!
 //! # Why the freshness baseline is taken from the store's own bytes
 //!
@@ -498,25 +496,44 @@ impl SettingsStore {
     /// `original` and re-baselines the written files' freshness (architecture §6;
     /// task 4.5).
     ///
-    /// The Apply pipeline ([`crate::core::apply`]) is a pure orchestrator and never
-    /// touches the store, so after it returns [`ApplyOutcome::Applied`](crate::core::apply::ApplyOutcome::Applied)
-    /// the UI (task 5.3) calls this to reconcile the store with what was just
-    /// written. It does two things:
+    /// This is the canonical statement of the commit-after-Applied contract. The
+    /// Apply pipeline ([`crate::core::apply::run`]) is a pure orchestrator that never
+    /// touches the store, so the store does not learn on its own that its staged
+    /// values reached disk. After every
+    /// [`ApplyOutcome::Applied`](crate::core::apply::ApplyOutcome::Applied) — and only
+    /// then; every other outcome wrote nothing the store should adopt — the caller
+    /// (the window, task 5.3) **must** call this, or the store is left out of step
+    /// with disk. It does two things:
     ///
     /// 1. **Promote staged → original.** An `Applied` outcome means every staged
     ///    value reached disk, so each becomes the new baseline and the store is clean
     ///    again (dirty is `false`). Every pending edit is promoted, since the caller
     ///    must have included every dirty setting in the applied plan (the apply
     ///    contract); a staged value equal to its original is harmlessly promoted too.
-    /// 2. **Re-baseline the written files.** `written` pairs each written file's
-    ///    **live** path (the same key the store tracked it under — freshness is keyed
-    ///    by the live XDG path, not the symlink-resolved target) with the exact bytes
+    /// 2. **Re-baseline the written files.** The app just rewrote those files, so
+    ///    their on-disk bytes no longer match the baseline recorded when they were
+    ///    loaded. Without a new baseline the **next** Apply's conflict check (its
+    ///    step 2) would hash the app's own bytes against the stale one, see a
+    ///    mismatch, and abort as
+    ///    [`ApplyOutcome::Conflicted`](crate::core::apply::ApplyOutcome::Conflicted)
+    ///    — a spurious self-conflict. `written` pairs each written file's **live**
+    ///    path (the same key the store tracked it under — freshness is keyed by the
+    ///    live XDG path, not the symlink-resolved target) with the exact bytes
     ///    written. Fingerprinting those bytes with [`FreshnessTracker::record_bytes`]
-    ///    — rather than re-reading the file — is what stops the app's own write from
-    ///    being mistaken for an external edit on the next Apply's conflict check, and
-    ///    it avoids the read→baseline TOCTOU window `record_bytes` exists for (an edit
-    ///    landing between the write and a re-read would otherwise be silently
-    ///    baselined as ours). A file absent from `written` keeps its prior baseline.
+    ///    — rather than re-reading the file — also avoids the read→baseline TOCTOU
+    ///    window `record_bytes` exists for (an edit landing between the write and a
+    ///    re-read would otherwise be silently baselined as ours). A file absent from
+    ///    `written` keeps its prior baseline.
+    ///
+    /// The contract lives here, with the state it reconciles, rather than in the
+    /// pipeline: keeping the pipeline free of the store is what lets it run against
+    /// a borrowed [`FreshnessTracker`] and be tested on its own, and it loses nothing
+    /// because the `Applied` outcome reports exactly which live paths were written.
+    /// `written` must list only files this store loaded
+    /// ([`AssembledPlan::store_writes`](crate::core::assemble::AssembledPlan::store_writes)
+    /// is exactly that list): files a bespoke page model reads itself are re-baselined
+    /// by that model's own commit, which
+    /// [`ModelCommits`](crate::core::assemble::ModelCommits) selects.
     ///
     /// This never fails: it only mutates in-memory state.
     pub fn commit_apply(&mut self, written: &[(PathBuf, Vec<u8>)]) {

@@ -25,22 +25,16 @@
 //! file and the section from scratch is a genuine but secondary fallback (a user
 //! without this dotfiles deployment, or a stripped-down `~/.config`).
 //!
-//! # Why a surgical, lossless editor (not a serializer)
+//! # Lossless, surgical editing
 //!
 //! These files are hand- and script-maintained: they carry a comment (the real
 //! files warn that an XSETTINGS/dconf session takes the cursor from `gsettings`
 //! instead, reinforcing why R3.4 also sets `gsettings`, not just this file),
-//! blank-line grouping, and a deliberate key ordering. The architecture's hard
-//! rule for every config parser (architecture §3) is to **never regenerate a
-//! file from a model**; instead we keep a lossless line representation and, when
-//! asked to change a value, rewrite *only* that value's byte span and re-emit
-//! every other byte identically. Two guarantees follow, both covered by tests:
-//!
-//! - **Round-trip identity**: [`IniFile::parse`] then [`IniFile::emit`] with no
-//!   edit reproduces the input byte-for-byte, comments and ordering included.
-//! - **Single-span edits**: [`IniFile::set_value`] on an existing key touches
-//!   exactly that value's bytes and leaves indentation, the spacing around `=`,
-//!   trailing whitespace, comments, and all other lines untouched.
+//! blank-line grouping, and a deliberate key ordering. This module therefore
+//! follows the [parser contract](crate::parsers#the-parser-contract) shared by
+//! every config parser: [`IniFile::parse`] then [`IniFile::emit`] with no edit
+//! reproduces the input byte for byte, and [`IniFile::set_value`] on an existing
+//! key rewrites only that value's bytes.
 //!
 //! # Writing both GTK files identically
 //!
@@ -54,11 +48,11 @@
 //! # Physical file creation is out of scope here
 //!
 //! The [create-from-scratch path](IniFile::set_value) produces the *bytes* of a
-//! new file (a `[Settings]` section with the set keys), but this module does not
-//! touch the filesystem — and no caller creates a `settings.ini` on disk today.
-//! The atomic writer (task 2.2, `system::writer`) `fs::canonicalize`s its target,
-//! so it only rewrites files that already exist, and the Theme model reads
-//! whichever of the two GTK files is present rather than creating an absent one.
+//! new file (a `[Settings]` section with the set keys), but like every parser this
+//! module never touches the filesystem ([parser contract](crate::parsers#the-parser-contract)),
+//! and no caller creates a `settings.ini` on disk today: the atomic writer only
+//! rewrites files that already exist, and the Theme model reads whichever of the
+//! two GTK files is present rather than creating an absent one.
 //! On the target dotfiles machine both files exist, so the edit-existing path is
 //! what actually runs; the create path stays implemented and tested so the
 //! parser's parse/edit/emit surface is complete for a host missing one of them.
@@ -277,8 +271,10 @@ impl IniFile {
     /// `warn`; they are *not* errors and do not stop parsing (task 3.5
     /// acceptance).
     ///
-    /// The returned warnings carry only line numbers — never the file's
-    /// contents, which are not logged at any level (R7.3).
+    /// The warnings carry line numbers only, never file contents, as
+    /// [every parser's diagnostics][r73] do (R7.3).
+    ///
+    /// [r73]: crate::parsers#diagnostics-carry-positions-not-contents-r73
     pub fn parse(input: &str) -> (Self, Vec<ParseWarning>) {
         let mut lines = Vec::new();
         let mut warnings = Vec::new();
