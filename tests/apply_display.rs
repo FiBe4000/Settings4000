@@ -15,6 +15,10 @@
 //! aborts *before* building the plan, so the conflict test here asserts that
 //! guard rather than an [`ApplyOutcome::Conflicted`].
 //!
+//! Turning an external monitor off and on through the `disabled,1` extra pair
+//! (task 10.4) is asserted here as a whole-file byte diff, alongside the refusal
+//! that keeps that pair off the laptop panel's records.
+//!
 //! The runtime laptop toggle (task 11.8) is covered here too, from detection
 //! onwards: the fixture repo's `scripts/hypr-toggle-laptop-display` stub is
 //! detected behind the deployed symlinks (R8.5) and run — through the mock
@@ -24,10 +28,11 @@ use std::fs;
 
 use settings4000::core::apply::{self, ApplyPlan};
 use settings4000::core::detect::{Binary, Capabilities, DetectionInputs};
-use settings4000::core::display::{DisplayModel, MonitorView};
+use settings4000::core::display::{DisplayModel, MonitorView, StageRefusal};
 use settings4000::core::freshness::FreshnessTracker;
 use settings4000::core::notifd::NotifdReplies;
 use settings4000::core::reload::ReloadParams;
+use settings4000::parsers::monitors::{GrammarRule, MonitorsFile};
 use settings4000::system::command::{Command, CommandOutput, MockCommandRunner};
 use settings4000::system::signal::MockProcessSignaller;
 use settings4000::testing::{
@@ -519,4 +524,193 @@ fn a_tree_without_the_toggle_script_hides_the_toggle() {
         "no script, no toggle"
     );
     assert!(model.records_editable(), "the file-backed rows stay");
+}
+
+/// The fixture's first office monitor record — an external display keyed on its
+/// EDID description, the record the disable tests turn off and on (task 10.4).
+const OFFICE_RECORD: &str = "monitor=desc:Example Monitor Corp QHD-24 0x0001,2560x1440@60,0x0,1";
+
+/// The exact bytes task 10.4 appends to a record to turn its output off.
+const DISABLED_PAIR: &str = ",disabled,1";
+
+/// A `hyprctl monitors all -j` payload with the fixture's laptop panel plus the
+/// office monitor that [`OFFICE_RECORD`] configures, both on.
+const HYPRCTL_DOCKED_JSON: &str = r#"[{
+    "name": "eDP-1",
+    "description": "Fixture Internal Panel",
+    "width": 2880,
+    "height": 1800,
+    "refreshRate": 120.0,
+    "x": 0,
+    "y": 0,
+    "scale": 1.333333,
+    "disabled": false,
+    "availableModes": ["2880x1800@120.00Hz"]
+}, {
+    "name": "DP-3",
+    "description": "Example Monitor Corp QHD-24 0x0001",
+    "width": 2560,
+    "height": 1440,
+    "refreshRate": 59.951,
+    "x": 0,
+    "y": 0,
+    "scale": 1.0,
+    "disabled": false,
+    "availableModes": ["2560x1440@59.95Hz"]
+}]"#;
+
+/// Builds the Display model from the installed tree with `hyprctl_json` as the
+/// compositor's reply.
+fn load_model_with(fx: &FixtureDotfiles, hyprctl_json: &str) -> DisplayModel {
+    let runner = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake_with_streams(
+        0,
+        hyprctl_json,
+        "",
+    ))]);
+    let model = DisplayModel::load(&runner, fx.config_path("hypr/monitors.conf"), None)
+        .expect("a successful probe yields a model");
+    assert!(model.records_editable(), "monitors.conf was readable");
+    model
+}
+
+/// Runs `model`'s contribution through the Apply pipeline with mocks, asserting it
+/// succeeded with exactly the full `hyprctl reload` a `monitors.conf` write needs.
+fn apply_and_expect_reload(model: &DisplayModel, path: &std::path::Path) {
+    let runner = MockCommandRunner::new();
+    let signaller = MockProcessSignaller::new();
+    let outcome = apply::run(
+        &plan_from(model),
+        &FreshnessTracker::new(),
+        &caps(),
+        &runner,
+        &signaller,
+    );
+    let (reload_failures, written) = expect_applied(outcome);
+    assert!(reload_failures.is_empty());
+    assert_eq!(written, vec![path.to_path_buf()]);
+    assert_eq!(
+        runner.recorded(),
+        vec![Command::new("hyprctl").arg("reload")]
+    );
+}
+
+/// `before` with `insertion` inserted directly after the one occurrence of `line`,
+/// i.e. the whole-file byte diff of a surgical append to that record.
+fn insert_after(before: &str, line: &str, insertion: &str) -> String {
+    let at = before.find(line).expect("the record is in the file") + line.len();
+    assert_eq!(before.matches(line).count(), 1, "the record is unique");
+    format!("{}{insertion}{}", &before[..at], &before[at..])
+}
+
+#[test]
+fn disabling_an_external_desc_monitor_appends_exactly_the_disabled_pair() {
+    // Task 10.4 acceptance on the fixture tree: turning the office monitor off
+    // inserts exactly `,disabled,1` at the end of its `desc:` record — the whole
+    // file differs from the original by that insertion and nothing else — and
+    // turning it back on removes exactly that pair, leaving the file byte-identical
+    // to the original. Both run the full pipeline (validate → atomic write through
+    // the deployed symlink → full `hyprctl reload`).
+    let fx = FixtureDotfiles::install();
+    let before_repo = repo_snapshot(&fx);
+    let path = fx.config_path("hypr/monitors.conf");
+    let original = fs::read_to_string(&path).expect("read the fixture monitors.conf");
+
+    let mut model = load_model_with(&fx, HYPRCTL_DOCKED_JSON);
+    let office = 1;
+    let view = model.monitor(office).expect("the office monitor is listed");
+    assert_eq!(view.name(), "DP-3");
+    assert!(!view.is_laptop() && view.effective_enabled());
+
+    model
+        .stage_enabled(office, false)
+        .expect("an external monitor can be turned off");
+    apply_and_expect_reload(&model, &path);
+    model.commit();
+
+    let off = fs::read_to_string(&path).expect("read the applied file");
+    assert_eq!(off, insert_after(&original, OFFICE_RECORD, DISABLED_PAIR));
+    assert_eq!(off.len(), original.len() + DISABLED_PAIR.len());
+    assert!(
+        !off.contains("disabled,true"),
+        "the pair's value is the number 1, never `true`"
+    );
+    // The written file is inside the frozen grammar: the validator accepts the pair.
+    let (parsed, warnings) = MonitorsFile::parse(&off);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(
+        parsed.is_enabled("desc:Example Monitor Corp QHD-24 0x0001"),
+        Some(false)
+    );
+    assert_repo_untouched_except(&fx, &before_repo, &["config/hypr/monitors.conf"]);
+
+    // Back on: exactly the pair goes again.
+    assert!(!model.monitor(office).expect("listed").effective_enabled());
+    model
+        .stage_enabled(office, true)
+        .expect("an off monitor can be turned back on");
+    apply_and_expect_reload(&model, &path);
+    assert_eq!(
+        fs::read_to_string(&path).expect("read the re-applied file"),
+        original,
+        "re-enabling restores the file byte for byte"
+    );
+    assert_repo_untouched_except(&fx, &before_repo, &[]);
+}
+
+#[test]
+fn disabling_keeps_an_existing_bitdepth_extra() {
+    // A record that already carries `bitdepth,10` keeps it: the pair is appended
+    // after it rather than the record body being rewritten.
+    let fx = FixtureDotfiles::install();
+    let path = fx.config_path("hypr/monitors.conf");
+    let with_bitdepth = format!("{OFFICE_RECORD},bitdepth,10");
+    let original = replace_once(
+        &fs::read_to_string(&path).expect("read the fixture monitors.conf"),
+        OFFICE_RECORD,
+        &with_bitdepth,
+    );
+    fs::write(&path, &original).expect("install the 10-bit office record");
+
+    let mut model = load_model_with(&fx, HYPRCTL_DOCKED_JSON);
+    model.stage_enabled(1, false).expect("stages");
+    apply_and_expect_reload(&model, &path);
+
+    assert_eq!(
+        fs::read_to_string(&path).expect("read the applied file"),
+        insert_after(&original, &with_bitdepth, DISABLED_PAIR),
+    );
+}
+
+#[test]
+fn disabling_a_laptop_panel_key_is_refused_naming_the_rule() {
+    // The pair is never written on an eDP key: neither the generic `eDP-1` record
+    // nor the `desc:` record the profile script maps a panel to (here the fixture's
+    // laptop-B rule, matched by the live panel's description). Both are refused at
+    // stage time with the rule named, and nothing is staged or written.
+    let fx = FixtureDotfiles::install();
+    let before_repo = repo_snapshot(&fx);
+
+    let laptop_b =
+        HYPRCTL_MONITORS_JSON.replace("Fixture Internal Panel", "Example Panel Vendor 0x2036");
+    for hyprctl in [HYPRCTL_MONITORS_JSON, laptop_b.as_str()] {
+        let mut model = load_model_with(&fx, hyprctl);
+        let refusal = model
+            .stage_enabled(0, false)
+            .expect_err("the laptop panel's record never carries the pair");
+        assert!(
+            matches!(
+                refusal,
+                StageRefusal::Grammar(GrammarRule::DisabledOnLaptopKey)
+            ),
+            "{refusal:?}"
+        );
+        assert!(
+            refusal
+                .to_string()
+                .contains("the laptop panel's record may not carry `disabled,1`"),
+            "the refusal names the rule: {refusal}"
+        );
+        assert!(!model.is_dirty());
+    }
+    assert_repo_untouched_except(&fx, &before_repo, &[]);
 }

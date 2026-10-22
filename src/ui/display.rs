@@ -1,4 +1,4 @@
-//! The Display page's bespoke GTK glue (tasks 6.1, 10.3, 11.8, 11.9; architecture §7;
+//! The Display page's bespoke GTK glue (tasks 6.1, 10.3, 10.4, 11.8, 11.9; architecture §7;
 //! R2.3, R4.2, R4.4, R5.2, R8.3).
 //!
 //! # Why this page is bespoke, not declarative
@@ -44,13 +44,12 @@
 //!
 //! # Staged vs. runtime controls (R5.1/R5.2)
 //!
-//! A non-laptop monitor's resolution/refresh/scale/position edits, and switching an
-//! output that is off back on, are **staged** into the model and written to
-//! `monitors.conf` on Apply (there is no switch to turn a running external output off:
-//! `monitors.conf`'s frozen grammar has no record form for it, task 11.9); the page
-//! reports each
-//! through the shared `on_changed` callback so the window's Apply/Reset chrome lights
-//! up (as the declarative pages do). The laptop panel's enable control is
+//! A non-laptop monitor's resolution/refresh/scale/position edits, and its enable
+//! switch, are **staged** into the model and written to `monitors.conf` on Apply —
+//! switching an external output off adds the `disabled,1` pair to its record and
+//! switching it on removes it (task 10.4); the page reports each through the shared
+//! `on_changed` callback so the window's Apply/Reset chrome lights up (as the
+//! declarative pages do). The laptop panel's enable control is
 //! **runtime-only**: toggling it runs the dotfiles' `scripts/hypr-toggle-laptop-display`
 //! right away, between two reads of the compositor's monitor list (task 11.8), never
 //! staging and never marking the page dirty. The switch is re-drawn from the state
@@ -363,10 +362,8 @@ impl Inner {
 
         // The enable control. A laptop panel's is the runtime toggle (R5.2), shown
         // only when the dotfiles script behind it was detected (R4.2). A non-laptop's
-        // is a staged monitors.conf edit (only when the file is editable), offered
-        // only while the output is off: the frozen grammar has no record form that
-        // turns an output off (task 11.9), so a switch on a running output could only
-        // ever refuse. The model refuses a disable too, as the defence behind this.
+        // is a staged monitors.conf edit (only when the file is editable): the
+        // `disabled,1` pair on its record (task 10.4).
         if view.is_laptop() {
             if view.laptop_toggle_available() {
                 section.append(&self.build_laptop_toggle(index, view));
@@ -377,13 +374,7 @@ impl Inner {
                 }
             }
         } else if editable {
-            if view.effective_enabled() {
-                section.append(&note(
-                    "Turning an external monitor off is not supported yet.",
-                ));
-            } else {
-                section.append(&self.build_enable_switch(index, view));
-            }
+            section.append(&self.build_enable_switch(index, view));
         }
 
         // The mode/scale/position drop-downs appear only while the output is enabled
@@ -440,11 +431,11 @@ impl Inner {
         labelled_row("Enabled", &switch)
     }
 
-    /// A non-laptop monitor's staged enable switch, built only while the output is
-    /// off, so turning it on stages a complete record for the output (see
-    /// [`DisplayModel::stage_enabled`]). Once it is staged on, the rebuild shows the
-    /// "not supported yet" note and the output's mode/scale rows in its place; Reset
-    /// discards the staged enable.
+    /// A non-laptop monitor's staged enable switch: turning it off stages the
+    /// `disabled,1` pair on the output's record, turning it on stages removing it (see
+    /// [`DisplayModel::stage_enabled`], task 10.4). The rebuild then hides or shows the
+    /// output's mode/scale rows; Reset discards the staged change, and a refused one
+    /// snaps the switch back with the reason underneath.
     fn build_enable_switch(self: &Rc<Self>, index: usize, view: MonitorView<'_>) -> GtkBox {
         let switch = Switch::new();
         switch.set_halign(Align::End);

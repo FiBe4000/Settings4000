@@ -1,5 +1,5 @@
 //! Surgical parser, writer and grammar validator for Hyprland's `monitors.conf`
-//! (tasks 3.3, 11.9; architecture §3 monitors row; R5.3 item 1, R6.1, R8.3).
+//! (tasks 3.3, 11.9, 10.4; architecture §3 monitors row; R5.3 item 1, R6.1, R8.3).
 //!
 //! # What this file is
 //!
@@ -61,9 +61,12 @@
 //!   *mode*; Hyprland's mode parser rejects it (an "invalid resolution" config
 //!   error) and adds the rule with the output still enabled at its preferred mode,
 //!   so the record does not do what it says (checked against Hyprland 0.56's
-//!   `hl.monitor` binding; disabling is the `disabled` boolean field there);
+//!   `hl.monitor` binding; disabling is the `disabled` boolean field there, which
+//!   this file reaches through the `disabled,1` extra pair described below);
 //! - **extras in complete `key,value` pairs** — an odd count leaves a key without a
 //!   value, and an empty key or value is no pair either;
+//! - **a `disabled` extra only as `disabled,1`, and never on an `eDP-…` record** —
+//!   see [Turning an output off](#turning-an-output-off-the-disabled1-pair);
 //! - **no `,` or `#` (nor a line break) inside any value**, the `desc:` string and
 //!   the output token included — a comma would split the value into an extra field
 //!   and shift every later field, a `#` starts a comment both parsers strip;
@@ -82,6 +85,35 @@
 //! reports a hand-edited record that breaks one as a [`ParseWarning`]; and
 //! [`MonitorsFile::grammar_violations`] checks a whole file, which the Display
 //! model runs at stage time and again on the bytes it is about to write.
+//!
+//! # Turning an output off: the `disabled,1` pair
+//!
+//! The grammar's only way to switch an output off is an extra pair (task 10.4):
+//!
+//! ```text
+//! monitor=desc:Example Monitor Corp QHD-24 0x0001,2560x1440@60,0x0,1,disabled,1
+//! ```
+//!
+//! The loader converts each extra value with `tonumber(v) or v`, so `1` reaches
+//! `hl.monitor` as the Lua number 1, which Hyprland's boolean option type
+//! (`CLuaConfigBool`) accepts as `true`. That type accepts a real boolean or the
+//! numbers 0 and 1 only: `disabled,true` would arrive as the *string* `"true"`,
+//! which Hyprland rejects with a config error while adding the rule enabled. The
+//! value `1` is therefore the only one this module writes or accepts
+//! ([`GrammarRule::DisabledValue`]); turning the output back on removes the pair
+//! rather than writing a `0`, so a record is off exactly when it carries
+//! `disabled,1`. [`MonitorsFile::set_disabled`] performs both edits surgically: it
+//! appends or removes those eleven bytes and leaves the rest of the record —
+//! mode, position, scale and any other extra such as `bitdepth,10` — untouched.
+//!
+//! The pair is never written on a laptop-panel record
+//! ([`GrammarRule::DisabledOnLaptopKey`]): the profile script's `awk` would hand
+//! it to `scripts/hypr-toggle-laptop-display` as part of the panel's extras, and
+//! that script splices the extras into its own `hl.monitor` call, so the panel's
+//! runtime toggle would fight the file. The panel is switched by that script
+//! alone (tasks 11.8, 10.3). This module can only recognise the `eDP-…`
+//! connector tokens; a `desc:` record that keys a panel is recognised by the
+//! Display model, which knows which live output is the panel.
 //!
 //! Semantic validation of the *contents* of a field (that a mode really is
 //! `WxH@Hz`, that a scale is in range) is the typed settings model's job
@@ -120,6 +152,16 @@ const LAPTOP_CONNECTOR_PREFIX: &str = "eDP-";
 /// The prefix of an output token that matches a monitor by its EDID
 /// description instead of its connector name.
 const DESC_PREFIX: &str = "desc:";
+
+/// The extra key that turns an output off (task 10.4): the loader passes it to
+/// `hl.monitor` as its `disabled` field. See the module docs' section on the
+/// `disabled,1` pair.
+pub const DISABLED_KEY: &str = "disabled";
+
+/// The only value written (and accepted) for [`DISABLED_KEY`]: the loader turns it
+/// into the Lua number 1, the one non-boolean "true" Hyprland accepts for the field.
+/// `true` would stay a string and be rejected (see [`GrammarRule::DisabledValue`]).
+pub const DISABLED_VALUE: &str = "1";
 
 /// A parsed `monitors.conf` that can re-emit itself byte-for-byte and edit
 /// individual monitor records in place.
@@ -183,8 +225,9 @@ enum LineKind {
         /// two fields whose second is `disable`. The grammar refuses that form
         /// ([`GrammarRule::DisableForm`]), but a hand-edited file may still carry
         /// it, so it is recognised to report the record as disabled rather than
-        /// read `disable` as a mode.
-        disabled: bool,
+        /// read `disable` as a mode. A record turned off by the `disabled,1` extra
+        /// pair is *not* this form: it keeps all of its fields.
+        legacy_disable: bool,
     },
     /// A non-blank, non-comment line that is not a `monitor=` record (some other
     /// directive that may legitimately appear in the file). Preserved verbatim
@@ -229,12 +272,14 @@ impl MonitorField {
     }
 }
 
-/// The three positional values of an enabled record, written by
+/// The three positional values of a record, written by
 /// [`MonitorsFile::set_record`] as `monitor=<output>,<mode>,<position>,<scale>`.
 ///
-/// There is deliberately no "disabled" counterpart: the legacy
-/// `<output>,disable` form is outside the frozen grammar (see
-/// [`GrammarRule::DisableForm`]), so this module has nothing to write for it.
+/// There is deliberately no "disabled" flag here: whether an output is off is the
+/// separate `disabled,1` extra pair, set and removed by
+/// [`MonitorsFile::set_disabled`] without rewriting these values (the legacy
+/// `<output>,disable` form is outside the frozen grammar, see
+/// [`GrammarRule::DisableForm`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MonitorRecord {
     /// The mode (`WxH@Hz` or `preferred`).
@@ -279,6 +324,25 @@ pub enum GrammarRule {
     /// count is odd (a key without a value, e.g. a trailing `,bitdepth`), or a
     /// key or value is empty.
     IncompleteExtra,
+    /// A `disabled` extra has a value other than `1` (task 10.4). The loader
+    /// passes `1` to Hyprland as a number, which its boolean option accepts;
+    /// `disabled,true` would arrive as the string `"true"`, which Hyprland rejects
+    /// with a config error while keeping the output **on**. A `0` would work but is
+    /// never written — an output is turned back on by removing the pair — so it is
+    /// refused too, keeping "the record carries `disabled,1`" the one encoding of
+    /// "off".
+    DisabledValue,
+    /// A `disabled` extra on a laptop-panel record (task 10.4). The profile
+    /// script's `awk` copies the panel record's extras into the toggle script's
+    /// `hl.monitor` call, so the pair would fight the runtime laptop toggle, which
+    /// is the only way the panel is switched (tasks 11.8, 10.3).
+    ///
+    /// This module flags it on every `eDP-…` connector token (the loader's own
+    /// laptop test). A `desc:` token may key a panel too, but only through the
+    /// profile script's `case` mapping, which the app does not read; the Display
+    /// model applies the same rule to the `desc:` record it matched to the live
+    /// laptop panel.
+    DisabledOnLaptopKey,
     /// A value contains a character the grammar cannot carry: a `,` (would split
     /// it into an extra field), a `#` (starts a comment), or a line break.
     ForbiddenCharacter {
@@ -330,6 +394,18 @@ impl fmt::Display for GrammarRule {
                 f,
                 "the fields after the scale must be complete key,value pairs, but a key \
                  has no value"
+            ),
+            GrammarRule::DisabledValue => write!(
+                f,
+                "the `disabled` key takes only the number `1` (hyprland.lua passes \
+                 `disabled,true` to Hyprland as a string, which it rejects and leaves the \
+                 output on)"
+            ),
+            GrammarRule::DisabledOnLaptopKey => write!(
+                f,
+                "the laptop panel's record may not carry `disabled,1`: the panel is switched \
+                 on and off by scripts/hypr-toggle-laptop-display, which reads that record's \
+                 extras through hypr-display-profile.sh"
             ),
             GrammarRule::ForbiddenCharacter { character } => {
                 let why = match character {
@@ -462,8 +538,9 @@ pub enum ParseWarningKind {
     Grammar(GrammarRule),
 }
 
-/// A failure from an edit method ([`MonitorsFile::set_field`] /
-/// [`MonitorsFile::set_record`]).
+/// A failure from an edit method ([`MonitorsFile::set_field`],
+/// [`MonitorsFile::set_record`], [`MonitorsFile::set_extra`],
+/// [`MonitorsFile::remove_extra`], [`MonitorsFile::set_disabled`]).
 ///
 /// Every variant leaves the file completely unchanged: the check happens before
 /// any byte is spliced, or the splice is undone, so a rejected edit can never
@@ -475,9 +552,9 @@ pub enum EditError {
     /// because a single field is not enough to build a valid one; use
     /// [`MonitorsFile::set_record`], which appends, to create a monitor.
     NoSuchMonitor(String),
-    /// The targeted record is in the legacy disable form, so it has no mode /
-    /// position / scale field to edit. [`MonitorsFile::set_record`] rewrites it
-    /// into a complete record.
+    /// The targeted record is in the legacy `<output>,disable` form, so it has no
+    /// mode / position / scale field to edit and no place for an extra pair.
+    /// [`MonitorsFile::set_record`] rewrites it into a complete record.
     RecordDisabled(String),
     /// The targeted record exists and is enabled but does not have the requested
     /// positional field (it is shorter than a full `output,mode,position,scale`
@@ -503,7 +580,8 @@ impl fmt::Display for EditError {
             }
             EditError::RecordDisabled(name) => write!(
                 f,
-                "the `monitor=` record named `{name}` is disabled and has no field to edit"
+                "the `monitor=` record named `{name}` is in the legacy `,disable` form and \
+                 has no field to edit"
             ),
             EditError::FieldMissing { monitor, field } => write!(
                 f,
@@ -559,7 +637,10 @@ impl MonitorsFile {
     /// when no edit has been made (round-trip identity).
     ///
     /// After edits, the output is identical to the input except within the edited
-    /// field spans and any record appended by [`set_record`](Self::set_record).
+    /// field spans, any extra pair inserted or removed by
+    /// [`set_extra`](Self::set_extra) / [`remove_extra`](Self::remove_extra) /
+    /// [`set_disabled`](Self::set_disabled), and any record appended by
+    /// [`set_record`](Self::set_record).
     pub fn emit(&self) -> String {
         line::emit(&self.lines)
     }
@@ -569,7 +650,8 @@ impl MonitorsFile {
     ///
     /// This is the whole-file check: the record-level rules
     /// ([`GrammarRule::TooFewFields`], [`GrammarRule::DisableForm`],
-    /// [`GrammarRule::IncompleteExtra`], [`GrammarRule::SpaceAfterOutput`]) for
+    /// [`GrammarRule::IncompleteExtra`], [`GrammarRule::SpaceAfterOutput`],
+    /// [`GrammarRule::DisabledValue`], [`GrammarRule::DisabledOnLaptopKey`]) for
     /// each record, plus the file-level ones
     /// ([`GrammarRule::DuplicateLaptopKey`], [`GrammarRule::CatchAllNotFirst`]).
     /// Comments, blank lines and non-`monitor=` lines are never violations. An
@@ -599,7 +681,7 @@ impl MonitorsFile {
             let LineKind::Record {
                 name,
                 fields,
-                disabled,
+                legacy_disable,
             } = &line.kind
             else {
                 continue;
@@ -612,7 +694,7 @@ impl MonitorsFile {
                 })
             };
 
-            if let Some(rule) = record_rule(&line.raw, fields, *disabled) {
+            if let Some(rule) = record_rule(&line.raw, fields, *legacy_disable) {
                 report(rule);
             }
 
@@ -649,29 +731,50 @@ impl MonitorsFile {
             .collect()
     }
 
-    /// Whether the record named `name` is enabled (`Some(true)`) or in the legacy
-    /// disable form (`Some(false)`), or `None` if no such record exists.
+    /// Whether the output token `name` is configured on (`Some(true)`) or off
+    /// (`Some(false)`), or `None` if no record has that token.
+    ///
+    /// It is off when its last record is in the legacy `<output>,disable` form, or
+    /// when **any** of its records carries the `disabled,1` pair — not only the
+    /// last: the loader's `hl.monitor` call seeds a later rule for the same output
+    /// from the existing one, so a `disabled = 1` from an earlier record persists
+    /// through every later record for that output within a reload (see
+    /// [`Self::set_disabled`]).
     pub fn is_enabled(&self, name: &str) -> Option<bool> {
-        let index = self.find_record(name)?;
-        match &self.lines[index].kind {
-            LineKind::Record { disabled, .. } => Some(!*disabled),
-            _ => None,
+        let last = self.find_record(name)?;
+        if matches!(
+            &self.lines[last].kind,
+            LineKind::Record {
+                legacy_disable: true,
+                ..
+            }
+        ) {
+            return Some(false);
         }
+        let off = self
+            .record_indices(name)
+            .into_iter()
+            .any(|index| self.carries_disabled_pair(index));
+        Some(!off)
     }
 
     /// Reads the mode / position / scale of the record named `name`.
     ///
-    /// Returns `None` if there is no such record, the record is disabled (it has
-    /// no such field), or the record is too short to have the requested field.
+    /// Returns `None` if there is no such record, the record is in the legacy
+    /// disable form (it has no such field), or the record is too short to have the
+    /// requested field. A record turned off by the `disabled,1` pair keeps its
+    /// fields, so they are read as usual.
     /// If several records share the name the last (effective, later-rule-wins)
     /// one is read.
     pub fn field(&self, name: &str, field: MonitorField) -> Option<&str> {
         let index = self.find_record(name)?;
         match &self.lines[index].kind {
             LineKind::Record {
-                fields, disabled, ..
+                fields,
+                legacy_disable,
+                ..
             } => {
-                if *disabled {
+                if *legacy_disable {
                     return None;
                 }
                 let (start, end) = *fields.get(field.index())?;
@@ -681,8 +784,9 @@ impl MonitorsFile {
         }
     }
 
-    /// Rewrites one field (mode, position, or scale) of the enabled record named
-    /// `name`, changing exactly that field's byte span and nothing else.
+    /// Rewrites one field (mode, position, or scale) of the record named `name` —
+    /// also one turned off by the `disabled,1` pair — changing exactly that field's
+    /// byte span and nothing else.
     ///
     /// This is the surgical edit the Display page uses to change a monitor's
     /// resolution/refresh or scale (task 6.1): the leading `monitor=<output>`
@@ -701,7 +805,8 @@ impl MonitorsFile {
     ///   would misread, whatever the caller validated).
     /// - [`EditError::NoSuchMonitor`] if no record has that name — this method
     ///   never creates a record.
-    /// - [`EditError::RecordDisabled`] if the record is in the disable form.
+    /// - [`EditError::RecordDisabled`] if the record is in the legacy disable form
+    ///   (a record turned off by the `disabled,1` pair is edited as usual).
     /// - [`EditError::FieldMissing`] if the record is too short to have the field.
     pub fn set_field(
         &mut self,
@@ -719,9 +824,11 @@ impl MonitorsFile {
         // of `kind` ends before `raw` is borrowed mutably.
         let (start, end) = match &self.lines[index].kind {
             LineKind::Record {
-                fields, disabled, ..
+                fields,
+                legacy_disable,
+                ..
             } => {
-                if *disabled {
+                if *legacy_disable {
                     return Err(EditError::RecordDisabled(name.to_string()));
                 }
                 match fields.get(field.index()) {
@@ -820,6 +927,155 @@ impl MonitorsFile {
         }
     }
 
+    /// Sets the extra pair `<key>,<value>` on the record named `name`, changing no
+    /// other byte of the record or the file.
+    ///
+    /// If the record already has an extra keyed `key`, only that pair's value span
+    /// is rewritten (the last such pair, should a hand edit have repeated the key —
+    /// the loader assigns the pairs into one Lua table in order, so the last one is
+    /// the value Hyprland sees). Otherwise `,<key>,<value>` is inserted directly
+    /// after the record's last field — before any whitespace, inline comment and
+    /// the terminator — so every existing extra such as `bitdepth,10` stays in
+    /// place. If several records share the name, the last (effective) one is
+    /// edited, as for [`set_field`](Self::set_field).
+    ///
+    /// Errors (each leaving the file untouched):
+    /// - [`EditError::Grammar`] if `key` or `value` contains a forbidden character,
+    ///   or the edited record would break a grammar rule: an empty key or value
+    ///   ([`GrammarRule::IncompleteExtra`]), a `disabled` key with any value but `1`
+    ///   ([`GrammarRule::DisabledValue`] — this is what keeps `disabled,true` out of
+    ///   the file), a `disabled` pair on an `eDP-…` record
+    ///   ([`GrammarRule::DisabledOnLaptopKey`]), or a record with fewer than the
+    ///   four positional fields ([`GrammarRule::TooFewFields`], checked before any
+    ///   byte is spliced — see below).
+    /// - [`EditError::NoSuchMonitor`] if no record has that name.
+    /// - [`EditError::RecordDisabled`] if the record is in the legacy disable form.
+    ///
+    /// The field count is checked up front rather than left to the grammar check
+    /// after the splice, because the appended pair would itself be read as
+    /// positional fields: on a two-field record `monitor=DP-1,1920x1080` it would
+    /// become the position (`disabled`) and the scale (`1`) of a record that then
+    /// *passes* the grammar, and on a three-field record it would only be caught
+    /// indirectly, as a dangling extra.
+    pub fn set_extra(&mut self, name: &str, key: &str, value: &str) -> Result<(), EditError> {
+        check_value(key).map_err(EditError::Grammar)?;
+        check_value(value).map_err(EditError::Grammar)?;
+        let index = self.editable_record(name)?;
+
+        let fields = self.record_fields(index);
+        if fields.len() < 4 {
+            return Err(EditError::Grammar(GrammarRule::TooFewFields {
+                field_count: fields.len(),
+            }));
+        }
+        let (range, replacement) = match self.pair_key_indices(index, key).last() {
+            Some(&key_index) => {
+                let (start, end) = fields[key_index + 1];
+                (start..end, value.to_string())
+            }
+            None => {
+                // A record always has at least its output field.
+                let end = fields.last().map_or(0, |&(_, end)| end);
+                (end..end, format!(",{key},{value}"))
+            }
+        };
+        self.splice_checked(index, range, &replacement)?;
+        tracing::debug!(monitor = name, key, "set monitor extra pair");
+        Ok(())
+    }
+
+    /// Removes the extra pair keyed `key` from the record named `name`, changing no
+    /// other byte of the record or the file, and returns whether a pair was removed.
+    ///
+    /// The removed bytes are the pair's preceding comma through the end of its
+    /// value — exactly what [`set_extra`](Self::set_extra) inserts — so setting and
+    /// then removing a pair restores the record byte for byte. Every pair keyed
+    /// `key` in the record goes, should a hand edit have repeated it. If several
+    /// records share the name, the last (effective) one is edited; a record without
+    /// the key is left as it is and `Ok(false)` returned.
+    ///
+    /// Errors (each leaving the file untouched): [`EditError::NoSuchMonitor`] if no
+    /// record has that name, [`EditError::RecordDisabled`] for the legacy disable
+    /// form, and [`EditError::Grammar`] if the record still breaks a rule
+    /// afterwards (one that was broken before this edit).
+    pub fn remove_extra(&mut self, name: &str, key: &str) -> Result<bool, EditError> {
+        let index = self.editable_record(name)?;
+        let original = self.lines[index].clone();
+        let removed = self.strip_pairs(index, key);
+        if removed > 0 {
+            if let Some(rule) = self.first_rule_on_line(index) {
+                self.lines[index] = original;
+                return Err(EditError::Grammar(rule));
+            }
+            tracing::debug!(monitor = name, key, "removed monitor extra pair");
+        }
+        Ok(removed > 0)
+    }
+
+    /// Turns the output `name` off (`true`) or back on (`false`) through the
+    /// `disabled,1` extra pair, leaving its mode, position, scale and other extras
+    /// byte-identical (task 10.4; see the module docs' section on the pair).
+    ///
+    /// - **Off** appends `,disabled,1` to the last record of `name` (through
+    ///   [`set_extra`](Self::set_extra)). [`DISABLED_VALUE`] is the only value ever
+    ///   written: `disabled,true` would reach Hyprland as a string, be rejected with
+    ///   a config error, and leave the output on.
+    /// - **On** removes the pair — never writes `disabled,0` — from **every** record
+    ///   of `name`, not only the last. The loader's `hl.monitor` call seeds a later
+    ///   rule for the same output from the existing one, so a `disabled = 1` from
+    ///   any earlier record of the token persists through all later records for that
+    ///   output within a reload; removing it from the last record alone would leave
+    ///   the output off. For the usual single record this removes exactly the
+    ///   eleven bytes the "off" edit inserted.
+    ///
+    /// The same seeding is why the "off" edit needs no care for earlier records:
+    /// the pair on the last record is the one Hyprland applies last.
+    ///
+    /// The grammar accepts the pair on the catch-all record too
+    /// (`monitor=,preferred,auto,1,disabled,1`). No app path writes that: the
+    /// Display model only addresses an output's own record and never the catch-all
+    /// (an output configured by the catch-all alone gets a record of its own first).
+    /// A future rule may want to refuse it outright, since on the catch-all the pair
+    /// would switch off every output no other record matches.
+    ///
+    /// Errors (each leaving the file untouched):
+    /// - [`EditError::Grammar`] with [`GrammarRule::DisabledOnLaptopKey`] when `name`
+    ///   is an `eDP-…` connector token (the laptop panel is switched by
+    ///   `scripts/hypr-toggle-laptop-display`, never by this pair), or any rule the
+    ///   edited record would break.
+    /// - [`EditError::NoSuchMonitor`] if no record has that name — this method never
+    ///   creates one; append it with [`set_record`](Self::set_record) first.
+    /// - [`EditError::RecordDisabled`] if the last record is in the legacy disable
+    ///   form.
+    pub fn set_disabled(&mut self, name: &str, disabled: bool) -> Result<(), EditError> {
+        if disabled {
+            return self.set_extra(name, DISABLED_KEY, DISABLED_VALUE);
+        }
+
+        self.editable_record(name)?;
+        let snapshot = self.lines.clone();
+        let mut removed = 0;
+        for index in self.record_indices(name) {
+            let removed_here = self.strip_pairs(index, DISABLED_KEY);
+            if removed_here == 0 {
+                continue;
+            }
+            if let Some(rule) = self.first_rule_on_line(index) {
+                self.lines = snapshot;
+                return Err(EditError::Grammar(rule));
+            }
+            removed += removed_here;
+        }
+        if removed > 0 {
+            tracing::debug!(
+                monitor = name,
+                removed,
+                "removed the monitor's disabled pair"
+            );
+        }
+        Ok(())
+    }
+
     /// Replaces `range` of line `index` with `replacement`, reclassifies the line,
     /// and undoes the splice — returning the broken rule — when the edited record
     /// breaks the grammar. Only rules located on the edited line count: a
@@ -860,6 +1116,88 @@ impl MonitorsFile {
         self.lines
             .iter()
             .rposition(|line| matches!(&line.kind, LineKind::Record { name: n, .. } if n == name))
+    }
+
+    /// The index of the last record named `name`, as an edit target that can carry
+    /// extras: [`EditError::NoSuchMonitor`] when there is none,
+    /// [`EditError::RecordDisabled`] when it is in the legacy disable form.
+    fn editable_record(&self, name: &str) -> Result<usize, EditError> {
+        let Some(index) = self.find_record(name) else {
+            return Err(EditError::NoSuchMonitor(name.to_string()));
+        };
+        match &self.lines[index].kind {
+            LineKind::Record {
+                legacy_disable: false,
+                ..
+            } => Ok(index),
+            _ => Err(EditError::RecordDisabled(name.to_string())),
+        }
+    }
+
+    /// The indices of every `monitor=` record whose output token equals `name`, in
+    /// file order.
+    fn record_indices(&self, name: &str) -> Vec<usize> {
+        self.lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| matches!(&line.kind, LineKind::Record { name: n, .. } if n == name))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// The field spans of the record at line `index`, or none for any other line.
+    fn record_fields(&self, index: usize) -> Vec<(usize, usize)> {
+        match &self.lines[index].kind {
+            LineKind::Record { fields, .. } => fields.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The field indices of every extra *key* equal to `key` on the record at line
+    /// `index`, in order. Extras are read as pairs from field 5 (index 4) on; a
+    /// trailing key without a value is not a pair and is never matched.
+    fn pair_key_indices(&self, index: usize, key: &str) -> Vec<usize> {
+        let fields = self.record_fields(index);
+        let raw = &self.lines[index].raw;
+        (4..fields.len())
+            .step_by(2)
+            .filter(|&key_index| {
+                let (start, end) = fields[key_index];
+                key_index + 1 < fields.len() && &raw[start..end] == key
+            })
+            .collect()
+    }
+
+    /// Whether the record at line `index` carries the `disabled,1` pair — the one
+    /// spelling the loader turns into an off output.
+    fn carries_disabled_pair(&self, index: usize) -> bool {
+        let fields = self.record_fields(index);
+        let raw = &self.lines[index].raw;
+        self.pair_key_indices(index, DISABLED_KEY)
+            .into_iter()
+            .any(|key_index| {
+                let (start, end) = fields[key_index + 1];
+                &raw[start..end] == DISABLED_VALUE
+            })
+    }
+
+    /// Removes every extra pair keyed `key` from the record at line `index`,
+    /// without any grammar check (the callers check the result), and returns how
+    /// many pairs went. Each removal cuts from the end of the field before the key
+    /// to the end of the value, i.e. `,<key>,<value>` plus any whitespace around
+    /// those separators, so the next field's bytes and everything after the value
+    /// (whitespace, inline comment, terminator) stay as they were.
+    fn strip_pairs(&mut self, index: usize, key: &str) -> usize {
+        let mut removed = 0;
+        while let Some(&key_index) = self.pair_key_indices(index, key).last() {
+            let fields = self.record_fields(index);
+            // A pair key is field 5 or later, so a field precedes it.
+            let range = fields[key_index - 1].1..fields[key_index + 1].1;
+            self.lines[index].raw.replace_range(range, "");
+            self.lines[index].kind = classify_line(&self.lines[index].raw);
+            removed += 1;
+        }
+        removed
     }
 
     /// The index of the last `monitor=` record line, if any — where a new record
@@ -924,11 +1262,12 @@ fn is_laptop_key(name: &str) -> bool {
 /// The record-level grammar rule a record breaks, if any. Only the first broken
 /// rule is returned, checked in this order: the disable form (a two-field record
 /// that would otherwise be reported as too short), the field count, the output
-/// token's comma, then the extras.
+/// token's comma, the extras' pairing, then each `disabled` pair (its value, then
+/// whether the record is a laptop panel's).
 ///
 /// `raw` is the record's line and `fields` its trimmed field spans within it.
-fn record_rule(raw: &str, fields: &[(usize, usize)], disabled: bool) -> Option<GrammarRule> {
-    if disabled {
+fn record_rule(raw: &str, fields: &[(usize, usize)], legacy_disable: bool) -> Option<GrammarRule> {
+    if legacy_disable {
         return Some(GrammarRule::DisableForm);
     }
     if fields.len() < 4 {
@@ -947,6 +1286,19 @@ fn record_rule(raw: &str, fields: &[(usize, usize)], disabled: bool) -> Option<G
     let extras = &fields[4..];
     if extras.len() % 2 != 0 || extras.iter().any(|&(start, end)| start == end) {
         return Some(GrammarRule::IncompleteExtra);
+    }
+    let output = &raw[fields[0].0..output_end];
+    for pair in extras.chunks_exact(2) {
+        let (key, value) = (&raw[pair[0].0..pair[0].1], &raw[pair[1].0..pair[1].1]);
+        if key != DISABLED_KEY {
+            continue;
+        }
+        if value != DISABLED_VALUE {
+            return Some(GrammarRule::DisabledValue);
+        }
+        if output.starts_with(LAPTOP_CONNECTOR_PREFIX) {
+            return Some(GrammarRule::DisabledOnLaptopKey);
+        }
     }
     None
 }
@@ -987,17 +1339,17 @@ fn classify_line(raw: &str) -> LineKind {
         return LineKind::Other;
     }
 
-    let (name, fields, disabled) = scan_record(code, eq);
+    let (name, fields, legacy_disable) = scan_record(code, eq);
     LineKind::Record {
         name,
         fields,
-        disabled,
+        legacy_disable,
     }
 }
 
 /// Splits a `monitor=` record's `code` (line text with any trailing comment
 /// already removed) into its comma-separated fields, returning the trimmed name,
-/// the trimmed byte span of every field, and whether it is the disable form.
+/// the trimmed byte span of every field, and whether it is the legacy disable form.
 ///
 /// The returned spans are offsets into `code`, which is a prefix of the line's
 /// `raw`, so they index into `raw` directly.
@@ -1025,12 +1377,12 @@ fn scan_record(code: &str, eq: usize) -> (String, Vec<(usize, usize)>, bool) {
 
     let (name_start, name_end) = fields[0];
     let name = code[name_start..name_end].to_string();
-    let disabled = fields.len() == 2 && {
+    let legacy_disable = fields.len() == 2 && {
         let (start, end) = fields[1];
         &code[start..end] == "disable"
     };
 
-    (name, fields, disabled)
+    (name, fields, legacy_disable)
 }
 
 /// Returns the trimmed byte span of `code[start..end]`: the range with leading
@@ -1393,6 +1745,8 @@ monitor=desc:AU Optronics 0x2036,2560x1440@60,auto,1
             GrammarRule::CatchAllNotFirst {
                 first_record_line: 3,
             },
+            GrammarRule::DisabledValue,
+            GrammarRule::DisabledOnLaptopKey,
         ];
         let texts: Vec<String> = rules.iter().map(ToString::to_string).collect();
         assert!(texts[0].contains("four fields") && texts[0].contains('2'));
@@ -1407,12 +1761,61 @@ monitor=desc:AU Optronics 0x2036,2560x1440@60,auto,1
         assert!(texts[5].contains("followed directly by `,`"));
         assert!(texts[6].contains("line 7"));
         assert!(texts[7].contains("catch-all") && texts[7].contains("line 3"));
+        assert!(texts[8].contains("only the number `1`") && texts[8].contains("disabled,true"));
+        assert!(
+            texts[9].contains("laptop panel") && texts[9].contains("hypr-toggle-laptop-display")
+        );
 
         let violation = GrammarViolation {
             line: 4,
             rule: GrammarRule::IncompleteExtra,
         };
         assert!(violation.to_string().starts_with("line 4: "));
+    }
+
+    #[test]
+    fn the_grammar_accepts_the_disabled_pair_only_as_disabled_one() {
+        // Task 10.4: `disabled,1` is an ordinary extra pair the loader turns into the
+        // Lua number 1, which Hyprland's boolean option accepts. It may sit beside
+        // other extras, on a connector or a `desc:` record.
+        assert!(violations("monitor=DP-1,2560x1440@60,0x0,1,disabled,1\n").is_empty());
+        assert!(
+            violations(
+                "monitor=desc:Example Monitor Corp QHD-24 0x0001,2560x1440@60,0x0,1,\
+                 bitdepth,10,disabled,1 # off for now\n"
+            )
+            .is_empty()
+        );
+
+        // Any other value is refused. `true` reaches Hyprland as the string "true",
+        // which it rejects with a config error while keeping the output on; `0` would
+        // work but is never written (turning back on removes the pair).
+        for value in ["true", "false", "0", "yes", "1.0"] {
+            assert_eq!(
+                violations(&format!(
+                    "monitor=DP-1,2560x1440@60,0x0,1,disabled,{value}\n"
+                )),
+                vec![(1, GrammarRule::DisabledValue)],
+                "disabled,{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_grammar_refuses_the_disabled_pair_on_a_laptop_connector() {
+        // The profile script's awk would copy the pair into the toggle script's
+        // `hl.monitor` call for the panel, fighting the runtime toggle (task 10.4).
+        for output in ["eDP-1", "eDP-2"] {
+            assert_eq!(
+                violations(&format!(
+                    "monitor={output},2880x1800@120,auto,1.333333,bitdepth,10,disabled,1\n"
+                )),
+                vec![(1, GrammarRule::DisabledOnLaptopKey)],
+                "{output}"
+            );
+        }
+        // Without the pair the same record is valid.
+        assert!(violations("monitor=eDP-1,2880x1800@120,auto,1.333333,bitdepth,10\n").is_empty());
     }
 
     // --- Surgical edits ---
@@ -1552,6 +1955,277 @@ monitor=desc:AU Optronics 0x2036,2560x1440@60,auto,1
             Err(EditError::RecordDisabled("DP-2".to_string()))
         );
         assert_eq!(file.emit(), input, "no rejected edit changed the file");
+    }
+
+    /// The fixture's external `desc:` record line.
+    const DESC_LINE: &str = "monitor=desc:AU Optronics 0x2036,2560x1440@60,auto,1";
+
+    #[test]
+    fn disabling_appends_exactly_the_pair_and_enabling_removes_it() {
+        // Task 10.4: turning an output off inserts exactly `,disabled,1` after the
+        // record's last field and nothing else anywhere in the file; turning it back
+        // on removes exactly those bytes, restoring the file byte for byte.
+        let (mut file, _) = MonitorsFile::parse(MONITORS_CONF);
+        file.set_disabled("desc:AU Optronics 0x2036", true)
+            .expect("an external record can be turned off");
+        let off = file.emit();
+        assert_eq!(
+            off,
+            MONITORS_CONF.replacen(DESC_LINE, &format!("{DESC_LINE},disabled,1"), 1)
+        );
+        assert_eq!(off.len(), MONITORS_CONF.len() + ",disabled,1".len());
+        assert!(!off.contains("disabled,true"));
+        assert_eq!(file.is_enabled("desc:AU Optronics 0x2036"), Some(false));
+        // An off record keeps its fields, which still read (and edit) as before.
+        assert_eq!(
+            file.field("desc:AU Optronics 0x2036", MonitorField::Mode),
+            Some("2560x1440@60")
+        );
+        assert!(file.grammar_violations().is_empty());
+
+        // The reparsed text agrees: the pair is what makes the output off.
+        let (reparsed, warnings) = MonitorsFile::parse(&off);
+        assert!(warnings.is_empty());
+        assert_eq!(reparsed.is_enabled("desc:AU Optronics 0x2036"), Some(false));
+
+        // Turning it off twice changes nothing more.
+        file.set_disabled("desc:AU Optronics 0x2036", true)
+            .expect("idempotent");
+        assert_eq!(file.emit(), off);
+
+        file.set_disabled("desc:AU Optronics 0x2036", false)
+            .expect("an off record can be turned back on");
+        assert_eq!(
+            file.emit(),
+            MONITORS_CONF,
+            "re-enabling restores every byte"
+        );
+        assert_eq!(file.is_enabled("desc:AU Optronics 0x2036"), Some(true));
+    }
+
+    #[test]
+    fn disabling_keeps_existing_extras_comments_and_line_endings() {
+        // The pair goes after the last extra, before whitespace, an inline comment
+        // and a CRLF terminator; `bitdepth,10` stays (unlike `set_record`, which
+        // rewrites the whole body).
+        let input = "monitor=,preferred,auto,1\r\n\
+                     monitor=DP-1,2560x1440@60,0x0,1,bitdepth,10  # office\r\n";
+        let (mut file, _) = MonitorsFile::parse(input);
+        file.set_disabled("DP-1", true).expect("editable");
+        assert_eq!(
+            file.emit(),
+            "monitor=,preferred,auto,1\r\n\
+             monitor=DP-1,2560x1440@60,0x0,1,bitdepth,10,disabled,1  # office\r\n"
+        );
+        file.set_disabled("DP-1", false).expect("editable");
+        assert_eq!(file.emit(), input);
+
+        // Whitespace around the pair's separators goes with it on removal, and the
+        // field before it keeps its own bytes.
+        let spaced = "monitor = DP-1, 2560x1440@60 , 0x0 , 1 , disabled , 1  # c\n";
+        let (mut file, warnings) = MonitorsFile::parse(spaced);
+        assert!(warnings.is_empty());
+        assert_eq!(file.is_enabled("DP-1"), Some(false));
+        file.set_disabled("DP-1", false).expect("editable");
+        assert_eq!(file.emit(), "monitor = DP-1, 2560x1440@60 , 0x0 , 1  # c\n");
+    }
+
+    #[test]
+    fn disabled_true_is_never_written() {
+        // The pin of task 10.4: no edit path can put `disabled,true` (or any value
+        // but `1`) into the file. The generic pair edit refuses it by rule, and
+        // `set_disabled` only ever writes `1`.
+        let input = "monitor=,preferred,auto,1\nmonitor=DP-1,2560x1440@60,0x0,1\n";
+        let (mut file, _) = MonitorsFile::parse(input);
+        for value in ["true", "0"] {
+            assert_eq!(
+                file.set_extra("DP-1", DISABLED_KEY, value),
+                Err(EditError::Grammar(GrammarRule::DisabledValue)),
+                "disabled,{value}"
+            );
+            assert_eq!(file.emit(), input, "a refused edit changes nothing");
+        }
+
+        file.set_disabled("DP-1", true).expect("editable");
+        let off = file.emit();
+        assert!(off.contains("monitor=DP-1,2560x1440@60,0x0,1,disabled,1\n"));
+        assert!(!off.contains("disabled,true"));
+        assert_eq!(DISABLED_VALUE, "1");
+
+        // Nor can the value of an existing pair be rewritten to `true`.
+        assert_eq!(
+            file.set_extra("DP-1", DISABLED_KEY, "true"),
+            Err(EditError::Grammar(GrammarRule::DisabledValue))
+        );
+        assert_eq!(file.emit(), off);
+    }
+
+    #[test]
+    fn disabling_a_laptop_connector_record_is_refused() {
+        // The panel is switched by its toggle script, never by this pair.
+        let (mut file, _) = MonitorsFile::parse(MONITORS_CONF);
+        assert_eq!(
+            file.set_disabled("eDP-1", true),
+            Err(EditError::Grammar(GrammarRule::DisabledOnLaptopKey))
+        );
+        assert_eq!(file.emit(), MONITORS_CONF);
+    }
+
+    #[test]
+    fn re_enabling_clears_a_pair_seeded_from_an_earlier_record() {
+        // `hl.monitor` seeds a later rule for the same output from the existing one,
+        // so the earlier record's `disabled = 1` keeps the output off although the
+        // last record has no pair. Re-enabling removes it from every record of the
+        // token.
+        let input = "monitor=,preferred,auto,1\n\
+                     monitor=DP-1,1920x1080@60,0x0,1,disabled,1\n\
+                     monitor=DP-1,2560x1440@60,0x0,1,bitdepth,10\n";
+        let (mut file, warnings) = MonitorsFile::parse(input);
+        assert!(warnings.is_empty(), "plain connector names may repeat");
+        assert_eq!(file.is_enabled("DP-1"), Some(false));
+
+        file.set_disabled("DP-1", false).expect("editable");
+        assert_eq!(
+            file.emit(),
+            "monitor=,preferred,auto,1\n\
+             monitor=DP-1,1920x1080@60,0x0,1\n\
+             monitor=DP-1,2560x1440@60,0x0,1,bitdepth,10\n"
+        );
+        assert_eq!(file.is_enabled("DP-1"), Some(true));
+    }
+
+    #[test]
+    fn set_extra_rewrites_an_existing_value_in_place() {
+        let (mut file, _) = MonitorsFile::parse(MONITORS_CONF);
+        file.set_extra("eDP-1", "bitdepth", "8").expect("editable");
+        let after = file.emit();
+        assert_eq!(
+            after,
+            MONITORS_CONF.replacen(
+                EDP_LINE,
+                "monitor=eDP-1,2880x1800@120,0x0,1.333333,bitdepth,8",
+                1
+            )
+        );
+
+        // Removing it restores the record without its pair; removing again finds
+        // nothing and changes nothing.
+        assert_eq!(file.remove_extra("eDP-1", "bitdepth"), Ok(true));
+        assert_eq!(
+            record_line(&file.emit(), "eDP-1"),
+            "monitor=eDP-1,2880x1800@120,0x0,1.333333"
+        );
+        let without = file.emit();
+        assert_eq!(file.remove_extra("eDP-1", "bitdepth"), Ok(false));
+        assert_eq!(file.emit(), without);
+    }
+
+    #[test]
+    fn a_pair_in_the_middle_of_the_extras_is_removed_and_rewritten_in_place() {
+        // The pair need not be last: removal cuts only `,disabled,1`, leaving the
+        // following extra and the comment; disabling again appends one fresh pair.
+        let input = "monitor=DP-1,2560x1440@60,0x0,1,disabled,1,bitdepth,10 # c\n";
+        let (mut file, warnings) = MonitorsFile::parse(input);
+        assert!(warnings.is_empty());
+        assert_eq!(file.is_enabled("DP-1"), Some(false));
+
+        // While the pair is there, "off" rewrites its value span in place (no second
+        // pair is added).
+        file.set_disabled("DP-1", true).expect("editable");
+        assert_eq!(file.emit(), input);
+
+        file.set_disabled("DP-1", false).expect("editable");
+        assert_eq!(
+            file.emit(),
+            "monitor=DP-1,2560x1440@60,0x0,1,bitdepth,10 # c\n"
+        );
+        file.set_disabled("DP-1", true).expect("editable");
+        assert_eq!(
+            file.emit(),
+            "monitor=DP-1,2560x1440@60,0x0,1,bitdepth,10,disabled,1 # c\n"
+        );
+    }
+
+    #[test]
+    fn only_a_disabled_key_counts_never_a_value_or_a_similar_key() {
+        // `disabled` as the *value* of another pair, and keys that merely contain the
+        // word, are neither read as off nor removed by re-enabling.
+        for input in [
+            "monitor=DP-1,2560x1440@60,0x0,1,mirror,disabled\n",
+            "monitor=DP-1,2560x1440@60,0x0,1,disabledx,1\n",
+            "monitor=DP-1,2560x1440@60,0x0,1,xdisabled,1\n",
+        ] {
+            let (mut file, warnings) = MonitorsFile::parse(input);
+            assert!(warnings.is_empty(), "{input:?}");
+            assert_eq!(file.is_enabled("DP-1"), Some(true), "{input:?}");
+            file.set_disabled("DP-1", false).expect("editable");
+            assert_eq!(file.emit(), input, "nothing to remove in {input:?}");
+            assert_eq!(file.remove_extra("DP-1", DISABLED_KEY), Ok(false));
+
+            // "Off" appends a fresh pair after the look-alike.
+            file.set_disabled("DP-1", true).expect("editable");
+            assert_eq!(
+                file.emit(),
+                input.replacen('\n', ",disabled,1\n", 1),
+                "{input:?}"
+            );
+            assert_eq!(file.is_enabled("DP-1"), Some(false));
+        }
+    }
+
+    #[test]
+    fn a_repeated_disabled_pair_is_removed_completely() {
+        let input = "monitor=DP-1,2560x1440@60,0x0,1,disabled,1,disabled,1\n";
+        let (mut file, warnings) = MonitorsFile::parse(input);
+        assert!(warnings.is_empty());
+        file.set_disabled("DP-1", false).expect("editable");
+        assert_eq!(file.emit(), "monitor=DP-1,2560x1440@60,0x0,1\n");
+        assert_eq!(file.is_enabled("DP-1"), Some(true));
+    }
+
+    #[test]
+    fn a_pair_is_never_added_to_a_record_without_its_four_fields() {
+        // On a two-field record the pair would become the position (`disabled`) and
+        // the scale (`1`) of a record that then passes the grammar; on a three-field
+        // record its key would become the scale. Both are refused by field count
+        // before anything is spliced.
+        for (input, field_count) in [
+            ("monitor=DP-1,1920x1080\n", 2),
+            ("monitor=DP-1,1920x1080,auto\n", 3),
+        ] {
+            let (mut file, _) = MonitorsFile::parse(input);
+            assert_eq!(
+                file.set_disabled("DP-1", true),
+                Err(EditError::Grammar(GrammarRule::TooFewFields {
+                    field_count
+                })),
+                "{input:?}"
+            );
+            assert_eq!(file.emit(), input);
+        }
+    }
+
+    #[test]
+    fn pair_edits_report_a_missing_or_legacy_record() {
+        let input = "monitor=,preferred,auto,1\nmonitor=DP-2,disable\n";
+        let (mut file, _) = MonitorsFile::parse(input);
+        assert_eq!(
+            file.set_disabled("DP-9", true),
+            Err(EditError::NoSuchMonitor("DP-9".to_string()))
+        );
+        assert_eq!(
+            file.set_disabled("DP-9", false),
+            Err(EditError::NoSuchMonitor("DP-9".to_string()))
+        );
+        assert_eq!(
+            file.set_disabled("DP-2", true),
+            Err(EditError::RecordDisabled("DP-2".to_string()))
+        );
+        assert_eq!(
+            file.remove_extra("DP-2", DISABLED_KEY),
+            Err(EditError::RecordDisabled("DP-2".to_string()))
+        );
+        assert_eq!(file.emit(), input);
     }
 
     #[test]

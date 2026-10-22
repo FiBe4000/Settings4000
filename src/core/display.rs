@@ -1,4 +1,4 @@
-//! GTK-free Display-page domain model (tasks 6.1, 11.8, 11.9; architecture §6
+//! GTK-free Display-page domain model (tasks 6.1, 11.8, 11.9, 10.4; architecture §6
 //! "Staging" + the Display page; R2.3, R4.2, R4.4, R5.2, R5.4, R8.3, R8.5, R6.2).
 //!
 //! # What this module is
@@ -74,18 +74,39 @@
 //!
 //! Edits go through the parser surgically: an in-place field edit
 //! ([`set_field`](crate::parsers::monitors::MonitorsFile::set_field)) keeps the
-//! record's other fields and extras byte-identical, a (re-)enable or first
-//! configure writes a whole record
+//! record's other fields and extras byte-identical, turning an output off or on
+//! adds or removes only its `disabled,1` pair
+//! ([`set_disabled`](crate::parsers::monitors::MonitorsFile::set_disabled)), and
+//! only an output without a specific record of its own gets a whole new one
 //! ([`set_record`](crate::parsers::monitors::MonitorsFile::set_record)). The app
 //! never touches either downstream script.
 //!
-//! **Disabling a non-laptop output is refused.** The only on-disk "off" form the
-//! app used to write, `monitor=<output>,disable`, is outside the grammar: the Lua
-//! loader would pass `disable` to Hyprland as a *mode*, which Hyprland rejects
-//! with a config error while leaving the output on ([`GrammarRule::DisableForm`]).
-//! So [`DisplayModel::stage_enabled`] refuses `false` with that rule named rather
-//! than write a record that does not do what it says. Enabling (writing a
-//! complete record for an output that is off) still works.
+//! # Turning an external output off: the `disabled,1` pair (task 10.4)
+//!
+//! A non-laptop output is switched off by appending the extra pair `disabled,1` to
+//! its record (`monitor=<output>,<mode>,<position>,<scale>,disabled,1`) and back on
+//! by removing that pair; both are staged and written on Apply like any other
+//! edit, followed by the full `hyprctl reload` that re-runs the Lua loader. The
+//! legacy `monitor=<output>,disable` record stays refused
+//! ([`GrammarRule::DisableForm`]): the loader would pass `disable` to Hyprland as a
+//! *mode*, which Hyprland rejects with a config error while leaving the output on.
+//! The value is always the number `1` — `disabled,true` would reach Hyprland as a
+//! string and be rejected the same way ([`GrammarRule::DisabledValue`]). An output
+//! configured only by the catch-all first gets a record of its own, built from the
+//! values the page shows, so the pair has a record to sit on and later edits
+//! address it.
+//!
+//! The pair is **never written on a laptop-panel record**
+//! ([`GrammarRule::DisabledOnLaptopKey`]): the panel's record is the one the
+//! profile script reads its extras from and splices into the toggle script's own
+//! `hl.monitor` call, and the panel is switched by that script only (see the next
+//! section). The parser recognises the `eDP-…` connector tokens; a `desc:` record
+//! can key the panel too, through a mapping inside the profile script that the app
+//! does not read, so this model also treats as the panel's any record it matched
+//! to a live `eDP` output — that mapping keys a panel on its own EDID description,
+//! which is exactly what the match compares. [`DisplayModel::stage_enabled`]
+//! refuses such a disable at stage time, naming the rule, and the writer refuses it
+//! again before any write.
 //!
 //! # The laptop-display toggle runs the dotfiles script (R5.2; task 11.8)
 //!
@@ -179,9 +200,10 @@ struct Mode {
 /// record's position and scale fields.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MonitorConfig {
-    /// Whether the output is enabled. For a laptop panel this mirrors the record and
-    /// is never staged (its live enablement is the runtime toggle); for other outputs
-    /// toggling it stages a `monitors.conf` enable/disable edit.
+    /// Whether the output is enabled. For a laptop panel this is always `true` and
+    /// never staged (its live enablement is the runtime toggle); for other outputs it
+    /// is the record's state — off while a record of the output's token carries the
+    /// `disabled,1` pair — and toggling it stages adding or removing that pair.
     enabled: bool,
     /// The mode field (`WIDTHxHEIGHT@REFRESH`, a bare `WIDTHxHEIGHT`, or `preferred`).
     mode: String,
@@ -215,11 +237,14 @@ struct Monitor {
     /// apply. Edits address the record by this name; when `None`, the output name is
     /// used to append a new specific record.
     record_name: Option<String>,
-    /// Whether a specific record for this output exists **and is enabled** — the
-    /// condition under which an in-place [`set_field`](crate::parsers::monitors::MonitorsFile::set_field)
-    /// edit applies; otherwise a full record is written with
+    /// Whether a specific record for this output exists **with all four positional
+    /// fields**, whether or not it carries the `disabled,1` pair — the condition under
+    /// which edits are made in place
+    /// ([`set_field`](crate::parsers::monitors::MonitorsFile::set_field),
+    /// [`set_disabled`](crate::parsers::monitors::MonitorsFile::set_disabled));
+    /// otherwise a full record is written first with
     /// [`set_record`](crate::parsers::monitors::MonitorsFile::set_record).
-    has_enabled_record: bool,
+    has_complete_record: bool,
     /// The modes the compositor reports this output supports (for the drop-downs).
     available: Vec<Mode>,
     /// The configured values as read (the drop-downs' baseline selections).
@@ -883,18 +908,24 @@ impl DisplayModel {
         self.stage_checked(index, valid, |config| config.position = position)
     }
 
-    /// Stages an enable/disable edit for a **non-laptop** monitor `index` (a staged
-    /// `monitors.conf` change).
+    /// Stages turning a **non-laptop** monitor `index` off (`enabled == false`) or
+    /// back on — on Apply, adding or removing the `disabled,1` pair on its
+    /// `monitors.conf` record (task 10.4; see the module docs).
     ///
-    /// Refused for a laptop panel, whose on/off state is the runtime toggle
-    /// ([`Self::toggle_laptop`], R5.2). Disabling is refused with
-    /// [`GrammarRule::DisableForm`] named: the frozen grammar has no record form that
-    /// turns an output off (the legacy `<output>,disable` record would leave it on
-    /// under `hyprland.lua`'s loader — see the module docs). Enabling an output that is
-    /// off writes a complete record and stages normally.
+    /// Refused, with nothing staged:
+    /// - disabling any output whose record keys the laptop panel — an `eDP` connector
+    ///   name or the `desc:` record matched to a live `eDP` output — with
+    ///   [`StageRefusal::Grammar`]`(`[`GrammarRule::DisabledOnLaptopKey`]`)`, naming
+    ///   the rule: the panel is switched by the dotfiles' toggle script
+    ///   ([`Self::laptop_toggle_request`], tasks 11.8, 10.3), never by this pair;
+    /// - enabling a laptop panel, with [`StageRefusal::LaptopEnablement`], for the
+    ///   same reason;
+    /// - an edit whose rendered file would break another grammar rule, like every
+    ///   `stage_*` call.
     pub fn stage_enabled(&mut self, index: usize, enabled: bool) -> Result<(), StageRefusal> {
-        let is_laptop = self.monitor(index).is_some_and(|view| view.is_laptop());
-        let valid = if is_laptop {
+        let valid = if !enabled && addresses_laptop_panel(&self.monitors, index) {
+            Err(StageRefusal::Grammar(GrammarRule::DisabledOnLaptopKey))
+        } else if self.monitor(index).is_some_and(|view| view.is_laptop()) {
             Err(StageRefusal::LaptopEnablement)
         } else {
             Ok(())
@@ -1054,9 +1085,10 @@ impl DisplayModel {
         // A dirty monitor does not always render an edit. A `,disable` record on disk
         // makes the page read-only, so the remaining case is an output that is off with
         // no specific record (only the catch-all configures it): the staged and original
-        // `enabled` flags are both false and `apply_edits` writes nothing for it (see its
-        // `else if staged.enabled` guard), so a staged mode/scale edit on such an output
-        // leaves `changed_keys` empty. That is reachable through this model's API — the
+        // `enabled` flags are both false and `apply_edits` writes nothing for it (it has
+        // no record to edit in place and writes a new one only for an output that is or
+        // becomes on, or is being turned off), so a staged mode/scale edit on such an
+        // output leaves `changed_keys` empty. That is reachable through this model's API — the
         // Display page hides the mode/scale rows of a disabled output, so it cannot
         // happen from the UI today. `Ok(None)` is the right answer: nothing is written,
         // so the window commits nothing and the staged edit simply stays pending (no
@@ -1121,21 +1153,23 @@ impl DisplayModel {
             for monitor in &mut self.monitors {
                 monitor.record_name =
                     match_record(records, &monitor.output_name, &monitor.description);
-                let enabled = monitor
+                monitor.has_complete_record = monitor
                     .record_name
-                    .as_ref()
-                    .and_then(|name| records.is_enabled(name));
-                monitor.has_enabled_record = enabled == Some(true);
+                    .as_deref()
+                    .is_some_and(|name| record_is_complete(records, name));
             }
         }
     }
 
-    /// The value validations for the staged edits (R8.3): each enabled, edited monitor
+    /// The value validations for the staged edits (R8.3): each edited monitor
     /// contributes its mode, position, and scale to be re-checked by the pipeline before
     /// any write, reusing the [`SettingId`] validators.
     ///
     /// The whole staged record is validated, not only the field the user touched, because
-    /// every field of it is about to be written into the same `monitor=` line.
+    /// every field of it is part of the `monitor=` line the write leaves behind. That
+    /// includes an output being turned off: its record keeps its fields beside the
+    /// `disabled,1` pair (task 10.4), and an output without a record of its own gets one
+    /// written from exactly these values.
     fn staged_validations(&self) -> Vec<(SettingId, Value)> {
         let mut validations = Vec::new();
         for monitor in &self.monitors {
@@ -1143,9 +1177,6 @@ impl DisplayModel {
                 continue;
             }
             let config = monitor.effective();
-            if !config.enabled {
-                continue;
-            }
             validations.push((SettingId::MonitorMode, Value::Enum(config.mode.clone())));
             validations.push((
                 SettingId::MonitorPosition,
@@ -1441,8 +1472,8 @@ fn run_laptop_toggle(
 ///   laptop panel's on/off state, re-read around each toggle);
 /// - the **effective** configuration — the pending staged edit if there is one,
 ///   otherwise the value configured by the output's `monitor=` record in
-///   `monitors.conf`, or the live state when no specific enabled record configures
-///   the output.
+///   `monitors.conf` (also while that record carries the `disabled,1` pair), or the
+///   live state when no specific complete record configures the output.
 ///
 /// The view borrows the model, so it cannot outlive a mutation: after any `stage_*`
 /// or toggle call, ask [`DisplayModel::monitor`] for a fresh one.
@@ -1660,15 +1691,19 @@ fn run_toggle_script(runner: &dyn CommandRunner, program: &str) -> Result<(), To
 /// labels for logging (R7.3). Shared by [`DisplayModel::apply_contribution`] (on a
 /// clone) and [`DisplayModel::commit`] (in place) so both render edits identically.
 ///
-/// An in-place field edit ([`MonitorField`]) preserves trailing extras such as
-/// `bitdepth,10`; a (re-)enable or a first-time configure writes the whole record body
-/// with [`MonitorsFile::set_record`]. A staged disable is refused with
-/// [`GrammarRule::DisableForm`]: the frozen grammar has no form that turns an output
-/// off (see the module docs), so there is nothing valid to write. A laptop panel's
-/// enablement is never staged (it is runtime-only) and never reaches this.
+/// For an output with a complete record of its own, every edit is in place: changed
+/// fields through [`MonitorsFile::set_field`], and a changed enablement through
+/// [`MonitorsFile::set_disabled`], which adds or removes only the `disabled,1` pair
+/// (task 10.4) — so trailing extras such as `bitdepth,10` survive both. An output
+/// without one (configured by the catch-all only) first gets a whole record written
+/// with [`MonitorsFile::set_record`] when it is, or becomes, enabled or is being
+/// turned off. Turning off a record that keys the laptop panel is refused with
+/// [`GrammarRule::DisabledOnLaptopKey`] before anything is edited — the last line of
+/// defence behind [`DisplayModel::stage_enabled`]. A laptop panel's enablement is
+/// otherwise never staged (it is runtime-only) and never reaches this.
 fn apply_edits(file: &mut MonitorsFile, monitors: &[Monitor]) -> Result<Vec<String>, EditError> {
     let mut changed = Vec::new();
-    for monitor in monitors {
+    for (index, monitor) in monitors.iter().enumerate() {
         let Some(staged) = &monitor.staged else {
             continue;
         };
@@ -1676,42 +1711,88 @@ fn apply_edits(file: &mut MonitorsFile, monitors: &[Monitor]) -> Result<Vec<Stri
             continue;
         }
         let name = monitor.address();
+        let output = &monitor.output_name;
+        let enablement_changed = staged.enabled != monitor.original.enabled;
+        if enablement_changed && !staged.enabled && addresses_laptop_panel(monitors, index) {
+            return Err(EditError::Grammar(GrammarRule::DisabledOnLaptopKey));
+        }
 
-        if staged.enabled != monitor.original.enabled {
-            if !staged.enabled {
-                return Err(EditError::Grammar(GrammarRule::DisableForm));
+        if monitor.has_complete_record {
+            // In-place field edits preserve the leading `monitor=<name>` token, the
+            // untouched fields, and any trailing extras (awk-parseable). They apply
+            // to a record that is off as well, which keeps its fields beside the pair.
+            if staged.mode != monitor.original.mode {
+                file.set_field(name, MonitorField::Mode, &staged.mode)?;
+                changed.push(format!("monitor {output} mode"));
             }
+            if staged.position != monitor.original.position {
+                file.set_field(name, MonitorField::Position, &staged.position)?;
+                changed.push(format!("monitor {output} position"));
+            }
+            if staged.scale != monitor.original.scale {
+                file.set_field(name, MonitorField::Scale, &staged.scale)?;
+                changed.push(format!("monitor {output} scale"));
+            }
+        } else if staged.enabled || enablement_changed {
+            // No record of its own yet (catch-all configured, or none): write a full
+            // specific record so this output wins later-rule precedence — and, for an
+            // output being turned off, so the pair below has a record to sit on.
             file.set_record(name, &active_record(staged))?;
-            changed.push(format!("monitor {} enabled", monitor.output_name));
-        } else if staged.enabled {
-            if monitor.has_enabled_record {
-                // In-place field edits preserve the leading `monitor=<name>` token,
-                // the untouched fields, and any trailing extras (awk-parseable).
-                if staged.mode != monitor.original.mode {
-                    file.set_field(name, MonitorField::Mode, &staged.mode)?;
-                    changed.push(format!("monitor {} mode", monitor.output_name));
-                }
-                if staged.position != monitor.original.position {
-                    file.set_field(name, MonitorField::Position, &staged.position)?;
-                    changed.push(format!("monitor {} position", monitor.output_name));
-                }
-                if staged.scale != monitor.original.scale {
-                    file.set_field(name, MonitorField::Scale, &staged.scale)?;
-                    changed.push(format!("monitor {} scale", monitor.output_name));
-                }
-            } else {
-                // No enabled record yet (catch-all configured, or none): write a full
-                // specific record so this output wins later-rule precedence.
-                file.set_record(name, &active_record(staged))?;
-                changed.push(format!("monitor {} configured", monitor.output_name));
+            if !enablement_changed {
+                changed.push(format!("monitor {output} configured"));
             }
+        }
+
+        if enablement_changed {
+            file.set_disabled(name, !staged.enabled)?;
+            let state = if staged.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            changed.push(format!("monitor {output} {state}"));
         }
     }
     Ok(changed)
 }
 
+/// Whether the record monitor `index` addresses keys the laptop panel, so the
+/// `disabled,1` pair must never be written on it (task 10.4,
+/// [`GrammarRule::DisabledOnLaptopKey`]).
+///
+/// That is the case when the monitor is itself a laptop panel, when its address is an
+/// `eDP` connector name (any case — wider than the loader's case-sensitive `eDP-`
+/// test, erring towards refusing), or when a live laptop panel is configured by the
+/// same record. The last case covers the `desc:` keys the profile script maps to the
+/// panel through its `case` statement, which the app does not read: the script keys a
+/// panel on its own EDID description, and the record matched to the live panel is
+/// exactly that key. A `desc:` record for another machine's panel matches no live
+/// output here, so the page never addresses it. An index naming no monitor is not a
+/// panel; the caller refuses it separately.
+fn addresses_laptop_panel(monitors: &[Monitor], index: usize) -> bool {
+    let Some(monitor) = monitors.get(index) else {
+        return false;
+    };
+    let address = monitor.address();
+    monitor.is_laptop
+        || address
+            .to_ascii_lowercase()
+            .starts_with(LAPTOP_OUTPUT_PREFIX)
+        || monitors
+            .iter()
+            .any(|other| other.is_laptop && other.address() == address)
+}
+
+/// Whether the record named `name` has all four positional fields, so it can be
+/// edited in place. The scale is the fourth field, so reading it succeeds exactly
+/// for such a record (and fails for the legacy `<output>,disable` form).
+fn record_is_complete(file: &MonitorsFile, name: &str) -> bool {
+    file.field(name, MonitorField::Scale).is_some()
+}
+
 /// The [`MonitorRecord`] of a config, sourcing mode/position/scale from the (staged)
-/// values — used when (re-)enabling or first-configuring an output.
+/// values — used when writing the first record of an output configured only by the
+/// catch-all.
 fn active_record(config: &MonitorConfig) -> MonitorRecord {
     MonitorRecord {
         mode: config.mode.clone(),
@@ -1830,23 +1911,24 @@ fn merge_monitor(live: LiveMonitor, records: Option<&MonitorsFile>) -> Monitor {
         match_record(file, &live.name, &live.description).map(|name| (file, name))
     });
 
-    // Read the configured values from a specific, enabled record; otherwise fall back
-    // to the live state so the drop-downs still show something meaningful.
+    // Read the configured values from a specific, complete record — also one turned
+    // off by the `disabled,1` pair, whose fields are what re-enabling restores;
+    // otherwise fall back to the live state so the drop-downs still show something
+    // meaningful.
     let record_enabled = matched
         .as_ref()
         .and_then(|(file, name)| file.is_enabled(name));
-    let has_enabled_record = record_enabled == Some(true);
+    let complete_record = matched
+        .as_ref()
+        .filter(|(file, name)| record_is_complete(file, name))
+        .map(|(file, name)| (*file, name.as_str()));
+    let has_complete_record = complete_record.is_some();
 
     let live_mode = live_mode_string(&live);
     let live_scale = trim_float(live.scale);
     let live_position = format!("{}x{}", live.position.0, live.position.1);
 
-    let enabled_record = if has_enabled_record {
-        matched.as_ref().map(|(file, name)| (*file, name.as_str()))
-    } else {
-        None
-    };
-    let (mode, position, scale) = if let Some((file, name)) = enabled_record {
+    let (mode, position, scale) = if let Some((file, name)) = complete_record {
         (
             file.field(name, MonitorField::Mode)
                 .map(str::to_string)
@@ -1887,7 +1969,7 @@ fn merge_monitor(live: LiveMonitor, records: Option<&MonitorsFile>) -> Monitor {
         is_laptop,
         live_enabled: !live.disabled,
         record_name: matched.map(|(_, name)| name),
-        has_enabled_record,
+        has_complete_record,
         available: live.available,
         original,
         staged: None,
@@ -2420,16 +2502,10 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         //
         // Every `stage_*` call already trial-renders its edit (task 11.9), so the failure
         // is injected by crafting the staged state directly, bypassing them: a staged
-        // disable, which the writer refuses because the frozen grammar has no record
-        // form that turns an output off.
+        // disable of the laptop panel, which the writer refuses because the
+        // `disabled,1` pair may never sit on the panel's record (task 10.4).
         let dir = tempfile::tempdir().expect("temp dir");
-        let conf = "monitor=,preferred,auto,1\nmonitor=DP-1,1920x1080@60,0x0,1\n";
-        let mut model = DisplayModel::from_sources(
-            Some(conf),
-            HYPRCTL_EXTERNAL,
-            dir.path().join("monitors.conf"),
-            None,
-        );
+        let mut model = laptop_model(dir.path());
         let mut crafted = model.monitors[0].original.clone();
         crafted.enabled = false;
         model.monitors[0].staged = Some(crafted);
@@ -2441,7 +2517,7 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         assert!(
             matches!(
                 error,
-                DisplayWriteError::Render(EditError::Grammar(GrammarRule::DisableForm))
+                DisplayWriteError::Render(EditError::Grammar(GrammarRule::DisabledOnLaptopKey))
             ),
             "the failure is a writer rejection naming the rule: {error}"
         );
@@ -2514,37 +2590,132 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
         assert!(error.to_string().contains("monitors.conf"), "{error}");
     }
 
+    /// A one-output `hyprctl monitors all -j` reply for the external `DP-1` that
+    /// [`MONITORS_CONF`]'s Lenovo `desc:` record configures.
+    const HYPRCTL_LENOVO: &str = r#"[{"name":"DP-1","description":"Lenovo Group Limited P24q-10 U4P00001","width":2560,"height":1440,"refreshRate":60.0,"x":0,"y":0,"scale":1.0,"disabled":false,"availableModes":["2560x1440@60.00Hz"]}]"#;
+
+    /// [`MONITORS_CONF`]'s Lenovo record line.
+    const LENOVO_LINE: &str = "monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1";
+
     #[test]
-    fn disabling_a_non_laptop_monitor_is_refused() {
-        // A non-laptop output's enable switch stages a monitors.conf edit, but the frozen
-        // grammar has no record form that turns an output off: the legacy
-        // `<output>,disable` record would reach Hyprland through hyprland.lua's loader as
-        // `mode = "disable"`, which Hyprland rejects while leaving the output on. The
-        // stage is refused, naming that rule, and nothing becomes dirty.
+    fn disabling_an_external_monitor_stages_the_disabled_pair() {
+        // Task 10.4: a non-laptop output is turned off by appending `,disabled,1` to its
+        // record — nothing else in the file changes — and turned back on by removing
+        // exactly that pair. The legacy `,disable` form is never written.
         let dir = tempfile::tempdir().expect("temp dir");
-        let hyprctl = r#"[{"name":"DP-1","description":"Lenovo Group Limited P24q-10 U4P00001","width":2560,"height":1440,"refreshRate":60.0,"x":0,"y":0,"scale":1.0,"disabled":false,"availableModes":["2560x1440@60.00Hz"]}]"#;
         let mut model = DisplayModel::from_sources(
             Some(MONITORS_CONF),
-            hyprctl,
+            HYPRCTL_LENOVO,
             dir.path().join("monitors.conf"),
             None,
         );
         assert!(!view(&model, 0).is_laptop());
         assert!(view(&model, 0).effective_enabled());
 
-        let refusal = model
+        model
             .stage_enabled(0, false)
-            .expect_err("a disable has no valid record form");
-        assert!(
-            matches!(refusal, StageRefusal::Grammar(GrammarRule::DisableForm)),
-            "{refusal:?}"
+            .expect("an external output can be turned off");
+        assert!(model.is_dirty());
+        assert!(!view(&model, 0).effective_enabled());
+        let contribution = rendered_contribution(&model);
+        assert_eq!(
+            contribution.write.changed_keys,
+            vec!["monitor DP-1 disabled"]
         );
-        assert!(
-            refusal.to_string().contains("`<output>,disable`"),
-            "the refusal names the rule: {refusal}"
+        // The record's values are re-validated, since they stay in the written line.
+        assert_eq!(contribution.validations.len(), 3);
+        let off = String::from_utf8(contribution.write.contents).expect("utf-8");
+        assert_eq!(
+            off,
+            MONITORS_CONF.replacen(LENOVO_LINE, &format!("{LENOVO_LINE},disabled,1"), 1)
         );
+        assert!(!off.contains(",disable\n") && !off.contains("disabled,true"));
+
+        // After the Apply the model is clean and reads the output as off; turning it
+        // back on removes exactly the pair again.
+        model.commit();
         assert!(!model.is_dirty());
-        assert!(view(&model, 0).effective_enabled());
+        assert!(!view(&model, 0).effective_enabled());
+        model
+            .stage_enabled(0, true)
+            .expect("an off output can be turned back on");
+        let contribution = rendered_contribution(&model);
+        assert_eq!(
+            contribution.write.changed_keys,
+            vec!["monitor DP-1 enabled"]
+        );
+        assert_eq!(
+            String::from_utf8(contribution.write.contents).expect("utf-8"),
+            MONITORS_CONF
+        );
+    }
+
+    #[test]
+    fn an_off_record_loads_disabled_with_its_own_values() {
+        // A record carrying the pair reads as off, and its mode/scale — the values
+        // re-enabling restores — come from the record, not from the (dark) output.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conf = MONITORS_CONF.replacen(LENOVO_LINE, &format!("{LENOVO_LINE},disabled,1"), 1);
+        let hyprctl = HYPRCTL_LENOVO
+            .replace(r#""disabled":false"#, r#""disabled":true"#)
+            .replace(r#""width":2560,"height":1440"#, r#""width":0,"height":0"#);
+        let mut model = DisplayModel::from_sources(
+            Some(&conf),
+            &hyprctl,
+            dir.path().join("monitors.conf"),
+            None,
+        );
+        assert!(model.records_editable(), "the pair is inside the grammar");
+        assert!(!view(&model, 0).effective_enabled());
+        assert_eq!(view(&model, 0).effective_resolution(), "2560x1440");
+
+        // A field edit on an output that stays off is made in place, keeping the
+        // pair. The page hides the rows of an off output, but the model's API
+        // reaches this, so the write must still be surgical.
+        model
+            .stage_scale(0, "1.25".to_string())
+            .expect("the edit stages");
+        assert_eq!(
+            rendered_text(&model),
+            MONITORS_CONF.replacen(
+                LENOVO_LINE,
+                "monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1.25,disabled,1",
+                1
+            )
+        );
+    }
+
+    #[test]
+    fn disabling_an_output_without_a_record_appends_one_carrying_the_pair() {
+        // An output configured only by the catch-all gets a record of its own, built
+        // from the values the page shows, with the pair on it.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conf = "monitor=,preferred,auto,1\n";
+        let mut model = DisplayModel::from_sources(
+            Some(conf),
+            HYPRCTL_EXTERNAL,
+            dir.path().join("monitors.conf"),
+            None,
+        );
+        model.stage_enabled(0, false).expect("stages");
+        let contribution = rendered_contribution(&model);
+        assert_eq!(
+            contribution.write.changed_keys,
+            vec!["monitor DP-1 disabled"]
+        );
+        assert_eq!(
+            String::from_utf8(contribution.write.contents).expect("utf-8"),
+            "monitor=,preferred,auto,1\nmonitor=DP-1,1920x1080@60,0x0,1,disabled,1\n"
+        );
+
+        // Committed, the appended record is the output's from now on: re-enabling
+        // removes only the pair and keeps the record.
+        model.commit();
+        model.stage_enabled(0, true).expect("stages");
+        assert_eq!(
+            rendered_text(&model),
+            "monitor=,preferred,auto,1\nmonitor=DP-1,1920x1080@60,0x0,1\n"
+        );
     }
 
     #[test]
@@ -2618,11 +2789,90 @@ monitor=desc:Lenovo Group Limited P24q-10 U4P00001,2560x1440,0x0,1
     #[test]
     fn staging_on_a_laptop_panel_enablement_is_refused() {
         // The laptop panel's on/off state is the runtime toggle (R5.2), never a record.
+        // Here the panel is configured by the `desc:` record keyed on its EDID
+        // description — the key the profile script maps it to — so disabling is refused
+        // with the rule that keeps the pair off a panel's record (task 10.4).
         let dir = tempfile::tempdir().expect("temp dir");
         let mut model = laptop_model(dir.path());
+        assert_eq!(
+            model.monitors[0].address(),
+            "desc:AU Optronics 0x2036",
+            "the panel is addressed through its desc: key"
+        );
+        let refusal = model
+            .stage_enabled(0, false)
+            .expect_err("the panel's record never carries the pair");
+        assert!(
+            matches!(
+                refusal,
+                StageRefusal::Grammar(GrammarRule::DisabledOnLaptopKey)
+            ),
+            "{refusal:?}"
+        );
+        assert!(
+            refusal.to_string().contains("hypr-toggle-laptop-display"),
+            "the refusal names the rule: {refusal}"
+        );
         assert!(matches!(
-            model.stage_enabled(0, false),
+            model.stage_enabled(0, true),
             Err(StageRefusal::LaptopEnablement)
+        ));
+        assert!(!model.is_dirty());
+    }
+
+    #[test]
+    fn disabling_an_edp_connector_record_is_refused_naming_the_rule() {
+        // A panel whose description matches no `desc:` record is addressed by its
+        // generic `eDP-1` record; disabling it is refused the same way, and the file is
+        // never rendered with the pair.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let hyprctl = HYPRCTL_LAPTOP.replace("AU Optronics 0x2036", "Another Panel 0x0001");
+        let mut model = DisplayModel::from_sources(
+            Some(MONITORS_CONF),
+            &hyprctl,
+            dir.path().join("monitors.conf"),
+            None,
+        );
+        assert_eq!(model.monitors[0].address(), "eDP-1");
+        let refusal = model
+            .stage_enabled(0, false)
+            .expect_err("an eDP record never carries the pair");
+        assert!(
+            matches!(
+                refusal,
+                StageRefusal::Grammar(GrammarRule::DisabledOnLaptopKey)
+            ),
+            "{refusal:?}"
+        );
+        assert!(
+            refusal
+                .to_string()
+                .starts_with("monitors.conf format: the laptop panel")
+        );
+        assert!(!model.is_dirty());
+    }
+
+    #[test]
+    fn an_external_output_sharing_the_panels_record_is_not_disabled() {
+        // Defence for a contrived match: an external output whose description contains
+        // the panel's `desc:` key is configured by the panel's record, so turning it off
+        // would put the pair on that record. Refused, naming the rule.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let hyprctl = r#"[
+            {"name":"eDP-1","description":"AU Optronics 0x2036","width":2560,"height":1440,"refreshRate":60.0,"x":0,"y":0,"scale":1.0,"disabled":false,"availableModes":["2560x1440@60.00Hz"]},
+            {"name":"DP-1","description":"AU Optronics 0x2036 (dock)","width":2560,"height":1440,"refreshRate":60.0,"x":0,"y":0,"scale":1.0,"disabled":false,"availableModes":["2560x1440@60.00Hz"]}
+        ]"#;
+        let mut model = DisplayModel::from_sources(
+            Some(MONITORS_CONF),
+            hyprctl,
+            dir.path().join("monitors.conf"),
+            None,
+        );
+        assert!(!view(&model, 1).is_laptop());
+        assert_eq!(model.monitors[1].address(), "desc:AU Optronics 0x2036");
+        assert!(matches!(
+            model.stage_enabled(1, false),
+            Err(StageRefusal::Grammar(GrammarRule::DisabledOnLaptopKey))
         ));
         assert!(!model.is_dirty());
     }
