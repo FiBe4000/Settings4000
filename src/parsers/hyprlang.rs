@@ -67,15 +67,17 @@
 //!   key `natural_scroll` inside `touchpad { }` inside `input { }`. Duplicate
 //!   sections are disambiguated by 0-based occurrence
 //!   ([`SectionStep::nth`]); the default is the first occurrence. This is what
-//!   the input page (task 6.6), power/idle page (task 6.8, positional
-//!   `listener` matching), and wallpaper/lock page (task 6.5) use.
+//!   the power/idle page (task 6.8, positional `listener` matching) and the
+//!   wallpaper/lock page (task 6.5) use.
 //! - **By repeatable top-level key + first field** —
 //!   [`HyprlangFile::set_repeatable_field_value`]. A top-level key such as
 //!   `env` can appear many times, so a specific line is selected by its first
 //!   comma-separated field (e.g. `env = XCURSOR_THEME,…` is selected by
 //!   `XCURSOR_THEME`) and only the value portion *after that first comma* is
-//!   edited, leaving the field name and everything else byte-identical. This is
-//!   what the cursor-env writer (task 6.4) uses.
+//!   edited, leaving the field name and everything else byte-identical. The
+//!   cursor-env writer (task 6.4) used it on Hyprland's former hyprlang main
+//!   config; since task 11.5 moved that write to `hyprland.lua` it is a parser
+//!   capability with no production caller.
 //!
 //! # Duplicated keys, and why sections are not merged
 //!
@@ -98,11 +100,10 @@
 //! writing resolve to the **first** such line. They agree, so the app never
 //! displays one copy while editing another, but hyprland's own `env` handling
 //! applies each line in turn and ends up with the *later* one's value, so an edit
-//! to the first line would not take effect. All the parser does about it is log a
-//! `warn` naming the key, the field, and the duplicated line numbers; that
-//! reaches the journal only — nothing tells the person at the screen. Task 9.31
-//! tracks surfacing it (and the duplicated-category case below) where the user
-//! can see it.
+//! to the first line would not take effect. The parser reports that shape as an
+//! [`Ambiguity::DoubledRepeatableField`] (see "Reporting ambiguous addresses"
+//! below) and logs a `warn` built from the same report whenever such an address
+//! is read or written.
 //!
 //! Sections are deliberately **not** merged: a [`KeyPath`] always names one
 //! section instance, by occurrence. That is required because a repeated block can
@@ -113,25 +114,46 @@
 //! category is written twice in one file, hyprlang merges the blocks and the
 //! later block's assignment wins, whereas this parser edits whichever occurrence
 //! the caller addressed — so an edit to the first block can still be shadowed by
-//! a second (also tracked by task 9.31). All four behaviours behind these rules
-//! were verified against libhyprlang 0.6.8: two `kb_layout` lines in one
-//! `input { }` block resolve to the second; a `sensitivity` set in a second
-//! `input { }` block overrides the first; two anonymous `listener { }` blocks
-//! become two instances; and a `timeout` doubled *inside* one such block resolves
-//! to the second, so the last-occurrence rule is right there too.
+//! a second; the parser reports that shape as an [`Ambiguity::RepeatedCategory`].
+//! All four behaviours behind these rules were verified against libhyprlang
+//! 0.6.8: two `kb_layout` lines in one `input { }` block resolve to the second; a
+//! `sensitivity` set in a second `input { }` block overrides the first; two
+//! anonymous `listener { }` blocks become two instances; and a `timeout` doubled
+//! *inside* one such block resolves to the second, so the last-occurrence rule is
+//! right there too.
 //!
-//! Which risk applies depends on the category, and nothing in the file text says
-//! which kind a block is. Of the categories this app addresses, `input { }` (with
-//! its nested `touchpad { }`) and hypridle's `general { }` are plain,
-//! single-instance categories: those are the ones a duplicate declaration in a
-//! hand-edited file could shadow. The blocks the app addresses positionally exist
-//! once per object by design — hypridle's `listener { }` (one per idle timeout),
-//! hyprlock's `label { }` (one per on-screen text, so a lock screen usually
-//! declares several), and the `monitor =`-carrying `background { }` /
-//! `wallpaper { }` blocks (the shape of a per-monitor instance) — so for those the
-//! occurrence *is* part of the address, and merging them would be the bug. The
-//! files this app owns declare each plain category once, so callers keep naming
-//! the occurrence they mean.
+//! Which kind a block is cannot be read from the file: the program that reads
+//! the file declares it when it sets up its parser. Three kinds occur in the
+//! files this app edits (checked against each daemon's source, see
+//! [`SpecialCategory`]):
+//!
+//! - **plain categories** — hypridle's and hyprlock's `general { }`, hyprlock's
+//!   `auth { }`: one set of values, so a second declaration continues the first
+//!   and its assignments win;
+//! - **anonymous special categories** — hypridle's `listener { }`, hyprlock's
+//!   `background { }`, `label { }`, `input-field { }`, `shape { }` and
+//!   `image { }`: every block is a new object, so a repeat is expected and is
+//!   addressed by occurrence;
+//! - **keyed special categories** — hyprpaper's `wallpaper { }`, keyed by its
+//!   `monitor` value: blocks for different monitors are different wallpapers,
+//!   while two blocks naming the *same* monitor are merged into one, exactly like
+//!   a plain category.
+//!
+//! # Reporting ambiguous addresses
+//!
+//! Neither shape above is a parse error — the file is valid and round-trips byte
+//! for byte — and neither can be fixed by guessing which line the user meant. So
+//! [`HyprlangFile::ambiguities`] *reports* them instead, as a read-only list of
+//! [`Ambiguity`] values naming the key or category and the line numbers, for the
+//! caller to show where the user can see it (task 9.31). Because the block kinds
+//! above are part of each daemon's schema rather than of the text, the caller
+//! passes a [`HyprlangSchema`] naming its daemon's special categories and
+//! repeatable keys; anything not named there is treated as a plain category or
+//! an ordinary key. Repeated anonymous blocks are never reported: repetition is
+//! their purpose. Like every other diagnostic here, a report carries names and
+//! line numbers only, never values ([R7.3][r73]).
+//!
+//! [r73]: crate::parsers#diagnostics-carry-positions-not-contents-r73
 //!
 //! # Appending
 //!
@@ -303,6 +325,14 @@ impl KeyPath {
             key: key.to_string(),
         }
     }
+
+    /// The name of the outermost section this path descends into, or `None` for a
+    /// top-level key — what a caller compares with
+    /// [`Ambiguity::top_level_category`] to tell whether a reported ambiguity
+    /// touches the value this path addresses (task 9.31).
+    pub fn top_section(&self) -> Option<&str> {
+        self.sections.first().map(|step| step.name.as_str())
+    }
 }
 
 impl fmt::Display for KeyPath {
@@ -390,6 +420,190 @@ pub enum ParseWarningKind {
         /// The name of the section left open.
         name: String,
     },
+}
+
+/// The part of a daemon's configuration schema that a hyprlang file's text does not
+/// reveal, which [`HyprlangFile::ambiguities`] needs to tell an expected repeat from
+/// an ambiguous one (task 9.31).
+///
+/// hyprlang leaves it to the program reading a file to declare which top-level
+/// blocks are separate objects ([`SpecialCategory`]) and which keys are directives
+/// meant to be repeated (`env`, `exec-once`); the file looks the same either way.
+/// Each caller therefore describes its daemon's file with one of these. A block name
+/// not listed in `special_categories` is treated as a plain category, and a key not
+/// listed in `repeatable_keys` is not checked for doubled first fields — so the
+/// default (empty) schema reports only repeated plain categories.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HyprlangSchema {
+    /// The top-level blocks the daemon declares as special categories.
+    pub special_categories: &'static [SpecialCategory],
+    /// The top-level keys whose lines are separate directives selected by their
+    /// first comma-field (see the module's "Addressing schemes"), checked for two
+    /// lines sharing that field.
+    pub repeatable_keys: &'static [&'static str],
+}
+
+impl HyprlangSchema {
+    /// The special category declared for the top-level block `name`, if any.
+    fn special_category(&self, name: &str) -> Option<SpecialCategory> {
+        self.special_categories
+            .iter()
+            .copied()
+            .find(|category| category.name() == name)
+    }
+}
+
+/// A top-level block that a daemon declares as a hyprlang *special category*: a block
+/// that may occur many times, each occurrence (or each key value) being its own object
+/// rather than a continuation of the previous one.
+///
+/// The two kinds mirror the two ways the daemons register them with libhyprlang
+/// (`addSpecialCategory`): with `anonymousKeyBased = true` — hypridle's `listener`,
+/// hyprlock's `background`, `label`, `input-field`, `shape` and `image` — or with a
+/// `key` — hyprpaper's `wallpaper`, keyed by `monitor`. For a keyed category hyprlang
+/// looks up an existing instance by the key's value, so two blocks naming the same
+/// value are merged into one instance (later assignments win) while different values
+/// stay separate objects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpecialCategory {
+    /// Every block is a new object (hyprlang's anonymous special category), so a
+    /// repeated block is never ambiguous.
+    Anonymous(&'static str),
+    /// Blocks are objects identified by the value of their `key` assignment; blocks
+    /// sharing that value are merged.
+    Keyed {
+        /// The block name (e.g. `wallpaper`).
+        name: &'static str,
+        /// The key whose value identifies the object (e.g. `monitor`).
+        key: &'static str,
+    },
+}
+
+impl SpecialCategory {
+    /// The block name this declaration applies to.
+    pub fn name(&self) -> &'static str {
+        match self {
+            SpecialCategory::Anonymous(name) | SpecialCategory::Keyed { name, .. } => name,
+        }
+    }
+}
+
+/// An address in a hyprlang file that names one line while the daemon reading the file
+/// takes its value from another, reported by [`HyprlangFile::ambiguities`] (task 9.31).
+///
+/// Both shapes are valid hyprlang and round-trip losslessly; what they break is the
+/// promise that an edit made through the app takes effect (R5.3). The report is meant
+/// to be shown to the user, so it names the key or category and the 1-based line
+/// numbers — never a value ([R7.3][r73]) — and its [`Display`](fmt::Display) form is a
+/// plain sentence fragment ("`general` is declared twice (lines 1 and 12)").
+///
+/// [r73]: crate::parsers#diagnostics-carry-positions-not-contents-r73
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ambiguity {
+    /// Two or more top-level lines of a repeatable key share their first comma-field
+    /// (`env = XCURSOR_THEME,…` written twice). The repeatable-key accessors read and
+    /// write the first of them, while the daemon applies each line in turn and ends up
+    /// with the last.
+    DoubledRepeatableField {
+        /// The repeatable key (e.g. `env`).
+        key: String,
+        /// The shared first comma-field (e.g. `XCURSOR_THEME`).
+        field: String,
+        /// The 1-based line numbers of the lines sharing it, in file order.
+        lines: Vec<usize>,
+    },
+    /// A category declared more than once among the same siblings — a plain category,
+    /// or a keyed special category naming the same key value — which the daemon merges
+    /// so that a later block's assignment wins, while a [`KeyPath`] addresses one of
+    /// the blocks.
+    RepeatedCategory {
+        /// The category's section path from the top level, outermost first (e.g.
+        /// `["general"]`, or `["auth", "fingerprint"]` for a nested repeat).
+        path: Vec<String>,
+        /// For a keyed special category, the key whose value the blocks share (e.g.
+        /// `monitor`); `None` for a plain category.
+        keyed_by: Option<&'static str>,
+        /// The 1-based line numbers of the blocks' headers, in file order.
+        lines: Vec<usize>,
+    },
+}
+
+impl Ambiguity {
+    /// The 1-based line numbers involved, in file order.
+    pub fn lines(&self) -> &[usize] {
+        match self {
+            Ambiguity::DoubledRepeatableField { lines, .. }
+            | Ambiguity::RepeatedCategory { lines, .. } => lines,
+        }
+    }
+
+    /// The top-level category a [`Ambiguity::RepeatedCategory`] lies in (the first
+    /// element of its path), or `None` for a repeatable key, which lives outside every
+    /// category. Lets a caller decide whether the ambiguity touches a value it edits, by
+    /// comparing it with the [`KeyPath::top_section`] of each address it uses.
+    pub fn top_level_category(&self) -> Option<&str> {
+        match self {
+            Ambiguity::RepeatedCategory { path, .. } => path.first().map(String::as_str),
+            Ambiguity::DoubledRepeatableField { .. } => None,
+        }
+    }
+}
+
+impl fmt::Display for Ambiguity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Ambiguity::DoubledRepeatableField { key, field, lines } => write!(
+                f,
+                "{} `{key}` lines share the first field `{field}` ({})",
+                count_word(lines.len()),
+                line_list(lines)
+            ),
+            Ambiguity::RepeatedCategory {
+                path,
+                keyed_by,
+                lines,
+            } => {
+                write!(f, "`{}` is declared {}", path.join("."), times(lines.len()))?;
+                if let Some(key) = keyed_by {
+                    write!(f, " for the same `{key}`")?;
+                }
+                write!(f, " ({})", line_list(lines))
+            }
+        }
+    }
+}
+
+/// "Two", "Three", … for the small counts an ambiguity report carries, so a sentence
+/// can start with it; larger counts fall back to digits.
+fn count_word(count: usize) -> String {
+    match count {
+        2 => "Two".to_string(),
+        3 => "Three".to_string(),
+        4 => "Four".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// "twice" for two, "N times" otherwise.
+fn times(count: usize) -> String {
+    if count == 2 {
+        "twice".to_string()
+    } else {
+        format!("{count} times")
+    }
+}
+
+/// Renders 1-based line numbers as English prose: "line 4", "lines 1 and 12",
+/// "lines 1, 5 and 12".
+fn line_list(lines: &[usize]) -> String {
+    match lines {
+        [] => "no lines".to_string(),
+        [only] => format!("line {only}"),
+        [init @ .., last] => {
+            let init: Vec<String> = init.iter().map(usize::to_string).collect();
+            format!("lines {} and {last}", init.join(", "))
+        }
+    }
 }
 
 /// A failure from an edit method ([`HyprlangFile::set_value`] /
@@ -588,8 +802,9 @@ impl HyprlangFile {
     /// If several entries share the key *and* the first field, the **first** of
     /// them is read — the same one
     /// [`set_repeatable_field_value`](Self::set_repeatable_field_value) edits, and
-    /// not necessarily the one hyprland ends up applying. See the module section
-    /// "Duplicated keys, and why sections are not merged".
+    /// not necessarily the one hyprland ends up applying — and a `warn` records the
+    /// [`Ambiguity::DoubledRepeatableField`]. See the module section "Duplicated keys,
+    /// and why sections are not merged".
     pub fn repeatable_field_value(&self, key: &str, first_field: &str) -> Option<&str> {
         let i = self.find_repeatable(key, first_field)?;
         let value = self.entry_value(i)?;
@@ -614,7 +829,8 @@ impl HyprlangFile {
     /// If several entries share the key *and* the first field, the **first** of
     /// them is rewritten (matching what
     /// [`repeatable_field_value`](Self::repeatable_field_value) reads) and a `warn`
-    /// records the ambiguity. Unlike a duplicated key inside a section, this is
+    /// records the ambiguity, which [`ambiguities`](Self::ambiguities) also reports
+    /// for a caller to show. Unlike a duplicated key inside a section, this is
     /// *not* resolved to the last occurrence: see the module section "Duplicated
     /// keys, and why sections are not merged" for why, and for what hyprland does
     /// with such a file.
@@ -816,19 +1032,47 @@ impl HyprlangFile {
     /// Finds the first repeatable top-level entry with the given key whose first
     /// comma-field equals `first_field`, returning its line index.
     ///
-    /// Only entries at the top level (outside every section) are considered, and
-    /// comments never match. The nesting is tracked by a simple depth counter
-    /// because repeatable keys (`env`, `exec-once`, `source`) live at the top
-    /// level.
-    ///
     /// The whole file is scanned rather than stopped at the first hit so that an
     /// ambiguous address — several entries sharing the key *and* the first field,
     /// which for `env` means the app's edit would be shadowed by the later line
-    /// (see the module docs) — can be logged. The first match is still the one
-    /// returned, so read and write stay in agreement; only the journal gains the
-    /// ambiguity. Making it visible to the user is task 9.31.
+    /// (see the module docs) — can be logged as the same
+    /// [`Ambiguity::DoubledRepeatableField`] that [`ambiguities`](Self::ambiguities)
+    /// reports. The first match is still the one returned, so read and write stay in
+    /// agreement.
     fn find_repeatable(&self, key: &str, first_field: &str) -> Option<usize> {
-        let mut matches: Vec<usize> = Vec::new();
+        let matches: Vec<usize> = self
+            .repeatable_entries(key)
+            .into_iter()
+            .filter(|(_, field)| *field == first_field)
+            .map(|(index, _)| index)
+            .collect();
+
+        if matches.len() > 1 {
+            let ambiguity = Ambiguity::DoubledRepeatableField {
+                key: key.to_string(),
+                field: first_field.to_string(),
+                lines: matches.iter().map(|index| index + 1).collect(),
+            };
+            // The report names the key, the field and line numbers only — no file
+            // contents (R7.3).
+            tracing::warn!(
+                %ambiguity,
+                "ambiguous hyprlang address: several entries share this key and first \
+                 field; using the first"
+            );
+        }
+
+        matches.first().copied()
+    }
+
+    /// The top-level entries with key `key`, each as its line index and its first
+    /// comma-field (trimmed), in file order.
+    ///
+    /// Only entries outside every section count, and comments never match. Nesting is
+    /// tracked by a simple depth counter because repeatable keys (`env`, `exec-once`,
+    /// `source`) live at the top level.
+    fn repeatable_entries(&self, key: &str) -> Vec<(usize, &str)> {
+        let mut entries = Vec::new();
         let mut depth = 0usize;
         for (i, line) in self.lines.iter().enumerate() {
             match &line.kind {
@@ -842,27 +1086,123 @@ impl HyprlangFile {
                 } if depth == 0 && entry_key == key => {
                     let value = &line.raw[*value_start..*value_end];
                     let field = value.split(',').next().unwrap_or_default().trim();
-                    if field == first_field {
-                        matches.push(i);
-                    }
+                    entries.push((i, field));
                 }
                 _ => {}
             }
         }
+        entries
+    }
 
-        if matches.len() > 1 {
-            // The key and field are caller-supplied identifiers and the line
-            // numbers are positions, so this carries no file contents (R7.3).
-            let lines: Vec<usize> = matches.iter().map(|index| index + 1).collect();
-            tracing::warn!(
-                key,
-                first_field,
-                ?lines,
-                "several hyprlang entries share this key and first field; using the first"
-            );
+    /// Reports every address in the file that names one line while the daemon takes
+    /// its value from another (task 9.31; see the module section "Reporting ambiguous
+    /// addresses").
+    ///
+    /// `schema` says which top-level blocks are special categories and which keys are
+    /// repeatable for the daemon that reads this file. Two shapes are reported:
+    ///
+    /// - [`Ambiguity::DoubledRepeatableField`] — two or more top-level lines of a
+    ///   key in [`HyprlangSchema::repeatable_keys`] sharing their first comma-field;
+    /// - [`Ambiguity::RepeatedCategory`] — a category declared more than once among
+    ///   the same siblings (the top level, or the inside of one block), when the
+    ///   daemon merges such blocks: a plain category, or a
+    ///   [`SpecialCategory::Keyed`] one whose blocks carry the same key value. A
+    ///   keyed block whose first assignment is not its key is left out:
+    ///   libhyprlang requires the key to be a special category's first value and
+    ///   rejects the block otherwise, so it is never merged. Repeated [`SpecialCategory::Anonymous`]
+    ///   blocks are never reported — each is its own object, and callers address
+    ///   them by occurrence on purpose (hypridle's `listener { }` blocks).
+    ///
+    /// Special categories are matched at the top level only, where the daemons
+    /// declare them; a block nested inside another is always treated as plain. For a
+    /// category repeated at the top level the nested blocks inside the copies are not
+    /// reported separately — the outer report already covers them.
+    ///
+    /// The result is sorted by first line number and is empty for an unambiguous
+    /// file. This only reads the parsed lines: it changes nothing, logs nothing, and
+    /// does not affect how [`value`](Self::value) or [`set_value`](Self::set_value)
+    /// resolve an address — logging the report is the caller's decision, so it can be
+    /// done once per load rather than on every call.
+    pub fn ambiguities(&self, schema: &HyprlangSchema) -> Vec<Ambiguity> {
+        let mut found = Vec::new();
+        for key in schema.repeatable_keys {
+            found.extend(self.doubled_repeatable_fields(key));
         }
+        found.extend(self.repeated_categories(schema));
+        found.sort_by_key(|ambiguity| ambiguity.lines().first().copied().unwrap_or(0));
+        found
+    }
 
-        matches.first().copied()
+    /// The [`Ambiguity::DoubledRepeatableField`] reports for one repeatable `key`, one
+    /// per first field that more than one line shares, in order of first appearance.
+    fn doubled_repeatable_fields(&self, key: &str) -> Vec<Ambiguity> {
+        let mut by_field: Vec<(&str, Vec<usize>)> = Vec::new();
+        for (index, field) in self.repeatable_entries(key) {
+            match by_field.iter_mut().find(|(seen, _)| *seen == field) {
+                Some((_, lines)) => lines.push(index + 1),
+                None => by_field.push((field, vec![index + 1])),
+            }
+        }
+        by_field
+            .into_iter()
+            .filter(|(_, lines)| lines.len() > 1)
+            .map(|(field, lines)| Ambiguity::DoubledRepeatableField {
+                key: key.to_string(),
+                field: field.to_string(),
+                lines,
+            })
+            .collect()
+    }
+
+    /// The [`Ambiguity::RepeatedCategory`] reports, found by walking the section tree
+    /// and comparing each parent's direct child blocks once the parent closes (the top
+    /// level last). A section the file never closes is closed at end-of-file, the same
+    /// tolerance [`resolve_path`](Self::resolve_path) applies.
+    fn repeated_categories(&self, schema: &HyprlangSchema) -> Vec<Ambiguity> {
+        let mut found = Vec::new();
+        let mut open: Vec<OpenBlock> = Vec::new();
+        let mut top_level: Vec<ChildBlock> = Vec::new();
+
+        for (i, line) in self.lines.iter().enumerate() {
+            match &line.kind {
+                LineKind::SectionOpen { name } => open.push(OpenBlock {
+                    name: name.clone(),
+                    line: i + 1,
+                    key_value: None,
+                    seen_entry: false,
+                    children: Vec::new(),
+                }),
+                LineKind::SectionClose => {
+                    // A stray `}` closes nothing (already a parse warning).
+                    if let Some(block) = open.pop() {
+                        close_block(block, &mut open, &mut top_level, &mut found);
+                    }
+                }
+                LineKind::Entry { key, .. } => {
+                    // Record a keyed special category's identifying value. libhyprlang
+                    // accepts the key only as the block's first assignment ("special
+                    // category's first value must be the key"), so only a first entry
+                    // directly inside the top-level block counts; a block whose first
+                    // assignment is anything else keeps `None` and is left out.
+                    if let [block] = open.as_mut_slice() {
+                        if let Some(SpecialCategory::Keyed { key: id_key, .. }) =
+                            schema.special_category(&block.name)
+                        {
+                            if !block.seen_entry && key == id_key {
+                                block.key_value = self.entry_value(i).map(str::to_string);
+                            }
+                        }
+                        block.seen_entry = true;
+                    }
+                }
+                LineKind::Blank | LineKind::Comment | LineKind::Malformed => {}
+            }
+        }
+        while let Some(block) = open.pop() {
+            close_block(block, &mut open, &mut top_level, &mut found);
+        }
+        found.extend(repeated_siblings(&[], &top_level, Some(schema)));
+        found
     }
 
     /// Counts the direct child sections named `name` within the section
@@ -987,6 +1327,122 @@ fn path_matches(frames: &[WalkFrame], target: &[SectionStep]) -> bool {
             .iter()
             .zip(target)
             .all(|(frame, step)| frame.name == step.name && frame.occurrence == step.occurrence)
+}
+
+/// A section still open during the [`HyprlangFile::ambiguities`] walk.
+struct OpenBlock {
+    /// The section's name.
+    name: String,
+    /// The 1-based line number of its header.
+    line: usize,
+    /// For a top-level keyed special category, the value of its key assignment when
+    /// that is the block's first assignment (see [`SpecialCategory::Keyed`]); `None`
+    /// otherwise.
+    key_value: Option<String>,
+    /// Whether a direct-child assignment of this block has been seen yet, so only the
+    /// first one can supply `key_value`.
+    seen_entry: bool,
+    /// The direct child sections closed so far.
+    children: Vec<ChildBlock>,
+}
+
+/// A closed section, as its parent sees it when comparing its children.
+struct ChildBlock {
+    /// The section's name.
+    name: String,
+    /// The 1-based line number of its header.
+    line: usize,
+    /// The keyed special category's identifying value, if any (see [`OpenBlock`]).
+    key_value: Option<String>,
+}
+
+/// Finishes `block` in the ambiguity walk: reports repeats among its own children,
+/// then hands it to its parent (the innermost section still open, or the top level).
+fn close_block(
+    block: OpenBlock,
+    open: &mut [OpenBlock],
+    top_level: &mut Vec<ChildBlock>,
+    found: &mut Vec<Ambiguity>,
+) {
+    let mut path: Vec<String> = open.iter().map(|parent| parent.name.clone()).collect();
+    path.push(block.name.clone());
+    // Special categories exist only at the top level, so a nested parent's children
+    // are compared as plain categories (no schema).
+    found.extend(repeated_siblings(&path, &block.children, None));
+
+    let child = ChildBlock {
+        name: block.name,
+        line: block.line,
+        key_value: block.key_value,
+    };
+    match open.last_mut() {
+        Some(parent) => parent.children.push(child),
+        None => top_level.push(child),
+    }
+}
+
+/// The [`Ambiguity::RepeatedCategory`] reports among one parent's direct children:
+/// every group of blocks the daemon would merge that has more than one member.
+///
+/// `parent` is the parent's section path (empty for the top level). `schema` is given
+/// only for the top level; a block it declares anonymous is skipped, a keyed one is
+/// grouped by its key value (skipped without one), and every other block is grouped by
+/// name alone.
+fn repeated_siblings(
+    parent: &[String],
+    children: &[ChildBlock],
+    schema: Option<&HyprlangSchema>,
+) -> Vec<Ambiguity> {
+    let mut groups: Vec<MergeGroup<'_>> = Vec::new();
+    for child in children {
+        let (key_value, keyed_by) =
+            match schema.and_then(|schema| schema.special_category(&child.name)) {
+                Some(SpecialCategory::Anonymous(_)) => continue,
+                Some(SpecialCategory::Keyed { key, .. }) => match child.key_value.as_deref() {
+                    Some(value) => (Some(value), Some(key)),
+                    None => continue,
+                },
+                None => (None, None),
+            };
+        match groups
+            .iter_mut()
+            .find(|group| group.name == child.name && group.key_value == key_value)
+        {
+            Some(group) => group.lines.push(child.line),
+            None => groups.push(MergeGroup {
+                name: &child.name,
+                key_value,
+                keyed_by,
+                lines: vec![child.line],
+            }),
+        }
+    }
+    groups
+        .into_iter()
+        .filter(|group| group.lines.len() > 1)
+        .map(|group| {
+            let mut path = parent.to_vec();
+            path.push(group.name.to_string());
+            Ambiguity::RepeatedCategory {
+                path,
+                keyed_by: group.keyed_by,
+                lines: group.lines,
+            }
+        })
+        .collect()
+}
+
+/// Sibling blocks the daemon merges into one, collected by [`repeated_siblings`].
+struct MergeGroup<'a> {
+    /// The blocks' shared name.
+    name: &'a str,
+    /// For a keyed special category, the key value the blocks share; `None` for a
+    /// plain category.
+    key_value: Option<&'a str>,
+    /// For a keyed special category, the key that value belongs to.
+    keyed_by: Option<&'static str>,
+    /// The 1-based header line numbers, in file order.
+    lines: Vec<usize>,
 }
 
 /// Extracts the leading indentation and the `=`-separator bytes of an existing
@@ -1850,10 +2306,10 @@ bind = $mainMod, Return, exec, $terminal
     fn a_doubled_repeatable_field_resolves_to_the_first_line() {
         // Two `env` lines sharing the same first field are an ambiguous address:
         // the parser resolves both reading and writing to the first line — so it
-        // never displays one copy while editing another — and logs a `warn`, which
-        // is all it does today (the module docs and task 9.31 say so; hyprland
-        // itself would apply the *later* line). This test pins that documented
-        // behaviour, including the log the docs promise.
+        // never displays one copy while editing another — and logs a `warn` built
+        // from the same report `ambiguities` returns (hyprland itself would apply
+        // the *later* line). This test pins that documented behaviour, including
+        // the log the docs promise.
         use std::sync::{Arc, Mutex};
         use tracing::Level;
         use tracing::subscriber::with_default;
@@ -2056,5 +2512,273 @@ bind = $mainMod, Return, exec, $terminal
             nested.section_count(&[SectionStep::first("outer")], "group"),
             2
         );
+    }
+
+    /// hypridle's schema as the tests below need it: `listener` is an anonymous
+    /// special category, nothing is repeatable.
+    const LISTENERS_ARE_OBJECTS: HyprlangSchema = HyprlangSchema {
+        special_categories: &[SpecialCategory::Anonymous("listener")],
+        repeatable_keys: &[],
+    };
+
+    /// A schema in which `env` is a repeatable key, as on Hyprland's former hyprlang
+    /// main config.
+    const ENV_IS_REPEATABLE: HyprlangSchema = HyprlangSchema {
+        special_categories: &[],
+        repeatable_keys: &["env"],
+    };
+
+    /// hyprpaper's schema: `wallpaper` is a special category keyed by `monitor`.
+    const WALLPAPERS_BY_MONITOR: HyprlangSchema = HyprlangSchema {
+        special_categories: &[SpecialCategory::Keyed {
+            name: "wallpaper",
+            key: "monitor",
+        }],
+        repeatable_keys: &[],
+    };
+
+    #[test]
+    fn a_doubled_repeatable_first_field_is_reported_with_key_field_and_lines() {
+        // Task 9.31, shape (a): two `env` lines sharing `XCURSOR_THEME` around an
+        // unrelated `env` line. The report names the key, the field and both line
+        // numbers, and its sentence form says the same.
+        let input =
+            "env = XCURSOR_THEME,First\nenv = XCURSOR_SIZE,16\nenv = XCURSOR_THEME,Second\n";
+        let (file, _) = HyprlangFile::parse(input);
+        let report = file.ambiguities(&ENV_IS_REPEATABLE);
+        assert_eq!(
+            report,
+            vec![Ambiguity::DoubledRepeatableField {
+                key: "env".to_string(),
+                field: "XCURSOR_THEME".to_string(),
+                lines: vec![1, 3],
+            }]
+        );
+        assert_eq!(
+            report[0].to_string(),
+            "Two `env` lines share the first field `XCURSOR_THEME` (lines 1 and 3)"
+        );
+        assert_eq!(report[0].top_level_category(), None);
+
+        // Whether a key is repeatable is the schema's call: without it the same
+        // file reports nothing (a plain top-level key resolves to its last copy).
+        assert!(file.ambiguities(&HyprlangSchema::default()).is_empty());
+    }
+
+    #[test]
+    fn a_commented_out_copy_of_a_repeatable_field_is_not_a_duplicate() {
+        // The fixture's decoy `#env = XCURSOR_THEME,…` is a comment, so the one
+        // real XCURSOR_THEME line is unambiguous.
+        let (file, _) = HyprlangFile::parse(REPEATABLE_KEYS);
+        assert!(file.ambiguities(&ENV_IS_REPEATABLE).is_empty());
+    }
+
+    #[test]
+    fn a_twice_declared_plain_category_is_reported_with_its_lines() {
+        // Task 9.31, shape (b): hypridle's `general { }` written twice. hyprlang
+        // merges the blocks (the later assignment wins) while a KeyPath addresses
+        // one of them, so the repeat is reported by category and header lines. The
+        // three listeners beside it are not.
+        let input = "\
+general {
+    lock_cmd = hyprlock
+}
+
+listener {
+    timeout = 150
+}
+
+general {
+    lock_cmd = swaylock
+}
+";
+        let (file, _) = HyprlangFile::parse(input);
+        let report = file.ambiguities(&LISTENERS_ARE_OBJECTS);
+        assert_eq!(
+            report,
+            vec![Ambiguity::RepeatedCategory {
+                path: vec!["general".to_string()],
+                keyed_by: None,
+                lines: vec![1, 9],
+            }]
+        );
+        assert_eq!(
+            report[0].to_string(),
+            "`general` is declared twice (lines 1 and 9)"
+        );
+        assert_eq!(report[0].top_level_category(), Some("general"));
+        // The report is read-only: the file still emits byte for byte, and the
+        // address still resolves to the first block as before.
+        assert_eq!(file.emit(), input);
+        assert_eq!(
+            file.value(&KeyPath::at(&["general"], "lock_cmd")),
+            Some("hyprlock")
+        );
+    }
+
+    #[test]
+    fn repeated_anonymous_blocks_are_not_ambiguous() {
+        // Three `listener { }` blocks are three listeners, addressed by occurrence
+        // on purpose: no report under hypridle's schema. The same file under an
+        // empty schema does report them, which proves it is the declaration — not
+        // an accident of the walk — that excludes them.
+        let (file, _) = HyprlangFile::parse(HYPRIDLE_CONF);
+        assert!(file.ambiguities(&LISTENERS_ARE_OBJECTS).is_empty());
+        assert_eq!(
+            file.ambiguities(&HyprlangSchema::default()),
+            vec![Ambiguity::RepeatedCategory {
+                path: vec!["listener".to_string()],
+                keyed_by: None,
+                lines: vec![7, 13, 18],
+            }]
+        );
+        assert_eq!(
+            file.ambiguities(&HyprlangSchema::default())[0].to_string(),
+            "`listener` is declared 3 times (lines 7, 13 and 18)"
+        );
+    }
+
+    #[test]
+    fn keyed_blocks_are_ambiguous_only_when_they_share_the_key_value() {
+        // hyprpaper merges `wallpaper` blocks naming the same monitor, and keeps
+        // blocks for different monitors apart.
+        let same = "wallpaper {\n    monitor =\n    path = /a.png\n}\nwallpaper {\n    monitor =\n    path = /b.png\n}\n";
+        let (file, _) = HyprlangFile::parse(same);
+        let report = file.ambiguities(&WALLPAPERS_BY_MONITOR);
+        assert_eq!(
+            report,
+            vec![Ambiguity::RepeatedCategory {
+                path: vec!["wallpaper".to_string()],
+                keyed_by: Some("monitor"),
+                lines: vec![1, 5],
+            }]
+        );
+        assert_eq!(
+            report[0].to_string(),
+            "`wallpaper` is declared twice for the same `monitor` (lines 1 and 5)"
+        );
+
+        let different = "wallpaper {\n    monitor = DP-1\n    path = /a.png\n}\nwallpaper {\n    monitor = eDP-1\n    path = /b.png\n}\n";
+        let (file, _) = HyprlangFile::parse(different);
+        assert!(file.ambiguities(&WALLPAPERS_BY_MONITOR).is_empty());
+
+        // A block without its key is rejected by the daemon rather than merged, so
+        // it is not reported either.
+        let keyless = "wallpaper {\n    path = /a.png\n}\nwallpaper {\n    path = /b.png\n}\n";
+        let (file, _) = HyprlangFile::parse(keyless);
+        assert!(file.ambiguities(&WALLPAPERS_BY_MONITOR).is_empty());
+
+        // Nor is one whose key comes after another assignment: libhyprlang requires
+        // the key to be the first value, so such a block is rejected too.
+        let key_not_first = "wallpaper {\n    path = /a.png\n    monitor =\n}\nwallpaper {\n    path = /b.png\n    monitor =\n}\n";
+        let (file, _) = HyprlangFile::parse(key_not_first);
+        assert!(file.ambiguities(&WALLPAPERS_BY_MONITOR).is_empty());
+
+        // The real file's single block is clean.
+        let (file, _) = HyprlangFile::parse(HYPRPAPER_CONF);
+        assert!(file.ambiguities(&WALLPAPERS_BY_MONITOR).is_empty());
+    }
+
+    #[test]
+    fn a_nested_repeat_is_reported_by_its_full_path() {
+        // Two `fingerprint { }` blocks inside one `auth { }` merge like any plain
+        // category; the report carries the dotted path. Special categories are a
+        // top-level notion, so a nested block named like one is still plain.
+        let input = "auth {\n    fingerprint {\n        enabled = true\n    }\n    fingerprint {\n        enabled = false\n    }\n}\n";
+        let (file, _) = HyprlangFile::parse(input);
+        let report = file.ambiguities(&HyprlangSchema::default());
+        assert_eq!(
+            report,
+            vec![Ambiguity::RepeatedCategory {
+                path: vec!["auth".to_string(), "fingerprint".to_string()],
+                keyed_by: None,
+                lines: vec![2, 5],
+            }]
+        );
+        assert_eq!(
+            report[0].to_string(),
+            "`auth.fingerprint` is declared twice (lines 2 and 5)"
+        );
+        assert_eq!(report[0].top_level_category(), Some("auth"));
+
+        // Blocks under *different* parent instances are not siblings: a repeated
+        // `input` with a `touchpad` in each is reported once, at `input`.
+        let outer = "input {\n    touchpad {\n    }\n}\ninput {\n    touchpad {\n    }\n}\n";
+        let (file, _) = HyprlangFile::parse(outer);
+        assert_eq!(
+            file.ambiguities(&HyprlangSchema::default()),
+            vec![Ambiguity::RepeatedCategory {
+                path: vec!["input".to_string()],
+                keyed_by: None,
+                lines: vec![1, 5],
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unclosed_repeat_is_still_reported() {
+        // A second `general {` the file never closes still merges in hyprlang's
+        // reading; the walk closes it at end-of-file like `resolve_path` does.
+        let (file, _) = HyprlangFile::parse("general {\n    a = 1\n}\ngeneral {\n    b = 2\n");
+        assert_eq!(
+            file.ambiguities(&HyprlangSchema::default()),
+            vec![Ambiguity::RepeatedCategory {
+                path: vec!["general".to_string()],
+                keyed_by: None,
+                lines: vec![1, 4],
+            }]
+        );
+    }
+
+    #[test]
+    fn reports_are_sorted_by_first_line() {
+        // Both shapes in one file come back in file order, whichever walk found them.
+        let input = "\
+env = A,1
+general {
+}
+general {
+}
+env = A,2
+";
+        let (file, _) = HyprlangFile::parse(input);
+        let lines: Vec<Vec<usize>> = file
+            .ambiguities(&ENV_IS_REPEATABLE)
+            .iter()
+            .map(|ambiguity| ambiguity.lines().to_vec())
+            .collect();
+        assert_eq!(lines, vec![vec![1, 6], vec![2, 4]]);
+    }
+
+    #[test]
+    fn the_well_formed_fixtures_are_unambiguous_under_their_schemas() {
+        // Every realistic fixture here declares each plain category once. Listeners
+        // (hypridle) and labels/backgrounds (hyprlock) are special categories.
+        let hyprlock = HyprlangSchema {
+            special_categories: &[
+                SpecialCategory::Anonymous("background"),
+                SpecialCategory::Anonymous("label"),
+            ],
+            repeatable_keys: &[],
+        };
+        for (name, input, schema) in [
+            ("hypridle.conf", HYPRIDLE_CONF, LISTENERS_ARE_OBJECTS),
+            ("hyprpaper.conf", HYPRPAPER_CONF, WALLPAPERS_BY_MONITOR),
+            ("hyprlock.conf", HYPRLOCK_CONF, hyprlock),
+            ("repeatable keys", REPEATABLE_KEYS, ENV_IS_REPEATABLE),
+            ("nested block", NESTED_BLOCK, HyprlangSchema::default()),
+            (
+                "dotted and variable keys",
+                DOTTED_AND_VARIABLE_KEYS,
+                ENV_IS_REPEATABLE,
+            ),
+        ] {
+            let (file, _) = HyprlangFile::parse(input);
+            assert!(
+                file.ambiguities(&schema).is_empty(),
+                "{name}: {:?}",
+                file.ambiguities(&schema)
+            );
+        }
     }
 }

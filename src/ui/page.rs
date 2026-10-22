@@ -80,17 +80,18 @@ use gtk4::{
 use relm4::{Component, ComponentParts, ComponentSender, Controller, SimpleComponent};
 
 use crate::core::detect::{Binary, Capabilities};
+use crate::core::hyprlang_notes::SettingNote;
 use crate::core::model::{Backing, LOCK_GRACE_SECONDS_RANGE, SettingId, Value, ValueKind};
 use crate::core::store::{SettingsStore, StageError, StageOutcome};
 use crate::ui::category::SidebarCategory;
 use crate::ui::row::{
-    ContentGate, DropDownOption, RowCapability, RowDescriptor, SetValue, WidgetKind,
+    ContentGate, DropDownOption, RowCapability, RowDescriptor, SetValue, WidgetKind, attach_notes,
     content_visible_rows, entry_text_from_value, list_items_from_value, list_with_added,
     list_with_swapped, list_without, scale_position_from_value, switch_active_from_value,
     token_switch_active_from_value, value_from_entry, value_from_scale, value_from_switch,
     value_from_token_toggle, visible_rows,
 };
-use crate::ui::widgets::{PAGE_MARGIN, ROW_SPACING, SECTION_SPACING, labelled_row};
+use crate::ui::widgets::{PAGE_MARGIN, ROW_SPACING, SECTION_SPACING, labelled_row, note};
 
 /// The initialization payload for a [`SettingsPage`].
 pub(crate) struct PageInit {
@@ -217,6 +218,11 @@ impl SimpleComponent for SettingsPage {
         for descriptor in &init.rows {
             let (row_widget, control) = build_control(descriptor, &emit);
             root.append(&row_widget);
+            // Configuration notes (task 9.31) sit directly below the control they
+            // concern. They are plain labels: the control above stays fully live.
+            for text in &descriptor.notes {
+                root.append(&note(text));
+            }
             controls.push(control);
         }
 
@@ -964,7 +970,8 @@ pub(crate) enum PagePlan {
 
 /// Decides how `category`'s page should be built under the detected `capabilities` and
 /// the configuration loaded into `store`, composing per-row gating with task 5.1's
-/// category gate (R4.2).
+/// category gate (R4.2), and places the configuration `notes` the startup load produced
+/// for the category on its visible rows (task 9.31, [`attach_notes`]).
 ///
 /// A category with no interim descriptors yields [`PagePlan::NoSpec`]; one whose every
 /// row is gated out yields [`PagePlan::Emptied`] (logged at `info` as a hidden
@@ -972,11 +979,14 @@ pub(crate) enum PagePlan {
 /// [`build_page`] to render. A row is visible when its capability is present
 /// ([`visible_rows`]) and its content gate, if it has one, holds for the loaded
 /// configuration ([`content_visible_rows`] — e.g. the lock grace period, task 11.13).
-/// Keeping the decision GTK-free is what lets it be tested without a display (R6.2).
+/// Notes only annotate rows; they never change which rows are visible or whether a
+/// category is emptied. Keeping the decision GTK-free is what lets it be tested without
+/// a display (R6.2).
 pub(crate) fn plan_category(
     category: SidebarCategory,
     capabilities: &Capabilities,
     store: &SettingsStore,
+    notes: &[SettingNote],
 ) -> PagePlan {
     let descriptors = category_rows(category);
     if descriptors.is_empty() {
@@ -994,7 +1004,7 @@ pub(crate) fn plan_category(
         return PagePlan::Emptied;
     }
 
-    PagePlan::Framework(visible)
+    PagePlan::Framework(attach_notes(visible, notes))
 }
 
 /// Launches a [`SettingsPage`] for `rows`, sharing `store` and reporting each edit
@@ -1220,18 +1230,18 @@ mod tests {
         // No loaded configuration: content-gated rows drop out, nothing else changes.
         let empty = SettingsStore::new();
         assert!(matches!(
-            plan_category(SidebarCategory::Theme, &any, &empty),
+            plan_category(SidebarCategory::Theme, &any, &empty, &[]),
             PagePlan::NoSpec
         ));
         assert!(matches!(
-            plan_category(SidebarCategory::Input, &any, &empty),
+            plan_category(SidebarCategory::Input, &any, &empty, &[]),
             PagePlan::NoSpec
         ));
 
         // Framework: a category whose rows are (at least partly) present. Power & Idle's
         // rows need hypridle, which `any` has.
         assert!(matches!(
-            plan_category(SidebarCategory::PowerAndIdle, &any, &empty),
+            plan_category(SidebarCategory::PowerAndIdle, &any, &empty, &[]),
             PagePlan::Framework(_)
         ));
 
@@ -1239,7 +1249,7 @@ mod tests {
         // hidden, so the whole category is dropped (R4.2) rather than shown empty.
         let nothing = Capabilities::for_tests(&[], &[], false);
         assert!(matches!(
-            plan_category(SidebarCategory::PowerAndIdle, &nothing, &empty),
+            plan_category(SidebarCategory::PowerAndIdle, &nothing, &empty, &[]),
             PagePlan::Emptied
         ));
     }
@@ -1247,7 +1257,7 @@ mod tests {
     /// The Power & Idle rows the plan keeps for `store`, by setting.
     fn planned_power_settings(store: &SettingsStore) -> Vec<SettingId> {
         let caps = Capabilities::for_tests(&[Binary::Hypridle], &[], false);
-        match plan_category(SidebarCategory::PowerAndIdle, &caps, store) {
+        match plan_category(SidebarCategory::PowerAndIdle, &caps, store, &[]) {
             PagePlan::Framework(rows) => rows.iter().map(|row| row.setting).collect(),
             _ => panic!("Power & Idle should plan framework rows"),
         }
@@ -1292,5 +1302,92 @@ mod tests {
             ],
             "only the grace row is hidden"
         );
+    }
+
+    /// The Power & Idle rows planned for `store` under hypridle with `notes`.
+    fn planned_power_rows(store: &SettingsStore, notes: &[SettingNote]) -> Vec<RowDescriptor> {
+        let caps = Capabilities::for_tests(&[Binary::Hypridle], &[], false);
+        match plan_category(SidebarCategory::PowerAndIdle, &caps, store, notes) {
+            PagePlan::Framework(rows) => rows,
+            _ => panic!("Power & Idle should plan framework rows"),
+        }
+    }
+
+    #[test]
+    fn a_doubled_general_block_is_noted_on_the_lock_command_row_only() {
+        // Task 9.31 end to end without GTK: a hypridle.conf declaring `general` twice
+        // is loaded the way the startup worker loads it (store loader + Power model),
+        // and the plan carries the model's note on the lock-command row — once, though
+        // the grace row edits the same block — while every row stays visible and the
+        // lock command still stages.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("hypridle.conf");
+        std::fs::write(
+            &path,
+            "general {\n    lock_cmd = pidof hyprlock || hyprlock --grace 10\n}\n\n\
+             listener {\n    timeout = 150\n}\n\n\
+             general {\n    before_sleep_cmd = loginctl lock-session\n}\n",
+        )
+        .expect("write hypridle.conf");
+        let mut store = SettingsStore::new();
+        store.load_file(
+            path.clone(),
+            crate::core::load::load_hypridle_conf(&path).expect("loads"),
+            Box::new(crate::core::load::load_hypridle_conf),
+        );
+        let model = crate::core::power::PowerModel::load(path);
+        let expected = "In hypridle.conf, `general` is declared twice (lines 1 and 9). \
+                        hypridle merges these blocks, so a value set again in a later block \
+                        overrides the first. The app shows and edits only the first block: \
+                        if a later block also sets a value shown here, a change made here \
+                        has no effect.";
+
+        let noted = planned_power_rows(&store, model.setting_notes());
+        let plain = planned_power_rows(&store, &[]);
+        let settings = |rows: &[RowDescriptor]| -> Vec<SettingId> {
+            rows.iter().map(|row| row.setting).collect()
+        };
+        assert_eq!(
+            settings(&noted),
+            settings(&plain),
+            "a note never hides or adds a row"
+        );
+        assert!(settings(&noted).contains(&SettingId::LockGracePeriod));
+        for row in &noted {
+            if row.setting == SettingId::LockCommand {
+                assert_eq!(row.notes, vec![expected.to_string()]);
+            } else {
+                assert!(row.notes.is_empty(), "{:?} carries no note", row.setting);
+            }
+        }
+
+        // The noted control is not blocked: an edit to it stages as usual.
+        let mut page = SettingsPage {
+            store: Rc::new(RefCell::new(store)),
+            on_changed: Rc::new(|| {}),
+        };
+        let outcome = page.handle(SetValue {
+            id: SettingId::LockCommand,
+            value: Value::String("hyprlock".to_string()),
+        });
+        assert!(matches!(outcome, Ok(StageOutcome::Staged)), "{outcome:?}");
+    }
+
+    #[test]
+    fn a_note_without_a_visible_row_is_dropped() {
+        // A swaylock command hides the grace row (task 11.13); a note that concerns
+        // only the grace period then has nowhere to sit and is left out, while the
+        // remaining rows are unaffected.
+        let store = test_store(&[(
+            SettingId::LockCommand,
+            Value::String("swaylock -f".to_string()),
+        )]);
+        let note = SettingNote {
+            settings: vec![SettingId::LockGracePeriod],
+            text: "a note".to_string(),
+        };
+        let rows = planned_power_rows(&store, &[note]);
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|row| row.notes.is_empty()));
     }
 }

@@ -44,7 +44,9 @@
 //! libadwaita apps will not follow the chosen theme through the `~/.config/gtk-4.0`
 //! theme links (task 11.16), and beside the live-restyle note when the chosen name is
 //! one GTK 4 has built in but GTK 3 can only load from a theme directory that is not
-//! installed (`Adwaita-dark`, task 9.29).
+//! installed (`Adwaita-dark`, task 9.29). Under the wallpaper's fit drop-down it shows
+//! when `hyprpaper.conf` declares the wallpaper block twice for the same monitor, so
+//! the block the page edits may be overridden (task 9.31).
 //!
 //! # Why this page is bespoke, not declarative
 //!
@@ -475,9 +477,10 @@ impl Inner {
     /// Builds the wallpaper section: a wallpaper image picker, a fit-mode drop-down, and
     /// an optional lock-screen override toggle that reveals a second picker (task 6.5).
     ///
-    /// A `fill` fit gets a note that its live preview shows as cover (task 11.14), and a
-    /// staged value a file refuses gets a note naming the file and the reason (task
-    /// 9.28).
+    /// A `fill` fit gets a note that its live preview shows as cover (task 11.14), a
+    /// `hyprpaper.conf` that declares the wallpaper block twice for the same monitor
+    /// gets a note that the later block wins (task 9.31), and a staged value a file
+    /// refuses gets a note naming the file and the reason (task 9.28).
     ///
     /// When `hyprpaper.conf` is unreadable the rows are hidden behind a note (R4.4); the
     /// lock-override toggle is shown only when hyprlock is present (R4.2).
@@ -532,6 +535,12 @@ impl Inner {
         // restarts; the file still keeps "fill".
         if let Some(preview) = model.fit_preview_note() {
             section.append(&note(&preview));
+        }
+        // Task 9.31: a `wallpaper { }` block declared twice for the same monitor is
+        // merged by hyprpaper (the later block wins) while the image and fit above edit
+        // the first; say so beside them. Information only — the controls stay live.
+        for ambiguity in model.ambiguity_notes() {
+            section.append(&note(ambiguity));
         }
 
         // The optional lock-screen override — only when hyprlock is present (R4.2).

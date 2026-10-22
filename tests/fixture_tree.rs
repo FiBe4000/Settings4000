@@ -24,13 +24,16 @@ use std::process::Command;
 use settings4000::core::detect::{Capabilities, DetectionInputs, HyprConfigProvider};
 use settings4000::core::model::validate_image_value;
 use settings4000::core::notifd::NotifdReplies;
-use settings4000::core::theme::load_palette_schema;
+use settings4000::core::power::HYPRIDLE_SCHEMA;
+use settings4000::core::theme::{HYPRLOCK_SCHEMA, HYPRPAPER_SCHEMA, load_palette_schema};
 use settings4000::parsers::env::{EnvFile, GtkThemeOverride};
 use settings4000::parsers::generated::{
     ActiveScheme, GENERATED_COLOR_PARTIALS, detect_active_scheme, generated_files,
     read_active_scheme,
 };
-use settings4000::parsers::hyprlang::{HyprlangFile, KeyPath, SectionStep};
+use settings4000::parsers::hyprlang::{
+    Ambiguity, HyprlangFile, HyprlangSchema, KeyPath, SectionStep,
+};
 use settings4000::parsers::ini::IniFile;
 use settings4000::parsers::lua_literal::{LuaConfigFile, LuaValue, TableStatus};
 use settings4000::parsers::monitors::{MonitorField, MonitorsFile};
@@ -265,23 +268,40 @@ fn every_color_header_names_the_active_scheme() {
 }
 
 /// Every hyprlang fixture parses warning-free through its deployed symlink,
-/// round-trips byte-identically, and yields the documented values at the
-/// section paths the app edits (tasks 6.5/6.8).
+/// round-trips byte-identically, is unambiguous under its daemon's schema (task
+/// 9.31), and yields the documented values at the section paths the app edits
+/// (tasks 6.5/6.8).
 #[test]
 fn hyprlang_configs_parse_losslessly_at_their_deployed_paths() {
     let fx = FixtureDotfiles::install();
 
-    // Round-trip identity + warning-free parse for the whole hyprlang family.
-    for relative in [
-        "hypr/hypridle.conf",
-        "hypr/hyprlock.conf",
-        "hypr/hyprpaper.conf",
+    // Round-trip identity + warning-free parse for the whole hyprlang family, and
+    // no ambiguity report (task 9.31): the real files declare each plain category
+    // once, so none of the three pages shows an ambiguity note.
+    for (relative, schema) in [
+        ("hypr/hypridle.conf", HYPRIDLE_SCHEMA),
+        ("hypr/hyprlock.conf", HYPRLOCK_SCHEMA),
+        ("hypr/hyprpaper.conf", HYPRPAPER_SCHEMA),
     ] {
         let input = read(&fx.config_path(relative));
         let (file, warnings) = HyprlangFile::parse(&input);
         assert!(warnings.is_empty(), "{relative}: unexpected {warnings:?}");
         assert_eq!(file.emit(), input, "{relative} should round-trip");
+        assert_eq!(file.ambiguities(&schema), Vec::new(), "{relative}");
     }
+
+    // That clean result rests on the schemas: read as plain categories, the real
+    // files' three listeners and four hyprlock labels would be reported.
+    let repeated = |relative: &str| -> Vec<String> {
+        let (file, _) = HyprlangFile::parse(&read(&fx.config_path(relative)));
+        file.ambiguities(&HyprlangSchema::default())
+            .iter()
+            .filter_map(Ambiguity::top_level_category)
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(repeated("hypr/hypridle.conf"), ["listener"]);
+    assert_eq!(repeated("hypr/hyprlock.conf"), ["label"]);
 
     // hypridle.conf: the positional listener addressing (task 6.8) — dim 150,
     // lock 300, DPMS 330, in file order.

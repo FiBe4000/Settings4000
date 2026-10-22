@@ -201,6 +201,14 @@ pub mod power;
 // grace period in step) and the `power` write glue.
 pub mod lock_grace;
 
+// Notes for hyprlang files that declare a category the app edits more than once
+// (task 9.31; R5.3, R7.3). hyprlang merges such blocks and the later assignment wins,
+// while the app edits the first block, so an edit can silently have no effect. The
+// parser reports the shape; this module logs the report once per load and phrases the
+// parts that touch an edited category as page notes. Used by `power` (hypridle.conf)
+// and `theme`'s wallpaper model (hyprpaper.conf, hyprlock.conf).
+pub mod hyprlang_notes;
+
 // The Sound-page domain model (task 6.2; R3.1, R5.2). It loads the PipeWire audio
 // devices (from `pw-dump` JSON, falling back to parsing `wpctl status`) and builds the
 // `wpctl` command vectors the runtime-only controls run — nothing is staged and nothing

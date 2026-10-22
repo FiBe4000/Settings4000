@@ -50,6 +50,7 @@
 //! task-5.1 placeholder until §6 fills it in.
 
 use crate::core::detect::{Binary, Capabilities};
+use crate::core::hyprlang_notes::SettingNote;
 use crate::core::lock_grace::grace_of;
 use crate::core::model::{SettingId, Value, ValueKind};
 use crate::core::store::SettingsStore;
@@ -277,6 +278,10 @@ pub(crate) struct RowDescriptor {
     /// The condition on the loaded configuration the row additionally needs, if any
     /// (see [`ContentGate`]); `None` for almost every row.
     pub(crate) content_gate: Option<ContentGate>,
+    /// Informational notes about the loaded configuration to show directly below the
+    /// control (task 9.31), attached by [`attach_notes`]; empty for almost every row.
+    /// A note never changes what the control does.
+    pub(crate) notes: Vec<String>,
 }
 
 impl RowDescriptor {
@@ -293,6 +298,7 @@ impl RowDescriptor {
             setting,
             capability,
             content_gate: None,
+            notes: Vec::new(),
         }
     }
 
@@ -376,6 +382,35 @@ pub(crate) fn content_visible_rows(
             _ => true,
         })
         .collect()
+}
+
+/// Attaches each of `notes` to the first row in `rows` that edits one of the note's
+/// settings, preserving the rows and their order (task 9.31).
+///
+/// Applied to the rows that survived both visibility gates, so a note lands on a row the
+/// page actually shows, and lands once even when several of its settings have rows (the
+/// lock command and its grace period share one ambiguous `general { }` block). A note
+/// whose settings have no visible row is dropped with a `debug` log: the ambiguity it
+/// describes cannot affect anything the page offers, and the loader has already logged
+/// the report itself at `warn`. Attaching a note never hides, disables or alters a row —
+/// staging and Apply see exactly the same descriptors otherwise.
+pub(crate) fn attach_notes(
+    mut rows: Vec<RowDescriptor>,
+    notes: &[SettingNote],
+) -> Vec<RowDescriptor> {
+    for setting_note in notes {
+        match rows
+            .iter_mut()
+            .find(|row| setting_note.settings.contains(&row.setting))
+        {
+            Some(row) => row.notes.push(setting_note.text.clone()),
+            None => tracing::debug!(
+                settings = ?setting_note.settings,
+                "no visible row for a configuration note; it is not shown (task 9.31)"
+            ),
+        }
+    }
+    rows
 }
 
 // --- Value conversions: widget change -> Value (one half of the loop) ---
@@ -949,5 +984,66 @@ mod tests {
                 "the hidden row is logged at info: {events:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_note_lands_on_its_first_visible_row_not_its_first_listed_setting() {
+        // Task 9.31: a note listing the grace period before the lock command, on a
+        // configuration whose lock command does not start hyprlock. The grace row is
+        // hidden by its content gate, so the note goes to the visible lock-command row
+        // rather than being dropped with the hidden one.
+        use crate::core::store::{FileReader, FileValues};
+
+        let values = vec![(
+            SettingId::LockCommand,
+            Value::String("swaylock -f".to_string()),
+        )];
+        let reader_values = values.clone();
+        let reader: FileReader = Box::new(move |_path: &std::path::Path| {
+            Ok(FileValues {
+                bytes: Vec::new(),
+                values: reader_values.clone(),
+            })
+        });
+        let mut store = SettingsStore::new();
+        store.load_file(
+            std::path::PathBuf::from("<row test seed>"),
+            FileValues {
+                bytes: Vec::new(),
+                values,
+            },
+            reader,
+        );
+
+        let rows = vec![
+            RowDescriptor::new(
+                "Lock command",
+                WidgetKind::Entry,
+                SettingId::LockCommand,
+                RowCapability::Binary(Binary::Hypridle),
+            ),
+            RowDescriptor::new(
+                "Grace",
+                WidgetKind::Spin {
+                    min: 0.0,
+                    max: 600.0,
+                    step: 1.0,
+                },
+                SettingId::LockGracePeriod,
+                RowCapability::Binary(Binary::Hypridle),
+            )
+            .with_content_gate(ContentGate::LockCommandStartsHyprlock),
+        ];
+        let visible = content_visible_rows(rows, &store);
+        assert_eq!(visible.len(), 1, "the grace row is gated out");
+
+        let note = SettingNote {
+            settings: vec![SettingId::LockGracePeriod, SettingId::LockCommand],
+            text: "a note".to_string(),
+        };
+        let noted = attach_notes(visible, &[note]);
+        assert_eq!(noted.len(), 1);
+        assert_eq!(noted[0].setting, SettingId::LockCommand);
+        assert_eq!(noted[0].notes, vec!["a note".to_string()]);
     }
 }

@@ -102,6 +102,7 @@ use crate::core::assemble::{
 };
 use crate::core::detect::Capabilities;
 use crate::core::display::DisplayModel;
+use crate::core::hyprlang_notes::SettingNote;
 use crate::core::input::InputModel;
 use crate::core::load::{LoadedFile, StartupLoad, adopt_refreshed_model, merge_refreshed_files};
 use crate::core::model::Category;
@@ -767,9 +768,18 @@ impl Shell {
                 SidebarCategory::Notifications => {
                     self.populate_notifications(category, &mut controllers);
                 }
-                // Pure framework pages: their rows come straight from `plan_category`.
+                // Pure framework pages: their rows come straight from `plan_category`,
+                // annotated with the notes the startup load found in hypridle.conf (an
+                // ambiguous `general { }` block, task 9.31).
                 SidebarCategory::PowerAndIdle => {
-                    self.populate_framework(category, &caps, &mut controllers);
+                    let notes = self
+                        .models
+                        .power
+                        .borrow()
+                        .as_ref()
+                        .map(|power| power.setting_notes().to_vec())
+                        .unwrap_or_default();
+                    self.populate_framework(category, &caps, &notes, &mut controllers);
                 }
             }
         }
@@ -792,17 +802,20 @@ impl Shell {
     /// [`page::plan_category`] decides between a framework page (its controller retained
     /// in `controllers`, its dirty marker registered), the task-5.1 placeholder for a
     /// category with no row descriptors, and dropping a category whose rows are all gated
-    /// out (R4.2; `plan_category` logs that case).
+    /// out (R4.2; `plan_category` logs that case). `notes` are the configuration notes the
+    /// startup load produced for the category (task 9.31); the plan places each below
+    /// the first visible row it concerns.
     fn populate_framework(
         &self,
         category: SidebarCategory,
         caps: &Capabilities,
+        notes: &[SettingNote],
         controllers: &mut Vec<Controller<SettingsPage>>,
     ) {
         // The plan reads the store too: some rows exist only for certain loaded
         // configurations (the lock grace period, task 11.13). The borrow ends with the
         // `plan_category` call, before `build_page` takes its own handle.
-        let plan = page::plan_category(category, caps, &self.store.borrow());
+        let plan = page::plan_category(category, caps, &self.store.borrow(), notes);
         match plan {
             PagePlan::Framework(rows) => {
                 let controller =

@@ -61,7 +61,9 @@ pub use palette::{PaletteModel, Scheme, load_palette_schema};
 pub use themes::{
     CursorCopy, GtkOverrideOrigin, ThemeRoots, ThemesApply, ThemesModel, ThemesPaths,
 };
-pub use wallpaper::{WallpaperApply, WallpaperModel, WallpaperPaths};
+pub use wallpaper::{
+    HYPRLOCK_SCHEMA, HYPRPAPER_SCHEMA, WallpaperApply, WallpaperModel, WallpaperPaths,
+};
 
 /// One staged value: what the backing config currently holds, plus any pending edit.
 ///

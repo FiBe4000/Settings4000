@@ -880,6 +880,45 @@ fn a_wallpaper_change_writes_both_files_identically() {
     );
 }
 
+#[test]
+fn a_wallpaper_block_doubled_for_one_monitor_is_noted_but_applies_as_usual() {
+    // Task 9.31: a hand-edited hyprpaper.conf with a second `wallpaper { }` block
+    // for the same (every-output) monitor. The model notes it, and the note changes
+    // nothing else: the new image lands in the first block of hyprpaper.conf and in
+    // hyprlock.conf, the second block stays byte-identical, and the one hyprpaper
+    // request is issued as on the clean file.
+    let fx = FixtureDotfiles::install();
+    let hyprpaper = fx.repo_path("config/hypr/hyprpaper.conf");
+    let second_block = "\nwallpaper {\n    monitor =\n    fit_mode = contain\n}\n";
+    let original = fs::read_to_string(&hyprpaper).expect("read hyprpaper.conf");
+    fs::write(&hyprpaper, format!("{original}{second_block}")).expect("add a second block");
+    let notes = load_wallpaper(&fx).ambiguity_notes().to_vec();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains("`wallpaper` is declared twice for the same `monitor`"),
+        "{}",
+        notes[0]
+    );
+
+    let new_wallpaper = fx.home().join("Pictures/wallpaper/next.png");
+    fs::write(&new_wallpaper, b"fixture next wallpaper").expect("create the new image");
+    let new_wallpaper_str = new_wallpaper.to_str().expect("UTF-8 path").to_string();
+    let recorded = apply_wallpaper(&fx, &new_wallpaper_str);
+
+    assert_eq!(
+        fs::read_to_string(&hyprpaper).expect("read the applied file"),
+        format!(
+            "{}{second_block}",
+            replace_once(
+                &original,
+                FIXTURE_WALLPAPER,
+                "~/Pictures/wallpaper/next.png"
+            )
+        )
+    );
+    assert_eq!(recorded, hyprpaper_reload(&new_wallpaper_str));
+}
+
 /// The capabilities of a session where Hyprland, hyprpaper and eww run and
 /// detection found the fixture's bar text-tone stub at its live path.
 fn bar_tone_capabilities(fx: &FixtureDotfiles, daemons: &[Daemon]) -> Capabilities {

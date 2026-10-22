@@ -405,3 +405,68 @@ fn the_fixture_lock_cmd_seeds_a_ten_second_grace() {
         ))
     );
 }
+
+#[test]
+fn a_doubled_general_block_is_noted_but_applies_and_restarts_as_usual() {
+    // Task 9.31: a hand-edited hypridle.conf that declares `general { }` a second
+    // time. The Power & Idle model notes it for the lock rows, and the note is all
+    // that changes: a timeout + grace Apply rewrites the same two value spans in
+    // the first `general` block and the lock listener, leaves the second block
+    // byte-identical, and restarts hypridle once, exactly as on the clean file.
+    let second_general = "\ngeneral {\n    before_sleep_cmd = loginctl lock-session\n}\n";
+    let (fx, original, applied, recorded) = apply_power_edits(
+        |fx| {
+            let path = fx.repo_path("config/hypr/hypridle.conf");
+            let text = fs::read_to_string(&path).expect("read the repo hypridle.conf");
+            fs::write(&path, format!("{text}{second_general}")).expect("add a second general");
+        },
+        &[
+            (SettingId::LockTimeout, Value::Integer(600)),
+            (SettingId::LockGracePeriod, Value::Integer(30)),
+        ],
+    );
+    let expected = replace_once(
+        &replace_once(&original, "timeout = 300", "timeout = 600"),
+        REAL_LOCK_CMD_LINE,
+        "lock_cmd = pidof hyprlock || hyprlock --grace 30",
+    );
+    assert_eq!(applied, expected);
+    assert!(applied.ends_with(second_general));
+    assert_eq!(recorded, systemd_restart());
+
+    // The note the page shows: once, for the two settings in `general`, naming
+    // both header lines.
+    let second_line = original
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| *line == "general {")
+        .map(|(index, _)| index + 1)
+        .last()
+        .expect("the second general block");
+    let model = PowerModel::load(hypridle_conf(&fx));
+    let notes = model.setting_notes();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(
+        notes[0].settings,
+        vec![SettingId::LockCommand, SettingId::LockGracePeriod]
+    );
+    assert!(
+        notes[0].text.starts_with(&format!(
+            "In hypridle.conf, `general` is declared twice (lines 1 and {second_line})."
+        )),
+        "{}",
+        notes[0].text
+    );
+}
+
+#[test]
+fn the_fixture_hypridle_conf_has_no_note() {
+    // The real file declares `general` once; its three listeners are positional by
+    // design and never noted (task 9.31).
+    let fx = FixtureDotfiles::install();
+    assert!(
+        PowerModel::load(hypridle_conf(&fx))
+            .setting_notes()
+            .is_empty()
+    );
+}

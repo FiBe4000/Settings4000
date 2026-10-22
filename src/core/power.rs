@@ -71,6 +71,15 @@
 //! changes nothing; the fixed order is what makes the outcome well-defined for any
 //! caller, and the one `general.lock_cmd` line is reported as changed once.
 //!
+//! # A repeated `general { }` block is reported, repeated listeners are not
+//!
+//! hypridle merges two `general { }` blocks (the later assignment wins), but
+//! [`power_key_path`] addresses the first, so in such a hand-edited file a lock-command
+//! change can be overridden by the second block. [`PowerModel::load`] reads the
+//! parser's ambiguity report under [`HYPRIDLE_SCHEMA`] and keeps it as a note for the
+//! lock rows (task 9.31; see [`crate::core::hyprlang_notes`]). Repeated `listener { }`
+//! blocks are the positional design above, not an ambiguity, and the schema says so.
+//!
 //! # Conflict safety comes from the store (R5.6)
 //!
 //! `hypridle.conf` is loaded through the store at startup, which fingerprints it as the
@@ -86,16 +95,40 @@ use std::fmt;
 use std::path::PathBuf;
 
 use crate::core::apply::FileWrite;
+use crate::core::hyprlang_notes::{SettingNote, ambiguity_notes, read_ambiguities};
 use crate::core::lock_grace::{GraceError, set_grace};
 use crate::core::model::{SettingId, Value};
 use crate::core::reload::BackingFile;
 use crate::core::store_write::{RenderedEdit, StoreBackedFile, StoreWriteError};
-use crate::parsers::hyprlang::{EditError, HyprlangFile, KeyPath, SectionStep};
+use crate::parsers::hyprlang::{
+    Ambiguity, EditError, HyprlangFile, HyprlangSchema, KeyPath, SectionStep, SpecialCategory,
+};
 
 /// The hyprlang section name of a `listener { }` block in `hypridle.conf`.
 const LISTENER_SECTION: &str = "listener";
 /// The `timeout` key inside a `listener { }` block.
 const TIMEOUT_KEY: &str = "timeout";
+
+/// What hypridle declares about `hypridle.conf`'s repeated blocks, for the ambiguity
+/// report (task 9.31): `listener` is an anonymous special category — hypridle registers
+/// it with `anonymousKeyBased = true`, so every block is its own listener — and no key
+/// is repeatable. `general` is therefore the one plain category the page edits; a
+/// second `general { }` block is merged by hypridle and reported, three listeners are
+/// not.
+pub const HYPRIDLE_SCHEMA: HyprlangSchema = HyprlangSchema {
+    special_categories: &[SpecialCategory::Anonymous(LISTENER_SECTION)],
+    repeatable_keys: &[],
+};
+
+/// Every setting the Power & Idle page backs, in page order — the domain of
+/// [`power_key_path`].
+const POWER_SETTINGS: [SettingId; 5] = [
+    SettingId::DimTimeout,
+    SettingId::LockTimeout,
+    SettingId::DpmsTimeout,
+    SettingId::LockCommand,
+    SettingId::LockGracePeriod,
+];
 
 /// The 0-based occurrence of the `listener { }` block that dims the screen (analysis
 /// §6). See the module docs on the positional-matching assumption.
@@ -331,15 +364,50 @@ pub struct PowerModel {
     /// rendering a write, plus how the shared glue labels and logs it (see
     /// [`write_target`]).
     hypridle_conf: StoreBackedFile,
+    /// The notes about `hypridle.conf` categories the page edits that the file
+    /// declares more than once (task 9.31), read once at load.
+    notes: Vec<SettingNote>,
 }
 
 impl PowerModel {
     /// Builds the model, recording the `hypridle.conf` path (the production entry point,
     /// called from the startup worker — architecture §8).
+    ///
+    /// It also reads the file once for its ambiguity report (task 9.31) — deliberately a
+    /// second read beside the store loader's, because this model holds no handle on the
+    /// store's copy of the text — logging each
+    /// entry at `warn` and keeping the ones that touch an edited category as
+    /// [`setting_notes`](Self::setting_notes). An unreadable file gives no notes; the
+    /// store loader has already logged it and the rows degrade (R4.4).
+    ///
+    /// Reading the report here, rather than on every page build, is sound because the
+    /// app never adds or removes lines in `hypridle.conf`: the store stages only
+    /// settings it loaded, so every Power & Idle write rewrites an existing value span
+    /// and the reported line numbers stay right until the next load (a Refresh, which
+    /// rebuilds this model).
     pub fn load(hypridle_conf: PathBuf) -> PowerModel {
+        let notes = match std::fs::read(&hypridle_conf) {
+            Ok(bytes) => notes_for_rows(&read_ambiguities(
+                "hypridle.conf",
+                &String::from_utf8_lossy(&bytes),
+                &HYPRIDLE_SCHEMA,
+            )),
+            Err(_) => Vec::new(),
+        };
         PowerModel {
             hypridle_conf: write_target(hypridle_conf),
+            notes,
         }
+    }
+
+    /// The informational notes for the Power & Idle page (task 9.31): one per category
+    /// the page edits that `hypridle.conf` declares more than once, naming the rows it
+    /// affects. In practice that is a repeated `general { }` block, which affects the
+    /// lock command and its grace period; repeated `listener { }` blocks are expected
+    /// and never noted. The page shows each next to the first affected row it displays;
+    /// a note never blocks a control or an Apply.
+    pub fn setting_notes(&self) -> &[SettingNote] {
+        &self.notes
     }
 
     /// The Power & Idle page's contribution to an Apply: the store's dirty timeouts and
@@ -363,6 +431,33 @@ impl PowerModel {
     ) -> Result<Option<FileWrite>, StoreWriteError<HypridleRenderError>> {
         self.hypridle_conf.render_write(dirty, render_hypridle_conf)
     }
+}
+
+/// Turns `hypridle.conf`'s ambiguity report into the Power & Idle page's notes (task
+/// 9.31): the categories the page edits are the outermost sections of
+/// [`power_key_path`]'s addresses, and each note names the settings addressed in its
+/// category, in page order. Every one of those addresses takes the first block of a
+/// plain category ([`KeyPath::at`]), which is what the note text states.
+fn notes_for_rows(ambiguities: &[Ambiguity]) -> Vec<SettingNote> {
+    let top_section =
+        |id: SettingId| power_key_path(id).and_then(|path| path.top_section().map(str::to_string));
+    let mut edited: Vec<String> = Vec::new();
+    for category in POWER_SETTINGS.into_iter().filter_map(top_section) {
+        if !edited.contains(&category) {
+            edited.push(category);
+        }
+    }
+    let edited: Vec<&str> = edited.iter().map(String::as_str).collect();
+    ambiguity_notes("hypridle.conf", "hypridle", ambiguities, &edited)
+        .into_iter()
+        .map(|note| SettingNote {
+            settings: POWER_SETTINGS
+                .into_iter()
+                .filter(|id| top_section(*id).as_deref() == Some(note.category.as_str()))
+                .collect(),
+            text: note.text,
+        })
+        .collect()
 }
 
 /// How the shared store-backed write glue addresses, labels and logs `hypridle.conf`
@@ -1085,5 +1180,75 @@ listener {
             on_disk.contains("    timeout = 360") && on_disk.contains("    lock_cmd = hyprlock\n"),
             "both applied edits are on disk: {on_disk:?}"
         );
+    }
+
+    /// Writes `contents` as a `hypridle.conf` in a fresh temporary directory and loads
+    /// the Power & Idle model from it (the directory is returned to keep it alive).
+    fn model_over(contents: &str) -> (tempfile::TempDir, PowerModel) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("hypridle.conf");
+        fs::write(&path, contents).expect("write hypridle.conf");
+        (dir, PowerModel::load(path))
+    }
+
+    #[test]
+    fn a_doubled_general_block_becomes_a_note_for_the_lock_rows() {
+        // Task 9.31: a hand-edited file with a second `general { }` block. hypridle
+        // merges the two, so the page notes it next to the two settings that live in
+        // `general` — the lock command and its grace period — and says the app edits
+        // the first block. The listener timeouts are not named.
+        let doubled = format!("{HYPRIDLE_CONF}\ngeneral {{\n    lock_cmd = swaylock\n}}\n");
+        let (_dir, model) = model_over(&doubled);
+        assert_eq!(
+            model.setting_notes(),
+            [SettingNote {
+                settings: vec![SettingId::LockCommand, SettingId::LockGracePeriod],
+                text: "In hypridle.conf, `general` is declared twice (lines 1 and 24). \
+                       hypridle merges these blocks, so a value set again in a later \
+                       block overrides the first. The app shows and edits only the first \
+                       block: if a later block also sets a value shown here, a change made \
+                       here has no effect."
+                    .to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn three_listeners_and_one_general_block_give_no_note() {
+        // The real layout: the listeners are positional by design, `general` is
+        // declared once — nothing to say. A missing file has no notes either; the
+        // store loader reports it (R4.4).
+        let (_dir, model) = model_over(HYPRIDLE_CONF);
+        assert!(model.setting_notes().is_empty());
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = PowerModel::load(dir.path().join("hypridle.conf"));
+        assert!(missing.setting_notes().is_empty());
+    }
+
+    #[test]
+    fn a_noted_file_still_renders_the_first_blocks_edit() {
+        // The note changes nothing about the write: a lock-command edit on the
+        // doubled file rewrites the first block's value span and leaves the second
+        // block alone, exactly as the note says.
+        let doubled = format!("{HYPRIDLE_CONF}\ngeneral {{\n    lock_cmd = swaylock\n}}\n");
+        let (_dir, model) = model_over(&doubled);
+        let write = model
+            .apply_contribution(&[(
+                SettingId::LockCommand,
+                Value::String("hyprlock".to_string()),
+            )])
+            .expect("the edit renders")
+            .expect("a dirty setting writes");
+        let written = String::from_utf8(write.contents).expect("utf-8");
+        assert_eq!(
+            written,
+            doubled.replacen(
+                "lock_cmd = pidof hyprlock || hyprlock --grace 10",
+                "lock_cmd = hyprlock",
+                1
+            )
+        );
+        assert!(written.contains("    lock_cmd = swaylock\n"));
     }
 }

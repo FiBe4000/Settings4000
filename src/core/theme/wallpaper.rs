@@ -12,6 +12,9 @@
 //! reads its config only at the next lock — intentional, architecture §6). Chosen image
 //! paths are validated (exists + readable + image extension, and holdable by every file
 //! and request they are written to — task 9.27; R8.3) before staging.
+//! A hand-edited `hyprpaper.conf` that declares the `wallpaper { }` block twice for the
+//! same monitor gets an informational note, because hyprpaper applies the later block
+//! while the page edits the first (task 9.31, [`WallpaperModel::ambiguity_notes`]).
 //! Both files may store their path home-relative (`~/Pictures/…`, analysis §7.4); how
 //! the model validates, previews, writes and reloads such a value is described under
 //! "Home-relative paths" on [`WallpaperModel`], whose docs carry the rest.
@@ -20,11 +23,12 @@ use std::path::{Path, PathBuf};
 
 use crate::core::apply::{FileWrite, SkippedWrite, WriteMode};
 use crate::core::home_path::{expand_home, expand_home_to_string, path_in_form_of};
+use crate::core::hyprlang_notes::{ambiguity_notes, log_ambiguities};
 use crate::core::model::{
     SettingId, ValidationError, Value, validate_lock_background_value, validate_wallpaper_value,
 };
 use crate::core::reload::{BackingFile, ReloadParams};
-use crate::parsers::hyprlang::{HyprlangFile, KeyPath};
+use crate::parsers::hyprlang::{Ambiguity, HyprlangFile, HyprlangSchema, KeyPath, SpecialCategory};
 
 use super::{BackingSet, BackingText, Selection, Staged, log_skipped_writes, skipped_writes_note};
 
@@ -40,6 +44,38 @@ const WALLPAPER_FIT_KEY: &str = "fit_mode";
 const LOCK_SECTION: &str = "background";
 /// The key naming the lock-screen background image path inside the `background` section.
 const LOCK_PATH_KEY: &str = "path";
+
+/// What hyprpaper declares about `hyprpaper.conf`'s repeated blocks, for the ambiguity
+/// report (task 9.31): `wallpaper` is a special category keyed by `monitor` (hyprpaper
+/// registers it with `key = "monitor"`). Blocks for different monitors are separate
+/// wallpapers — the page edits only the first, by design — while two blocks naming the
+/// same monitor are merged by hyprpaper with the later assignment winning, which is the
+/// case reported.
+pub const HYPRPAPER_SCHEMA: HyprlangSchema = HyprlangSchema {
+    special_categories: &[SpecialCategory::Keyed {
+        name: WALLPAPER_SECTION,
+        key: "monitor",
+    }],
+    repeatable_keys: &[],
+};
+
+/// What hyprlock declares about `hyprlock.conf`'s repeated blocks, for the ambiguity
+/// report (task 9.31): its widgets — `background`, `input-field`, `label`, `shape` and
+/// `image` — are anonymous special categories (each block is one more widget), so only
+/// a repeated plain category such as `general` or `auth` is reported. That report is
+/// logged at load but never shown as a note: the one block this page edits,
+/// `background`, is a widget, so a second `background { }` block is a second
+/// background drawn by hyprlock rather than a continuation of the first.
+pub const HYPRLOCK_SCHEMA: HyprlangSchema = HyprlangSchema {
+    special_categories: &[
+        SpecialCategory::Anonymous(LOCK_SECTION),
+        SpecialCategory::Anonymous("input-field"),
+        SpecialCategory::Anonymous("label"),
+        SpecialCategory::Anonymous("shape"),
+        SpecialCategory::Anonymous("image"),
+    ],
+    repeatable_keys: &[],
+};
 
 /// The file name a [`SkippedWrite`] uses for `hyprpaper.conf`.
 const HYPRPAPER_FILE: &str = "hyprpaper.conf";
@@ -214,6 +250,11 @@ pub struct WallpaperModel {
     lock_available: bool,
     /// The backing paths, kept so [`Self::reload`] can re-read the files.
     paths: WallpaperPaths,
+    /// The notes about `wallpaper { }` blocks `hyprpaper.conf` declares more than once
+    /// for the same monitor (task 9.31), derived from the current backing text: at load,
+    /// and again after a commit, whose write may have appended a line and so moved the
+    /// reported line numbers.
+    ambiguity_notes: Vec<String>,
 }
 
 /// The Theme page's wallpaper / lock-background contribution to an
@@ -267,6 +308,21 @@ fn override_from_paths(wallpaper: Option<&str>, lock: Option<&str>, home: Option
     }
 }
 
+/// Phrases `hyprpaper.conf`'s ambiguity report as the wallpaper rows' notes (task 9.31):
+/// the page edits values in the first `wallpaper { }` block only
+/// ([`KeyPath::at`]), so that block's category is the one that matters.
+fn wallpaper_notes(ambiguities: &[Ambiguity]) -> Vec<String> {
+    ambiguity_notes(
+        HYPRPAPER_FILE,
+        "hyprpaper",
+        ambiguities,
+        &[WALLPAPER_SECTION],
+    )
+    .into_iter()
+    .map(|note| note.text)
+    .collect()
+}
+
 impl WallpaperModel {
     /// Builds the model by reading the backing config (task 6.5; R4.4, R8.5).
     ///
@@ -310,6 +366,17 @@ impl WallpaperModel {
 
         let fit_options: Vec<String> = CURATED_FIT_MODES.iter().map(|s| (*s).to_string()).collect();
 
+        // Task 9.31: log each file's ambiguity report once per load; only the
+        // hyprpaper.conf one can concern a value this page edits (see the schemas).
+        let hyprpaper_ambiguities = hyprpaper_file
+            .as_ref()
+            .map(|file| file.ambiguities(&HYPRPAPER_SCHEMA))
+            .unwrap_or_default();
+        log_ambiguities(HYPRPAPER_FILE, &hyprpaper_ambiguities);
+        if let Some(file) = &hyprlock_file {
+            log_ambiguities(HYPRLOCK_FILE, &file.ambiguities(&HYPRLOCK_SCHEMA));
+        }
+
         tracing::info!(
             wallpaper = wallpaper_path.is_some(),
             lock = lock_path.is_some(),
@@ -327,6 +394,7 @@ impl WallpaperModel {
             override_initial,
             lock_available,
             paths,
+            ambiguity_notes: wallpaper_notes(&hyprpaper_ambiguities),
         }
     }
 
@@ -396,6 +464,16 @@ impl WallpaperModel {
              differently."
                 .to_string()
         })
+    }
+
+    /// The notes the Theme page shows beside the wallpaper rows when `hyprpaper.conf`
+    /// declares the `wallpaper { }` block more than once for the same monitor (task
+    /// 9.31): hyprpaper merges such blocks and a later assignment wins, while the page
+    /// shows and edits the first, so a change can have no effect. Empty for a file
+    /// with one block per monitor. Informational only — staging and Apply are
+    /// unaffected (R5.3).
+    pub fn ambiguity_notes(&self) -> &[String] {
+        &self.ambiguity_notes
     }
 
     /// Whether the lock-screen override is on (a different image than the wallpaper).
@@ -599,6 +677,19 @@ impl WallpaperModel {
     pub fn commit(&mut self) {
         let (writes, record) = self.render_writes();
         self.backing.absorb_writes(&writes);
+        // An appended key (a `fit_mode` the file lacked) shifts the lines after it, so
+        // re-derive the notes from the text now on disk. Not logged again: the report
+        // itself is the one already logged at load.
+        self.ambiguity_notes = self
+            .hyprpaper()
+            .map(|backing| {
+                wallpaper_notes(
+                    &HyprlangFile::parse(&backing.text)
+                        .0
+                        .ambiguities(&HYPRPAPER_SCHEMA),
+                )
+            })
+            .unwrap_or_default();
         // Capture the effective lock path (which depends on the still-staged wallpaper
         // value when the override is off) before promoting the wallpaper edit.
         let new_lock = self.effective_lock();
@@ -2201,5 +2292,107 @@ label {
             .stage_wallpaper(&wall)
             .expect("an absolute image needs no home");
         assert_eq!(model.wallpaper_path(), Some(wall.as_str()));
+    }
+
+    /// The note text for a `hyprpaper.conf` declaring `wallpaper` twice for the same
+    /// monitor with the second block's header on `second`.
+    fn same_monitor_note(second: usize) -> String {
+        format!(
+            "In hyprpaper.conf, `wallpaper` is declared twice for the same `monitor` (lines 1 \
+             and {second}). hyprpaper merges these blocks, so a value set again in a later \
+             block overrides the first. The app shows and edits only the first block: if a \
+             later block also sets a value shown here, a change made here has no effect."
+        )
+    }
+
+    #[test]
+    fn only_a_wallpaper_block_doubled_for_one_monitor_is_noted() {
+        // Task 9.31: hyprpaper keys `wallpaper { }` by monitor. The fixture's single
+        // block and a second block for another monitor (a second wallpaper, which the
+        // page leaves alone by design) give no note; two blocks for the same monitor
+        // are merged by hyprpaper and are noted.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let paths = write_wallpaper_fixture(&tmp.path().join("config"));
+        assert!(
+            WallpaperModel::load(paths.clone(), true)
+                .ambiguity_notes()
+                .is_empty()
+        );
+
+        let other_monitor = "\nwallpaper {\n    monitor = DP-1\n    path = /elsewhere.png\n}\n";
+        fs::write(
+            &paths.hyprpaper_conf,
+            format!("{HYPRPAPER_CONF}{other_monitor}"),
+        )
+        .expect("add a second monitor's wallpaper");
+        assert!(
+            WallpaperModel::load(paths.clone(), true)
+                .ambiguity_notes()
+                .is_empty()
+        );
+
+        let same_monitor = "\nwallpaper {\n    monitor =\n    fit_mode = contain\n}\n";
+        fs::write(
+            &paths.hyprpaper_conf,
+            format!("{HYPRPAPER_CONF}{same_monitor}"),
+        )
+        .expect("add a second block for the same monitor");
+        assert_eq!(
+            WallpaperModel::load(paths, true).ambiguity_notes(),
+            [same_monitor_note(10)]
+        );
+    }
+
+    #[test]
+    fn a_noted_wallpaper_still_applies_and_the_note_follows_the_written_file() {
+        // The note never blocks a change: a fit staged against a file whose first
+        // block lacks `fit_mode` is appended to that first block and applied as usual
+        // (hyprpaper will still prefer the second block's fit — what the note says).
+        // The append moves the second block down one line, and after the commit the
+        // note names the new line.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let paths = write_wallpaper_fixture(&tmp.path().join("config"));
+        let doubled = "wallpaper {\n    monitor =\n    path = ~/Pictures/wallpaper/18.jpg\n}\n\nwallpaper {\n    monitor =\n    fit_mode = contain\n}\n";
+        fs::write(&paths.hyprpaper_conf, doubled).expect("write the doubled file");
+        let mut model = WallpaperModel::load(paths.clone(), true);
+        assert_eq!(model.ambiguity_notes(), [same_monitor_note(6)]);
+
+        model.stage_fit("tile");
+        let contribution = model.apply_contribution().expect("a dirty fit contributes");
+        assert!(contribution.skipped.is_empty());
+        let plan = ApplyPlan {
+            validations: contribution.validations,
+            writes: contribution.writes,
+            links: Vec::new(),
+            palette: None,
+            reload_params: contribution.reload_params,
+        };
+        let caps = Capabilities::for_tests(&[Binary::Hyprctl], &[Daemon::Hyprpaper], true);
+        let runner = MockCommandRunner::new();
+        assert!(matches!(
+            apply::run(
+                &plan,
+                &FreshnessTracker::new(),
+                &caps,
+                &runner,
+                &MockProcessSignaller::new(),
+            ),
+            ApplyOutcome::Applied { .. }
+        ));
+        assert_eq!(
+            fs::read_to_string(&paths.hyprpaper_conf).expect("read back"),
+            doubled.replacen("18.jpg\n}", "18.jpg\n    fit_mode = tile\n}", 1),
+            "the fit lands in the first block; the second is untouched"
+        );
+        assert_eq!(
+            runner.recorded().len(),
+            1,
+            "the hyprpaper reload runs as for any fit change: {:?}",
+            runner.recorded()
+        );
+
+        model.commit();
+        assert!(!model.is_dirty());
+        assert_eq!(model.ambiguity_notes(), [same_monitor_note(7)]);
     }
 }
