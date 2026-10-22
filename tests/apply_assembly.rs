@@ -48,7 +48,7 @@ use settings4000::system::command::{Command, CommandOutput, MockCommandRunner};
 use settings4000::system::signal::{MockProcessSignaller, SignalCall};
 use settings4000::testing::{
     FixtureDotfiles, assert_repo_untouched_except, expect_applied, load_into_store, loaders,
-    repo_snapshot,
+    replace_once, repo_snapshot,
 };
 
 /// A canned `hyprctl monitors all -j` payload for the fixture's laptop panel, matching
@@ -897,12 +897,14 @@ fn an_assembled_plan_applies_then_reconciles_every_source() {
         plan,
         store_writes,
         commits,
+        skipped,
     } = assemble_apply_plan(ApplySources {
         display: Some(&display),
         input: Some(&input),
         ..ApplySources::for_store(&store)
     })
     .expect("both writes render");
+    assert!(skipped.is_empty(), "neither page model refused a value");
 
     // Hyprland alone is reloaded for these two files (task 4.4); the runner is mocked so
     // nothing pokes a live compositor.
@@ -1058,4 +1060,167 @@ fn an_assembled_theme_apply_orders_its_follow_up_reloads() {
             pids: vec![77],
         }]
     );
+}
+
+/// Makes the fixture's `hyprland.lua` structurally unsafe for the Lua editor — a stray
+/// closing brace at the end, as a half-finished hand edit leaves it — and returns the
+/// bytes it now holds, so a test can prove the app left them alone.
+fn break_hyprland_lua(fx: &FixtureDotfiles) -> String {
+    let path = fx.config_path("hypr/hyprland.lua");
+    let mut text = fs::read_to_string(&path).expect("read the fixture hyprland.lua");
+    text.push_str("}\n");
+    fs::write(&path, &text).expect("write the broken hyprland.lua");
+    text
+}
+
+#[test]
+fn a_refused_hyprland_lua_copy_is_reported_while_the_rest_applies() {
+    // Task 9.28 (R3.4, R5.5): a hyprland.lua the Lua editor cannot follow refuses the
+    // cursor theme, while the other four copies take it. The Apply still writes those
+    // four and pushes the theme live — the push follows settings.ini, which took it —
+    // but the assembled plan names the refused value, the file and the editor's reason,
+    // so the UI can say so; and the page keeps the change pending with a note.
+    let fx = FixtureDotfiles::install();
+    fs::create_dir_all(fx.home().join(".icons/Fixture-Cursors/cursors"))
+        .expect("create a cursor theme the scan finds");
+    let lua_before = break_hyprland_lua(&fx);
+
+    let store = loaded_store(&fx);
+    let mut themes = themes_model(&fx);
+    themes
+        .stage_cursor_theme("Fixture-Cursors")
+        .expect("the value passes the stage-time check");
+
+    let assembled = assemble_apply_plan(ApplySources {
+        themes: Some(&themes),
+        ..ApplySources::for_store(&store)
+    })
+    .expect("the refusal does not stop the Apply");
+    let skipped: Vec<String> = assembled.skipped.iter().map(ToString::to_string).collect();
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert!(
+        skipped[0].starts_with(
+            "Cursor theme could not be written to hyprland.lua: the file's structure cannot \
+             be followed (line "
+        ),
+        "the warning names the value, the file and the reason: {}",
+        skipped[0]
+    );
+    assert!(!assembled.plan.changes_nothing());
+    assert!(assembled.commits.themes, "the other copies were written");
+    assert!(
+        !write_paths(&assembled.plan).contains(&fx.config_path("hypr/hyprland.lua")),
+        "nothing is planned for the refused file"
+    );
+
+    let caps = Capabilities::for_tests(&[Binary::Gsettings, Binary::Hyprctl], &[], true);
+    let runner = MockCommandRunner::new();
+    let outcome = apply::run(
+        &assembled.plan,
+        store.freshness(),
+        &caps,
+        &runner,
+        &MockProcessSignaller::new(),
+    );
+    let (reload_failures, written) = expect_applied(outcome);
+    assert!(reload_failures.is_empty());
+    assert_eq!(
+        written.len(),
+        4,
+        "both settings.ini, uwsm/env and index.theme"
+    );
+    assert_eq!(
+        runner.recorded(),
+        vec![
+            Command::new("gsettings").args([
+                "set",
+                "org.gnome.desktop.interface",
+                "cursor-theme",
+                "Fixture-Cursors",
+            ]),
+            Command::new("gsettings").args([
+                "set",
+                "org.gnome.desktop.interface",
+                "cursor-size",
+                "24",
+            ]),
+            Command::new("hyprctl").args(["setcursor", "Fixture-Cursors", "24"]),
+        ],
+        "settings.ini took the theme, so it is pushed live; hyprland.lua was not \
+         written, so Hyprland's config is not reloaded"
+    );
+    assert_eq!(
+        fs::read_to_string(fx.config_path("hypr/hyprland.lua")).expect("read hyprland.lua"),
+        lua_before,
+        "the refused file is byte-identical"
+    );
+
+    themes.commit();
+    assert!(themes.is_dirty(), "the refused change stays pending");
+    let note = themes
+        .skipped_writes_note()
+        .expect("the page explains why it stays dirty");
+    assert!(note.contains(&skipped[0]), "{note}");
+}
+
+#[test]
+fn an_apply_whose_every_value_is_refused_reports_it_instead_of_nothing() {
+    // Task 9.28: a lock-image change against a hyprlock.conf whose `background { }`
+    // block was removed by hand is the only staged value, and the file refuses it. The
+    // assembled plan therefore changes nothing — the pipeline reports `Applied` with no
+    // write and runs no command — and the skip list is the only thing that says why.
+    // The UI turns exactly this combination into a warning (see `ui::chrome`).
+    let fx = FixtureDotfiles::install();
+    let hyprlock = fx.config_path("hypr/hyprlock.conf");
+    let original = fs::read_to_string(&hyprlock).expect("read the fixture hyprlock.conf");
+    fs::write(
+        &hyprlock,
+        replace_once(&original, "background {", "shape {"),
+    )
+    .expect("write a hyprlock.conf without a background block");
+    let lock_image = fx.home().join("Pictures/lock.png");
+    fs::write(&lock_image, b"fixture lock image").expect("create the lock image");
+
+    let store = loaded_store(&fx);
+    let mut wallpaper = wallpaper_model(&fx);
+    wallpaper.set_override(true);
+    wallpaper
+        .stage_lock(lock_image.to_str().expect("UTF-8 path"))
+        .expect("an existing image stages");
+
+    let assembled = assemble_apply_plan(ApplySources {
+        wallpaper: Some(&wallpaper),
+        ..ApplySources::for_store(&store)
+    })
+    .expect("the refusal does not stop the Apply");
+    assert!(assembled.plan.changes_nothing(), "nothing can be written");
+    assert!(
+        !assembled.commits.wallpaper,
+        "a model that wrote nothing is not committed"
+    );
+    let skipped: Vec<String> = assembled.skipped.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        skipped,
+        vec![
+            "Lock-screen background could not be written to hyprlock.conf: no section for \
+             `background.path` to edit or append into"
+                .to_string()
+        ]
+    );
+
+    let runner = MockCommandRunner::new();
+    let outcome = apply::run(
+        &assembled.plan,
+        store.freshness(),
+        &Capabilities::for_tests(&[Binary::Hyprctl], &[Daemon::Hyprpaper], true),
+        &runner,
+        &MockProcessSignaller::new(),
+    );
+    let (_, written) = expect_applied(outcome);
+    assert!(written.is_empty());
+    assert!(runner.recorded().is_empty(), "nothing ran");
+    let note = wallpaper
+        .skipped_writes_note()
+        .expect("the page explains why the change stays pending");
+    assert!(note.contains(&skipped[0]), "{note}");
 }

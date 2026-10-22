@@ -35,7 +35,9 @@
 //! (R2.2). The whole appearance section is only built when `gsettings` is present
 //! (the window gates it, R4.2). Below the cursor drop-downs the section shows the
 //! model's two cursor notes: which of the duplicated cursor copies disagree (R3.4),
-//! and that the session environment copies take effect at the next login. Above the
+//! and that the session environment copies take effect at the next login. This
+//! section and the wallpaper section both end with a note naming any staged value one
+//! of its files refuses, which therefore stays pending after Apply (task 9.28). Above the
 //! drop-downs it shows the notes that another program is likely to rewrite the GTK
 //! settings (task 11.12): a `settings.ini` no longer linked to its dotfiles repo copy,
 //! and a running `xsettingsd`. Under the GTK-theme drop-down it shows when GTK 4 and
@@ -282,7 +284,8 @@ impl Inner {
     /// cursor-copy and next-login notes (task 11.5), the external-writer notes
     /// (task 11.12), the note that an older notifd shows a new icon theme only
     /// after its next start (task 11.14), and the GTK 4 theme-link note under the
-    /// GTK-theme drop-down (task 11.16).
+    /// GTK-theme drop-down (task 11.16), and the note naming staged values a file
+    /// refuses (task 9.28).
     ///
     /// When `settings.ini` is unreadable the rows are hidden behind a note (R4.4); when
     /// a `GTK_THEME` override is active the GTK-theme drop-down is disabled and the
@@ -395,6 +398,13 @@ impl Inner {
         if let Some(login) = model.cursor_login_note() {
             section.append(&note(&login));
         }
+        // Task 9.28 (R3.4, R5.5): a staged value one of its files refuses — in practice
+        // a hyprland.lua the Lua editor cannot follow — stays pending after every Apply;
+        // say which value, which file and why, instead of leaving a page that never
+        // becomes clean unexplained.
+        if let Some(skipped) = model.skipped_writes_note() {
+            section.append(&note(&skipped));
+        }
 
         frame.set_child(Some(&section));
         frame
@@ -455,7 +465,9 @@ impl Inner {
     /// Builds the wallpaper section: a wallpaper image picker, a fit-mode drop-down, and
     /// an optional lock-screen override toggle that reveals a second picker (task 6.5).
     ///
-    /// A `fill` fit gets a note that its live preview shows as cover (task 11.14).
+    /// A `fill` fit gets a note that its live preview shows as cover (task 11.14), and a
+    /// staged value a file refuses gets a note naming the file and the reason (task
+    /// 9.28).
     ///
     /// When `hyprpaper.conf` is unreadable the rows are hidden behind a note (R4.4); the
     /// lock-override toggle is shown only when hyprlock is present (R4.2).
@@ -536,6 +548,12 @@ impl Inner {
                 );
                 section.append(&labelled_row("Lock-screen image", &lock_button));
             }
+        }
+
+        // Task 9.28 (R5.5): a staged image or fit that its file cannot take (e.g. a
+        // hyprlock.conf with no `background { }` block) stays pending; say why.
+        if let Some(skipped) = model.skipped_writes_note() {
+            section.append(&note(&skipped));
         }
 
         frame.set_child(Some(&section));

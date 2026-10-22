@@ -40,8 +40,8 @@ use gtk4::{
     RevealerTransitionType, Window, glib,
 };
 
-use crate::core::apply::ApplyOutcome;
-use crate::core::assemble::{ConflictedSource, FailedWrite, PrepareFailure};
+use crate::core::apply::{ApplyOutcome, SkippedWrite};
+use crate::core::assemble::{AssembledPlan, ConflictedSource, FailedWrite, PrepareFailure};
 use crate::core::freshness::Conflict;
 use crate::core::model::Category;
 use crate::core::reload::ReloadError;
@@ -98,15 +98,17 @@ pub(crate) fn marker_category(category: SidebarCategory) -> Option<Category> {
 pub(crate) enum ApplyResponse {
     /// The writes stood (R5.5). The window commits the apply to the store, then — if
     /// `toast` is `Some` — shows it as a non-fatal notification. A `toast` is present
-    /// only when some component could not be reloaded; the file writes still stand.
+    /// only when something deserves a word although the file writes stand: a component
+    /// could not be reloaded, another program changed an unrelated file, or a staged
+    /// value could not be written to one of its files (task 9.28).
     Commit {
-        /// A non-fatal reload-failure summary to toast, or `None` for a fully clean
-        /// apply.
+        /// The non-fatal notes to toast, or `None` for a fully clean apply.
         toast: Option<String>,
     },
-    /// The apply aborted or failed (invalid values, an external conflict, or a write
-    /// failure). The window shows this as a modal warning and does **not** commit, so
-    /// the staged edits are kept for correction/retry.
+    /// The apply aborted, failed, or could write nothing at all (invalid values, an
+    /// external conflict, a write failure, or every staged value refused by its files).
+    /// The window shows this as a modal warning and does **not** commit, so the staged
+    /// edits are kept for correction/retry.
     Warn {
         /// A short heading for the dialog title/summary.
         heading: String,
@@ -115,7 +117,8 @@ pub(crate) enum ApplyResponse {
     },
 }
 
-/// Decides how the window should respond to `outcome` (R5.3–R5.6).
+/// Decides how the window should respond to `outcome`, the result of running
+/// `assembled`'s plan (R5.3–R5.6).
 ///
 /// The load-bearing mapping the window relies on:
 ///
@@ -128,23 +131,54 @@ pub(crate) enum ApplyResponse {
 ///   `reload_failures` becomes a toast (R5.5) — the reloads are non-fatal and the
 ///   writes still stand — and so does a non-empty `unrelated_conflicts` (R5.6): those
 ///   files were changed by another program and this apply left them alone, so the user
-///   is told to Refresh (task 9.11). When both are present the toast carries both
-///   notes, since either alone would hide the other.
+///   is told to Refresh (task 9.11). A non-empty [`AssembledPlan::skipped`] is a third
+///   note (task 9.28; R3.4, R5.5): those values were refused by one of their files, so
+///   the page keeps them pending, and the note names each value, file and reason. When
+///   several are present the toast carries them all, since any one alone would hide
+///   the others.
+/// - [`ApplyOutcome::Applied`] of a plan that [changes
+///   nothing](crate::core::apply::ApplyPlan::changes_nothing) while values were skipped
+///   → [`ApplyResponse::Warn`]. Every staged value was refused, so the Apply wrote
+///   nothing; reported as a commit it would show nothing at all, and the user would be
+///   left clicking an Apply that visibly does nothing, forever (task 9.28). There is
+///   nothing to commit either — no file changed, and the refused values must stay
+///   pending.
 /// - [`ApplyOutcome::ValidationFailed`] / [`ApplyOutcome::Conflicted`] /
 ///   [`ApplyOutcome::WriteFailed`] → [`ApplyResponse::Warn`]. Nothing durable changed
 ///   that the store must learn about (a write failure already rolled back), so no
 ///   commit; the user sees the reason and the staged edits are retained.
-pub(crate) fn respond_to_apply(outcome: &ApplyOutcome) -> ApplyResponse {
+///
+/// The function is GTK-free by construction and lives here only because the dialog and
+/// toast strings it composes do; it is a candidate for `core/assemble.rs`, where the
+/// module-boundary guard (`tests/module_boundaries.rs`) would cover it.
+pub(crate) fn respond_to_apply(outcome: &ApplyOutcome, assembled: &AssembledPlan) -> ApplyResponse {
     match outcome {
         ApplyOutcome::Applied {
             reload_failures,
             unrelated_conflicts,
             ..
         } => {
-            // Both notes are optional and independent, so they are collected and joined
-            // rather than nested: an apply can perfectly well have a component that
-            // would not reload *and* an unrelated file someone else edited.
+            let skipped = &assembled.skipped;
+            if !skipped.is_empty() && assembled.plan.changes_nothing() {
+                let mut detail = nothing_applied_summary(skipped);
+                if !unrelated_conflicts.is_empty() {
+                    detail.push_str("\n\n");
+                    detail.push_str(&unrelated_conflict_summary(unrelated_conflicts));
+                }
+                return ApplyResponse::Warn {
+                    heading: "Nothing was applied".to_string(),
+                    detail,
+                };
+            }
+            // The notes are optional and independent, so they are collected and joined
+            // rather than nested: an apply can perfectly well have a value one file
+            // refused, a component that would not reload *and* an unrelated file
+            // someone else edited. The skipped values come first, because they are the
+            // one note about the user's own changes not taking full effect.
             let mut notes = Vec::new();
+            if !skipped.is_empty() {
+                notes.push(skipped_write_summary(skipped));
+            }
             if !reload_failures.is_empty() {
                 notes.push(reload_failure_summary(reload_failures));
             }
@@ -309,6 +343,38 @@ pub(crate) fn assembly_warning(failure: &PrepareFailure) -> ConflictWarning {
             }
         }
     }
+}
+
+/// Formats the note about staged values one of their files refused, for the toast of an
+/// Apply that wrote everything else (task 9.28; R3.4, R5.5).
+///
+/// The framing says the rest was saved and that the listed values stay pending, which
+/// is why the page does not become clean; each line is the value's own
+/// [`SkippedWrite`] sentence, naming the value, the file and the reason.
+fn skipped_write_summary(skipped: &[SkippedWrite]) -> String {
+    let mut summary = String::from(
+        "Your other changes were saved, but some could not be written to every file that \
+         holds them, so the page keeps them pending:",
+    );
+    for skip in skipped {
+        summary.push_str(&format!("\n• {skip}"));
+    }
+    summary
+}
+
+/// Formats the warning body for an Apply in which every staged value was refused by its
+/// files, so nothing was written (task 9.28).
+fn nothing_applied_summary(skipped: &[SkippedWrite]) -> String {
+    let mut summary = String::from(
+        "None of the pending changes could be written, so no file was changed and they \
+         are still pending:",
+    );
+    for skip in skipped {
+        summary.push_str(&format!("\n• {skip}"));
+    }
+    summary
+        .push_str("\n\nFix the file named above and apply again, or Reset to discard the changes.");
+    summary
 }
 
 /// Formats a non-fatal reload-failure summary for a toast (R5.5).
@@ -490,13 +556,16 @@ mod tests {
 
     use super::*;
     use crate::core::apply::{
-        self, ApplyPlan, FileWrite, InvalidSetting, WriteFailure, WriteFailureCause, WriteMode,
+        self, ApplyPlan, FileWrite, InvalidSetting, PaletteSwitch, WriteFailure, WriteFailureCause,
+        WriteMode,
     };
+    use crate::core::assemble::{ApplySources, ModelCommits, assemble_apply_plan, base_apply_plan};
     use crate::core::detect::{Binary, Capabilities};
     use crate::core::freshness::FreshnessTracker;
     use crate::core::model::{SettingId, Value};
     use crate::core::reload::{BackingFile, ReloadParams};
     use crate::core::store::{FileReader, FileValues, SettingsStore};
+    use crate::core::theme::{ThemeRoots, ThemesModel, ThemesPaths};
     use crate::system::command::{CommandOutput, MockCommandRunner};
     use crate::system::signal::MockProcessSignaller;
 
@@ -521,6 +590,18 @@ mod tests {
             reader,
         );
         store
+    }
+
+    /// An assembled plan with no skipped write — the ordinary case, under which
+    /// [`respond_to_apply`] decides from the outcome alone. Its plan is never consulted
+    /// then, so the store's empty base plan stands in for whatever ran.
+    fn assembled_without_skips() -> AssembledPlan {
+        AssembledPlan {
+            plan: base_apply_plan(&SettingsStore::new()),
+            store_writes: Vec::new(),
+            commits: ModelCommits::default(),
+            skipped: Vec::new(),
+        }
     }
 
     #[test]
@@ -588,6 +669,135 @@ mod tests {
         );
     }
 
+    /// A skipped write as the GTK/icon/cursor model reports one, for the tests that need
+    /// a skip but not the fixture behind it.
+    fn skipped_cursor_write() -> SkippedWrite {
+        SkippedWrite {
+            value: "Cursor theme",
+            file: "hyprland.lua",
+            reason: "the file's structure cannot be followed (line 3: `}` closes nothing), \
+                     so it is not edited"
+                .to_string(),
+        }
+    }
+
+    #[test]
+    fn a_skipped_write_commits_with_a_toast_naming_it() {
+        // Task 9.28 end to end through the core seam: a fixture hyprland.lua the Lua
+        // editor cannot follow refuses the cursor theme while the other copies take it.
+        // The writes stand, so the Apply commits — and the toast names the value, the
+        // file and the reason instead of passing over the refusal in silence.
+        let fx = crate::testing::FixtureDotfiles::install();
+        fs::create_dir_all(fx.home().join(".icons/Fixture-Cursors/cursors"))
+            .expect("create a cursor theme the scan finds");
+        let lua = fx.config_path("hypr/hyprland.lua");
+        let mut text = fs::read_to_string(&lua).expect("read the fixture hyprland.lua");
+        text.push_str("}\n");
+        fs::write(&lua, text).expect("break hyprland.lua's structure");
+
+        let roots = ThemeRoots {
+            gtk_theme_dirs: Vec::new(),
+            icon_dirs: vec![fx.home().join(".icons")],
+        };
+        let paths = ThemesPaths {
+            gtk3_settings: fx.config_path("gtk-3.0/settings.ini"),
+            gtk4_settings: fx.config_path("gtk-4.0/settings.ini"),
+            hyprland_lua: Some(lua),
+            uwsm_env: fx.config_path("uwsm/env"),
+            cursor_fallback_theme: Some(fx.home().join(".icons/default/index.theme")),
+            dotfiles_repo: Some(fx.repo_root().to_path_buf()),
+            home: Some(fx.home().to_path_buf()),
+        };
+        let mut themes = ThemesModel::load(&roots, paths, false, None);
+        themes
+            .stage_cursor_theme("Fixture-Cursors")
+            .expect("the value passes the stage-time check");
+        let store = SettingsStore::new();
+        let assembled = assemble_apply_plan(ApplySources {
+            themes: Some(&themes),
+            ..ApplySources::for_store(&store)
+        })
+        .expect("the refusal does not stop the Apply");
+        let outcome = apply::run(
+            &assembled.plan,
+            store.freshness(),
+            &Capabilities::for_tests(&[], &[], true),
+            &MockCommandRunner::new(),
+            &MockProcessSignaller::new(),
+        );
+
+        match respond_to_apply(&outcome, &assembled) {
+            ApplyResponse::Commit { toast } => {
+                let text = toast.expect("a skipped write must produce a toast");
+                assert!(
+                    text.contains("Cursor theme could not be written to hyprland.lua: the file's structure cannot be followed"),
+                    "the toast names the value, the file and the reason: {text}"
+                );
+                assert!(
+                    text.contains("the page keeps them pending"),
+                    "the toast says the change is not lost: {text}"
+                );
+            }
+            other => panic!("expected Commit with a toast, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_apply_whose_every_value_was_refused_warns() {
+        // Task 9.28: with the refused value the only staged one, the plan writes nothing
+        // and the pipeline reports `Applied` with no write. That must be a visible
+        // warning naming the value and the file — and not a commit, since nothing changed
+        // and the value must stay pending — rather than `Commit { toast: None }`, which
+        // would make Apply silently do nothing on every click.
+        let outcome = ApplyOutcome::Applied {
+            reload_failures: Vec::new(),
+            written: Vec::new(),
+            unrelated_conflicts: Vec::new(),
+        };
+        let assembled = AssembledPlan {
+            skipped: vec![skipped_cursor_write()],
+            ..assembled_without_skips()
+        };
+        match respond_to_apply(&outcome, &assembled) {
+            ApplyResponse::Warn { heading, detail } => {
+                assert_eq!(heading, "Nothing was applied");
+                assert!(
+                    detail.contains(&skipped_cursor_write().to_string()),
+                    "the warning names the value, the file and the reason: {detail}"
+                );
+            }
+            other => panic!("expected Warn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_palette_switch_beside_a_refused_value_still_commits() {
+        // A plan with no file write can still have done something: a palette switch runs
+        // generate-colors, which is not a planned write. Treating that Apply as "nothing
+        // was applied" would skip the palette commit and re-run the generator next time,
+        // so only a plan that changes nothing at all becomes the warning.
+        let outcome = ApplyOutcome::Applied {
+            reload_failures: Vec::new(),
+            written: Vec::new(),
+            unrelated_conflicts: Vec::new(),
+        };
+        let mut assembled = AssembledPlan {
+            skipped: vec![skipped_cursor_write()],
+            ..assembled_without_skips()
+        };
+        assembled.plan.palette = Some(PaletteSwitch {
+            scheme: "nord".to_string(),
+            generate_colors: PathBuf::from("/dotfiles/scripts/generate-colors"),
+        });
+        match respond_to_apply(&outcome, &assembled) {
+            ApplyResponse::Commit { toast } => assert!(
+                toast.is_some_and(|text| text.contains(&skipped_cursor_write().to_string())),
+                "the palette commits and the refusal is still named"
+            ),
+            other => panic!("expected Commit, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_clean_apply_commits_without_a_toast() {
         let outcome = ApplyOutcome::Applied {
@@ -595,7 +805,7 @@ mod tests {
             written: Vec::new(),
             unrelated_conflicts: Vec::new(),
         };
-        match respond_to_apply(&outcome) {
+        match respond_to_apply(&outcome, &assembled_without_skips()) {
             ApplyResponse::Commit { toast } => {
                 assert!(toast.is_none(), "a clean apply commits and shows no toast")
             }
@@ -615,7 +825,7 @@ mod tests {
             written: Vec::new(),
             unrelated_conflicts: Vec::new(),
         };
-        match respond_to_apply(&outcome) {
+        match respond_to_apply(&outcome, &assembled_without_skips()) {
             ApplyResponse::Commit { toast } => {
                 let text = toast.expect("a reload failure must produce a toast");
                 assert!(
@@ -669,7 +879,7 @@ mod tests {
         let signaller = MockProcessSignaller::new();
         let outcome = apply::run(&plan, &tracker, &caps, &runner, &signaller);
 
-        match respond_to_apply(&outcome) {
+        match respond_to_apply(&outcome, &assembled_without_skips()) {
             ApplyResponse::Commit { toast } => {
                 let text = toast.expect("both notes must produce a toast");
                 assert!(
@@ -694,7 +904,7 @@ mod tests {
             id: SettingId::WallpaperPath,
             error,
         }]);
-        match respond_to_apply(&outcome) {
+        match respond_to_apply(&outcome, &assembled_without_skips()) {
             ApplyResponse::Warn { detail, .. } => {
                 assert!(
                     detail.contains("no file exists"),
@@ -719,7 +929,7 @@ mod tests {
             rolled_back: Vec::new(),
             rollback_failures: Vec::new(),
         });
-        match respond_to_apply(&outcome) {
+        match respond_to_apply(&outcome, &assembled_without_skips()) {
             ApplyResponse::Warn { heading, detail } => {
                 assert!(!heading.is_empty());
                 assert!(
@@ -757,7 +967,7 @@ mod tests {
         let caps = Capabilities::for_tests(&[], &[], false);
         let outcome = apply::run(&plan, &FreshnessTracker::new(), &caps, &runner, &signaller);
 
-        match respond_to_apply(&outcome) {
+        match respond_to_apply(&outcome, &assembled_without_skips()) {
             ApplyResponse::Warn { detail, .. } => assert!(
                 detail.contains("theme/fonts is missing or incomplete"),
                 "the warning must show the generator's own message: {detail}"
@@ -801,7 +1011,7 @@ mod tests {
             matches!(outcome, ApplyOutcome::Conflicted(_)),
             "the external edit must conflict"
         );
-        match respond_to_apply(&outcome) {
+        match respond_to_apply(&outcome, &assembled_without_skips()) {
             ApplyResponse::Warn { detail, .. } => assert!(
                 detail.contains("input.lua"),
                 "the warning names the conflicting file: {detail}"

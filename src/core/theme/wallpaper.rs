@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::core::apply::{FileWrite, WriteMode};
+use crate::core::apply::{FileWrite, SkippedWrite, WriteMode};
 use crate::core::home_path::{expand_home, expand_home_to_string, path_in_form_of};
 use crate::core::model::{
     SettingId, ValidationError, Value, validate_lock_background_value, validate_wallpaper_value,
@@ -26,7 +26,7 @@ use crate::core::model::{
 use crate::core::reload::{BackingFile, ReloadParams};
 use crate::parsers::hyprlang::{HyprlangFile, KeyPath};
 
-use super::{BackingSet, BackingText, Selection, Staged};
+use super::{BackingSet, BackingText, Selection, Staged, log_skipped_writes, skipped_writes_note};
 
 /// The `hyprpaper.conf` section holding the wallpaper (`wallpaper { path = … }`).
 const WALLPAPER_SECTION: &str = "wallpaper";
@@ -40,6 +40,11 @@ const WALLPAPER_FIT_KEY: &str = "fit_mode";
 const LOCK_SECTION: &str = "background";
 /// The key naming the lock-screen background image path inside the `background` section.
 const LOCK_PATH_KEY: &str = "path";
+
+/// The file name a [`SkippedWrite`] uses for `hyprpaper.conf`.
+const HYPRPAPER_FILE: &str = "hyprpaper.conf";
+/// The file name a [`SkippedWrite`] uses for `hyprlock.conf`.
+const HYPRLOCK_FILE: &str = "hyprlock.conf";
 
 /// Fit modes offered in the fit-mode drop-down, in a sensible order.
 ///
@@ -75,17 +80,21 @@ pub struct WallpaperPaths {
 }
 
 /// Which of the wallpaper page's staged values a render actually managed to write into a
-/// file — the wallpaper model's counterpart of the themes model's `ThemeRenderRecord`
-/// (private to the sibling `themes` module, hence named rather than linked), and used for
-/// the same reason.
+/// file, and which a file refused — the wallpaper model's counterpart of the themes
+/// model's `ThemeRenderRecord` (private to the sibling `themes` module, hence named
+/// rather than linked), and used for the same reasons.
 ///
 /// A hyprlang edit can fail per key (the addressed `wallpaper { }` / `background { }`
 /// section does not exist in the user's file, or the chosen image path contains a `#`,
 /// which hyprlang would read as an inline comment and silently truncate). The skipped key
-/// is logged and the other keys are still written, so [`WallpaperModel::commit`] promotes
-/// only the values flagged here: a value that reached no file stays staged, keeping the
-/// page dirty and retryable instead of re-baselining the model to something the disk
-/// never received.
+/// is recorded and the other keys are still written, so [`WallpaperModel::commit`]
+/// promotes only the values flagged here: a value that reached no file stays staged,
+/// keeping the page dirty and retryable instead of re-baselining the model to something
+/// the disk never received. Each such refusal is also kept as a [`SkippedWrite`] (task
+/// 9.28), so the Apply can say what it left out and the page why it stays dirty. Since
+/// task 9.27 refuses a `#` when the image is picked, a missing section is what is left
+/// to cause one — most plausibly a hand-edited `hyprlock.conf` without a
+/// `background { }` block.
 ///
 /// Unlike the theme values, these need no separate "a copy refused it" record. With the
 /// override off the wallpaper path *is* written to `hyprlock.conf` as well, so it is not
@@ -94,22 +103,35 @@ pub struct WallpaperPaths {
 /// [`WallpaperModel::hyprlock_write_needed`] and stays retryable. A cursor value has no
 /// such per-copy baseline: one model value covers four files, which is why the theme
 /// record has to track divergence explicitly.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct WrittenWallpaperValues {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct WallpaperRenderRecord {
     /// The wallpaper image path reached the `hyprpaper.conf` write.
     wallpaper: bool,
     /// The fit mode reached the `hyprpaper.conf` write.
     fit: bool,
     /// The lock-screen background path reached the `hyprlock.conf` write.
     lock: bool,
+    /// The values a file refused, in render order (task 9.28).
+    skipped: Vec<SkippedWrite>,
 }
 
-impl WrittenWallpaperValues {
+impl WallpaperRenderRecord {
     /// Folds one file's render result into the page-wide record.
-    fn merge(&mut self, other: WrittenWallpaperValues) {
+    fn merge(&mut self, other: WallpaperRenderRecord) {
         self.wallpaper |= other.wallpaper;
         self.fit |= other.fit;
         self.lock |= other.lock;
+        self.skipped.extend(other.skipped);
+    }
+
+    /// Records that `file` refused the staged `value` (its user-facing name) for
+    /// `reason`, the hyprlang writer's explanation.
+    fn refuse(&mut self, value: &'static str, file: &'static str, reason: String) {
+        self.skipped.push(SkippedWrite {
+            value,
+            file,
+            reason,
+        });
     }
 }
 
@@ -204,14 +226,22 @@ pub struct WallpaperModel {
 /// validations re-check the chosen image paths at apply time (R8.3), so a path deleted
 /// between staging and Apply is caught before any write.
 pub struct WallpaperApply {
-    /// The atomic writes, one per changed backing file.
+    /// The atomic writes, one per changed backing file. Empty when every staged value
+    /// was refused — the contribution then still exists, to report [`Self::skipped`]
+    /// (task 9.28).
     pub writes: Vec<FileWrite>,
-    /// The reload parameters — only the wallpaper path, and only when `hyprpaper.conf`
-    /// is written (the pipeline merges these into its plan-wide [`ReloadParams`]).
+    /// The reload parameters — the wallpaper path and fit, and only when
+    /// `hyprpaper.conf` is written (the pipeline merges these into its plan-wide
+    /// [`ReloadParams`]). Each carries what the file holds after the write, so a value
+    /// the file refused is never pushed to hyprpaper (task 9.28).
     pub reload_params: ReloadParams,
     /// The chosen image paths to validate before writing (R8.3), reusing the
     /// [`SettingId`] image-path validator.
     pub validations: Vec<(SettingId, Value)>,
+    /// The staged values a file refused, each naming the value, the file and the reason
+    /// (task 9.28; R5.5). They stay pending after the Apply; the assembler collects the
+    /// list so the UI can say so.
+    pub skipped: Vec<SkippedWrite>,
 }
 
 /// Derives the lock-screen override toggle from a wallpaper path and a lock-screen path:
@@ -508,25 +538,51 @@ impl WallpaperModel {
     }
 
     /// The Theme page's wallpaper / lock-background contribution to the Apply plan, or
-    /// `None` when nothing changed (task 6.5).
+    /// `None` when there is nothing to contribute (task 6.5).
+    ///
+    /// A value a file refused is reported in [`WallpaperApply::skipped`] (task 9.28).
+    /// When every staged value was refused — a lock-image change against a
+    /// `hyprlock.conf` with no `background { }` block is the realistic case — there is
+    /// no write, but the contribution is still returned (with its validations) because
+    /// the refusals are the only explanation the user gets for an Apply that changes
+    /// nothing. `None` means "not dirty", or dirty with nothing written and nothing
+    /// refused.
     pub fn apply_contribution(&self) -> Option<WallpaperApply> {
         if !self.is_dirty() {
             return None;
         }
-        let (writes, _) = self.render_writes();
-        if writes.is_empty() {
-            // Dirty but nothing could be written (e.g. a parser edit error). Nothing to
-            // apply; the page stays dirty for a retry.
+        let (writes, record) = self.render_writes();
+        log_skipped_writes(&record.skipped);
+        if writes.is_empty() && record.skipped.is_empty() {
+            // Dirty but no file to write. Nothing to apply or to report; the page stays
+            // dirty for a retry.
             tracing::warn!(
                 "wallpaper change is dirty but no backing file could be written; skipping the wallpaper apply (R4.4)"
             );
             return None;
         }
+        let reload_params = self.reload_params(&record);
         Some(WallpaperApply {
             writes,
-            reload_params: self.reload_params(),
+            reload_params,
             validations: self.validations(),
+            skipped: record.skipped,
         })
+    }
+
+    /// The wallpaper-section note naming each staged value a file cannot take, with the
+    /// file and the reason, or `None` when every staged value can be written (task 9.28;
+    /// R5.5).
+    ///
+    /// Derived from a fresh render of the staged values for the reason given on
+    /// [`ThemesModel::skipped_writes_note`](super::ThemesModel::skipped_writes_note): the
+    /// render is deterministic, so this is what the last Apply skipped and what the next
+    /// would, and it cannot go stale.
+    pub fn skipped_writes_note(&self) -> Option<String> {
+        if !self.is_dirty() {
+            return None;
+        }
+        skipped_writes_note(&self.render_writes().1.skipped)
     }
 
     /// Commits the staged changes after a successful Apply: takes the written bytes back
@@ -536,23 +592,23 @@ impl WallpaperModel {
     ///
     /// Promotion is derived from the rendered writes, not from the
     /// `*_write_needed` predicates: a value whose hyprlang edit was skipped (see
-    /// [`WrittenWallpaperValues`]) stays staged, so the page stays dirty and the user can
+    /// [`WallpaperRenderRecord`]) stays staged, so the page stays dirty and the user can
     /// retry. Promoting it would leave the model claiming a path that reached no file, and
     /// because the value would then no longer look changed, no later Apply would write it
     /// — a permanent silent divergence between the UI and the config.
     pub fn commit(&mut self) {
-        let (writes, written) = self.render_writes();
+        let (writes, record) = self.render_writes();
         self.backing.absorb_writes(&writes);
         // Capture the effective lock path (which depends on the still-staged wallpaper
         // value when the override is off) before promoting the wallpaper edit.
         let new_lock = self.effective_lock();
-        if written.wallpaper {
+        if record.wallpaper {
             self.wallpaper.commit();
         }
-        if written.fit {
+        if record.fit {
             self.fit.commit();
         }
-        if written.lock {
+        if record.lock {
             // `hyprlock.conf` received exactly this path, so it becomes the baseline and
             // the staged override value (if any) has served its purpose.
             self.lock.original = new_lock;
@@ -573,27 +629,27 @@ impl WallpaperModel {
     }
 
     /// Renders the file writes for the current staged changes, together with which values
-    /// actually reached one of them (used by both [`Self::apply_contribution`], which
-    /// needs only the writes, and [`Self::commit`], which needs the promotion record).
-    fn render_writes(&self) -> (Vec<FileWrite>, WrittenWallpaperValues) {
+    /// actually reached one of them and which a file refused — used by
+    /// [`Self::apply_contribution`] (the writes, the refusals and the reload parameters),
+    /// by [`Self::commit`] (the promotion record) and by [`Self::skipped_writes_note`].
+    fn render_writes(&self) -> (Vec<FileWrite>, WallpaperRenderRecord) {
         let mut writes = Vec::new();
-        let mut written = WrittenWallpaperValues::default();
+        let mut record = WallpaperRenderRecord::default();
         if self.hyprpaper_write_needed() {
             if let Some(backing) = self.hyprpaper() {
-                let (write, keys) = self.render_hyprpaper(backing);
-                written.merge(keys);
+                let (write, file_record) = self.render_hyprpaper(backing);
+                record.merge(file_record);
                 writes.extend(write);
             }
         }
         if self.hyprlock_write_needed() {
             if let Some(backing) = self.hyprlock() {
-                if let Some(write) = self.render_hyprlock(backing) {
-                    written.lock = true;
-                    writes.push(write);
-                }
+                let (write, file_record) = self.render_hyprlock(backing);
+                record.merge(file_record);
+                writes.extend(write);
             }
         }
-        (writes, written)
+        (writes, record)
     }
 
     /// Renders the `hyprpaper.conf` write, editing only the `wallpaper.path` and/or
@@ -602,21 +658,19 @@ impl WallpaperModel {
     fn render_hyprpaper(
         &self,
         backing: &BackingText,
-    ) -> (Option<FileWrite>, WrittenWallpaperValues) {
+    ) -> (Option<FileWrite>, WallpaperRenderRecord) {
         let (mut file, _) = HyprlangFile::parse(&backing.text);
         let mut changed_keys = Vec::new();
-        let mut written = WrittenWallpaperValues::default();
+        let mut record = WallpaperRenderRecord::default();
 
         if self.wallpaper.is_dirty() {
             if let Some(path) = self.wallpaper.effective() {
                 match file.set_value(&KeyPath::at(&[WALLPAPER_SECTION], WALLPAPER_PATH_KEY), path) {
                     Ok(()) => {
                         changed_keys.push("wallpaper path".to_string());
-                        written.wallpaper = true;
+                        record.wallpaper = true;
                     }
-                    Err(error) => {
-                        tracing::warn!(%error, "could not set the wallpaper path in hyprpaper.conf");
-                    }
+                    Err(error) => record.refuse("Wallpaper", HYPRPAPER_FILE, error.to_string()),
                 }
             }
         }
@@ -625,17 +679,17 @@ impl WallpaperModel {
                 match file.set_value(&KeyPath::at(&[WALLPAPER_SECTION], WALLPAPER_FIT_KEY), fit) {
                     Ok(()) => {
                         changed_keys.push("fit mode".to_string());
-                        written.fit = true;
+                        record.fit = true;
                     }
                     Err(error) => {
-                        tracing::warn!(%error, "could not set the fit mode in hyprpaper.conf");
+                        record.refuse("Wallpaper fit mode", HYPRPAPER_FILE, error.to_string())
                     }
                 }
             }
         }
 
         if changed_keys.is_empty() {
-            return (None, written);
+            return (None, record);
         }
         (
             Some(FileWrite {
@@ -650,47 +704,55 @@ impl WallpaperModel {
                 // fit-only change carries just a mode from a fixed list, and
                 // deliberately does not drag the unchanged path into validation, so
                 // such a write declares no setting.
-                validated_by: if written.wallpaper {
+                validated_by: if record.wallpaper {
                     vec![SettingId::WallpaperPath]
                 } else {
                     Vec::new()
                 },
                 mode: WriteMode::Replace,
             }),
-            written,
+            record,
         )
     }
 
     /// Renders the `hyprlock.conf` write, editing only the `background.path` value span
     /// to the effective lock path (surgical, R5.3).
     ///
-    /// `None` means the edit could not be made — most plausibly a `hyprlock.conf` with no
-    /// `background { }` section, which the hyprlang writer never invents — and is what
-    /// keeps [`Self::commit`] from promoting the lock path (see
-    /// [`WrittenWallpaperValues`]).
-    fn render_hyprlock(&self, backing: &BackingText) -> Option<FileWrite> {
-        let path = self.effective_lock()?;
+    /// No write means the edit could not be made — most plausibly a `hyprlock.conf` with
+    /// no `background { }` section, which the hyprlang writer never invents. The refusal
+    /// is recorded in the returned [`WallpaperRenderRecord`], which is what keeps
+    /// [`Self::commit`] from promoting the lock path and what tells the user why.
+    fn render_hyprlock(&self, backing: &BackingText) -> (Option<FileWrite>, WallpaperRenderRecord) {
+        let mut record = WallpaperRenderRecord::default();
+        let Some(path) = self.effective_lock() else {
+            return (None, record);
+        };
         let (mut file, _) = HyprlangFile::parse(&backing.text);
         match file.set_value(&KeyPath::at(&[LOCK_SECTION], LOCK_PATH_KEY), &path) {
-            Ok(()) => Some(FileWrite {
-                path: backing.path.clone(),
-                contents: file.emit().into_bytes(),
-                changed_keys: vec!["lock background path".to_string()],
-                backing: BackingFile::HyprlockConf,
-                // This write exists only when there is an effective lock path, which is
-                // exactly the condition under which [`Self::validations`] re-checks that
-                // path (R8.3) — so its value is always covered by the plan.
-                validated_by: vec![SettingId::LockBackgroundPath],
-                mode: WriteMode::Replace,
-            }),
+            Ok(()) => {
+                record.lock = true;
+                let write = FileWrite {
+                    path: backing.path.clone(),
+                    contents: file.emit().into_bytes(),
+                    changed_keys: vec!["lock background path".to_string()],
+                    backing: BackingFile::HyprlockConf,
+                    // This write exists only when there is an effective lock path, which is
+                    // exactly the condition under which [`Self::validations`] re-checks that
+                    // path (R8.3) — so its value is always covered by the plan.
+                    validated_by: vec![SettingId::LockBackgroundPath],
+                    mode: WriteMode::Replace,
+                };
+                (Some(write), record)
+            }
             Err(error) => {
-                tracing::warn!(%error, "could not set the lock background path in hyprlock.conf");
-                None
+                record.refuse("Lock-screen background", HYPRLOCK_FILE, error.to_string());
+                (None, record)
             }
         }
     }
 
-    /// The reload parameters for the change (task 4.4).
+    /// The reload parameters for the change, from the render in `record` (tasks 4.4,
+    /// 9.28).
     ///
     /// The wallpaper path **and** the fit mode are set only when `hyprpaper.conf` is
     /// written, so the live `hyprctl hyprpaper wallpaper ,<path>[,<fit>]` applies the
@@ -700,19 +762,34 @@ impl WallpaperModel {
     /// [`BackingFile::HyprlockConf`] mapping to no action, issues no reload command at
     /// all (the intentional hyprlock behaviour, architecture §6).
     ///
+    /// Each of the two carries what `hyprpaper.conf` holds after the write: the staged
+    /// value when the render wrote it, the loaded value when the file refused it. So a
+    /// path the file could not take is never shown live while the file keeps the old
+    /// image — the live session and the config would otherwise disagree until the next
+    /// hyprpaper start, which reverts it (the same rule as the theme model's `gsettings`
+    /// push, task 9.28).
+    ///
     /// The path is expanded to its absolute form even when the file stores `~/…`,
     /// because hyprpaper's IPC accepts only absolute paths (see "Home-relative paths" on
     /// [`WallpaperModel`]). Only with an unknown home does a `~/…` value pass through
     /// unexpanded; it can then never have been validated, so it only reaches the
     /// reload on a fit-only change, where `hyprctl` expands it from its own `$HOME`.
-    fn reload_params(&self) -> ReloadParams {
+    fn reload_params(&self, record: &WallpaperRenderRecord) -> ReloadParams {
         let home = self.paths.home.as_deref();
-        let (wallpaper, fit) = if self.hyprpaper_write_needed() {
+        let (wallpaper, fit) = if record.wallpaper || record.fit {
+            let path = if record.wallpaper {
+                self.wallpaper.effective()
+            } else {
+                self.wallpaper.original.as_deref()
+            };
+            let fit = if record.fit {
+                self.fit.effective()
+            } else {
+                self.fit.value.original.as_deref()
+            };
             (
-                self.wallpaper
-                    .effective()
-                    .map(|path| expand_home_to_string(path, home)),
-                self.fit.effective().map(str::to_string),
+                path.map(|path| expand_home_to_string(path, home)),
+                fit.map(str::to_string),
             )
         } else {
             (None, None)
@@ -767,6 +844,7 @@ mod tests {
     use crate::core::freshness::FreshnessTracker;
     use crate::system::command::{Command, MockCommandRunner};
     use crate::system::signal::MockProcessSignaller;
+    use crate::testing::replace_once;
 
     /// A `hyprpaper.conf` fixture: a `wallpaper { }` block with a monitor line, a
     /// comment, the wallpaper `path`, and `fit_mode`, plus a top-level `splash` key —
@@ -1569,6 +1647,19 @@ label {
             "only hyprpaper.conf could be rendered"
         );
         assert_eq!(contribution.writes[0].backing, BackingFile::HyprpaperConf);
+        // Task 9.28: the refusal is reported, naming the value, the file and the
+        // writer's reason, so the user is told why the page stays dirty.
+        assert_eq!(contribution.skipped.len(), 1, "{:?}", contribution.skipped);
+        let skip = &contribution.skipped[0];
+        assert_eq!(
+            (skip.value, skip.file),
+            ("Lock-screen background", "hyprlock.conf")
+        );
+        assert!(
+            skip.reason.contains("no section for `background.path`"),
+            "the reason is the hyprlang writer's: {}",
+            skip.reason
+        );
 
         let plan = ApplyPlan {
             validations: contribution.validations,
@@ -1608,6 +1699,63 @@ label {
             Some(wall.as_str()),
             "the wallpaper path, which was written, is promoted"
         );
+        let note = model
+            .skipped_writes_note()
+            .expect("the page explains the change that stays pending");
+        assert!(
+            note.contains("Lock-screen background could not be written to hyprlock.conf"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn a_hyprpaper_conf_without_a_wallpaper_block_refuses_both_values() {
+        // Task 9.28: a hand-edited hyprpaper.conf whose `wallpaper { }` block is gone
+        // cannot take the image path or the fit mode — the hyprlang writer never invents
+        // a section. With hyprlock absent those are the only staged values, so the
+        // contribution carries no write at all, only the two refusals.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let paths = write_wallpaper_fixture(&tmp.path().join("config"));
+        fs::write(
+            &paths.hyprpaper_conf,
+            replace_once(HYPRPAPER_CONF, "wallpaper {", "splash_block {"),
+        )
+        .expect("write a hyprpaper.conf without a wallpaper block");
+        let wall = write_image(tmp.path(), "wall.png");
+
+        let mut model = WallpaperModel::load(paths, false);
+        model
+            .stage_wallpaper(&wall)
+            .expect("a real image validates");
+        model.stage_fit("tile");
+
+        let contribution = model
+            .apply_contribution()
+            .expect("the refusals still contribute");
+        assert_eq!(
+            contribution
+                .skipped
+                .iter()
+                .map(|skip| (skip.value, skip.file))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Wallpaper", "hyprpaper.conf"),
+                ("Wallpaper fit mode", "hyprpaper.conf"),
+            ]
+        );
+        assert_eq!(
+            contribution.reload_params,
+            ReloadParams::default(),
+            "nothing reached hyprpaper.conf, so nothing is pushed live"
+        );
+        let plan = ApplyPlan {
+            validations: contribution.validations,
+            writes: contribution.writes,
+            links: Vec::new(),
+            palette: None,
+            reload_params: contribution.reload_params,
+        };
+        assert!(plan.changes_nothing(), "no file can be written");
     }
 
     #[test]
@@ -1647,6 +1795,30 @@ label {
             rendered.contains("fit_mode = tile")
                 && rendered.contains("path = ~/Pictures/wallpaper/18.jpg"),
             "the fit mode is rewritten while the wallpaper path keeps its on-disk value"
+        );
+        // Task 9.28: the live hyprpaper request shows what the file now holds — the new
+        // fit with the on-disk image — never the image the file refused.
+        assert_eq!(
+            contribution.reload_params.wallpaper,
+            Some(expand_home_to_string(
+                "~/Pictures/wallpaper/18.jpg",
+                model.paths.home.as_deref()
+            )),
+            "the refused path is not pushed live"
+        );
+        assert_eq!(contribution.reload_params.fit.as_deref(), Some("tile"));
+        // Task 9.28: both refusals are reported — with the override off the same path
+        // also goes to hyprlock.conf, whose writer refuses the `#` too.
+        assert_eq!(
+            contribution
+                .skipped
+                .iter()
+                .map(|skip| (skip.value, skip.file))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Wallpaper", "hyprpaper.conf"),
+                ("Lock-screen background", "hyprlock.conf"),
+            ]
         );
 
         model.commit();

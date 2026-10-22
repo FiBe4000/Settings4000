@@ -98,8 +98,7 @@ use relm4::{ComponentController, Controller};
 
 use crate::core::apply;
 use crate::core::assemble::{
-    ApplySources, AssembledPlan, ConflictedSource, ModelCommits, PrepareFailure,
-    assemble_apply_plan,
+    ApplySources, ConflictedSource, ModelCommits, PrepareFailure, assemble_apply_plan,
 };
 use crate::core::detect::Capabilities;
 use crate::core::display::DisplayModel;
@@ -1072,7 +1071,9 @@ impl Shell {
     ///   conflict check measures the store's files against the baselines the startup load
     ///   recorded (R5.6) rather than an empty tracker.
     /// - [`chrome::respond_to_apply`] maps the outcome to commit-or-warn; a commit is
-    ///   reconciled by [`Self::commit_applied`] and may raise a non-fatal toast (R5.5).
+    ///   reconciled by [`Self::commit_applied`] and may raise a non-fatal toast (R5.5),
+    ///   which also names any staged value a file refused, while an Apply whose every
+    ///   staged value was refused is a warning rather than a silent commit (task 9.28).
     fn wire_apply(&self, apply_button: &Button) {
         let shell = self.clone();
         apply_button.connect_clicked(move |_| {
@@ -1102,11 +1103,7 @@ impl Shell {
                     wallpaper: wallpaper.as_ref(),
                 })
             };
-            let AssembledPlan {
-                plan,
-                store_writes,
-                commits,
-            } = match assembled {
+            let assembled = match assembled {
                 Ok(assembled) => assembled,
                 Err(failure) => {
                     // Nothing was written either way. A conflicted model additionally has
@@ -1128,12 +1125,18 @@ impl Shell {
             let outcome = {
                 let store = shell.store.borrow();
                 let caps = shell.capabilities.borrow();
-                apply::run(&plan, store.freshness(), &caps, &runner, &signaller)
+                apply::run(
+                    &assembled.plan,
+                    store.freshness(),
+                    &caps,
+                    &runner,
+                    &signaller,
+                )
             };
 
-            match chrome::respond_to_apply(&outcome) {
+            match chrome::respond_to_apply(&outcome, &assembled) {
                 ApplyResponse::Commit { toast: message } => {
-                    shell.commit_applied(&store_writes, commits);
+                    shell.commit_applied(&assembled.store_writes, assembled.commits);
                     if let Some(message) = message {
                         shell.toast.show(&message);
                     }

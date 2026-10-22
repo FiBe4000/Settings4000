@@ -50,7 +50,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::core::apply::FileWrite;
+use crate::core::apply::{FileWrite, SkippedWrite};
 use crate::core::freshness::FreshnessTracker;
 
 mod palette;
@@ -334,5 +334,49 @@ impl BackingSet {
                 }),
             }
         }
+    }
+}
+
+/// The Theme-page note listing the staged values a file cannot take, or `None` when
+/// every staged value can be written everywhere it lives (task 9.28; R3.4, R5.5).
+///
+/// Shared by [`ThemesModel::skipped_writes_note`] and
+/// [`WallpaperModel::skipped_writes_note`], so both sections of the page explain a
+/// refused write in the same words. The note exists because such a value stays pending
+/// after every Apply (the model never promotes a value one of its files refused, task
+/// 9.6), and without it the only visible symptom is a page that never becomes clean.
+/// The wording holds both before and after an Apply, since the models derive the list
+/// from the same render the Apply performs.
+fn skipped_writes_note(skipped: &[SkippedWrite]) -> Option<String> {
+    if skipped.is_empty() {
+        return None;
+    }
+    let mut note = String::from(
+        "These changes cannot be written to every file that holds them, so Apply will leave \
+         them pending:",
+    );
+    for skip in skipped {
+        note.push_str(&format!("\n• {skip}"));
+    }
+    note.push_str("\nFix the file named above, or Reset to discard the change.");
+    Some(note)
+}
+
+/// Logs each staged value a Theme model could not write, at `warn`, when the model
+/// hands its contribution to an Apply (task 9.28).
+///
+/// Logged here, once per Apply, rather than inside the per-file renders, because the
+/// models also render to decide what to promote after the Apply and to compute
+/// [`skipped_writes_note`] whenever the page is rebuilt; logging there would repeat the
+/// same warning on every page rebuild.
+fn log_skipped_writes(skipped: &[SkippedWrite]) {
+    for skip in skipped {
+        tracing::warn!(
+            value = skip.value,
+            file = skip.file,
+            reason = %skip.reason,
+            "a staged Theme-page value was not written to one of its files, so it stays \
+             pending (R3.4, task 9.28)"
+        );
     }
 }

@@ -29,7 +29,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use crate::core::apply::{FileWrite, LinkAction, LinkWrite, WriteMode};
+use crate::core::apply::{FileWrite, LinkAction, LinkWrite, SkippedWrite, WriteMode};
 use crate::core::home_path::contract_home;
 use crate::core::model::{SettingId, ValidationError, Value, parse_cursor_size};
 use crate::core::notifd::NotifdStatus;
@@ -39,7 +39,7 @@ use crate::parsers::env::{EnvFile, GtkThemeOverride};
 use crate::parsers::ini::IniFile;
 use crate::parsers::lua_literal::{LuaConfigFile, LuaEditError};
 
-use super::{BackingSet, BackingText, Selection};
+use super::{BackingSet, BackingText, Selection, log_skipped_writes, skipped_writes_note};
 
 /// The GLib key-file group the app's theme keys live under in `settings.ini`.
 const SETTINGS_GROUP: &str = "Settings";
@@ -322,9 +322,20 @@ impl ThemeValue {
             ThemeValue::CursorSize => SettingId::CursorSize,
         }
     }
+
+    /// The value's user-facing name at the start of a sentence, as a
+    /// [`SkippedWrite`] names it.
+    fn label(self) -> &'static str {
+        match self {
+            ThemeValue::GtkTheme => "GTK theme",
+            ThemeValue::IconTheme => "Icon theme",
+            ThemeValue::CursorTheme => "Cursor theme",
+            ThemeValue::CursorSize => "Cursor size",
+        }
+    }
 }
 
-/// A flag per theme value, used for the two per-value render outcomes tracked in
+/// A flag per theme value, used for the per-value render outcomes tracked in
 /// [`ThemeRenderRecord`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ThemeValueFlags {
@@ -399,23 +410,54 @@ impl ThemeValueFlags {
 ///   value up front and the Apply pipeline re-checks it (task 9.27) — so for that case
 ///   this record is defence in depth; a structure the Lua editor cannot follow remains
 ///   the everyday reason for a refused copy.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// Every refusal is also kept as a [`SkippedWrite`] naming the value, the file and the
+/// parser's reason (task 9.28), so the Apply can tell the user what was left out and
+/// the page can say why it stays dirty. The two are recorded together by
+/// [`Self::refuse`], which is what keeps the invariant that a value is listed in
+/// `skipped` exactly when it is flagged `diverged` — the note on the page then explains
+/// precisely the values that will not be promoted, no more and no fewer. An absent copy
+/// is not listed, for the reason given above.
+///
+/// The record also says which values reached a `settings.ini` file in particular, since
+/// that, not "some file", decides the live `gsettings` push — see
+/// [`ThemesModel::reload_params`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ThemeRenderRecord {
     /// Values that reached at least one of the files carrying them.
     written: ThemeValueFlags,
+    /// Values that reached at least one of the two `settings.ini` files — a subset of
+    /// [`Self::written`].
+    in_gtk_settings: ThemeValueFlags,
     /// Values that a file which *does* carry them refused, so the copies on disk diverge.
     diverged: ThemeValueFlags,
+    /// One entry per refusal flagged in [`Self::diverged`], in render order.
+    skipped: Vec<SkippedWrite>,
 }
 
 impl ThemeRenderRecord {
     /// Folds one file's render result into the page-wide record.
     fn merge(&mut self, other: ThemeRenderRecord) {
         self.written.merge(other.written);
+        self.in_gtk_settings.merge(other.in_gtk_settings);
         self.diverged.merge(other.diverged);
+        self.skipped.extend(other.skipped);
+    }
+
+    /// Records that `file`, which carries `value`, refused the staged value for
+    /// `reason` (the parser's explanation): the copies on disk now diverge, so the value
+    /// must not be promoted, and the user is told which file and why.
+    fn refuse(&mut self, value: ThemeValue, file: &'static str, reason: String) {
+        *self.diverged.flag(value) = true;
+        self.skipped.push(SkippedWrite {
+            value: value.label(),
+            file,
+            reason,
+        });
     }
 
     /// The values [`ThemesModel::commit`] may promote: written somewhere, refused nowhere.
-    fn promotable(self) -> ThemeValueFlags {
+    fn promotable(&self) -> ThemeValueFlags {
         self.written.without(self.diverged)
     }
 }
@@ -501,18 +543,23 @@ struct UnlinkedSettingsIni {
 /// — `~/.icons/default/index.theme`) with the identical value, so they never desync
 /// (R3.4); a GTK/icon theme change contributes only the two `settings.ini` writes, plus,
 /// for a GTK theme, the GTK 4 theme link steps (task 11.16). The reload parameters carry
-/// only the values that changed, so the reload table (task 4.4) emits `gsettings set` /
-/// `hyprctl setcursor` only for those.
+/// only the values that reached a `settings.ini` file, so the reload table (task 4.4)
+/// emits `gsettings set` / `hyprctl setcursor` only for those (task 9.28).
 pub struct ThemesApply {
-    /// The atomic writes, one per changed backing file.
+    /// The atomic writes, one per changed backing file. Empty when every staged value
+    /// was refused by the files that carry it — the contribution then still exists, to
+    /// report [`Self::skipped`] (task 9.28).
     pub writes: Vec<FileWrite>,
     /// The GTK 4 theme link steps, one per link that must change; empty unless the GTK
     /// theme changed (task 11.16). The pipeline runs them after every file write — see
     /// [`LinkWrite`] — and [`ThemesModel::gtk4_links_note`] explains on the page what
     /// they do not cover.
     pub links: Vec<LinkWrite>,
-    /// The reload parameters for the changed theme/cursor values (the pipeline merges
-    /// these into its plan-wide [`ReloadParams`]).
+    /// The reload parameters for the changed theme/cursor values that reached a
+    /// `settings.ini` file (the pipeline merges these into its plan-wide
+    /// [`ReloadParams`]). A staged value no `settings.ini` took is left out, so it is
+    /// never pushed into dconf while the files still hold the old value — see
+    /// [`ThemesModel::reload_params`] for the rule (task 9.28).
     pub reload_params: ReloadParams,
     /// Every staged theme value, as the [`SettingId`] it is validated by, for the
     /// pipeline's step 1 to re-check before any write (task 9.27, R8.3).
@@ -523,6 +570,11 @@ pub struct ThemesApply {
     /// declares the settings it carries ([`FileWrite::validated_by`]), which the
     /// pipeline's plan-drift guard checks against this list.
     pub validations: Vec<(SettingId, Value)>,
+    /// The staged values a file that carries them refused, each naming the value, the
+    /// file and the reason (task 9.28; R3.4, R5.5). These values stay pending after the
+    /// Apply; the assembler collects the list so the UI can say so. A copy that is
+    /// merely absent is not listed (see [`SkippedWrite`]).
+    pub skipped: Vec<SkippedWrite>,
 }
 
 impl ThemesModel {
@@ -1104,7 +1156,7 @@ impl ThemesModel {
     }
 
     /// The Theme page's GTK/icon/cursor contribution to the Apply plan, or `None` when
-    /// nothing changed (task 6.4).
+    /// there is nothing to contribute (task 6.4).
     ///
     /// Renders each changed value into the files that carry it through the surgical
     /// parsers (§3) and collects the reload parameters. A cursor change produces writes
@@ -1112,14 +1164,22 @@ impl ThemesModel {
     /// lines) and — when the theme changed — `~/.icons/default/index.theme`, all with
     /// the **identical** value (R3.4); a GTK/icon theme change produces only the two
     /// `settings.ini` writes.
+    ///
+    /// A value a file refused is reported in [`ThemesApply::skipped`] (task 9.28). When
+    /// *every* staged value was refused there is no write, but the contribution is still
+    /// returned — with its validations, so the pipeline's step 1 still re-checks the
+    /// values — because the refusals are the only explanation the user will get for an
+    /// Apply that changes nothing. `None` therefore means "not dirty", or dirty with no
+    /// file to render into and nothing refused (no readable copy at all, R4.4).
     pub fn apply_contribution(&self) -> Option<ThemesApply> {
         if !self.is_dirty() {
             return None;
         }
         let (writes, record) = self.render_writes();
-        if writes.is_empty() {
-            // Dirty but nothing could be written — e.g. both settings.ini files were
-            // unreadable. Nothing to apply; the page stays dirty for a retry.
+        log_skipped_writes(&record.skipped);
+        if writes.is_empty() && record.skipped.is_empty() {
+            // Dirty but no file to write — e.g. no copy of the value was readable.
+            // Nothing to apply or to report; the page stays dirty for a retry.
             tracing::warn!(
                 "theme change is dirty but no backing file could be written; skipping the theme apply (R4.4)"
             );
@@ -1132,12 +1192,36 @@ impl ThemesModel {
         } else {
             Vec::new()
         };
+        let reload_params = self.reload_params(&record);
         Some(ThemesApply {
             writes,
             links,
-            reload_params: self.reload_params(),
+            reload_params,
             validations: self.validations(),
+            skipped: record.skipped,
         })
+    }
+
+    /// The Theme-page note naming each staged GTK/icon/cursor value that one of its
+    /// files cannot take, with the file and the reason, or `None` when every staged
+    /// value can be written everywhere it lives (task 9.28; R3.4, R5.5).
+    ///
+    /// Such a value stays pending after an Apply, so without this note a page that never
+    /// becomes clean would be explained only in the journal. The everyday cause is a
+    /// `hyprland.lua` whose structure the Lua editor cannot follow, which refuses both
+    /// cursor values (see [`Self::render_hyprland_lua`]).
+    ///
+    /// Derived from a fresh render of the staged values rather than remembered from the
+    /// last Apply: the render is deterministic over the staged values and the backing
+    /// texts — which is also what [`Self::commit`] relies on — so it is exactly what the
+    /// last Apply skipped and what the next one would. Re-deriving it means the note
+    /// cannot go stale after a Reset, a Refresh or a conflict reload, and it already
+    /// shows when the value is picked, before the user clicks Apply.
+    pub fn skipped_writes_note(&self) -> Option<String> {
+        if !self.is_dirty() {
+            return None;
+        }
+        skipped_writes_note(&self.render_writes().1.skipped)
     }
 
     /// The staged theme values as the [`SettingId`]s step 1 of the Apply pipeline
@@ -1384,9 +1468,9 @@ impl ThemesModel {
     }
 
     /// Renders the file writes for the current staged changes, together with the per-value
-    /// record of what each render achieved (used by both [`Self::apply_contribution`],
-    /// which needs only the writes, and [`Self::commit`], which needs the record to decide
-    /// what may be promoted).
+    /// record of what each render achieved — used by [`Self::apply_contribution`] (the
+    /// writes, the refusals and the reload parameters), by [`Self::commit`] (which values
+    /// may be promoted) and by [`Self::skipped_writes_note`] (the refusals).
     fn render_writes(&self) -> (Vec<FileWrite>, ThemeRenderRecord) {
         // Which files are involved is decided here; *which keys* each file receives is
         // decided by the per-render functions, which read the same per-value dirty flags.
@@ -1398,8 +1482,15 @@ impl ThemesModel {
 
         // Every theme/cursor key lives in settings.ini, so any change writes both files.
         if any_dirty {
-            for backing in [self.gtk3(), self.gtk4()].into_iter().flatten() {
-                let (write, file_record) = self.render_settings_ini(backing);
+            let copies = [
+                (self.gtk3(), CursorCopy::Gtk3Settings),
+                (self.gtk4(), CursorCopy::Gtk4Settings),
+            ];
+            for (backing, copy) in copies {
+                let Some(backing) = backing else {
+                    continue;
+                };
+                let (write, file_record) = self.render_settings_ini(backing, copy.label());
                 record.merge(file_record);
                 writes.extend(write);
             }
@@ -1430,15 +1521,20 @@ impl ThemesModel {
     /// Renders one `settings.ini` write, editing only the keys that changed, and reports
     /// which of those keys the edit actually landed for.
     ///
-    /// A key whose `set_value` fails is skipped and logged; the remaining keys are still
-    /// written, and the returned [`ThemeRenderRecord`] tells [`Self::commit`] which
-    /// selections may be promoted. A failure here is always a *refusal* by a file that
-    /// carries the key, never an absent copy — the INI writer appends the key, and even
-    /// the `[Settings]` group, when it is missing — so it blocks promotion. (In practice a
+    /// A key whose `set_value` fails is skipped and recorded as a refusal by `file` (the
+    /// copy's user-facing name); the remaining keys are still written, and the returned
+    /// [`ThemeRenderRecord`] tells [`Self::commit`] which selections may be promoted. A
+    /// failure here is always a *refusal* by a file that carries the key, never an
+    /// absent copy — the INI writer appends the key, and even the `[Settings]` group,
+    /// when it is missing — so it blocks promotion. (In practice a
     /// value the INI writer rejects, i.e. one containing a newline, is rejected by the env
     /// and Lua writers too, so nothing is written anywhere; the flag is what keeps
     /// that conclusion from depending on the writers agreeing.)
-    fn render_settings_ini(&self, backing: &BackingText) -> (Option<FileWrite>, ThemeRenderRecord) {
+    fn render_settings_ini(
+        &self,
+        backing: &BackingText,
+        file: &'static str,
+    ) -> (Option<FileWrite>, ThemeRenderRecord) {
         let (mut ini, _) = IniFile::parse(&backing.text);
         let mut changed_keys = Vec::new();
         let mut validated_by = Vec::new();
@@ -1453,11 +1549,9 @@ impl ThemesModel {
                     changed_keys.push(label.to_string());
                     validated_by.push(value_id.setting_id());
                     *record.written.flag(value_id) = true;
+                    *record.in_gtk_settings.flag(value_id) = true;
                 }
-                Err(error) => {
-                    tracing::warn!(key, %error, "could not set a settings.ini theme key");
-                    *record.diverged.flag(value_id) = true;
-                }
+                Err(error) => record.refuse(value_id, file, error.to_string()),
             }
         };
         if self.gtk_theme.is_dirty() {
@@ -1537,8 +1631,9 @@ impl ThemesModel {
     ///   present, that field is still written rather than the file being abandoned.
     /// - a structure the editor cannot follow ([`LuaEditError::UnsafeFile`]): no line can
     ///   be located safely, so nothing is written, but the file may well hold an env line
-    ///   with the old value, so it counts as a **refusal** that blocks promotion (logged
-    ///   at `warn` with the reason) — the app refuses rather than guesses.
+    ///   with the old value, so it counts as a **refusal** that blocks promotion and is
+    ///   reported as a [`SkippedWrite`] with the editor's reason (task 9.28) — the app
+    ///   refuses rather than guesses.
     /// - a value the Lua string rule rejects ([`LuaEditError::Literal`] — a `"`, `\` or
     ///   control character): the existing line keeps its old value, a refusal too.
     ///
@@ -1566,13 +1661,7 @@ impl ThemesModel {
                     );
                 }
                 Err(error) => {
-                    tracing::warn!(
-                        name,
-                        %error,
-                        "hyprland.lua's cursor line was not written, so its copy may now \
-                         differ from the others (R3.4); not promoting the change"
-                    );
-                    *record.diverged.flag(value_id) = true;
+                    record.refuse(value_id, CursorCopy::HyprlandLua.label(), error.to_string())
                 }
             }
         };
@@ -1624,8 +1713,9 @@ impl ThemesModel {
     /// read is left alone, like any other unreadable copy.
     ///
     /// A value the INI writer rejects (a newline) is a refusal that blocks promotion
-    /// when the file exists; for a file that would have been created nothing on disk
-    /// disagrees, so it is merely skipped.
+    /// (and is reported, task 9.28) when the file exists; for a file that would have
+    /// been created nothing on disk disagrees, so it is merely skipped, like any other
+    /// absent copy.
     fn render_cursor_fallback(&self) -> (Option<FileWrite>, ThemeRenderRecord) {
         let mut record = ThemeRenderRecord::default();
         if !self.cursor_theme.is_dirty() {
@@ -1648,12 +1738,16 @@ impl ThemesModel {
 
         let (mut ini, _) = IniFile::parse(text);
         if let Err(error) = ini.set_value(ICON_THEME_GROUP, KEY_INHERITS, theme) {
-            tracing::warn!(
-                %error,
-                "could not set Inherits= in the XCursor fallback theme; that copy is skipped"
-            );
-            if mode == WriteMode::Replace {
-                record.diverged.cursor_theme = true;
+            match mode {
+                WriteMode::Replace => record.refuse(
+                    ThemeValue::CursorTheme,
+                    CursorCopy::CursorFallbackTheme.label(),
+                    error.to_string(),
+                ),
+                WriteMode::CreateNew => tracing::debug!(
+                    %error,
+                    "the XCursor fallback theme would not take the cursor theme; not creating it"
+                ),
             }
             return (None, record);
         }
@@ -1676,7 +1770,8 @@ impl ThemesModel {
     /// `XCURSOR_*` exports, and reports which fields the edit landed for.
     ///
     /// Like the `settings.ini` render, a failure here is a refusal by a file that carries
-    /// the value (the env writer appends a missing export), so it blocks promotion.
+    /// the value (the env writer appends a missing export), so it blocks promotion and
+    /// is reported (task 9.28).
     fn render_uwsm_env(&self, backing: &BackingText) -> (Option<FileWrite>, ThemeRenderRecord) {
         let (mut file, _) = EnvFile::parse(&backing.text);
         let mut changed_keys = Vec::new();
@@ -1694,8 +1789,7 @@ impl ThemesModel {
                     *record.written.flag(value_id) = true;
                 }
                 Err(error) => {
-                    tracing::warn!(key, %error, "could not set a uwsm/env cursor variable");
-                    *record.diverged.flag(value_id) = true;
+                    record.refuse(value_id, CursorCopy::UwsmEnv.label(), error.to_string())
                 }
             }
         };
@@ -1733,15 +1827,46 @@ impl ThemesModel {
         )
     }
 
-    /// The reload parameters for the changed values (task 4.4): a value is set only
-    /// when it changed, so the reload table emits `gsettings set` / `hyprctl setcursor`
-    /// only for those. The cursor value carries the effective theme *and* size (both
-    /// are needed for `hyprctl setcursor`), so it is present when either changed.
-    fn reload_params(&self) -> ReloadParams {
-        let cursor = if self.cursor_theme.is_dirty() || self.cursor_size.is_dirty() {
+    /// The reload parameters for the values this Apply actually put into a
+    /// `settings.ini` file, as recorded by the render in `record` (tasks 4.4, 9.28).
+    ///
+    /// The reload table turns these into `gsettings set` calls and `hyprctl setcursor`,
+    /// so a value set here is pushed into the live session. The rule:
+    ///
+    /// - **A value is pushed only when it reached a `settings.ini` file.** Deriving the
+    ///   parameters from "the value is staged" instead (as before task 9.28) pushed a
+    ///   value every file writer had refused into dconf, leaving the live session and
+    ///   the config files disagreeing.
+    /// - **When a value reached some files but not others, the push follows
+    ///   `settings.ini`.** `settings.ini` is what GTK reads, what this app reads back
+    ///   (see [`Self::load`]) and what the `gsettings` keys mirror, so the live value
+    ///   should be whatever it now holds. A cursor value refused only by `hyprland.lua`
+    ///   is therefore still pushed: GTK and the live Hyprland cursor show the new theme,
+    ///   and the copy that lags behind is named in [`ThemesApply::skipped`] and on the
+    ///   page. A value refused by `settings.ini` itself is not pushed, even where
+    ///   `uwsm/env` took it.
+    ///
+    /// The GTK and icon themes live only in `settings.ini`, so for them "reached a file"
+    /// and "reached `settings.ini`" coincide. The cursor value carries theme *and* size
+    /// (`hyprctl setcursor` needs both), so it is present when either reached
+    /// `settings.ini`; each half is the staged value when that half was written and the
+    /// value already on disk otherwise, so the push never carries a half the files
+    /// refused.
+    fn reload_params(&self, record: &ThemeRenderRecord) -> ReloadParams {
+        let reached = record.in_gtk_settings;
+        // The value `settings.ini` holds after this Apply: the staged one if it was
+        // written, the loaded one otherwise.
+        fn now_in_settings(selection: &Selection, written: bool) -> Option<&str> {
+            if written {
+                selection.effective()
+            } else {
+                selection.value.original.as_deref()
+            }
+        }
+        let cursor = if reached.cursor_theme || reached.cursor_size {
             match (
-                self.cursor_theme.effective(),
-                self.cursor_size.effective().and_then(parse_cursor_size),
+                now_in_settings(&self.cursor_theme, reached.cursor_theme),
+                now_in_settings(&self.cursor_size, reached.cursor_size).and_then(parse_cursor_size),
             ) {
                 (Some(theme), Some(size)) => Some(CursorValue {
                     theme: theme.to_string(),
@@ -1764,14 +1889,12 @@ impl ThemesModel {
             wallpaper: None,
             fit: None,
             cursor,
-            gtk_theme: self
+            gtk_theme: reached
                 .gtk_theme
-                .is_dirty()
                 .then(|| self.gtk_theme.effective().map(str::to_string))
                 .flatten(),
-            icon_theme: self
+            icon_theme: reached
                 .icon_theme
-                .is_dirty()
                 .then(|| self.icon_theme.effective().map(str::to_string))
                 .flatten(),
         }
@@ -3539,11 +3662,27 @@ export XCURSOR_SIZE=16
         );
 
         // The retry renders nothing at all (the rejected value is the only dirty one), so
-        // there is no contribution — and a commit in that state must still promote
-        // nothing rather than silently re-baselining.
+        // the contribution carries no write — only the refusal, which is what tells the
+        // user why the Apply changes nothing (task 9.28) — and a commit in that state
+        // must still promote nothing rather than silently re-baselining.
+        let retry = model
+            .apply_contribution()
+            .expect("a refused value still contributes its refusal");
         assert!(
-            model.apply_contribution().is_none(),
+            retry.writes.is_empty(),
             "with only the rejected value staged, no file can be written"
+        );
+        assert_eq!(
+            retry
+                .skipped
+                .iter()
+                .map(|skip| (skip.value, skip.file))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Icon theme", "gtk-3.0/settings.ini"),
+                ("Icon theme", "gtk-4.0/settings.ini"),
+            ],
+            "each settings.ini copy that refused the value is named"
         );
         model.commit();
         assert!(
@@ -3929,9 +4068,137 @@ export XCURSOR_SIZE=16
                 .all(|write| write.backing != BackingFile::HyprlandLua),
             "nothing is written to a hyprland.lua whose structure cannot be followed"
         );
+        // Task 9.28: the refusal is reported with the Lua editor's reason, and the live
+        // push follows settings.ini, which did take the new theme.
+        assert_eq!(contribution.skipped.len(), 1, "{:?}", contribution.skipped);
+        let skip = &contribution.skipped[0];
+        assert_eq!((skip.value, skip.file), ("Cursor theme", "hyprland.lua"));
+        assert!(
+            skip.reason.contains("structure cannot be followed"),
+            "the reason is the Lua editor's: {}",
+            skip.reason
+        );
+        assert_eq!(
+            contribution.reload_params.cursor,
+            Some(CursorValue {
+                theme: "Bibata".to_string(),
+                size: 16,
+            }),
+            "settings.ini holds the new theme, so gsettings and setcursor get it"
+        );
         model.commit();
         assert!(model.is_dirty(), "the refused copy blocks promotion");
         assert_eq!(fs::read_to_string(hypr_lua(&paths)).unwrap(), unsafe_lua);
+
+        // The page says why it stays dirty, and stops saying so once the change is
+        // discarded.
+        let note = model
+            .skipped_writes_note()
+            .expect("the pending change is explained on the page");
+        assert!(
+            note.contains("Cursor theme could not be written to hyprland.lua"),
+            "{note}"
+        );
+        model.reset();
+        assert_eq!(model.skipped_writes_note(), None);
+    }
+
+    #[test]
+    fn a_missing_lua_cursor_line_is_not_reported_as_skipped() {
+        // Task 9.28 keeps task 9.6's absent-copy rule: a hyprland.lua with no hl.env
+        // cursor lines carries no copy to disagree with, so nothing is reported — a
+        // warning there would be one the user can do nothing about, shown on every
+        // cursor change.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let paths = write_backing_fixture(&tmp.path().join("config"), UWSM_ENV);
+        fs::write(
+            hypr_lua(&paths),
+            "hl.config({\n    general = {\n    },\n})\n",
+        )
+        .unwrap();
+
+        let mut model = load_with_cursors(tmp.path(), &paths);
+        model
+            .stage_cursor_theme("Bibata")
+            .expect("the value passes the stage-time check");
+        let contribution = model
+            .apply_contribution()
+            .expect("the other copies are written");
+        assert_eq!(contribution.skipped, Vec::new());
+        assert_eq!(model.skipped_writes_note(), None);
+    }
+
+    #[test]
+    fn a_value_no_settings_ini_took_is_never_pushed_live() {
+        // Task 9.28: the gsettings push is driven by what reached settings.ini, not by
+        // what is staged. Here the icon theme is refused by both settings.ini files (a
+        // line break, which since task 9.27 only the test seam can stage) while the GTK
+        // theme is written: gsettings must set the GTK theme and must not push the icon
+        // theme, which no file holds.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let paths = write_backing_fixture(&tmp.path().join("config"), UWSM_ENV);
+        let themes = tmp.path().join("themes");
+        fs::create_dir_all(themes.join("Adwaita").join("gtk-4.0")).unwrap();
+        let roots = ThemeRoots {
+            gtk_theme_dirs: vec![themes],
+            icon_dirs: Vec::new(),
+        };
+        let mut model = ThemesModel::load(&roots, paths, false, None);
+        model
+            .stage_gtk_theme("Adwaita")
+            .expect("the value passes the stage-time check");
+        model.stage_unchecked_for_tests(SettingId::IconTheme, "Papirus\nInjected");
+
+        let contribution = model
+            .apply_contribution()
+            .expect("the GTK theme change contributes");
+        assert_eq!(
+            contribution.reload_params.gtk_theme.as_deref(),
+            Some("Adwaita")
+        );
+        assert_eq!(
+            contribution.reload_params.icon_theme, None,
+            "the refused icon theme is not pushed into dconf"
+        );
+
+        // Through the pipeline. Step 1 would reject the corrupted icon value first —
+        // the primary defence — so its validation is left out here to reach the reload
+        // step and pin this second one; no write carries the icon theme, so the
+        // plan-drift guard has nothing to object to.
+        let plan = ApplyPlan {
+            validations: contribution
+                .validations
+                .into_iter()
+                .filter(|(id, _)| *id != SettingId::IconTheme)
+                .collect(),
+            writes: contribution.writes,
+            links: Vec::new(),
+            palette: None,
+            reload_params: contribution.reload_params,
+        };
+        let caps = Capabilities::for_tests(&[Binary::Gsettings], &[], true);
+        let runner = MockCommandRunner::new();
+        let outcome = apply::run(
+            &plan,
+            &FreshnessTracker::new(),
+            &caps,
+            &runner,
+            &MockProcessSignaller::new(),
+        );
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            runner.recorded(),
+            vec![Command::new("gsettings").args([
+                "set",
+                "org.gnome.desktop.interface",
+                "gtk-theme",
+                "Adwaita",
+            ])],
+            "only the value settings.ini took is pushed live"
+        );
     }
 
     #[test]

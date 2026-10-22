@@ -217,6 +217,59 @@ pub enum WriteMode {
     CreateNew,
 }
 
+/// A staged value that a page model could not put into one of the files that carry
+/// it, although that file exists and was read — the counterpart of a [`FileWrite`] that
+/// was *not* planned (task 9.28; R3.4, R5.5).
+///
+/// The Theme page's models render every staged value into each of its files through
+/// a surgical parser edit, and an edit can be refused for a reason that lies in the
+/// *file*, not in the value: `hyprland.lua` has a structure the Lua editor cannot
+/// follow, `hyprlock.conf` has no `background { }` block for the lock image, and so on.
+/// Such a refusal is not a failure of the Apply — every other value is still written
+/// and the refused one simply stays pending, so the page stays dirty (task 9.6) — but it
+/// must not pass in silence either: before this type existed the Apply reported
+/// success, and when the refused value was the only staged one it visibly did nothing
+/// at all, every time, with only the journal saying why. A model therefore reports
+/// each refusal as one of these beside its writes, the assembler collects them into
+/// [`AssembledPlan::skipped`](crate::core::assemble::AssembledPlan::skipped), and the UI
+/// names them after the Apply (and on the page itself).
+///
+/// The pipeline never reads this type: there is nothing for it to write or roll back.
+/// It lives here, beside [`FileWrite`], because it is part of the same vocabulary a
+/// page model uses to describe what an Apply will do.
+///
+/// A file that simply does not carry the value — a `hyprland.lua` without an
+/// `hl.env("XCURSOR_SIZE", …)` line, an unreadable copy — is deliberately **not** a
+/// skipped write: nothing on disk then disagrees with the new value, the change is
+/// promoted on the strength of the other copies, and there is nothing for the user to
+/// fix (task 9.6's "absent copy").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkippedWrite {
+    /// The user-facing name of the value, capitalised as the start of a sentence
+    /// (e.g. `"Cursor theme"`).
+    pub value: &'static str,
+    /// The short user-facing name of the file that refused it (e.g. `"hyprland.lua"`,
+    /// `"gtk-3.0/settings.ini"`) — the form the Theme page's other notes use.
+    pub file: &'static str,
+    /// Why the file could not take the value: the parser's own explanation, which
+    /// names the offending line or character (e.g. "the file's structure cannot be
+    /// followed (line 12: `}` closes nothing), so it is not edited").
+    pub reason: String,
+}
+
+impl fmt::Display for SkippedWrite {
+    /// One self-contained sentence naming the value, the file and the reason, worded
+    /// so it reads correctly both before an Apply (on the page) and after one (in the
+    /// post-Apply note).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} could not be written to {}: {}",
+            self.value, self.file, self.reason
+        )
+    }
+}
+
 /// One planned change to a symbolic link the app manages — the write phase's link step
 /// (step 3, after every [`FileWrite`]; task 11.16).
 ///
@@ -312,6 +365,20 @@ pub struct ApplyPlan {
     pub palette: Option<PaletteSwitch>,
     /// The runtime values the parameterized reloads need (step 5, task 4.4).
     pub reload_params: ReloadParams,
+}
+
+impl ApplyPlan {
+    /// Whether running this plan would change nothing on disk: no file write, no link
+    /// step and no palette switch (task 9.28).
+    ///
+    /// Validations and reload parameters do not count. The validations only gate the
+    /// changes, and every reload is planned from a changed file or the palette switch,
+    /// so a plan with neither runs no command at all. The UI uses this to tell an Apply
+    /// that wrote nothing *because every staged value was refused* (see
+    /// [`SkippedWrite`]) apart from one that did its job.
+    pub fn changes_nothing(&self) -> bool {
+        self.writes.is_empty() && self.links.is_empty() && self.palette.is_none()
+    }
 }
 
 /// A staged value that failed validation, with the setting it belongs to (R8.3).

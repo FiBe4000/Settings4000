@@ -36,6 +36,13 @@
 //!    succeed for everything else and then commit the staged values of the skipped page
 //!    against a file that was never written, silently desyncing the app from disk. The
 //!    staged edits survive every abort path: nothing here mutates a source.
+//! 4. **A single value a Theme model's file refused is collected, not aborted on**
+//!    ([`AssembledPlan::skipped`], task 9.28). The two Theme models decide per value,
+//!    and promote only what was written (task 9.6), so a refused value cannot be
+//!    committed by mistake and need not stop the rest of the Apply — but it must reach
+//!    the user, so the assembler gathers every model's list for the UI to show after
+//!    the Apply, including the Apply that writes nothing because *every* staged value
+//!    was refused.
 //!
 //! # What stays in the window
 //!
@@ -52,7 +59,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use crate::core::apply::{ApplyPlan, FileWrite};
+use crate::core::apply::{ApplyPlan, FileWrite, SkippedWrite};
 use crate::core::display::DisplayModel;
 use crate::core::input::InputModel;
 use crate::core::model::{Category, SettingId, Value};
@@ -157,7 +164,8 @@ pub enum ConflictedSource {
 /// Display model (its writer refuses an edit, e.g. one that would break the frozen
 /// `monitors.conf` grammar). The remaining contributions cannot
 /// fail — a palette switch runs a script and the two Theme models skip a value they
-/// cannot write (task 9.6), which task 9.28 will surface separately.
+/// cannot write (task 9.6), which is reported through [`AssembledPlan::skipped`]
+/// instead (task 9.28).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FailedWrite {
     /// The Display model's `monitors.conf` write (task 6.1).
@@ -211,9 +219,12 @@ pub struct ModelCommits {
     pub display: bool,
     /// The palette model contributed a scheme switch (task 6.3).
     pub palette: bool,
-    /// The GTK/icon/cursor model contributed at least one write (task 6.4).
+    /// The GTK/icon/cursor model contributed at least one write (task 6.4). A
+    /// contribution whose every value was refused carries no write and leaves this
+    /// `false` (task 9.28).
     pub themes: bool,
-    /// The wallpaper model contributed at least one write (task 6.5).
+    /// The wallpaper model contributed at least one write (task 6.5) — with the same
+    /// caveat as [`Self::themes`].
     pub wallpaper: bool,
 }
 
@@ -236,6 +247,16 @@ pub struct AssembledPlan {
     pub store_writes: Vec<(PathBuf, Vec<u8>)>,
     /// Which bespoke models must be committed on success — see [`ModelCommits`].
     pub commits: ModelCommits,
+    /// The staged values a Theme model could not write into one of its files, in
+    /// fold order (GTK/icon/cursor model, then wallpaper model; task 9.28; R3.4, R5.5).
+    ///
+    /// Not a reason to refuse the Apply: the other values are still written, and the
+    /// models keep a refused value pending rather than committing it. It is what the UI
+    /// tells the user after an [`Applied`](crate::core::apply::ApplyOutcome::Applied)
+    /// outcome — and when [`ApplyPlan::changes_nothing`] holds as well, every staged
+    /// value was refused, so the Apply must be reported as having done nothing rather
+    /// than as a silent success.
+    pub skipped: Vec<SkippedWrite>,
 }
 
 /// Assembles the Apply plan from every staging source, or reports why no Apply may run
@@ -251,7 +272,8 @@ pub struct AssembledPlan {
 /// 3. the three store-backed file writes, in category order;
 /// 4. the store-write snapshot for the later commit;
 /// 5. the four bespoke model contributions (Display, palette, GTK/icon/cursor themes,
-///    wallpaper).
+///    wallpaper), collecting the two Theme models' refused values into
+///    [`AssembledPlan::skipped`].
 ///
 /// Any failure in steps 3 or 5 aborts with [`PrepareFailure::Write`] before the caller
 /// can run the pipeline, so nothing is written and nothing is committed.
@@ -306,6 +328,7 @@ pub fn assemble_apply_plan(sources: ApplySources<'_>) -> Result<AssembledPlan, P
     // different mix of validations and reload parameters — so they are folded one by one
     // rather than through a shared helper that would have to accept all of it as optional.
     let mut commits = ModelCommits::default();
+    let mut skipped = Vec::new();
 
     // The Display page's `monitors.conf` write plus the staged monitor values to
     // re-validate (task 6.1; R8.3).
@@ -335,13 +358,16 @@ pub fn assemble_apply_plan(sources: ApplySources<'_>) -> Result<AssembledPlan, P
     // values are re-validated by the pipeline against every one of those writers' rules
     // (task 9.27, R8.3), and the reload parameters drive `gsettings set` plus `hyprctl
     // setcursor`. A GTK-theme change also brings the GTK 4 theme link steps (task 11.16),
-    // which the pipeline runs after every file write.
+    // which the pipeline runs after every file write. A value one of those files refused
+    // is collected for the post-Apply note (task 9.28); the model is committed only when
+    // something was actually written.
     if let Some(contribution) = sources.themes.and_then(ThemesModel::apply_contribution) {
+        commits.themes = !contribution.writes.is_empty();
         plan.writes.extend(contribution.writes);
         plan.links.extend(contribution.links);
         plan.validations.extend(contribution.validations);
         merge_reload_params(&mut plan.reload_params, contribution.reload_params);
-        commits.themes = true;
+        skipped.extend(contribution.skipped);
     }
 
     // The wallpaper / lock-background writes (task 6.5): `hyprpaper.conf` (path + fit)
@@ -352,16 +378,18 @@ pub fn assemble_apply_plan(sources: ApplySources<'_>) -> Result<AssembledPlan, P
         .wallpaper
         .and_then(WallpaperModel::apply_contribution)
     {
+        commits.wallpaper = !contribution.writes.is_empty();
         plan.writes.extend(contribution.writes);
         plan.validations.extend(contribution.validations);
         merge_reload_params(&mut plan.reload_params, contribution.reload_params);
-        commits.wallpaper = true;
+        skipped.extend(contribution.skipped);
     }
 
     Ok(AssembledPlan {
         plan,
         store_writes,
         commits,
+        skipped,
     })
 }
 
