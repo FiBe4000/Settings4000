@@ -1,9 +1,15 @@
 # Continuous-integration gate for Settings4000 (task 1.4, requirement R6.1).
 #
-# Runs the project's three mandatory checks — formatting, lints-as-errors, and
-# the test suite — as separate steps in one job. GitHub Actions fails a job as
-# soon as any step exits non-zero, so the run fails if *any* of the three gates
-# fails, which is exactly the acceptance criterion for this task.
+# The `gate` job runs the project's three mandatory checks — formatting,
+# lints-as-errors, and the test suite — as separate steps in one job. GitHub
+# Actions fails a job as soon as any step exits non-zero, so the run fails if
+# *any* of the three gates fails, which is exactly the acceptance criterion for
+# task 1.4.
+#
+# The `arch-package` job (task 12.3, requirement R8.7) builds the Arch Linux
+# package from packaging/arch/settings4000-git/ on Arch itself, so a PKGBUILD
+# that no longer builds, a stale .SRCINFO, or a namcap error turns the run red.
+# The two jobs are independent and run in parallel.
 name: CI
 
 # Gate every push to the default branch and every pull request. This is the
@@ -14,7 +20,7 @@ on:
     branches: [main]
   pull_request:
 
-# Least-privilege token: this job only reads the repository to build and test
+# Least-privilege token: both jobs only read the repository to build and test
 # it, so drop the default broader `GITHUB_TOKEN` scope to read-only. This limits
 # the blast radius if a step (or a third-party action) were ever compromised.
 permissions:
@@ -72,3 +78,160 @@ jobs:
 
       - name: Test gate — cargo test
         run: cargo test
+
+  arch-package:
+    name: Arch package
+    runs-on: ubuntu-latest
+    # makepkg, pacman and namcap only exist on Arch Linux, and the package must
+    # be built against Arch's own gtk4 and Rust, so the job runs inside the
+    # official Arch image on the Ubuntu runner. Every `run:` step below executes
+    # in that container, as root.
+    container: archlinux:latest
+    defaults:
+      run:
+        # Fail on the first failing command, on a failure anywhere in a
+        # pipeline (the .SRCINFO check pipes makepkg into diff), and on an
+        # unset variable. GitHub's `shell: bash` is the same without `-u`; it
+        # is spelled out because the steps rely on all three.
+        shell: bash --noprofile --norc -euo pipefail {0}
+        working-directory: packaging/arch/settings4000-git
+    steps:
+      - name: Install the build tools
+        # Must run before the checkout: the Arch image ships without git, and
+        # actions/checkout falls back to downloading a tarball through the
+        # REST API when git is missing — that tree has no .git directory, so
+        # makepkg could not clone it and pkgver() could not count commits.
+        # `-Syu` rather than `-Sy`: Arch supports only full upgrades, and the
+        # image may lag behind the repositories. `rust` is named here because
+        # both `rust` and `rustup` provide the PKGBUILD's `cargo` makedepend
+        # and pacman's choice between them is not guaranteed; with `rust`
+        # installed, the later `--needed` install of `cargo` is already
+        # satisfied. The package's own dependencies are installed in a later
+        # step, read from the PKGBUILD.
+        working-directory: /
+        run: pacman -Syu --noconfirm --needed base-devel git namcap rust
+
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          # The full history, not the default single commit: pkgver() appends
+          # `git rev-list --count HEAD`, which a shallow clone would report as 1,
+          # and makepkg's clone of this checkout would be shallow as well.
+          fetch-depth: 0
+
+      - name: Create the unprivileged build user
+        # makepkg refuses to run as root (it would let a PKGBUILD's package()
+        # write anywhere on the system), so it runs as `builder` through
+        # runuser, which keeps the working directory and resets HOME to the
+        # user's own home for cargo. Owning the checkout lets makepkg create its
+        # src/, pkg/ and clone directories and rewrite the PKGBUILD's `pkgver=`
+        # line, and it also satisfies git's ownership check (`safe.directory`)
+        # when makepkg clones the checkout as that user — the checkout itself
+        # is created as root, which actions/checkout already allows for its own
+        # git commands.
+        working-directory: /
+        run: |
+          useradd --create-home builder
+          chown -R builder: "$GITHUB_WORKSPACE"
+
+      - name: Install the package's dependencies from the PKGBUILD
+        # The list comes from the PKGBUILD itself — makepkg's own parser prints
+        # every `depends`, `makedepends` and `checkdepends` entry — so a
+        # dependency added there is installed here without editing this file.
+        # They are installed up front so a plain `makepkg` finds them all and
+        # never needs `-s` (which would call sudo). `cargo` is already
+        # satisfied by the `rust` package installed in the first step.
+        # Versioned entries (`foo>=1`) pass through to pacman unchanged, which
+        # accepts them; should an entry with `<` ever be added, this sed is the
+        # place to strip the version constraint.
+        run: |
+          mapfile -t deps < <(runuser -u builder -- makepkg --printsrcinfo |
+            sed -n -E 's/^\t(depends|makedepends|checkdepends) = //p')
+          printf 'Installing: %s\n' "${deps[*]}"
+          pacman -S --noconfirm --needed "${deps[@]}"
+
+      # The checks below run in this order on purpose: a build rewrites the
+      # PKGBUILD's `pkgver=0` placeholder with the computed version, so the
+      # .SRCINFO comparison and the PKGBUILD lint must see the committed file
+      # and therefore run before the build.
+      - name: Check that .SRCINFO matches the PKGBUILD
+        # .SRCINFO is generated by `makepkg --printsrcinfo` and committed beside
+        # the PKGBUILD; diff exits non-zero and prints the difference when
+        # someone changed the PKGBUILD without regenerating it.
+        run: runuser -u builder -- makepkg --printsrcinfo | diff -u .SRCINFO -
+
+      - name: Lint the PKGBUILD with namcap
+        # namcap exits 0 even when it reports problems, so its output is
+        # searched instead: any error (`E:`) or warning (`W:`) line fails the
+        # step. Informational notes are not printed without `-i`.
+        run: |
+          namcap PKGBUILD | tee namcap-pkgbuild.log
+          if grep -E ' [EW]: ' namcap-pkgbuild.log; then
+            echo '::error::namcap reported the problems above in the PKGBUILD'
+            exit 1
+          fi
+
+      - name: Build and test the package with makepkg
+        # The full build, including check() and therefore the whole test suite.
+        # `_repo` points the git source at this checkout instead of GitHub, so
+        # the commit under test is the one built, not the tip of main (the
+        # PKGBUILD header documents the override). makepkg mirrors the
+        # repository and builds its HEAD; on pull requests actions/checkout
+        # leaves a detached HEAD at the merge commit, and that clone simply
+        # checks out the same detached commit, so pkgver() still works.
+        run: runuser -u builder -- env _repo="file://$GITHUB_WORKSPACE" makepkg --noconfirm
+
+      - name: Lint the built package with namcap
+        # Arch's default makepkg.conf also produces a `-debug` package of
+        # detached symbols; the glob skips it (pkgver starts with a digit),
+        # and exactly one main package must exist. As for the PKGBUILD, every
+        # `E:`/`W:` line fails the step, with one accepted exception: namcap
+        # reports the dynamic loader as an unused shared library in every Rust
+        # binary, because Rust links it explicitly and nothing references a
+        # symbol from it. That is a known false positive, not a packaging bug.
+        # Because both `archlinux:latest` and namcap float, a new namcap
+        # release can turn this step (or the PKGBUILD lint) red with no change
+        # in the repository. That is accepted: the new finding is either fixed
+        # or, if it is a false positive, added to the allow-list below.
+        run: |
+          shopt -s nullglob
+          packages=(settings4000-git-[0-9]*.pkg.tar.zst)
+          if (( ${#packages[@]} != 1 )); then
+            echo "::error::expected one built package, found: ${packages[*]:-none}"
+            exit 1
+          fi
+          namcap "${packages[0]}" | tee namcap-package.log
+          if grep -E ' [EW]: ' namcap-package.log |
+            grep -vF "W: Unused shared library '/usr/lib64/ld-linux-x86-64.so.2'"; then
+            echo '::error::namcap reported the problems above in the built package'
+            exit 1
+          fi
+
+      - name: List the package contents and check the installed files
+        # The listing is printed for the log; the check fails if any of the four
+        # artifacts the package exists to install (binary, desktop entry, icon,
+        # license; see package() in the PKGBUILD) is missing. The package is
+        # selected exactly as in the namcap step, so this step stands on its
+        # own rather than relying on that step's check.
+        run: |
+          shopt -s nullglob
+          packages=(settings4000-git-[0-9]*.pkg.tar.zst)
+          if (( ${#packages[@]} != 1 )); then
+            echo "::error::expected one built package, found: ${packages[*]:-none}"
+            exit 1
+          fi
+          package=${packages[0]}
+          tar -tvf "$package"
+          contents=$(tar -tf "$package")
+          status=0
+          for file in \
+            usr/bin/settings4000 \
+            usr/share/applications/org.settings4000.Settings4000.desktop \
+            usr/share/icons/hicolor/scalable/apps/org.settings4000.Settings4000.svg \
+            usr/share/licenses/settings4000-git/LICENSE; do
+            if ! grep -qxF "$file" <<<"$contents"; then
+              echo "::error::$package does not contain $file"
+              status=1
+            fi
+          done
+          exit "$status"
