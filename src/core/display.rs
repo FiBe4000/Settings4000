@@ -1319,6 +1319,12 @@ impl LaptopToggleRequest {
         self.enable
     }
 
+    /// The output the toggle switches (`eDP-1`) — what the Display page names in
+    /// its log when the toggle does not report back in time (task 10.7).
+    pub fn output(&self) -> &str {
+        &self.output
+    }
+
     /// Step 2 of the laptop toggle: runs the dotfiles' toggle script between two
     /// reads of the compositor's monitor list and reports what was read (task
     /// 11.8; analysis §7.3, §8.1). Blocks for as long as the commands take, so the

@@ -1,5 +1,5 @@
-//! The Display page's bespoke GTK glue (tasks 6.1, 10.3, 10.4, 11.8, 11.9; architecture §7;
-//! R2.3, R4.2, R4.4, R5.2, R8.3).
+//! The Display page's bespoke GTK glue (tasks 6.1, 10.3, 10.4, 10.7, 11.8, 11.9;
+//! architecture §7; R2.3, R4.2, R4.4, R5.2, R8.3).
 //!
 //! # Why this page is bespoke, not declarative
 //!
@@ -95,10 +95,34 @@
 //! replace the model while the script runs, and either would otherwise forget that a
 //! toggle is still running and offer the switch again. When the outcome arrives it
 //! is stored on whichever model is current, and whichever page is current is rebuilt.
+//!
+//! # A toggle that never reports back (task 10.7)
+//!
+//! The worker's wait has no bound of its own: after the runner's 5 s timeout kills
+//! the script's shell, the runner keeps draining the captured output until every
+//! process holding the inherited pipes closes them, and a wedged grandchild (a
+//! `launch-eww-bars` that never exits) never does. So every toggle arms a watchdog
+//! on the main loop when it starts. If no outcome has arrived when it fires, the
+//! page stops waiting: the switch is re-enabled at the panel state last *read* (the
+//! model's, not the requested position), a note says the toggle did not report
+//! back, and a `warn` names the output and the interval. Nothing is killed or
+//! signalled — the stuck process is the bar launcher, and killing it would leave the
+//! session without bars — so the abandoned worker simply stays blocked until its
+//! pipes close. An outcome that arrives first cancels the watchdog.
+//!
+//! Each toggle carries a generation number, and only the outcome of the toggle the
+//! page is still waiting for is stored. An outcome that turns up after its watchdog
+//! fired is logged at `info` and dropped as a whole, its read state included: by
+//! then the user may have started a newer toggle, whose own reads are the ones to
+//! show, and the late read may be older than state stored since (by that newer
+//! toggle or by a Refresh). The page cannot tell which read is fresher, so it keeps
+//! the one it has; the next Refresh reads the compositor again.
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
+use std::time::Duration;
 
+use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{Align, Box as GtkBox, Frame, Orientation, ScrolledWindow, Switch};
 
@@ -139,25 +163,31 @@ impl DisplayPage {
     }
 }
 
+/// How long the page waits for a laptop toggle's outcome before it gives up and
+/// re-enables the switch (task 10.7).
+///
+/// One toggle issues at most three commands, each bounded by the runner's 5 s
+/// timeout, so a toggle that has not reported back after twice that total is stuck
+/// in the runner's drain of the script's output (see the module docs), not slow.
+const LAPTOP_TOGGLE_WATCHDOG: Duration = Duration::from_secs(30);
+
 /// The runtime laptop toggle's state that must outlive any one Display page and any
 /// one Display model (task 10.3): whether a toggle is running on the worker, why the
-/// last one did not take, and which page to rebuild when an outcome arrives.
+/// last one did not take, and which page to rebuild when an outcome arrives — plus
+/// the watchdog that stops waiting for an outcome that never comes (task 10.7).
 ///
-/// The window creates one for its whole lifetime and hands it to every page it
-/// builds ([`build`]). See the module docs for why the flag cannot live on the page
-/// or on the model.
-#[derive(Default)]
+/// The window creates one for its whole lifetime (through [`Default`], which arms
+/// the production watchdog interval) and hands it to every page it builds
+/// ([`build`]). See the module docs for why the flag cannot live on the page or on
+/// the model.
 pub(crate) struct LaptopToggleState {
     /// The panel state the running toggle asked for (`true` for on), or `None` when
     /// no toggle is running. While `Some`, the switch is drawn at this position and
     /// insensitive, and a new toggle is refused.
     ///
-    /// There is no upper bound on how long it stays `Some`: if the runner's drain of
-    /// the script's output never finishes (a grandchild keeps the inherited stdout or
-    /// stderr open), the switch stays insensitive with the "Switching…" note for the
-    /// window's lifetime, and by design neither Refresh nor Reset clears it. That is
-    /// strictly better than the frozen window it replaces; a watchdog is backlog
-    /// task 10.7 in `docs/tasks.md`.
+    /// It stays `Some` until the toggle's outcome arrives or, at the latest, until
+    /// the watchdog fires after [`Self::watchdog_interval`] (task 10.7). Neither
+    /// Refresh nor Reset clears it: the script may still be running then.
     pending: Cell<Option<bool>>,
     /// Why the last laptop toggle did not take, shown under the switch until the
     /// next toggle, Reset or Apply (R5.5), or `None` after a successful one.
@@ -166,14 +196,58 @@ pub(crate) struct LaptopToggleState {
     /// finishes. Weak, so a page the window dropped (a Refresh rebuilds the page)
     /// is simply skipped.
     page: RefCell<Weak<Inner>>,
+    /// The number of the most recently started toggle. Each toggle's outcome and
+    /// watchdog carry the number it started with, and act only while it is still
+    /// the current one *and* [`Self::pending`] is `Some` — so neither a late outcome
+    /// nor a stale watchdog can finish a newer toggle (task 10.7).
+    generation: Cell<u64>,
+    /// How long a toggle may run before the watchdog gives up on it:
+    /// [`LAPTOP_TOGGLE_WATCHDOG`] in the app, chosen per toggle in tests. Read when
+    /// a toggle starts, so a change affects only toggles started afterwards.
+    watchdog_interval: Cell<Duration>,
+    /// The running toggle's armed watchdog, aborted when the outcome arrives first
+    /// so a toggle that finished in time leaves no timer behind; `None` when no
+    /// toggle is running.
+    watchdog: RefCell<Option<glib::JoinHandle<()>>>,
+}
+
+impl Default for LaptopToggleState {
+    /// No toggle running, no note, no page yet, and the production watchdog interval.
+    fn default() -> Self {
+        Self::with_watchdog_interval(LAPTOP_TOGGLE_WATCHDOG)
+    }
 }
 
 impl LaptopToggleState {
+    /// A state with no toggle running whose watchdog gives up on a toggle after
+    /// `watchdog_interval` — [`LAPTOP_TOGGLE_WATCHDOG`] through [`Default`]; tests
+    /// pass a short interval so they need not wait half a minute.
+    fn with_watchdog_interval(watchdog_interval: Duration) -> Self {
+        Self {
+            pending: Cell::new(None),
+            error: RefCell::new(None),
+            page: RefCell::new(Weak::new()),
+            generation: Cell::new(0),
+            watchdog_interval: Cell::new(watchdog_interval),
+            watchdog: RefCell::new(None),
+        }
+    }
+
+    /// Changes the watchdog interval for toggles started from now on, so a test can
+    /// let one toggle's watchdog fire quickly and give the next one no practical
+    /// deadline.
+    #[cfg(test)]
+    fn set_watchdog_interval(&self, interval: Duration) {
+        self.watchdog_interval.set(interval);
+    }
+
     /// Starts the runtime laptop toggle of monitor `index` towards `enable` (R5.2):
-    /// takes the request from the shared `model`, marks the toggle as running and
-    /// rebuilds the page, then runs the script and its reads through `runner` on a
-    /// worker thread and returns at once. The outcome is handled by [`Self::finish`]
-    /// on the main thread.
+    /// takes the request from the shared `model`, marks the toggle as running, arms
+    /// its watchdog and rebuilds the page, then runs the script and its reads
+    /// through `runner` on a worker thread and returns at once. The outcome is
+    /// handled by [`Self::finish`] on the main thread, or — if it does not arrive
+    /// within the watchdog interval — the wait is abandoned by
+    /// [`Self::watchdog_fired`] (task 10.7).
     ///
     /// A toggle the model refuses outright ([`LaptopToggleError::Unavailable`]) runs
     /// nothing and only shows why; without a model there is no switch to update. A
@@ -212,26 +286,115 @@ impl LaptopToggleState {
             }
         };
 
+        let generation = self.generation.get().wrapping_add(1);
+        self.generation.set(generation);
         self.pending.set(Some(request.enable()));
         self.error.replace(None);
+        self.arm_watchdog(generation, request.output().to_owned());
         self.rebuild_page();
 
         let state = Rc::clone(self);
         let model = Rc::clone(model);
         run_off_main_thread(
             move || request.run(&runner),
-            move |outcome| state.finish(&model, outcome),
+            move |outcome| state.finish(generation, &model, outcome),
         );
     }
 
-    /// Handles a toggle's outcome on the main thread: stores the read state on the
-    /// current model ([`DisplayModel::finish_laptop_toggle`]), keeps any error for
-    /// the switch's note, clears the running flag and rebuilds the current page.
+    /// Schedules [`Self::watchdog_fired`] for toggle `generation` of `output` after
+    /// the watchdog interval, on the calling thread's main context (the GTK main
+    /// loop in the app, a test's own context in tests).
+    ///
+    /// The timer holds only a [`Weak`] reference, so it never keeps the state alive
+    /// on its own.
+    fn arm_watchdog(self: &Rc<Self>, generation: u64, output: String) {
+        let state = Rc::downgrade(self);
+        let interval = self.watchdog_interval.get();
+        let handle = relm4::spawn_local(async move {
+            glib::timeout_future(interval).await;
+            if let Some(state) = state.upgrade() {
+                state.watchdog_fired(generation, &output);
+            }
+        });
+        // No previous toggle's handle can be left here: a toggle only starts when
+        // none is running, and every running toggle ends either in `finish`, which
+        // takes its handle, or in `watchdog_fired`, which clears it.
+        debug_assert!(self.watchdog.borrow().is_none());
+        self.watchdog.replace(Some(handle));
+    }
+
+    /// Gives up waiting for toggle `generation` of `output` (task 10.7): clears the
+    /// running flag so the switch is re-enabled at the model's last read state,
+    /// leaves a note saying the toggle did not report back, logs at `warn` and
+    /// rebuilds the page. The worker is left alone — nothing is killed or
+    /// signalled — and its outcome, should it ever arrive, is ignored by
+    /// [`Self::finish`].
+    ///
+    /// Does nothing when that toggle is no longer the one running: its outcome
+    /// arrived first (which also aborts this timer, so this is only a safeguard) or
+    /// a newer toggle has started since.
+    fn watchdog_fired(&self, generation: u64, output: &str) {
+        if !self.is_running(generation) {
+            tracing::debug!(
+                generation,
+                "a laptop-display toggle watchdog fired after its toggle had ended; ignored"
+            );
+            return;
+        }
+        tracing::warn!(
+            %output,
+            interval = ?self.watchdog_interval.get(),
+            "the laptop-display toggle did not report back in time; the switch is \
+             re-enabled at the last state read, and the toggle's outcome will be ignored \
+             if it still arrives (R5.5)"
+        );
+        // Only now, with this toggle known to be the running one, is the handle
+        // its own; a stale watchdog must never discard a newer toggle's handle.
+        self.watchdog.replace(None);
+        self.pending.set(None);
+        self.error.replace(Some(WATCHDOG_NOTE.to_owned()));
+        self.rebuild_page();
+    }
+
+    /// Whether toggle `generation` is the one the page is still waiting for: the
+    /// most recently started toggle, and not yet finished or given up on.
+    fn is_running(&self, generation: u64) -> bool {
+        self.pending.get().is_some() && self.generation.get() == generation
+    }
+
+    /// Handles the outcome of toggle `generation` on the main thread: cancels its
+    /// watchdog, stores the read state on the current model
+    /// ([`DisplayModel::finish_laptop_toggle`]), keeps any error for the switch's
+    /// note, clears the running flag and rebuilds the current page.
     ///
     /// `outcome` is `None` when the worker ended without one (it panicked); the
     /// switch is then re-enabled at the last state read before the toggle, and the
     /// loss is logged — the commands, if they ran, were logged by the runner.
-    fn finish(&self, model: &RefCell<Option<DisplayModel>>, outcome: Option<LaptopToggleOutcome>) {
+    ///
+    /// An outcome for a toggle the page is no longer waiting for — its watchdog
+    /// fired, whether or not a newer toggle has started since — is logged at `info`
+    /// and otherwise ignored: it neither stores its read state, nor sets a note,
+    /// nor touches the running flag (see the module docs for why the read is
+    /// dropped too).
+    fn finish(
+        &self,
+        generation: u64,
+        model: &RefCell<Option<DisplayModel>>,
+        outcome: Option<LaptopToggleOutcome>,
+    ) {
+        if !self.is_running(generation) {
+            tracing::info!(
+                generation,
+                current = self.generation.get(),
+                ?outcome,
+                "a laptop-display toggle reported back after its watchdog gave up on it; \
+                 the outcome is ignored"
+            );
+            return;
+        }
+        if let Some(watchdog) = self.watchdog.take() {
+            watchdog.abort();
+        }
         self.pending.set(None);
         let result = match outcome {
             Some(outcome) => model
@@ -264,6 +427,12 @@ impl LaptopToggleState {
         }
     }
 }
+
+/// The note the watchdog leaves under the laptop switch when a toggle did not report
+/// back in time (task 10.7). It tells the user that the switch may be stale — the
+/// toggle may still have switched the panel afterwards — and how to read it again.
+const WATCHDOG_NOTE: &str = "The laptop display toggle did not report back, so the switch \
+                             shows the last state read. Refresh to read it again.";
 
 /// The note shown under the laptop switch for a toggle that did not take (R5.5).
 fn toggle_error_note(error: &LaptopToggleError) -> String {
@@ -617,7 +786,8 @@ fn position_of(options: &[String], value: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    //! The page's laptop-toggle bookkeeping, exercised without widgets (task 10.3).
+    //! The page's laptop-toggle bookkeeping, exercised without widgets (tasks 10.3,
+    //! 10.7).
     //!
     //! Building the page needs an initialised GTK and so a display server, which the
     //! test suite does not have; [`LaptopToggleState`] does not touch widgets unless
@@ -633,7 +803,7 @@ mod tests {
 
     use gtk4::glib::MainContext;
 
-    use super::LaptopToggleState;
+    use super::{LaptopToggleState, WATCHDOG_NOTE};
     use crate::core::display::DisplayModel;
     use crate::system::command::{
         Command, CommandError, CommandOutput, CommandRunner, MockCommandRunner,
@@ -879,5 +1049,223 @@ mod tests {
         fn run(&self, command: &Command) -> Result<CommandOutput, CommandError> {
             self.0.run(command)
         }
+    }
+
+    /// The watchdog interval of the tests that let it fire: long enough for the
+    /// worker to reach the blocked script call, short enough to keep the tests fast.
+    const SHORT_WATCHDOG: Duration = Duration::from_millis(50);
+
+    /// Iterates `context` until every toggle outcome `state` is waiting on has been
+    /// delivered — late ones included — by watching `state`'s strong count: each
+    /// outcome handler holds one strong reference until it has run, and the watchdog
+    /// holds none, so the count returns to the test's own reference exactly when the
+    /// last outcome has been handled.
+    fn drive_until_every_outcome_arrived(context: &MainContext, state: &Rc<LaptopToggleState>) {
+        drive_until(context, || Rc::strong_count(state) == 1);
+    }
+
+    /// The read–script prefix of [`toggle_sequence`]: what a toggle whose script never
+    /// returns has issued — and nothing else, so in particular no `kill`.
+    fn stuck_sequence() -> Vec<Command> {
+        toggle_sequence()[..2].to_vec()
+    }
+
+    #[test]
+    fn a_toggle_that_never_reports_back_re_enables_the_switch_after_the_watchdog() {
+        // Task 10.7 acceptance: the script never returns (the gate stays shut until
+        // the end), so only the watchdog can end the wait. It re-enables the switch at
+        // the last state *read* (on, as loaded — not the requested off), leaves the
+        // note and logs a `warn` naming the output and the interval. The runner saw
+        // just the first read and the script: nothing was killed or signalled (the
+        // page holds no `ProcessSignaller`, and a `kill` would be a recorded command).
+        // When the script is finally released its outcome — a read of "off" — is
+        // ignored, since nothing waits for it any more.
+        let events = crate::testing::capture_logs(|| {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let model = shared_model(dir.path());
+            let state = Rc::new(LaptopToggleState::with_watchdog_interval(SHORT_WATCHDOG));
+            let (runner, recorder, release) = gated_runner([
+                probe_reply(true),
+                Ok(CommandOutput::fake(0)),
+                probe_reply(false),
+            ]);
+
+            let context = MainContext::new();
+            context
+                .with_thread_default(|| {
+                    state.start(&model, 0, false, runner);
+                    drive_until(&context, || state.pending.get().is_none());
+
+                    assert!(
+                        panel_enabled(&model),
+                        "the switch is back at the read state"
+                    );
+                    assert_eq!(state.error.borrow().as_deref(), Some(WATCHDOG_NOTE));
+                    // On a busy machine the watchdog can fire before the worker has
+                    // even reached the script, so wait for it to block there first.
+                    drive_until(&context, || recorder.recorded().len() == 2);
+                    assert_eq!(recorder.recorded(), stuck_sequence());
+
+                    release.send(()).expect("the script is still waiting");
+                    drive_until_every_outcome_arrived(&context, &state);
+                })
+                .expect("the test thread owns its main context");
+
+            assert!(
+                panel_enabled(&model),
+                "the late read of \"off\" was not stored"
+            );
+            assert_eq!(state.error.borrow().as_deref(), Some(WATCHDOG_NOTE));
+            assert_eq!(state.pending.get(), None);
+            assert_eq!(
+                recorder.recorded(),
+                toggle_sequence(),
+                "no command besides the toggle"
+            );
+        });
+
+        let warning = events
+            .iter()
+            .find(|event| event.level == tracing::Level::WARN)
+            .unwrap_or_else(|| panic!("no warn event in {events:?}"));
+        assert!(
+            warning.message.contains("did not report back"),
+            "{warning:?}"
+        );
+        assert!(warning.fields.contains("output=eDP-1"), "{warning:?}");
+        assert!(warning.fields.contains("interval=50ms"), "{warning:?}");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.level == tracing::Level::INFO
+                    && event.message.contains("after its watchdog gave up")),
+            "the late outcome is logged: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_late_outcome_never_finishes_a_newer_toggle() {
+        // Task 10.7 acceptance: toggle A never reports back and its watchdog fires;
+        // the user toggles again (B, also blocked in its script). A's outcome then
+        // arrives — first replayed directly, deterministically, then for real once
+        // A's script is released — and must leave B running, the model unchanged and
+        // the note empty. B's own outcome still finishes B.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let model = shared_model(dir.path());
+        let state = Rc::new(LaptopToggleState::with_watchdog_interval(SHORT_WATCHDOG));
+        // A reads the panel off after its script; B's script leaves it on.
+        let (runner_a, recorder_a, release_a) = gated_runner([
+            probe_reply(true),
+            Ok(CommandOutput::fake(0)),
+            probe_reply(false),
+        ]);
+        let (runner_b, recorder_b, release_b) = gated_runner([
+            probe_reply(true),
+            Ok(CommandOutput::fake(1)),
+            probe_reply(true),
+        ]);
+
+        let context = MainContext::new();
+        context
+            .with_thread_default(|| {
+                state.start(&model, 0, false, runner_a);
+                let generation_a = state.generation.get();
+                drive_until(&context, || state.pending.get().is_none());
+                assert_eq!(state.error.borrow().as_deref(), Some(WATCHDOG_NOTE));
+
+                // B must outlive everything below however slowly the machine runs,
+                // so its watchdog gets no practical deadline.
+                state.set_watchdog_interval(Duration::from_secs(600));
+                state.start(&model, 0, false, runner_b);
+                drive_until(&context, || recorder_b.recorded().len() == 2);
+                assert_eq!(state.pending.get(), Some(false), "B is running");
+
+                // A's outcome, as its worker would deliver it: the panel read off.
+                let late_a = model
+                    .borrow()
+                    .as_ref()
+                    .expect("model")
+                    .laptop_toggle_request(0, false)
+                    .expect("the toggle is available")
+                    .run(&MockCommandRunner::with_outcomes([
+                        probe_reply(true),
+                        Ok(CommandOutput::fake(0)),
+                        probe_reply(false),
+                    ]));
+                state.finish(generation_a, &model, Some(late_a));
+                state.finish(generation_a, &model, None);
+                assert_eq!(state.pending.get(), Some(false), "B is still running");
+                assert!(panel_enabled(&model), "A's read was not stored");
+                assert_eq!(*state.error.borrow(), None, "A left no note");
+                assert!(
+                    state.watchdog.borrow().is_some(),
+                    "B's watchdog is still armed"
+                );
+
+                // A's real outcome arrives while B still runs (its strong reference
+                // is the only one released before B is).
+                release_a.send(()).expect("A's script is still waiting");
+                drive_until(&context, || Rc::strong_count(&state) == 2);
+                assert_eq!(state.pending.get(), Some(false), "B is still running");
+                assert!(panel_enabled(&model), "A's real read was not stored");
+
+                release_b.send(()).expect("B's script is still waiting");
+                drive_until_every_outcome_arrived(&context, &state);
+            })
+            .expect("the test thread owns its main context");
+
+        assert_eq!(state.pending.get(), None, "B finished with its own outcome");
+        assert!(panel_enabled(&model), "B's read (still on) is shown");
+        assert!(
+            state
+                .error
+                .borrow()
+                .as_deref()
+                .is_some_and(|note| note.contains("still on after running the toggle script")),
+            "B's error is shown: {:?}",
+            state.error.borrow()
+        );
+        assert_eq!(recorder_a.recorded(), toggle_sequence());
+        assert_eq!(recorder_b.recorded(), toggle_sequence());
+    }
+
+    #[test]
+    fn an_outcome_before_the_watchdog_cancels_it() {
+        // The outcome arrives well inside the interval: its timer is destroyed with
+        // it, and once the interval has passed there is still no note and the panel
+        // shows the toggle's read — a stale watchdog cannot re-open a finished toggle.
+        let interval = Duration::from_millis(500);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let model = shared_model(dir.path());
+        let state = Rc::new(LaptopToggleState::with_watchdog_interval(interval));
+        let (runner, _recorder, release) = gated_runner([
+            probe_reply(true),
+            Ok(CommandOutput::fake(0)),
+            probe_reply(false),
+        ]);
+        release.send(()).expect("pre-release the script");
+
+        let context = MainContext::new();
+        context
+            .with_thread_default(|| {
+                state.start(&model, 0, false, runner);
+                let timer = state
+                    .watchdog
+                    .borrow()
+                    .as_ref()
+                    .map(|handle| handle.source().clone())
+                    .expect("the watchdog is armed while the toggle runs");
+                drive_until(&context, || state.pending.get().is_none());
+                assert!(timer.is_destroyed(), "the outcome cancelled the watchdog");
+                assert!(state.watchdog.borrow().is_none());
+
+                let after_interval = std::time::Instant::now() + interval + interval / 2;
+                drive_until(&context, || std::time::Instant::now() >= after_interval);
+            })
+            .expect("the test thread owns its main context");
+
+        assert_eq!(*state.error.borrow(), None, "no watchdog note");
+        assert_eq!(state.pending.get(), None);
+        assert!(!panel_enabled(&model), "the toggle's read stays");
     }
 }
