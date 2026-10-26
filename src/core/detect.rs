@@ -166,7 +166,10 @@ pub enum Binary {
 
 impl Binary {
     /// Every binary the detector scans for, in a fixed order.
-    const ALL: &'static [Binary] = &[
+    ///
+    /// Crate-visible so the Arch packaging guard test in `ui/app.rs` (task 12.2)
+    /// can check that every detected tool has an `optdepends` entry.
+    pub(crate) const ALL: &'static [Binary] = &[
         Binary::Hyprctl,
         Binary::Gsettings,
         Binary::Pactl,

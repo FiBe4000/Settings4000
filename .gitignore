@@ -4,3 +4,11 @@
 
 # Claude Code per-user settings (shared config under .claude/ stays tracked)
 .claude/settings.local.json
+
+# makepkg output beside each PKGBUILD in packaging/arch/ (task 12.2): its build
+# and package directories, the clone of the git source, built packages and logs
+/packaging/arch/*/src/
+/packaging/arch/*/pkg/
+/packaging/arch/*/settings4000/
+/packaging/arch/**/*.pkg.tar.*
+/packaging/arch/**/*.log

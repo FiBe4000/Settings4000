@@ -248,10 +248,11 @@ mod tests {
         // compositors/launchers associate that window (and its icon) with the
         // desktop file named `<app-id>.desktop`. The desktop entry's file name,
         // its `StartupWMClass`/`Icon` values, the installed icon's file name,
-        // and install.sh's own copy of the ID (a shell script cannot read the
-        // Rust constant, so it hardcodes one) must therefore all equal the
+        // install.sh's own copy of the ID, and the Arch PKGBUILD's copy (task
+        // 12.2; neither a shell script nor a PKGBUILD can read the Rust
+        // constant, so each hardcodes one) must therefore all equal the
         // GApplication ID — if `APP_ID` is ever changed, this guard fails
-        // headlessly until `data/` and `install.sh` move with it.
+        // headlessly until `data/`, `install.sh` and the PKGBUILD move with it.
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let data_dir = manifest_dir.join("data");
 
@@ -294,6 +295,147 @@ mod tests {
             "{} must contain the line `{expected}`",
             installer_path.display()
         );
+
+        // The PKGBUILD names the installed desktop entry and icon after its
+        // `_app_id` variable in the same way.
+        let (pkgbuild_path, pkgbuild) = read_arch_pkgbuild();
+        let expected = format!("_app_id={APP_ID}");
+        assert!(
+            pkgbuild.lines().any(|line| line == expected),
+            "{} must contain the line `{expected}`",
+            pkgbuild_path.display()
+        );
+    }
+
+    /// Reads the Arch `PKGBUILD` of the `settings4000-git` package (task 12.2),
+    /// returning its path for failure messages together with its text.
+    fn read_arch_pkgbuild() -> (std::path::PathBuf, String) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("packaging/arch/settings4000-git/PKGBUILD");
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!("the Arch PKGBUILD must live at {}: {error}", path.display())
+        });
+        (path, text)
+    }
+
+    /// The Arch package providing a detected tool, or `None` for a tool that
+    /// every system able to install the package already has, so the `PKGBUILD`
+    /// need not list it in `optdepends`.
+    ///
+    /// An exhaustive `match` rather than a lookup table, so adding a
+    /// [`Binary`](crate::core::detect::Binary) variant fails to compile until its
+    /// package is decided here (and, through the test below, in the `PKGBUILD`).
+    fn arch_package_of(binary: crate::core::detect::Binary) -> Option<&'static str> {
+        use crate::core::detect::Binary;
+        match binary {
+            Binary::Hyprctl => Some("hyprland"),
+            // gsettings ships with glib2, a direct dependency of the package.
+            Binary::Gsettings => None,
+            Binary::Pactl => Some("libpulse"),
+            Binary::Wpctl => Some("wireplumber"),
+            Binary::Kitty => Some("kitty"),
+            Binary::Eww => Some("eww"),
+            // busctl ships with systemd, part of every Arch base system.
+            Binary::Busctl => None,
+            Binary::Hyprpaper => Some("hyprpaper"),
+            Binary::Hypridle => Some("hypridle"),
+            Binary::Hyprlock => Some("hyprlock"),
+            Binary::Nmcli => Some("networkmanager"),
+            Binary::NmConnectionEditor => Some("nm-connection-editor"),
+            Binary::Dconf => Some("dconf"),
+        }
+    }
+
+    #[test]
+    fn arch_pkgbuild_follows_the_cargo_metadata_and_the_detected_tools() {
+        // Task 12.2 (R8.7): the PKGBUILD is a shell file that cannot read the
+        // Cargo metadata, so it carries its own copies of the project URL and
+        // the license, and its own list of the optional tools the app detects
+        // (R4). This guard keeps each copy equal to its source of truth.
+        let (path, pkgbuild) = read_arch_pkgbuild();
+        let path = path.display();
+
+        let expected = format!("url='{}'", env!("CARGO_PKG_REPOSITORY"));
+        assert!(
+            pkgbuild.lines().any(|line| line == expected),
+            "{path} must contain the line `{expected}` (Cargo.toml `repository`)"
+        );
+        let expected = format!("license=({})", env!("CARGO_PKG_LICENSE"));
+        assert!(
+            pkgbuild.lines().any(|line| line == expected),
+            "{path} must contain the line `{expected}` (Cargo.toml `license`)"
+        );
+
+        // R8.6: Cargo.toml is the single version source. makepkg refuses a
+        // PKGBUILD without a non-empty `pkgver=` line, so the file carries the
+        // placeholder `0` and a pkgver() function that reads Cargo.toml; makepkg
+        // rewrites the placeholder with the computed version on every build, and
+        // that rewritten line must not be committed (it would be a second,
+        // soon-stale version literal).
+        let pkgver_lines: Vec<&str> = pkgbuild
+            .lines()
+            .filter(|line| line.starts_with("pkgver="))
+            .collect();
+        assert_eq!(
+            pkgver_lines,
+            ["pkgver=0"],
+            "{path} must carry only the placeholder `pkgver=0`; if makepkg rewrote \
+             it during a local build, discard that change with `git restore`"
+        );
+        assert!(
+            pkgbuild.lines().any(|line| line == "pkgver() {"),
+            "{path} must define a pkgver() function"
+        );
+        let version_source = r#"sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml"#;
+        assert!(
+            pkgbuild.contains(version_source),
+            "{path}'s pkgver() must read the version with `{version_source}`"
+        );
+        // Comment lines are skipped: prose may mention unrelated numbers (such
+        // as a makepkg version) that a short Cargo version would match.
+        let version = env!("CARGO_PKG_VERSION");
+        if let Some(line) = pkgbuild
+            .lines()
+            .find(|line| !line.trim_start().starts_with('#') && line.contains(version))
+        {
+            panic!("{path} must not contain the version literal `{version}`: `{line}`");
+        }
+
+        // Every `optdepends` entry is a `'package: reason'` line between
+        // `optdepends=(` and the closing `)`.
+        let optdepends: Vec<(&str, &str)> = pkgbuild
+            .lines()
+            .skip_while(|line| *line != "optdepends=(")
+            .skip(1)
+            .take_while(|line| *line != ")")
+            .map(|line| {
+                let entry = line.trim().trim_matches('\'');
+                entry.split_once(": ").unwrap_or_else(|| {
+                    panic!("{path}: optdepends entry `{entry}` must read `package: reason`")
+                })
+            })
+            .collect();
+        assert!(
+            !optdepends.is_empty(),
+            "{path} must declare an `optdepends=(` array, one entry per line"
+        );
+        for (package, reason) in &optdepends {
+            assert!(
+                !reason.trim().is_empty(),
+                "{path}: optdepends entry `{package}` needs a reason"
+            );
+        }
+        for &binary in crate::core::detect::Binary::ALL {
+            let Some(package) = arch_package_of(binary) else {
+                continue;
+            };
+            assert!(
+                optdepends.iter().any(|(name, _)| *name == package),
+                "{path} must list `{package}` in optdepends: it provides `{}`, \
+                 which the app detects at startup",
+                binary.command_name()
+            );
+        }
     }
 
     #[test]

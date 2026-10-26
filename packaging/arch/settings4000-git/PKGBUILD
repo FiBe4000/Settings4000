@@ -1,0 +1,162 @@
+# Maintainer: FiBe4000 <https://github.com/FiBe4000>
+#
+# Arch Linux package for Settings4000, a native GTK 4 settings GUI for a
+# dotfiles-managed Hyprland desktop (requirement R8.7 in docs/requirements.md).
+# This is the VCS ("-git") variant: it builds the latest commit of the project's
+# git repository rather than a tagged release, and installs the same three
+# artifacts the per-user install.sh does (binary, desktop entry, icon), plus the
+# license, under /usr instead of ~/.local.
+#
+# Build and install from this directory:
+#
+#   makepkg -si
+#
+# By default the source is cloned from GitHub, so the package contains the tip
+# of the default branch as pushed there. To package a local clone instead, set
+# `_repo` in makepkg's environment:
+#
+#   _repo="file://$(git rev-parse --show-toplevel)" makepkg -si
+#
+# makepkg clones that repository like any other git source, so what gets built
+# is the *committed* tip of the branch checked out in the local clone at the
+# time of the first clone; uncommitted changes in the working tree are not
+# included. makepkg keeps its clone in ./settings4000/ and only fetches into it
+# on later runs, so delete that directory when switching between the GitHub
+# and the local source, or between branches.
+#
+# The version is never written here by hand: pkgver() reads it from the
+# checked-out Cargo.toml, the project's single version source (R8.6), and
+# appends the commit count and abbreviated hash. makepkg requires a non-empty
+# `pkgver=` line before it can call pkgver(), so the line below carries the
+# placeholder 0 — not a version. makepkg rewrites that line in place with the
+# computed version after every build; that edit is build output, not a change
+# to commit (`git restore PKGBUILD` discards it, and a guard test in
+# src/ui/app.rs fails while it is present). The committed .SRCINFO therefore
+# shows `pkgver = 0` and `provides = settings4000=0`; that is stable, because
+# `makepkg --printsrcinfo` never runs pkgver(). The built package still carries
+# the real version: makepkg re-sources this file after pkgver(), so `provides`
+# in the package's .PKGINFO is versioned correctly.
+#
+# There is no install scriptlet: pacman's own hooks refresh the desktop-entry
+# database and the hicolor icon cache for every package that installs under
+# /usr/share/applications and /usr/share/icons/hicolor.
+#
+# This file lives in packaging/arch/settings4000-git/ rather than at the
+# repository root because makepkg creates src/ and pkg/ directories beside the
+# PKGBUILD, and src/ at the root is the Rust source tree. Those build
+# directories, the clone and the built package are ignored by the repository's
+# .gitignore. Regenerate .SRCINFO with `makepkg --printsrcinfo > .SRCINFO`
+# (with `_repo` unset) whenever this file changes.
+
+pkgname=settings4000-git
+_pkgbase=settings4000
+# Must equal APP_ID in src/ui/app.rs: the desktop entry and the icon are named
+# after the GApplication ID so launchers can match the app's windows to them.
+# A unit test there pins this exact line.
+_app_id=org.settings4000.Settings4000
+pkgver=0
+pkgrel=1
+pkgdesc='Native GTK 4 settings GUI for a dotfiles-managed Hyprland desktop'
+arch=(x86_64)
+url='https://github.com/FiBe4000/Settings4000'
+license=(MIT)
+# Every library the binary links directly (as namcap reports it), even those
+# gtk4 already pulls in, plus hicolor-icon-theme, which owns the icon directory.
+depends=(
+  cairo
+  glib2
+  glibc
+  gtk4
+  hicolor-icon-theme
+  libgcc
+)
+makedepends=(
+  cargo
+  git
+)
+# The app detects each of these tools at startup and hides the settings that
+# need a missing one instead of failing (R4), so none is a hard dependency.
+# Two detected tools are absent on purpose: gsettings ships with glib2 (a
+# dependency above) and busctl with systemd (part of the base system). pipewire
+# and dconf are currently also pulled in through gtk4; they stay listed because
+# the app uses them directly and gtk4 may stop requiring them.
+optdepends=(
+  'hyprland: hyprctl for live reloads and the Display, Input and cursor settings'
+  'hyprpaper: Wallpaper settings'
+  'hypridle: Power & Idle page'
+  'hyprlock: lock-screen background setting'
+  'wireplumber: wpctl for the Sound page'
+  'pipewire: pw-dump for the Sound page device list'
+  'libpulse: pactl, detected as a Sound backend (no current setting needs it)'
+  'eww: reload the status bars after theme, wallpaper and display changes'
+  'kitty: recolor terminals on a palette change and run nmtui for networks'
+  'networkmanager: nmcli for the Network page'
+  'nm-connection-editor: preferred editor behind "Open Network Settings"'
+  'dconf: live restyling of running GTK apps after a theme change'
+)
+provides=("$_pkgbase=$pkgver")
+conflicts=("$_pkgbase")
+# `_repo` is an optional override for building a local clone (see the header);
+# the clone directory is named after the upstream package, not after $pkgver,
+# because pkgver() changes $pkgver after the source has been extracted.
+source=("$_pkgbase::git+${_repo:-https://github.com/FiBe4000/Settings4000.git}")
+# A git source has no fixed content to checksum.
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$_pkgbase"
+  # The only line in Cargo.toml that starts with `version = ` is the [package]
+  # version (dependencies declare theirs inline), so this yields exactly one.
+  local version
+  version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
+  if [[ -z $version || $version == *$'\n'* ]]; then
+    printf 'pkgver: expected exactly one `version = "..."` line in Cargo.toml\n' >&2
+    return 1
+  fi
+  printf '%s.r%s.g%s' "$version" \
+    "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd "$_pkgbase"
+  # Pin the toolchain so a user's rustup default (for example nightly) cannot
+  # change the build, then download every dependency in Cargo.lock for the host
+  # target only, so build() and check() run offline against exactly the
+  # versions the project's own tests use.
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$_pkgbase"
+  export RUSTUP_TOOLCHAIN=stable
+  # A user-wide CARGO_TARGET_DIR would put the binary where package() does not
+  # look. No --all-features: the crate's only feature, `testing`, compiles test
+  # fixtures into the library and is never meant for a release build.
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$_pkgbase"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # Every test suite is headless (R6.2), so this needs no display. Tests run in
+  # the default debug profile, as the Arch Rust guidelines advise and as the
+  # project's CI does: a release build would disable overflow checks and
+  # debug_assert!, which the tests are meant to exercise.
+  cargo test --frozen
+}
+
+package() {
+  cd "$_pkgbase"
+  install -Dm755 target/release/settings4000 -t "$pkgdir/usr/bin/"
+  # Installed verbatim: its `Exec=settings4000` resolves through PATH to
+  # /usr/bin, so the rewrite install.sh performs for ~/.local/bin is not needed.
+  install -Dm644 "data/$_app_id.desktop" -t "$pkgdir/usr/share/applications/"
+  install -Dm644 "data/$_app_id.svg" \
+    -t "$pkgdir/usr/share/icons/hicolor/scalable/apps/"
+  # MIT is not one of the common licenses Arch ships in the `licenses`
+  # package, so the text must be installed with the package.
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+}

@@ -13,7 +13,8 @@
 # so install.sh rewrites this line to the absolute installed binary path
 # (~/.local/bin/settings4000) when it copies the file into
 # ~/.local/share/applications. The bare command here still works for anyone
-# who installs the binary onto $PATH by other means.
+# who installs the binary onto $PATH by other means, such as the Arch package
+# in packaging/arch/, which installs this file unchanged to /usr/share.
 [Desktop Entry]
 Type=Application
 Name=Settings4000
