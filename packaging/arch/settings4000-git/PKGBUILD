@@ -55,7 +55,7 @@ _pkgbase=settings4000
 # A unit test there pins this exact line.
 _app_id=org.settings4000.Settings4000
 pkgver=0
-pkgrel=1
+pkgrel=2
 pkgdesc='Native GTK 4 settings GUI for a dotfiles-managed Hyprland desktop'
 arch=(x86_64)
 url='https://github.com/FiBe4000/Settings4000'
