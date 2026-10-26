@@ -296,26 +296,113 @@ mod tests {
             installer_path.display()
         );
 
-        // The PKGBUILD names the installed desktop entry and icon after its
-        // `_app_id` variable in the same way.
-        let (pkgbuild_path, pkgbuild) = read_arch_pkgbuild();
+        // Both PKGBUILDs (tasks 12.2 and 12.5) name the installed desktop entry
+        // and icon after their `_app_id` variable in the same way.
         let expected = format!("_app_id={APP_ID}");
-        assert!(
-            pkgbuild.lines().any(|line| line == expected),
-            "{} must contain the line `{expected}`",
-            pkgbuild_path.display()
-        );
+        for package in [VCS_PACKAGE, RELEASE_PACKAGE] {
+            let (pkgbuild_path, pkgbuild) = read_arch_pkgbuild(package);
+            assert!(
+                pkgbuild.lines().any(|line| line == expected),
+                "{} must contain the line `{expected}`",
+                pkgbuild_path.display()
+            );
+        }
     }
 
-    /// Reads the Arch `PKGBUILD` of the `settings4000-git` package (task 12.2),
-    /// returning its path for failure messages together with its text.
-    fn read_arch_pkgbuild() -> (std::path::PathBuf, String) {
+    /// The Arch VCS package (task 12.2), which builds the latest commit; also
+    /// the name of its directory under `packaging/arch/`.
+    const VCS_PACKAGE: &str = "settings4000-git";
+
+    /// The Arch release package (task 12.5), which builds the git tag of the
+    /// version in Cargo.toml; also the name of its directory under
+    /// `packaging/arch/`.
+    const RELEASE_PACKAGE: &str = "settings4000";
+
+    /// Reads the `PKGBUILD` of the Arch package `package` from
+    /// `packaging/arch/<package>/`, returning its path for failure messages
+    /// together with its text.
+    fn read_arch_pkgbuild(package: &str) -> (std::path::PathBuf, String) {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("packaging/arch/settings4000-git/PKGBUILD");
+            .join("packaging/arch")
+            .join(package)
+            .join("PKGBUILD");
         let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
             panic!("the Arch PKGBUILD must live at {}: {error}", path.display())
         });
         (path, text)
+    }
+
+    /// The lines strictly between the line `opener` and the next line equal to
+    /// `closer` in a `PKGBUILD`, verbatim.
+    ///
+    /// Both PKGBUILDs are written so that every multi-line block can be found
+    /// this way: an array is opened by `name=(` and closed by a `)` line, and a
+    /// function is opened by `name() {` and closed by a `}` at column 0 (the
+    /// bodies are indented, so an inner `}` never matches). The opener must
+    /// appear exactly once: a second definition of a function or array would
+    /// silently replace the first when makepkg sources the file, so checking
+    /// the first one would miss the definition that takes effect.
+    fn pkgbuild_block<'a>(
+        path: &std::path::Path,
+        pkgbuild: &'a str,
+        opener: &str,
+        closer: &str,
+    ) -> Vec<&'a str> {
+        let path = path.display();
+        let openers = pkgbuild.lines().filter(|line| *line == opener).count();
+        assert_eq!(
+            openers, 1,
+            "{path} must contain the line `{opener}` exactly once"
+        );
+        let mut body = Vec::new();
+        for line in pkgbuild.lines().skip_while(|line| *line != opener).skip(1) {
+            if line == closer {
+                return body;
+            }
+            body.push(line);
+        }
+        panic!("{path}: the block opened by `{opener}` is never closed by `{closer}`")
+    }
+
+    /// The entries of the one-entry-per-line array `name=(` … `)`, verbatim.
+    fn pkgbuild_array<'a>(path: &std::path::Path, pkgbuild: &'a str, name: &str) -> Vec<&'a str> {
+        pkgbuild_block(path, pkgbuild, &format!("{name}=("), ")")
+    }
+
+    /// The body of the function `name() {` … `}`, verbatim.
+    fn pkgbuild_function<'a>(
+        path: &std::path::Path,
+        pkgbuild: &'a str,
+        name: &str,
+    ) -> Vec<&'a str> {
+        pkgbuild_block(path, pkgbuild, &format!("{name}() {{"), "}")
+    }
+
+    /// The lines of a `PKGBUILD` that assign the variable `name`, such as
+    /// `pkgver=0` for `pkgver`.
+    fn pkgbuild_assignments<'a>(pkgbuild: &'a str, name: &str) -> Vec<&'a str> {
+        let prefix = format!("{name}=");
+        pkgbuild
+            .lines()
+            .filter(|line| line.starts_with(&prefix))
+            .collect()
+    }
+
+    /// Asserts that a `PKGBUILD` carries the project URL and the license from
+    /// the Cargo metadata. A `PKGBUILD` is a shell file that cannot read
+    /// Cargo.toml, so it keeps its own copies; this keeps them equal.
+    fn assert_pkgbuild_follows_cargo_metadata(path: &std::path::Path, pkgbuild: &str) {
+        let path = path.display();
+        let expected = format!("url='{}'", env!("CARGO_PKG_REPOSITORY"));
+        assert!(
+            pkgbuild.lines().any(|line| line == expected),
+            "{path} must contain the line `{expected}` (Cargo.toml `repository`)"
+        );
+        let expected = format!("license=({})", env!("CARGO_PKG_LICENSE"));
+        assert!(
+            pkgbuild.lines().any(|line| line == expected),
+            "{path} must contain the line `{expected}` (Cargo.toml `license`)"
+        );
     }
 
     /// The Arch package providing a detected tool, or `None` for a tool that
@@ -352,19 +439,9 @@ mod tests {
         // Cargo metadata, so it carries its own copies of the project URL and
         // the license, and its own list of the optional tools the app detects
         // (R4). This guard keeps each copy equal to its source of truth.
-        let (path, pkgbuild) = read_arch_pkgbuild();
-        let path = path.display();
-
-        let expected = format!("url='{}'", env!("CARGO_PKG_REPOSITORY"));
-        assert!(
-            pkgbuild.lines().any(|line| line == expected),
-            "{path} must contain the line `{expected}` (Cargo.toml `repository`)"
-        );
-        let expected = format!("license=({})", env!("CARGO_PKG_LICENSE"));
-        assert!(
-            pkgbuild.lines().any(|line| line == expected),
-            "{path} must contain the line `{expected}` (Cargo.toml `license`)"
-        );
+        let (path_buf, pkgbuild) = read_arch_pkgbuild(VCS_PACKAGE);
+        assert_pkgbuild_follows_cargo_metadata(&path_buf, &pkgbuild);
+        let path = path_buf.display();
 
         // R8.6: Cargo.toml is the single version source. makepkg refuses a
         // PKGBUILD without a non-empty `pkgver=` line, so the file carries the
@@ -372,12 +449,8 @@ mod tests {
         // rewrites the placeholder with the computed version on every build, and
         // that rewritten line must not be committed (it would be a second,
         // soon-stale version literal).
-        let pkgver_lines: Vec<&str> = pkgbuild
-            .lines()
-            .filter(|line| line.starts_with("pkgver="))
-            .collect();
         assert_eq!(
-            pkgver_lines,
+            pkgbuild_assignments(&pkgbuild, "pkgver"),
             ["pkgver=0"],
             "{path} must carry only the placeholder `pkgver=0`; if makepkg rewrote \
              it during a local build, discard that change with `git restore`"
@@ -403,11 +476,8 @@ mod tests {
 
         // Every `optdepends` entry is a `'package: reason'` line between
         // `optdepends=(` and the closing `)`.
-        let optdepends: Vec<(&str, &str)> = pkgbuild
-            .lines()
-            .skip_while(|line| *line != "optdepends=(")
-            .skip(1)
-            .take_while(|line| *line != ")")
+        let optdepends: Vec<(&str, &str)> = pkgbuild_array(&path_buf, &pkgbuild, "optdepends")
+            .into_iter()
             .map(|line| {
                 let entry = line.trim().trim_matches('\'');
                 entry.split_once(": ").unwrap_or_else(|| {
@@ -434,6 +504,111 @@ mod tests {
                 "{path} must list `{package}` in optdepends: it provides `{}`, \
                  which the app detects at startup",
                 binary.command_name()
+            );
+        }
+    }
+
+    #[test]
+    fn arch_release_pkgbuild_builds_the_tag_of_the_cargo_version() {
+        // Task 12.5 (R8.6, R8.7): the release package builds the annotated git
+        // tag `v<version>`, so unlike the -git package it must name its version
+        // as a literal. Cargo.toml stays the single version source: this guard
+        // fails as soon as the two disagree, so a release commit cannot bump
+        // one without the other (docs/releasing.md lists the steps).
+        let (path_buf, pkgbuild) = read_arch_pkgbuild(RELEASE_PACKAGE);
+        assert_pkgbuild_follows_cargo_metadata(&path_buf, &pkgbuild);
+        let path = path_buf.display();
+
+        let version = env!("CARGO_PKG_VERSION");
+        assert_eq!(
+            pkgbuild_assignments(&pkgbuild, "pkgver"),
+            [format!("pkgver={version}")],
+            "{path} must carry exactly one `pkgver=` line, equal to the version \
+             in Cargo.toml"
+        );
+        // A pkgver() function would replace the literal with a computed
+        // version after the checkout, so the package could build one version
+        // and be labelled with another.
+        assert!(
+            !pkgbuild.lines().any(|line| line.starts_with("pkgver()")),
+            "{path} must not define a pkgver() function: the version selects the tag"
+        );
+        let pkgrel = pkgbuild_assignments(&pkgbuild, "pkgrel");
+        assert!(
+            matches!(
+                pkgrel.as_slice(),
+                [line] if line
+                    .strip_prefix("pkgrel=")
+                    .and_then(|number| number.parse::<u32>().ok())
+                    .is_some_and(|number| number >= 1)
+            ),
+            "{path} must carry exactly one `pkgrel=` line with a positive integer, \
+             got {pkgrel:?}"
+        );
+
+        // The source is the project's own repository, pinned to the tag that
+        // `pkgver` names; makepkg expands `$pkgver` when it reads the array.
+        let sources = pkgbuild_assignments(&pkgbuild, "source");
+        let [source] = sources.as_slice() else {
+            panic!("{path} must carry exactly one `source=` line, got {sources:?}");
+        };
+        let repository = format!("git+{}.git", env!("CARGO_PKG_REPOSITORY"));
+        assert!(
+            source.contains(&repository) && source.contains("#tag=v$pkgver\""),
+            "{path}: `{source}` must clone `{repository}` at `#tag=v$pkgver`"
+        );
+    }
+
+    #[test]
+    fn arch_release_and_vcs_pkgbuilds_build_and_install_identically() {
+        // Task 12.5: the two Arch packages differ only in where the source comes
+        // from (a tag versus the latest commit) and in how the version is
+        // found. A PKGBUILD cannot source a shared file, so the build steps and
+        // the dependency lists are duplicated; this guard keeps the copies
+        // byte-identical, so a fix made in one package cannot be forgotten in
+        // the other. The source directory differs by necessity and is read
+        // through the `_srcdir` variable, which keeps the function bodies equal.
+        let (vcs_path, vcs) = read_arch_pkgbuild(VCS_PACKAGE);
+        let (release_path, release) = read_arch_pkgbuild(RELEASE_PACKAGE);
+        let (vcs_name, release_name) = (vcs_path.display(), release_path.display());
+
+        // The function bodies only stay equivalent while each file defines the
+        // clone directory once and clones its source into it: with the
+        // `_srcdir=` line deleted, `cd "$_srcdir"` would still compare equal
+        // here but, as `cd ""`, stay in makepkg's `$srcdir` at build time.
+        for (path, pkgbuild) in [(&vcs_path, &vcs), (&release_path, &release)] {
+            let path = path.display();
+            let srcdirs = pkgbuild_assignments(pkgbuild, "_srcdir");
+            assert_eq!(
+                srcdirs.len(),
+                1,
+                "{path} must assign `_srcdir=` exactly once, got {srcdirs:?}"
+            );
+            let sources = pkgbuild_assignments(pkgbuild, "source");
+            assert!(
+                matches!(sources.as_slice(), [source] if source.starts_with("source=(\"$_srcdir::")),
+                "{path} must carry one `source=` line cloning into `$_srcdir`, got {sources:?}"
+            );
+        }
+        for name in ["pkgdesc", "arch", "_app_id"] {
+            assert_eq!(
+                pkgbuild_assignments(&release, name),
+                pkgbuild_assignments(&vcs, name),
+                "`{name}=` must be identical in {release_name} and {vcs_name}"
+            );
+        }
+        for name in ["depends", "makedepends", "optdepends"] {
+            assert_eq!(
+                pkgbuild_array(&release_path, &release, name),
+                pkgbuild_array(&vcs_path, &vcs, name),
+                "the `{name}` array must be identical in {release_name} and {vcs_name}"
+            );
+        }
+        for name in ["prepare", "build", "check", "package"] {
+            assert_eq!(
+                pkgbuild_function(&release_path, &release, name),
+                pkgbuild_function(&vcs_path, &vcs, name),
+                "the body of `{name}()` must be identical in {release_name} and {vcs_name}"
             );
         }
     }

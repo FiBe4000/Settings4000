@@ -94,6 +94,13 @@ There are two install paths: an Arch Linux package, and a per-user script for
 everything else. **Do not mix them** — see the warning at the end of this
 section.
 
+The Arch commands below build the latest commit of `main`. To install the
+latest tagged release instead, run `makepkg -si` in
+`packaging/arch/settings4000/` and remove it with `pacman -R settings4000`;
+the `_repo` override and the `git restore` advice below apply only to the
+`-git` package. How releases are made is described in
+[`docs/releasing.md`](docs/releasing.md).
+
 ### Arch Linux: the `settings4000-git` package
 
 ```sh
@@ -237,6 +244,7 @@ until they land those parts of the app keep their earlier behaviour.
 - `docs/benchmarks.md` — startup-time benchmark procedure and recorded values.
 - `docs/logging_audit.md` — the R7.3 logging-coverage audit with a real
   journal walkthrough.
+- `docs/releasing.md` — the versioning policy and the release checklist.
 
 ## License
 

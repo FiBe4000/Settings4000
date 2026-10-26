@@ -6,18 +6,24 @@
 # *any* of the three gates fails, which is exactly the acceptance criterion for
 # task 1.4.
 #
-# The `arch-package` job (task 12.3, requirement R8.7) builds the Arch Linux
-# package from packaging/arch/settings4000-git/ on Arch itself, so a PKGBUILD
-# that no longer builds, a stale .SRCINFO, or a namcap error turns the run red.
-# The two jobs are independent and run in parallel.
+# The `arch-package` job (tasks 12.3 and 12.5, requirement R8.7) builds both
+# Arch Linux packages on Arch itself — the VCS package in
+# packaging/arch/settings4000-git/ and the release package in
+# packaging/arch/settings4000/ — so a PKGBUILD that no longer builds, a stale
+# .SRCINFO, or a namcap error turns the run red. On a release tag it also
+# checks that the tag names the version in Cargo.toml. The jobs are independent
+# and run in parallel.
 name: CI
 
 # Gate every push to the default branch and every pull request. This is the
 # authoritative pre-merge check; the optional local hook in `.githooks/`
-# mirrors it for faster feedback before pushing.
+# mirrors it for faster feedback before pushing. Pushing a release tag
+# (`v<version>`, see docs/releasing.md) runs the same checks on the tagged
+# commit, plus the tag/version check in `arch-package`.
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 # Least-privilege token: both jobs only read the repository to build and test
@@ -80,13 +86,26 @@ jobs:
         run: cargo test
 
   arch-package:
-    name: Arch package
+    name: Arch package (${{ matrix.package }})
     runs-on: ubuntu-latest
     # makepkg, pacman and namcap only exist on Arch Linux, and the package must
     # be built against Arch's own gtk4 and Rust, so the job runs inside the
     # official Arch image on the Ubuntu runner. Every `run:` step below executes
     # in that container, as root.
     container: archlinux:latest
+    strategy:
+      # Each package is built in its own run of this job. They share every
+      # step; only the directory, the built package's name and the source of
+      # the build (see the makepkg step) differ. fail-fast is off so a failure
+      # in one package does not cancel the other's build, whose result is
+      # still worth seeing.
+      fail-fast: false
+      matrix:
+        package: [settings4000-git, settings4000]
+    env:
+      # The package name, passed to the scripts through the environment rather
+      # than expanded into their text by the workflow engine.
+      PACKAGE: ${{ matrix.package }}
     defaults:
       run:
         # Fail on the first failing command, on a failure anywhere in a
@@ -94,7 +113,7 @@ jobs:
         # unset variable. GitHub's `shell: bash` is the same without `-u`; it
         # is spelled out because the steps rely on all three.
         shell: bash --noprofile --norc -euo pipefail {0}
-        working-directory: packaging/arch/settings4000-git
+        working-directory: packaging/arch/${{ matrix.package }}
     steps:
       - name: Install the build tools
         # Must run before the checkout: the Arch image ships without git, and
@@ -118,6 +137,26 @@ jobs:
           # `git rev-list --count HEAD`, which a shallow clone would report as 1,
           # and makepkg's clone of this checkout would be shallow as well.
           fetch-depth: 0
+
+      - name: Check that the release tag matches the version
+        # Only on a tag push. A release tag `v<version>` must name exactly the
+        # version in Cargo.toml (read with the same sed as the -git package's
+        # pkgver()) and in the release package's `pkgver=`; otherwise the tag
+        # was put on the wrong commit or the version bump is incomplete. The
+        # unit tests already keep Cargo.toml and `pkgver=` equal to each other,
+        # so this step mainly guards the tag itself.
+        if: github.ref_type == 'tag'
+        working-directory: .
+        run: |
+          tag_version=${GITHUB_REF_NAME#v}
+          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
+          pkgbuild_version=$(sed -n 's/^pkgver=//p' packaging/arch/settings4000/PKGBUILD)
+          printf 'tag %s, Cargo.toml %s, release PKGBUILD %s\n' \
+            "$GITHUB_REF_NAME" "$cargo_version" "$pkgbuild_version"
+          if [[ $tag_version != "$cargo_version" || $tag_version != "$pkgbuild_version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $cargo_version in Cargo.toml and $pkgbuild_version in the release PKGBUILD"
+            exit 1
+          fi
 
       - name: Create the unprivileged build user
         # makepkg refuses to run as root (it would let a PKGBUILD's package()
@@ -150,10 +189,10 @@ jobs:
           printf 'Installing: %s\n' "${deps[*]}"
           pacman -S --noconfirm --needed "${deps[@]}"
 
-      # The checks below run in this order on purpose: a build rewrites the
-      # PKGBUILD's `pkgver=0` placeholder with the computed version, so the
-      # .SRCINFO comparison and the PKGBUILD lint must see the committed file
-      # and therefore run before the build.
+      # The checks below run in this order on purpose: a build of the -git
+      # package rewrites the PKGBUILD's `pkgver=0` placeholder with the
+      # computed version, so the .SRCINFO comparison and the PKGBUILD lint must
+      # see the committed file and therefore run before the build.
       - name: Check that .SRCINFO matches the PKGBUILD
         # .SRCINFO is generated by `makepkg --printsrcinfo` and committed beside
         # the PKGBUILD; diff exits non-zero and prints the difference when
@@ -173,13 +212,31 @@ jobs:
 
       - name: Build and test the package with makepkg
         # The full build, including check() and therefore the whole test suite.
-        # `_repo` points the git source at this checkout instead of GitHub, so
-        # the commit under test is the one built, not the tip of main (the
-        # PKGBUILD header documents the override). makepkg mirrors the
-        # repository and builds its HEAD; on pull requests actions/checkout
-        # leaves a detached HEAD at the merge commit, and that clone simply
-        # checks out the same detached commit, so pkgver() still works.
-        run: runuser -u builder -- env _repo="file://$GITHUB_WORKSPACE" makepkg --noconfirm
+        #
+        # -git package: `_repo` points the git source at this checkout instead
+        # of GitHub, so the commit under test is the one built, not the tip of
+        # main (the PKGBUILD header documents the override). makepkg mirrors
+        # the repository and builds its HEAD; on pull requests
+        # actions/checkout leaves a detached HEAD at the merge commit, and that
+        # clone simply checks out the same detached commit, so pkgver() still
+        # works.
+        #
+        # Release package: it has no such override and clones the tag
+        # `v<pkgver>` from GitHub, exactly as a user's build does, so this
+        # proves the published release builds. The tag must therefore already
+        # be on GitHub whenever this runs — on a `main` push too, not only on
+        # the tag push. That is why a release commit (which changes `pkgver=`)
+        # and its tag are pushed together in one `git push --follow-tags`
+        # (docs/releasing.md): pushed without its tag, or before the first tag
+        # existed, the release commit fails here. A pull request that bumps
+        # the version fails here for the same reason, so releases are made on
+        # `main` directly.
+        run: |
+          build_env=()
+          if [[ $PACKAGE == *-git ]]; then
+            build_env=(_repo="file://$GITHUB_WORKSPACE")
+          fi
+          runuser -u builder -- env "${build_env[@]}" makepkg --noconfirm
 
       - name: Lint the built package with namcap
         # Arch's default makepkg.conf also produces a `-debug` package of
@@ -195,7 +252,7 @@ jobs:
         # or, if it is a false positive, added to the allow-list below.
         run: |
           shopt -s nullglob
-          packages=(settings4000-git-[0-9]*.pkg.tar.zst)
+          packages=("$PACKAGE"-[0-9]*.pkg.tar.zst)
           if (( ${#packages[@]} != 1 )); then
             echo "::error::expected one built package, found: ${packages[*]:-none}"
             exit 1
@@ -215,7 +272,7 @@ jobs:
         # own rather than relying on that step's check.
         run: |
           shopt -s nullglob
-          packages=(settings4000-git-[0-9]*.pkg.tar.zst)
+          packages=("$PACKAGE"-[0-9]*.pkg.tar.zst)
           if (( ${#packages[@]} != 1 )); then
             echo "::error::expected one built package, found: ${packages[*]:-none}"
             exit 1
@@ -228,7 +285,7 @@ jobs:
             usr/bin/settings4000 \
             usr/share/applications/org.settings4000.Settings4000.desktop \
             usr/share/icons/hicolor/scalable/apps/org.settings4000.Settings4000.svg \
-            usr/share/licenses/settings4000-git/LICENSE; do
+            "usr/share/licenses/$PACKAGE/LICENSE"; do
             if ! grep -qxF "$file" <<<"$contents"; then
               echo "::error::$package does not contain $file"
               status=1

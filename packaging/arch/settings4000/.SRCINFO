@@ -1,0 +1,31 @@
+pkgbase = settings4000
+	pkgdesc = Native GTK 4 settings GUI for a dotfiles-managed Hyprland desktop
+	pkgver = 1.1.0
+	pkgrel = 1
+	url = https://github.com/FiBe4000/Settings4000
+	arch = x86_64
+	license = MIT
+	makedepends = cargo
+	makedepends = git
+	depends = cairo
+	depends = glib2
+	depends = glibc
+	depends = gtk4
+	depends = hicolor-icon-theme
+	depends = libgcc
+	optdepends = hyprland: hyprctl for live reloads and the Display, Input and cursor settings
+	optdepends = hyprpaper: Wallpaper settings
+	optdepends = hypridle: Power & Idle page
+	optdepends = hyprlock: lock-screen background setting
+	optdepends = wireplumber: wpctl for the Sound page
+	optdepends = pipewire: pw-dump for the Sound page device list
+	optdepends = libpulse: pactl, detected as a Sound backend (no current setting needs it)
+	optdepends = eww: reload the status bars after theme, wallpaper and display changes
+	optdepends = kitty: recolor terminals on a palette change and run nmtui for networks
+	optdepends = networkmanager: nmcli for the Network page
+	optdepends = nm-connection-editor: preferred editor behind "Open Network Settings"
+	optdepends = dconf: live restyling of running GTK apps after a theme change
+	source = settings4000-1.1.0::git+https://github.com/FiBe4000/Settings4000.git#tag=v1.1.0
+	sha256sums = SKIP
+
+pkgname = settings4000

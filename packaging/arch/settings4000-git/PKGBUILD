@@ -5,7 +5,9 @@
 # This is the VCS ("-git") variant: it builds the latest commit of the project's
 # git repository rather than a tagged release, and installs the same three
 # artifacts the per-user install.sh does (binary, desktop entry, icon), plus the
-# license, under /usr instead of ~/.local.
+# license, under /usr instead of ~/.local. The release package in
+# packaging/arch/settings4000/ builds a tagged release instead; the two
+# conflict, so install one or the other.
 #
 # Build and install from this directory:
 #
@@ -96,15 +98,19 @@ optdepends=(
 )
 provides=("$_pkgbase=$pkgver")
 conflicts=("$_pkgbase")
-# `_repo` is an optional override for building a local clone (see the header);
-# the clone directory is named after the upstream package, not after $pkgver,
-# because pkgver() changes $pkgver after the source has been extracted.
-source=("$_pkgbase::git+${_repo:-https://github.com/FiBe4000/Settings4000.git}")
+# The directory makepkg clones the source into. It is named after the upstream
+# package, not after $pkgver, because pkgver() changes $pkgver after the source
+# has been extracted. The build functions below only ever refer to it through
+# this variable, which keeps them byte-identical to the release package's in
+# packaging/arch/settings4000/ (a guard test in src/ui/app.rs compares them).
+_srcdir=$_pkgbase
+# `_repo` is an optional override for building a local clone (see the header).
+source=("$_srcdir::git+${_repo:-https://github.com/FiBe4000/Settings4000.git}")
 # A git source has no fixed content to checksum.
 sha256sums=('SKIP')
 
 pkgver() {
-  cd "$_pkgbase"
+  cd "$_srcdir"
   # The only line in Cargo.toml that starts with `version = ` is the [package]
   # version (dependencies declare theirs inline), so this yields exactly one.
   local version
@@ -118,7 +124,7 @@ pkgver() {
 }
 
 prepare() {
-  cd "$_pkgbase"
+  cd "$_srcdir"
   # Pin the toolchain so a user's rustup default (for example nightly) cannot
   # change the build, then download every dependency in Cargo.lock for the host
   # target only, so build() and check() run offline against exactly the
@@ -128,7 +134,7 @@ prepare() {
 }
 
 build() {
-  cd "$_pkgbase"
+  cd "$_srcdir"
   export RUSTUP_TOOLCHAIN=stable
   # A user-wide CARGO_TARGET_DIR would put the binary where package() does not
   # look. No --all-features: the crate's only feature, `testing`, compiles test
@@ -138,7 +144,7 @@ build() {
 }
 
 check() {
-  cd "$_pkgbase"
+  cd "$_srcdir"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   # Every test suite is headless (R6.2), so this needs no display. Tests run in
@@ -149,7 +155,7 @@ check() {
 }
 
 package() {
-  cd "$_pkgbase"
+  cd "$_srcdir"
   install -Dm755 target/release/settings4000 -t "$pkgdir/usr/bin/"
   # Installed verbatim: its `Exec=settings4000` resolves through PATH to
   # /usr/bin, so the rewrite install.sh performs for ~/.local/bin is not needed.
