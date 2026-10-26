@@ -29,6 +29,10 @@ cargo test <name>                # single test by substring
 cargo test --test <file>         # one integration test file in tests/
 cargo fmt --check                # CI gate
 cargo clippy -- -D warnings      # CI gate (warnings are errors)
+
+# Arch package, run in packaging/arch/settings4000-git/:
+makepkg --printsrcinfo > .SRCINFO                            # whenever the PKGBUILD changes
+_repo="file://$(git rev-parse --show-toplevel)" makepkg -si  # build + install the local clone's committed HEAD
 ```
 
 The pre-commit / CI gate is exactly these three: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`. Logs go to journald: `journalctl --user -t settings4000`.
@@ -79,3 +83,5 @@ These are the constraints that are easy to violate and expensive to get wrong. R
 ## Non-functionals to respect
 
 Cold start < 500 ms (R8.1); no root, user files only under `~/.dotfiles`/`~/.config` (R8.2); never break a working desktop — validate all staged values (hex, `WxH@Hz`, ranges, existing/readable image paths, per-writer forbidden characters) before any write (R8.3); single instance via fixed GApplication ID (R8.4); one version source in `Cargo.toml` (R8.6). Guard tests to keep green besides the unit suites: `tests/module_boundaries.rs` (no `gtk`/`glib` in `core/`, `parsers/` or `core/load/`), `tests/no_custom_css.rs`, `tests/page_entry_deferral.rs` (building a page spawns nothing), and the fixture-tree Apply suites. **Never run anything against the live session while developing:** no `hyprctl`, `eww`, `generate-colors`, the toggle script, the real `~/.config` or the `~/.dotfiles` working tree — tests use the fixture tree and `MockCommandRunner`, and dotfiles facts are read with `git -C ~/.dotfiles show <commit>:<path>`.
+
+- **Packaging (R8.7).** The Arch package lives in `packaging/arch/settings4000-git/PKGBUILD`, never at the repo root (makepkg creates `src/` beside the `PKGBUILD`, which would collide with the Rust tree). Its `pkgver()` reads the version from `Cargo.toml` (R8.6); the `pkgver=0` line is only makepkg's required placeholder, which makepkg rewrites after every build — `git restore` it after a local build, never commit the rewrite. The app id, `url`, `license`, the placeholder and the `optdepends` (the package of every `core::detect::Binary` that is not already a dependency) are pinned by guard tests in `src/ui/app.rs`. The `arch-package` CI job (`.github/workflows/ci.yml`) also fails when `.SRCINFO` is stale and on any `namcap` warning not in its allow-list.

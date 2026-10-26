@@ -71,6 +71,12 @@ module-boundary and no-custom-CSS guards). The `testing` cargo feature — the
 fixture installer and mock seams — is enabled for test targets automatically
 via a self-referential dev-dependency, so no extra flags are needed.
 
+GitHub Actions runs that gate on every push to `main` and every pull request,
+and a second job builds the Arch package (below) in an `archlinux:latest`
+container — checking that `.SRCINFO` is current, running the full test suite in
+the package's `check()`, and failing on any `namcap` warning outside its
+allow-list.
+
 A pre-commit hook mirroring the gate ships in `.githooks/pre-commit`; opt in
 with `git config core.hooksPath .githooks`.
 
@@ -83,6 +89,70 @@ Two documented runtime checks beyond the test suite:
   500 ms cold-start budget (the binary logs a `first frame painted … ms` mark).
 
 ## Install
+
+There are two install paths: an Arch Linux package, and a per-user script for
+everything else. **Do not mix them** — see the warning at the end of this
+section.
+
+### Arch Linux: the `settings4000-git` package
+
+```sh
+cd packaging/arch/settings4000-git
+makepkg -si          # builds the committed tip of main from GitHub and installs it
+pacman -R settings4000-git   # as root: removes the package again
+```
+
+`makepkg -s` installs the build dependencies (`cargo`, `git`) and the runtime
+dependencies with pacman, and `-i` installs the built package. The package
+installs four files:
+
+- `/usr/bin/settings4000` — the binary;
+- `/usr/share/applications/org.settings4000.Settings4000.desktop` — the
+  desktop entry, verbatim from `data/`;
+- `/usr/share/icons/hicolor/scalable/apps/org.settings4000.Settings4000.svg` —
+  the icon;
+- `/usr/share/licenses/settings4000-git/LICENSE` — the MIT license text.
+
+The external tools the app drives (`hyprland`, `hyprpaper`, `hypridle`,
+`hyprlock`, `wireplumber`, `pipewire`, `libpulse`, `eww`, `kitty`,
+`networkmanager`, `nm-connection-editor`, `dconf`) are recorded as
+`optdepends`, not `depends`: the app detects each one at startup and hides the
+settings that need a missing tool instead of failing (R4), so none of them is
+required to install or start it. `pacman -Qi settings4000-git` lists them with
+what each one enables.
+
+To package your local clone instead of GitHub's `main`, override the source
+repository:
+
+```sh
+cd packaging/arch/settings4000-git
+_repo="file://$(git rev-parse --show-toplevel)" makepkg -si
+```
+
+This builds the local clone's *committed* `HEAD`; uncommitted changes in the
+working tree are not included. makepkg keeps its clone in
+`packaging/arch/settings4000-git/settings4000/` and only fetches into it on
+later runs, so delete that directory when switching between the GitHub and the
+local source, or between branches.
+
+Two things to know when building:
+
+- **Restore the PKGBUILD afterwards.** The version comes from `Cargo.toml`
+  through the PKGBUILD's `pkgver()` function; the committed `pkgver=0` line is
+  only the placeholder makepkg requires, and makepkg rewrites it in place with
+  the computed version after every build. That edit is build output, not a
+  change to commit: discard it with
+  `git restore packaging/arch/settings4000-git/PKGBUILD`. Until you do, a guard
+  test in `cargo test` fails.
+- **A rustup toolchain outside pacman.** If your `cargo` comes from a rustup
+  install made outside pacman (for example the rustup.rs script) rather than
+  pacman's `rust` package, pacman does not know about it, so makepkg treats the
+  `cargo` build dependency as missing. Either install the `rust` package, or
+  build with `makepkg -i --nodeps`, which skips makepkg's dependency checks
+  (pacman still resolves the runtime dependencies when it installs the
+  package).
+
+### Any distribution, no root: `install.sh`
 
 ```sh
 ./install.sh              # build --release and install for the current user
@@ -97,6 +167,15 @@ No root. The script installs three files: the binary to
 launchable from rofi/wofi-style launchers; the app is single-instance (fixed
 GApplication ID `org.settings4000.Settings4000`), so relaunching it activates
 the existing window instead of starting a second process.
+
+### Do not mix the two
+
+Both paths install a desktop entry with the same name, and a per-user entry
+under `~/.local/share/applications` shadows the system one in
+`/usr/share/applications` — the launcher would start the `~/.local/bin` copy
+even after the package is installed. Run `./install.sh --uninstall` before
+installing the package, and `pacman -R settings4000-git` before using
+`install.sh`.
 
 ## Logging
 
