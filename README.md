@@ -158,3 +158,7 @@ until they land those parts of the app keep their earlier behaviour.
 - `docs/benchmarks.md` — startup-time benchmark procedure and recorded values.
 - `docs/logging_audit.md` — the R7.3 logging-coverage audit with a real
   journal walkthrough.
+
+## License
+
+Settings4000 is released under the MIT License; see [`LICENSE`](LICENSE).

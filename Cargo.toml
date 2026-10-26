@@ -13,6 +13,10 @@ description = "Native GTK4 settings GUI for a dotfiles-managed Hyprland desktop"
 # `CARGO_PKG_REPOSITORY`; a unit test in src/ui/app.rs keeps both non-empty.
 authors = ["FiBe4000"]
 repository = "https://github.com/FiBe4000/Settings4000"
+# The SPDX license identifier, read as `CARGO_PKG_LICENSE` by the About window and
+# by the guard tests in src/ui/app.rs, which keep it set and (task 12.2) equal to
+# the Arch `PKGBUILD`'s `license=`. The full license text lives in `LICENSE`.
+license = "MIT"
 
 [features]
 # Compiles the crate's test-support surface — the fixture-dotfiles installer

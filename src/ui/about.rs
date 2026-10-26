@@ -76,6 +76,10 @@ pub(crate) struct AboutInfo {
     /// The project's repository URL from `Cargo.toml` (`CARGO_PKG_REPOSITORY`); the
     /// window's link opens it.
     pub(crate) repository: &'static str,
+    /// The SPDX license identifier from `Cargo.toml` (`CARGO_PKG_LICENSE`), e.g.
+    /// `MIT`; shown on the version line. Task 12.1's guard test in `super::app`
+    /// keeps the key set, so it never renders blank.
+    pub(crate) license: &'static str,
     /// The icon name to look up in the icon theme. It is the GApplication ID because
     /// that is the name the installer gives the icon file
     /// (`hicolor/scalable/apps/<app-id>.svg`) and the name the desktop entry's `Icon=`
@@ -98,6 +102,7 @@ impl AboutInfo {
             version: env!("CARGO_PKG_VERSION"),
             authors: format_authors(env!("CARGO_PKG_AUTHORS")),
             repository: env!("CARGO_PKG_REPOSITORY"),
+            license: env!("CARGO_PKG_LICENSE"),
             icon_name: APP_ID,
         }
     }
@@ -112,9 +117,12 @@ impl AboutInfo {
         self.menu_label()
     }
 
-    /// The version line shown under the name, e.g. "Version 1.0.0".
+    /// The version line shown under the name, e.g. "Version 1.0.0 · MIT License".
+    ///
+    /// The license rides on this line rather than getting a row of its own so the
+    /// window gains no widget for it.
     pub(crate) fn version_line(&self) -> String {
-        format!("Version {}", self.version)
+        format!("Version {} · {} License", self.version, self.license)
     }
 
     /// The author line, e.g. "Created by FiBe4000".
@@ -150,9 +158,9 @@ pub(crate) fn menu_model(info: &AboutInfo) -> gio::Menu {
 /// Shows the About window, modal over and transient for `parent` (R2.5).
 ///
 /// Layout, top to bottom, all centred: the application icon, the name as a bold
-/// heading, the version, the author line, and a [`LinkButton`] to the repository. The
-/// window is closed from its own title bar's close button or with Escape; it is
-/// destroyed with its parent, so it can never outlive the main window.
+/// heading, the version and license, the author line, and a [`LinkButton`] to the
+/// repository. The window is closed from its own title bar's close button or with
+/// Escape; it is destroyed with its parent, so it can never outlive the main window.
 ///
 /// # The icon
 ///
@@ -245,6 +253,7 @@ mod tests {
         let info = AboutInfo::from_cargo();
         assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(info.repository, env!("CARGO_PKG_REPOSITORY"));
+        assert_eq!(info.license, env!("CARGO_PKG_LICENSE"));
         assert!(
             info.repository
                 .starts_with("https://github.com/FiBe4000/Settings4000"),
@@ -288,7 +297,11 @@ mod tests {
         assert_eq!(info.window_title(), info.menu_label());
         assert_eq!(
             info.version_line(),
-            format!("Version {}", env!("CARGO_PKG_VERSION"))
+            format!(
+                "Version {} · {} License",
+                env!("CARGO_PKG_VERSION"),
+                env!("CARGO_PKG_LICENSE")
+            )
         );
         assert_eq!(info.authors_line(), format!("Created by {}", info.authors));
     }

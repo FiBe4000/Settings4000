@@ -347,6 +347,39 @@ mod tests {
     }
 
     #[test]
+    fn crate_declares_the_mit_license_and_ships_its_text() {
+        // Task 12.1 (R8.7): the project is MIT-licensed. A distribution package
+        // must declare its license, and Arch's `licenses` package does not carry
+        // the MIT text, so the Arch `PKGBUILD` (task 12.2) both declares the SPDX
+        // identifier from Cargo.toml and installs the `LICENSE` file from the
+        // repository root. Cargo silently expands a missing `license` key to an
+        // empty string, so without this guard deleting the key, or the file, would
+        // still compile and only surface as a package without a license.
+        assert_eq!(
+            env!("CARGO_PKG_LICENSE"),
+            "MIT",
+            "Cargo.toml must declare `license = \"MIT\"`"
+        );
+
+        let license_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("LICENSE");
+        let license = std::fs::read_to_string(&license_path).unwrap_or_else(|error| {
+            panic!(
+                "the license text must live at {}: {error}",
+                license_path.display()
+            )
+        });
+        // The SPDX "MIT" text opens with this title line; the copyright holder is
+        // the GitHub handle, the same one `authors` carries, never a real name.
+        for expected in ["MIT License", "Copyright (c) 2026 FiBe4000"] {
+            assert!(
+                license.lines().any(|line| line.trim() == expected),
+                "{} must contain the line `{expected}`",
+                license_path.display()
+            );
+        }
+    }
+
+    #[test]
     fn app_id_is_a_valid_gapplication_id() {
         // Single-instance activation (R8.4) depends on registering this exact ID
         // on the session bus; an invalid ID would make registration fail at
