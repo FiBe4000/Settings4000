@@ -41,7 +41,10 @@ use wait_timeout::ChildExt;
 /// `busctl`, `gsettings`) while still guaranteeing that a wedged or
 /// interactively-blocked process can never stall Apply or startup. The value is
 /// fixed for production; tests may construct a [`SystemCommandRunner`] with a
-/// shorter limit to exercise the timeout path quickly.
+/// shorter limit to exercise the timeout path quickly. A single command that is
+/// known to need longer — the notification-centre script, which waits for the eww
+/// daemon (task 13.1) — carries its own limit ([`Command::with_timeout`]), which
+/// the runner uses instead.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Upper bound, in bytes, on how much of a command's captured stderr is ever
@@ -77,7 +80,8 @@ pub const STDERR_EXCERPT_LIMIT: usize = 512;
 /// --fork …` launcher) is marked [`detached`](Command::detached); see that method
 /// for what changes. The flag participates in equality, so a
 /// [`MockCommandRunner`] assertion on the recorded commands also verifies that a
-/// launch really was detached.
+/// launch really was detached. The same holds for a command's own timeout
+/// ([`Command::with_timeout`]).
 ///
 /// The type deliberately shares its short name with [`std::process::Command`];
 /// within this crate it refers to this value type, and the standard library's
@@ -93,6 +97,10 @@ pub struct Command {
     /// [`Command::detached`]): output streams are discarded instead of captured,
     /// so the runner never waits on anything the direct child hands its pipes to.
     detached: bool,
+    /// The wall-clock limit for this command, replacing the runner's own
+    /// ([`DEFAULT_TIMEOUT`] in production) — `None` for every command but the few
+    /// that are known to need a different bound (see [`Command::with_timeout`]).
+    timeout: Option<Duration>,
 }
 
 impl Command {
@@ -105,6 +113,7 @@ impl Command {
             program: program.into(),
             args: Vec::new(),
             detached: false,
+            timeout: None,
         }
     }
 
@@ -160,6 +169,29 @@ impl Command {
     /// Whether this command is a detached launch (see [`Command::detached`]).
     pub fn is_detached(&self) -> bool {
         self.detached
+    }
+
+    /// Gives this command its own wall-clock limit, returning it for chaining.
+    ///
+    /// The runner's limit ([`DEFAULT_TIMEOUT`], 5 s) suits the short queries and
+    /// reloads the app issues. A command whose normal, successful run is known to
+    /// take longer would otherwise be killed half-way — for the notification-centre
+    /// script that means after the eww window opened but before the script told the
+    /// daemon (task 13.1). Such a command states its bound here, where the command
+    /// is defined, so a test asserting the recorded commands also pins the bound.
+    /// Everything else about the run (no shell, capture, kill on overrun, logging)
+    /// is unchanged. Use it only for commands that run off the GTK main thread: a
+    /// longer bound on the main thread would only freeze the window for longer.
+    #[must_use]
+    pub fn with_timeout(mut self, limit: Duration) -> Self {
+        self.timeout = Some(limit);
+        self
+    }
+
+    /// The command's own wall-clock limit, or `None` when the runner's applies
+    /// (see [`Command::with_timeout`]).
+    pub fn timeout(&self) -> Option<Duration> {
+        self.timeout
     }
 }
 
@@ -294,7 +326,8 @@ pub trait CommandRunner {
 }
 
 /// The production [`CommandRunner`]: spawns real processes via
-/// [`std::process::Command`] under the [`DEFAULT_TIMEOUT`] deadline.
+/// [`std::process::Command`] under the [`DEFAULT_TIMEOUT`] deadline, or under a
+/// command's own limit when it carries one ([`Command::with_timeout`]).
 ///
 /// Each invocation is spawned with no controlling shell and with stdin closed;
 /// stdout and stderr are captured and the invocation plus its exit status is
@@ -398,10 +431,11 @@ impl CommandRunner for SystemCommandRunner {
         // then trivially non-blocking even while the detached tool lives on.
         let stdout_reader = spawn_pipe_reader(child.stdout.take());
         let stderr_reader = spawn_pipe_reader(child.stderr.take());
+        let limit = command.timeout.unwrap_or(self.timeout);
 
         // Block until the child exits or the deadline passes. `wait_timeout`
         // uses the OS wait primitives, so it neither polls nor busy-waits.
-        match child.wait_timeout(self.timeout) {
+        match child.wait_timeout(limit) {
             Ok(Some(status)) => {
                 // The child has exited, so both write ends are closed and the
                 // readers have hit (or will imminently hit) EOF; joining them
@@ -440,12 +474,10 @@ impl CommandRunner for SystemCommandRunner {
                 tracing::warn!(
                     program = %command.program,
                     args = ?command.args,
-                    timeout = ?self.timeout,
+                    timeout = ?limit,
                     "command exceeded its timeout and was killed"
                 );
-                Err(CommandError::Timeout {
-                    limit: self.timeout,
-                })
+                Err(CommandError::Timeout { limit })
             }
             Err(error) => {
                 // Waiting itself failed (a rare OS-level error). Kill and reap
@@ -864,6 +896,51 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "timeout should return shortly after the deadline, took {elapsed:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_with_its_own_timeout_overrides_the_runners() {
+        use std::time::Instant;
+
+        // Task 13.1: a command's own limit replaces the runner's in both directions.
+        // A runner with a long deadline still kills `sleep 30` at the command's short
+        // one…
+        let runner = SystemCommandRunner::with_timeout(Duration::from_secs(60));
+        let start = Instant::now();
+        let result = runner.run(
+            &Command::new("sleep")
+                .arg("30")
+                .with_timeout(Duration::from_millis(200)),
+        );
+        assert!(
+            matches!(result, Err(CommandError::Timeout { limit }) if limit == Duration::from_millis(200)),
+            "expected the command's own timeout, got {result:?}"
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+
+        // …and a runner with a short deadline lets a command with a longer limit of
+        // its own finish.
+        let runner = SystemCommandRunner::with_timeout(Duration::from_millis(50));
+        let output = runner
+            .run(
+                &Command::new("sleep")
+                    .arg("0.3")
+                    .with_timeout(Duration::from_secs(10)),
+            )
+            .expect("the command's own limit lets it finish");
+        assert!(output.success());
+    }
+
+    #[test]
+    fn a_commands_own_timeout_is_part_of_its_identity() {
+        // The limit participates in equality, so a recorded-command assertion pins it.
+        let plain = Command::new("script").arg("open");
+        assert_eq!(plain.timeout(), None);
+        let bounded = plain.clone().with_timeout(Duration::from_secs(20));
+        assert_eq!(bounded.timeout(), Some(Duration::from_secs(20)));
+        assert_ne!(plain, bounded);
+        assert_eq!(bounded.to_string(), "script open");
     }
 
     #[cfg(unix)]

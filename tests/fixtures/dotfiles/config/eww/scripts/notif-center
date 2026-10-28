@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Fixture stand-in for the real dotfiles config/eww/scripts/notif-center.
+#
+# Taken from the dotfiles commit e8f7558, not 8a5b20b like the rest of the
+# tree: e8f7558 is the version that runs on the target desktop, and it differs
+# from 8a5b20b only in how it probes the eww daemon (tests/fixtures/README.md).
+#
+# The real script (`notif-center toggle|open|close`) opens or closes the eww
+# notification-centre window on the focused monitor and, only after the window
+# exists, tells the notifd daemon with `notifctl center open|close`
+# (docs/dotfiles_analysis.md §7.5). It exits 0 when the centre is open (or
+# already was), 1 when eww is not up or the open failed, 2 on a bad argument.
+# Running it from a test would open a window on the live session.
+#
+# The app runs `<this script> open` through the CommandRunner seam (task 13.1),
+# which tests replace with MockCommandRunner; the fixture carries this file so
+# detection finds an executable script at ~/.config/eww/scripts/notif-center.
+# When a test does run it for real on purpose, the stub is a no-op that records
+# how it was called:
+#
+# - one line naming the script and its shell-quoted arguments goes to stderr,
+#   which the command runner captures and logs;
+# - the same line is appended to the file named by SETTINGS4000_FIXTURE_STUB_LOG
+#   when that variable is set, so the test can assert the exact argv;
+#
+# and it exits 0.
+record="${0##*/}"
+for arg in "$@"; do
+    record+=" $(printf '%q' "$arg")"
+done
+printf 'settings4000 fixture stub: %s\n' "$record" >&2
+if [[ -n "${SETTINGS4000_FIXTURE_STUB_LOG:-}" ]]; then
+    printf '%s\n' "$record" >>"$SETTINGS4000_FIXTURE_STUB_LOG"
+fi
+exit 0

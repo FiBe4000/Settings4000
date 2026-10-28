@@ -1,6 +1,6 @@
 //! GTK-free Notifications-page model: the runtime-only controls of the notifd
-//! notification daemon (task 11.7; architecture §3, §7; analysis §7.5, §8.2; R4.2,
-//! R5.2, R6.1, R6.2, R7.3).
+//! notification daemon (tasks 11.7, 13.1; architecture §3, §7; analysis §7.5, §8.2;
+//! R4.2, R5.2, R6.1, R6.2, R7.3).
 //!
 //! # What this module is
 //!
@@ -40,11 +40,38 @@
 //! request pending (the UI then asks the user), and [`NotificationsModel::confirm_clear`]
 //! is the only path that issues `Clear()` — and it refuses unless a request is
 //! pending. A cancelled dialog calls [`NotificationsModel::cancel_clear`].
+//!
+//! # Opening the centre runs the eww script, never `SetCenter` (task 13.1)
+//!
+//! The notification centre is an eww window. notifd's `SetCenter(s)` method, despite
+//! its name, does not open it: it only records the daemon's "center open" flag,
+//! hides the popups on screen and mutes new ones. The window is opened by the eww
+//! script `~/.config/eww/scripts/notif-center open` — what the bar click and
+//! `SUPER+N` run — which opens the window on the focused monitor and only *then*
+//! tells notifd (`notifctl center open`). The app therefore runs that script and
+//! never calls `SetCenter`: a direct call would leave popups muted with no window on
+//! screen (analysis §7.5). The button exists only when the script was detected and
+//! `eww` is on `$PATH` ([`center_script`], R4.2).
+//!
+//! The script can take longer than the runner's usual 5 s: it retries the eww
+//! daemon for 2–3 s before it gives up, and each of its own `eww`/`hyprctl` calls is
+//! bounded at 5 s. So the open is split like the laptop-display toggle (task 10.3):
+//! [`NotificationsModel::open_center_request`] captures what the run needs on the
+//! main thread, [`OpenCenterRequest::run`] runs the script (under
+//! [`CENTER_SCRIPT_TIMEOUT`]) and then re-reads the daemon's state on any thread,
+//! and [`NotificationsModel::finish_open_center`] stores that read back on the main
+//! thread. The page shows whether the centre is open from that read, never from an
+//! assumption. Whether an open is in flight is kept by the page, not here, for the
+//! same reason as the laptop toggle's flag: the page and its model may be rebuilt
+//! while the script runs.
 
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::core::apply::stderr_excerpt;
+use crate::core::detect::{Binary, Capabilities};
 use crate::core::notifd::{
     self, NotifdMethod, NotifdState, NotifdVersion, capture_stdout, control_command,
     name_has_owner_command, server_information_command,
@@ -55,6 +82,69 @@ use crate::system::command::{Command, CommandError, CommandRunner};
 /// `$XDG_RUNTIME_DIR`. It holds no message text (unlike its neighbours `center.json`
 /// and `popup<k>.json`, which the app never opens).
 const BAR_JSON_RELATIVE: &[&str] = &["notifd", "bar.json"];
+
+/// How long one run of the notification-centre script may take before the runner
+/// kills it (task 13.1) — longer than the runner's usual 5 s on purpose.
+///
+/// A successful `open` on a busy eww daemon can need several seconds: the script
+/// first retries `eww active-windows` for up to 2–3 s to see whether eww is up, checks
+/// again whether the window is already open (another 2–3 s at worst), then runs a
+/// few `hyprctl`/`eww` calls that it bounds at 5 s each, among them the `eww open`
+/// itself, and finally `notifctl center open`. Killing it half-way would be worse
+/// than waiting: after the window opened but before the daemon was told, popups and
+/// the centre would disagree. Twenty seconds covers that sequence with margin while
+/// still ending a genuinely wedged run; the run happens on a worker thread, so the
+/// window stays responsive meanwhile.
+///
+/// One case outlasts this bound on purpose: an eww daemon that is running but wedged
+/// (its process answers no request). The script's `eww_up` check then makes ten
+/// attempts at `timeout 5 eww active-windows`, each followed by a 0.2 s pause, so
+/// about 52 s pass before the script itself gives up with exit status 1. The runner
+/// kills it at 20 s instead. The page then reports that the script timed out rather
+/// than "eww is not running". That is accepted: the window stays responsive
+/// throughout, the state re-read still follows, and the 20 s bound plus the 5 s read
+/// stays inside the page's 30 s watchdog.
+pub const CENTER_SCRIPT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// `<script> open` under [`CENTER_SCRIPT_TIMEOUT`] — the command that opens the
+/// notification centre exactly as the bar click and `SUPER+N` do (task 13.1).
+///
+/// `script` is the detected `~/.config/eww/scripts/notif-center`. The argument is the
+/// fixed word `open` (the script's `open` is idempotent: an already open centre stays
+/// open), never `toggle`, so a click can never close the centre. The script inherits
+/// the app's environment, which it needs: `HOME` to find `notifctl`,
+/// `XDG_RUNTIME_DIR` for its lock and notifd's state files, and
+/// `HYPRLAND_INSTANCE_SIGNATURE` for `hyprctl`.
+pub fn center_open_command(script: &str) -> Command {
+    Command::new(script)
+        .arg("open")
+        .with_timeout(CENTER_SCRIPT_TIMEOUT)
+}
+
+/// The notification-centre script the Notifications page may run, or `None` when its
+/// "open the notification center" button must be hidden (task 13.1; R4.2).
+///
+/// Both halves are required: the eww `notif-center` script detected at its live XDG
+/// path ([`Capabilities::notif_center_script`]) and the `eww` binary on `$PATH`
+/// ([`Binary::Eww`]) — the script drives eww and can do nothing without it. Without
+/// either the button is hidden like any control whose application is missing; the
+/// rest of the page is unaffected. A script path that is not UTF-8 never reaches
+/// here (detection drops it), so the returned program string names exactly the
+/// detected file.
+pub fn center_script(capabilities: &Capabilities) -> Option<String> {
+    let script = capabilities.notif_center_script()?;
+    if !capabilities.has_binary(Binary::Eww) {
+        // `debug`, not `info`: this runs on every page build and Refresh, and
+        // detection has already logged the missing eww binary once at `info` (R4.2).
+        tracing::debug!(
+            script = %script.display(),
+            "the eww notif-center script is present but eww is not on PATH; the \
+             Notifications page offers no \"open the notification center\" button (R4.2)"
+        );
+        return None;
+    }
+    script.to_str().map(str::to_owned)
+}
 
 /// What the page knows about the daemon right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,17 +243,30 @@ pub struct NotificationsModel {
     view: DaemonView,
     /// Whether a "clear all" was requested and awaits confirmation.
     clear_pending: bool,
+    /// The eww notification-centre script the "open" action runs, or `None` when the
+    /// action is not offered (see [`center_script`]).
+    center_script: Option<String>,
 }
 
 impl NotificationsModel {
     /// A model that has not queried anything yet. `bar_json` is the pre-1.1 state
     /// file location — [`Self::bar_json_path`] in production, a temp path in tests.
-    pub fn new(bar_json: Option<PathBuf>) -> NotificationsModel {
+    /// `center_script` is what [`center_script`] decided from the detected
+    /// capabilities: the script that opens the notification centre, or `None` to
+    /// hide that action (task 13.1).
+    pub fn new(bar_json: Option<PathBuf>, center_script: Option<String>) -> NotificationsModel {
         NotificationsModel {
             bar_json,
             view: DaemonView::NotQueried,
             clear_pending: false,
+            center_script,
         }
+    }
+
+    /// Whether the "open the notification center" action is offered at all (task
+    /// 13.1): the script and eww were detected. The page hides the button otherwise.
+    pub fn can_open_center(&self) -> bool {
+        self.center_script.is_some()
     }
 
     /// `<runtime_dir>/notifd/bar.json`, or `None` when `runtime_dir` (the value of
@@ -219,10 +322,7 @@ impl NotificationsModel {
         let version = capture_stdout(runner, &server_information_command(), true)
             .as_deref()
             .and_then(notifd::parse_notifd_version);
-        let state = match version {
-            Some(version) if version.supports_state_and_reload() => self.state_from_dbus(runner),
-            _ => self.state_from_bar_json(),
-        };
+        let state = StateSource::for_version(version, self.bar_json.as_deref()).read(runner);
         // Per page entry, so `debug`: R7.3 keeps `info` for detection, writes and
         // reloads.
         tracing::debug!(
@@ -233,46 +333,6 @@ impl NotificationsModel {
         tracing::debug!(state = ?state, "notifd state");
         self.view = DaemonView::Running { version, state };
         self.view
-    }
-
-    /// The state from `GetState()` (daemon ≥ 1.1).
-    fn state_from_dbus(&self, runner: &dyn CommandRunner) -> Option<NotifdState> {
-        let state = capture_stdout(runner, &control_command(NotifdMethod::GetState), true)
-            .as_deref()
-            .and_then(notifd::parse_get_state);
-        if state.is_none() {
-            tracing::info!("notifd GetState failed or its reply was not `bubb …`; state unknown");
-        }
-        state
-    }
-
-    /// The state from `bar.json` (daemon older than 1.1, which has no `GetState`).
-    /// Only that file is read — never the message-bearing files beside it.
-    fn state_from_bar_json(&self) -> Option<NotifdState> {
-        let Some(path) = &self.bar_json else {
-            tracing::info!("XDG_RUNTIME_DIR is unset; the state of a pre-1.1 notifd is unknown");
-            return None;
-        };
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                let state = notifd::parse_bar_json(&bytes);
-                if state.is_none() {
-                    tracing::info!(
-                        path = %path.display(),
-                        "notifd bar.json does not hold the expected state fields; state unknown"
-                    );
-                }
-                state
-            }
-            Err(error) => {
-                tracing::info!(
-                    path = %path.display(),
-                    %error,
-                    "could not read notifd bar.json; state unknown"
-                );
-                None
-            }
-        }
     }
 
     /// Switches do-not-disturb on or off immediately (R5.2) with `SetDnd s on|off`.
@@ -291,13 +351,62 @@ impl NotificationsModel {
         Ok(())
     }
 
-    /// Opens the notification center immediately with `SetCenter s open`. Refused
-    /// without a call when the daemon was last seen not running.
-    pub fn open_center(&mut self, runner: &dyn CommandRunner) -> Result<(), NotifdActionError> {
-        let reply = self.call(runner, NotifdMethod::OpenCenter)?;
-        let open = notifd::parse_bool_reply(&reply).unwrap_or(true);
-        self.update_state(|state| state.center_open = open);
-        Ok(())
+    /// Step 1 of opening the notification centre (task 13.1): checks that the action
+    /// is offered and the daemon was last seen running, and captures what the run
+    /// needs into an [`OpenCenterRequest`] — the script and where to re-read the state
+    /// from afterwards — so it can run on a worker thread without borrowing the model.
+    ///
+    /// Runs nothing. Without a detected script (or eww) this is
+    /// [`OpenCenterError::Unavailable`]; with the daemon last seen not running it is
+    /// [`OpenCenterError::NotRunning`], because the script's final step,
+    /// `notifctl center open`, could not reach the daemon and the window would open
+    /// with notifd unaware of it.
+    pub fn open_center_request(&self) -> Result<OpenCenterRequest, OpenCenterError> {
+        let Some(script) = self.center_script.clone() else {
+            tracing::info!(
+                "opening the notification center is not offered (no notif-center script \
+                 or no eww); nothing was run"
+            );
+            return Err(OpenCenterError::Unavailable);
+        };
+        let DaemonView::Running { version, .. } = self.view else {
+            tracing::info!(
+                "notifd is not running; the notification center was not opened (its script \
+                 reports the open to the daemon)"
+            );
+            return Err(OpenCenterError::NotRunning);
+        };
+        Ok(OpenCenterRequest {
+            script,
+            state_source: StateSource::for_version(version, self.bar_json.as_deref()),
+        })
+    }
+
+    /// Step 3 of opening the notification centre (task 13.1): stores the daemon state
+    /// the finished run read after the script — so the page shows whether the centre
+    /// really is open — and returns the run's result for the page to show (R5.5).
+    ///
+    /// The read is stored only while the model still sees the daemon running; a
+    /// refresh in the meantime that found it stopped wins. When the re-read failed
+    /// the previously shown state stays, as on any other failed read of a single
+    /// value; the result still says whether the script succeeded.
+    pub fn finish_open_center(
+        &mut self,
+        outcome: OpenCenterOutcome,
+    ) -> Result<(), OpenCenterError> {
+        let OpenCenterOutcome { state, result } = outcome;
+        match (&mut self.view, state) {
+            (DaemonView::Running { state: shown, .. }, Some(read)) => *shown = Some(read),
+            (_, Some(_)) => tracing::debug!(
+                "the notification center run finished after the daemon was seen stopped; \
+                 its state read is not stored"
+            ),
+            (_, None) => tracing::info!(
+                "the notifd state could not be re-read after the notification center script; \
+                 the page keeps the state it showed"
+            ),
+        }
+        result
     }
 
     /// Marks a "clear all" as requested; the UI must now ask the user and answer
@@ -372,6 +481,231 @@ impl NotificationsModel {
     }
 }
 
+/// Where the daemon's state is read from: `GetState()` on notifd ≥ 1.1, else the
+/// pre-1.1 state file `bar.json` (see the module docs). Owned, so an
+/// [`OpenCenterRequest`] can carry it to a worker thread.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StateSource {
+    /// `GetState()` over D-Bus (daemon ≥ 1.1).
+    GetState,
+    /// `bar.json` at this path, or `None` when `$XDG_RUNTIME_DIR` is unset (the
+    /// state is then unknown).
+    BarJson(Option<PathBuf>),
+}
+
+impl StateSource {
+    /// The source for a daemon that reported `version` (`None`: no usable version,
+    /// treated as older than 1.1).
+    fn for_version(version: Option<NotifdVersion>, bar_json: Option<&Path>) -> StateSource {
+        match version {
+            Some(version) if version.supports_state_and_reload() => StateSource::GetState,
+            _ => StateSource::BarJson(bar_json.map(Path::to_path_buf)),
+        }
+    }
+
+    /// Reads the state, degrading every failure to `None` (logged at `info`).
+    fn read(&self, runner: &dyn CommandRunner) -> Option<NotifdState> {
+        match self {
+            StateSource::GetState => state_from_dbus(runner),
+            StateSource::BarJson(path) => state_from_bar_json(path.as_deref()),
+        }
+    }
+}
+
+/// The state from `GetState()` (daemon ≥ 1.1).
+fn state_from_dbus(runner: &dyn CommandRunner) -> Option<NotifdState> {
+    let state = capture_stdout(runner, &control_command(NotifdMethod::GetState), true)
+        .as_deref()
+        .and_then(notifd::parse_get_state);
+    if state.is_none() {
+        tracing::info!("notifd GetState failed or its reply was not `bubb …`; state unknown");
+    }
+    state
+}
+
+/// The state from `bar.json` (daemon older than 1.1, which has no `GetState`).
+/// Only that file is read — never the message-bearing files beside it.
+fn state_from_bar_json(path: Option<&Path>) -> Option<NotifdState> {
+    let Some(path) = path else {
+        tracing::info!("XDG_RUNTIME_DIR is unset; the state of a pre-1.1 notifd is unknown");
+        return None;
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let state = notifd::parse_bar_json(&bytes);
+            if state.is_none() {
+                tracing::info!(
+                    path = %path.display(),
+                    "notifd bar.json does not hold the expected state fields; state unknown"
+                );
+            }
+            state
+        }
+        Err(error) => {
+            tracing::info!(
+                path = %path.display(),
+                %error,
+                "could not read notifd bar.json; state unknown"
+            );
+            None
+        }
+    }
+}
+
+/// Why the notification centre was not opened (task 13.1). Its text completes the
+/// page's "The notification center could not be opened: …" line.
+#[derive(Debug)]
+pub enum OpenCenterError {
+    /// The action is not offered: no `notif-center` script or no eww was detected.
+    /// The page hides the button then, so only a caller that skipped
+    /// [`NotificationsModel::can_open_center`] sees this.
+    Unavailable,
+    /// The daemon was last seen not running; nothing was run.
+    NotRunning,
+    /// The script exited with status 1 with its valid `open` argument. The script
+    /// (dotfiles commit `e8f7558`) has three causes for exit status 1:
+    ///
+    /// - eww's daemon does not answer (`eww_up` fails). This is the usual case, when
+    ///   eww is installed but its daemon is not running.
+    /// - An `eww open` fails against a daemon that answered a moment earlier.
+    /// - The script's last step, `notifctl center open`, fails. That `busctl` call
+    ///   runs after the window has opened, so the centre may be on screen without
+    ///   notifd knowing.
+    ///
+    /// The page says "eww is not running" for all three, as task 13.1 specifies:
+    /// the script reports no finer cause, and the first is by far the most common.
+    /// The state re-read after the script keeps the page honest whichever cause it
+    /// was, because it shows what notifd actually reports.
+    EwwNotRunning,
+    /// The script ran and exited unsuccessfully with any other status. Its stderr is
+    /// logged at `debug` only and is not part of the message.
+    Failed {
+        /// The exit code, or `None` when the process was terminated by a signal.
+        code: Option<i32>,
+    },
+    /// The script could not be run: it failed to start, or it overran
+    /// [`CENTER_SCRIPT_TIMEOUT`] and was killed.
+    Command(CommandError),
+}
+
+impl fmt::Display for OpenCenterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OpenCenterError::Unavailable => {
+                f.write_str("the eww notification center script or eww itself was not found")
+            }
+            OpenCenterError::NotRunning => f.write_str("the notification daemon is not running"),
+            OpenCenterError::EwwNotRunning => f.write_str("eww is not running"),
+            OpenCenterError::Failed { code: Some(code) } => {
+                write!(f, "the notif-center script exited with status {code}")
+            }
+            OpenCenterError::Failed { code: None } => {
+                f.write_str("the notif-center script was terminated by a signal")
+            }
+            OpenCenterError::Command(error) => {
+                write!(f, "the notif-center script could not be run: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for OpenCenterError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            OpenCenterError::Command(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// An open of the notification centre ready to run, made by
+/// [`NotificationsModel::open_center_request`] (step 1; task 13.1).
+///
+/// It owns copies of what the commands need and nothing else, and is [`Send`], so
+/// step 2 ([`Self::run`]) can issue them on a worker thread while the model stays on
+/// the main thread (see the module docs).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenCenterRequest {
+    /// The detected `notif-center` script, as the program string of a [`Command`].
+    script: String,
+    /// Where the state is re-read from after the script.
+    state_source: StateSource,
+}
+
+impl OpenCenterRequest {
+    /// Step 2 of opening the notification centre (task 13.1): runs the eww script and
+    /// then re-reads the daemon's state, blocking for as long as both take — so the
+    /// page calls it on a worker thread. It touches no model.
+    ///
+    /// Issues exactly this sequence through `runner`:
+    ///
+    /// 1. `<script> open` ([`center_open_command`], bounded by
+    ///    [`CENTER_SCRIPT_TIMEOUT`]) — the script opens the eww window on the focused
+    ///    monitor and then tells notifd itself;
+    /// 2. the state read: `GetState` on a daemon ≥ 1.1 (on an older one, `bar.json` is
+    ///    read and no command is issued).
+    ///
+    /// The read follows every script outcome, failures included: it is what the page
+    /// shows, and after a timeout it is the only way to learn whether the centre got
+    /// open anyway. Nothing here ever calls notifd's `SetCenter`. The script's failure
+    /// is logged at `error` (its stderr at `debug` only) and returned in the outcome;
+    /// none is fatal (R5.5).
+    pub fn run(self, runner: &dyn CommandRunner) -> OpenCenterOutcome {
+        let OpenCenterRequest {
+            script,
+            state_source,
+        } = self;
+        let result = run_center_script(runner, &script);
+        let state = state_source.read(runner);
+        if result.is_ok() {
+            tracing::info!(
+                center_open = ?state.map(|state| state.center_open),
+                "ran the eww notif-center script to open the notification center (R5.2)"
+            );
+        }
+        OpenCenterOutcome { state, result }
+    }
+}
+
+/// What an open of the notification centre read and how it ended, produced on any
+/// thread by [`OpenCenterRequest::run`] and stored by
+/// [`NotificationsModel::finish_open_center`] (task 13.1). [`Send`], so a worker
+/// thread can hand it back to the main thread.
+#[derive(Debug)]
+pub struct OpenCenterOutcome {
+    /// The daemon state read after the script, or `None` when that read failed.
+    state: Option<NotifdState>,
+    /// Whether the script reported success, and why not.
+    result: Result<(), OpenCenterError>,
+}
+
+/// Runs `<script> open` and classifies its outcome (see [`OpenCenterError`]).
+fn run_center_script(runner: &dyn CommandRunner, script: &str) -> Result<(), OpenCenterError> {
+    let command = center_open_command(script);
+    let output = match runner.run(&command) {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::error!(%command, %error, "could not run the eww notif-center script");
+            return Err(OpenCenterError::Command(error));
+        }
+    };
+    if output.success() {
+        return Ok(());
+    }
+    // The script's diagnostics are for debugging only; the page names the cause.
+    tracing::debug!(
+        %command,
+        stderr = ?stderr_excerpt(output.stderr()),
+        "eww notif-center script stderr"
+    );
+    let error = match output.code() {
+        Some(1) => OpenCenterError::EwwNotRunning,
+        code => OpenCenterError::Failed { code },
+    };
+    tracing::error!(%command, exit_code = ?output.code(), %error, "the eww notif-center script failed");
+    Err(error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,7 +723,7 @@ mod tests {
 
     /// A model that already saw a running 1.1 daemon with [`STATE`].
     fn running_model() -> NotificationsModel {
-        let mut model = NotificationsModel::new(None);
+        let mut model = NotificationsModel::new(None, None);
         let runner = MockCommandRunner::with_outcomes([ok(OWNED), ok(INFO_1_1), ok(STATE)]);
         model.refresh(&runner);
         model
@@ -397,7 +731,7 @@ mod tests {
 
     #[test]
     fn refresh_on_a_1_1_daemon_reads_get_state() {
-        let mut model = NotificationsModel::new(None);
+        let mut model = NotificationsModel::new(None, None);
         assert_eq!(model.view(), DaemonView::NotQueried);
         let runner = MockCommandRunner::with_outcomes([ok(OWNED), ok(INFO_1_1), ok(STATE)]);
         let view = model.refresh(&runner);
@@ -425,7 +759,7 @@ mod tests {
 
     #[test]
     fn a_malformed_get_state_reply_leaves_the_state_unknown() {
-        let mut model = NotificationsModel::new(None);
+        let mut model = NotificationsModel::new(None, None);
         let runner = MockCommandRunner::with_outcomes([
             ok(OWNED),
             ok(INFO_1_1),
@@ -475,7 +809,7 @@ mod tests {
     #[test]
     fn a_1_0_daemon_reads_its_state_from_bar_json() {
         let dir = bar_json_dir();
-        let mut model = NotificationsModel::new(Some(dir.path().join("bar.json")));
+        let mut model = NotificationsModel::new(Some(dir.path().join("bar.json")), None);
         let runner = MockCommandRunner::with_outcomes([ok(OWNED), ok(INFO_1_0)]);
         assert_eq!(
             model.refresh(&runner),
@@ -489,7 +823,7 @@ mod tests {
     #[test]
     fn a_1_0_daemon_is_never_sent_get_state() {
         let dir = bar_json_dir();
-        let mut model = NotificationsModel::new(Some(dir.path().join("bar.json")));
+        let mut model = NotificationsModel::new(Some(dir.path().join("bar.json")), None);
         let runner = MockCommandRunner::with_outcomes([ok(OWNED), ok(INFO_1_0)]);
         model.refresh(&runner);
         assert_eq!(
@@ -504,7 +838,7 @@ mod tests {
         // GetServerInformation failed, so the version is unknown and the conservative
         // pre-1.1 source is used.
         let dir = bar_json_dir();
-        let mut model = NotificationsModel::new(Some(dir.path().join("bar.json")));
+        let mut model = NotificationsModel::new(Some(dir.path().join("bar.json")), None);
         let runner = MockCommandRunner::with_outcomes([ok(OWNED), Ok(CommandOutput::fake(1))]);
         assert_eq!(
             model.refresh(&runner),
@@ -519,7 +853,7 @@ mod tests {
     #[test]
     fn a_missing_bar_json_leaves_the_state_unknown() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut model = NotificationsModel::new(Some(dir.path().join("bar.json")));
+        let mut model = NotificationsModel::new(Some(dir.path().join("bar.json")), None);
         let runner = MockCommandRunner::with_outcomes([ok(OWNED), ok(INFO_1_0)]);
         assert_eq!(
             model.refresh(&runner),
@@ -532,7 +866,7 @@ mod tests {
 
     #[test]
     fn an_unowned_bus_name_reads_as_not_running() {
-        let mut model = NotificationsModel::new(None);
+        let mut model = NotificationsModel::new(None, None);
         let runner = MockCommandRunner::with_outcomes([ok("b false\n")]);
         assert_eq!(model.refresh(&runner), DaemonView::NotRunning);
     }
@@ -540,7 +874,7 @@ mod tests {
     #[test]
     fn an_unowned_daemon_is_asked_nothing_more() {
         // Liveness is the bus name; the page never asks systemd or the daemon itself.
-        let mut model = NotificationsModel::new(None);
+        let mut model = NotificationsModel::new(None, None);
         let runner = MockCommandRunner::with_outcomes([ok("b false\n")]);
         model.refresh(&runner);
         assert_eq!(runner.recorded(), vec![name_has_owner_command()]);
@@ -549,7 +883,7 @@ mod tests {
 
     #[test]
     fn a_failed_owner_query_reads_as_not_running() {
-        let mut model = NotificationsModel::new(None);
+        let mut model = NotificationsModel::new(None, None);
         let failing = MockCommandRunner::with_outcomes([Ok(CommandOutput::fake(1))]);
         assert_eq!(model.refresh(&failing), DaemonView::NotRunning);
     }
@@ -668,25 +1002,243 @@ mod tests {
         ));
     }
 
+    /// A placeholder path for the detected `notif-center` script; nothing is executed.
+    const CENTER_SCRIPT: &str = "/test/config/eww/scripts/notif-center";
+
+    /// [`STATE`] with the centre open, as notifd reports it once the script told it.
+    const STATE_CENTER_OPEN: &str = "bubb false 22 false true\n";
+
+    /// A model with the centre script, that already saw a running 1.1 daemon with
+    /// [`STATE`].
+    fn running_model_with_center() -> NotificationsModel {
+        let mut model = NotificationsModel::new(None, Some(CENTER_SCRIPT.to_string()));
+        let runner = MockCommandRunner::with_outcomes([ok(OWNED), ok(INFO_1_1), ok(STATE)]);
+        model.refresh(&runner);
+        model
+    }
+
+    /// The centre-open flag the model currently shows, if its state is known.
+    fn shown_center_open(model: &NotificationsModel) -> Option<bool> {
+        match model.view() {
+            DaemonView::Running {
+                state: Some(state), ..
+            } => Some(state.center_open),
+            _ => None,
+        }
+    }
+
+    /// Runs the three steps of an open against `runner`, returning the result.
+    fn open_center(
+        model: &mut NotificationsModel,
+        runner: &MockCommandRunner,
+    ) -> Result<(), OpenCenterError> {
+        let request = model.open_center_request().expect("the open is offered");
+        let outcome = request.run(runner);
+        model.finish_open_center(outcome)
+    }
+
     #[test]
-    fn open_center_issues_set_center_open() {
-        let mut model = running_model();
-        let runner = MockCommandRunner::with_outcomes([ok("b true\n")]);
-        model.open_center(&runner).expect("SetCenter succeeds");
+    fn opening_the_center_runs_the_eww_script_then_reads_get_state() {
+        // Task 13.1: exactly what the bar click and SUPER+N do — `notif-center open`,
+        // which opens the window and then tells notifd — followed by a GetState read
+        // that decides what the page shows. Never SetCenter.
+        let mut model = running_model_with_center();
+        assert!(model.can_open_center());
+        assert_eq!(shown_center_open(&model), Some(false));
+
+        let runner = MockCommandRunner::with_outcomes([ok(""), ok(STATE_CENTER_OPEN)]);
+        open_center(&mut model, &runner).expect("the script succeeds");
+
+        let recorded = runner.recorded();
+        assert_eq!(
+            recorded,
+            vec![
+                center_open_command(CENTER_SCRIPT),
+                control_command(NotifdMethod::GetState),
+            ]
+        );
+        assert_eq!(recorded[0].program(), CENTER_SCRIPT);
+        assert_eq!(recorded[0].args_slice(), ["open"]);
+        let timeout = recorded[0].timeout().expect("the script has its own bound");
+        assert!(timeout >= Duration::from_secs(15), "{timeout:?}");
+        assert_eq!(
+            recorded[1].timeout(),
+            None,
+            "GetState keeps the 5 s default"
+        );
+        assert!(
+            recorded
+                .iter()
+                .all(|command| !command.to_string().contains("SetCenter")),
+            "{recorded:?}"
+        );
+        assert_eq!(shown_center_open(&model), Some(true), "shown from the read");
+    }
+
+    #[test]
+    fn the_center_is_shown_from_the_read_not_from_the_script_status() {
+        // A script that exits 0 while the daemon still reports the centre closed is
+        // shown as closed: the page never assumes the open worked.
+        let mut model = running_model_with_center();
+        let runner = MockCommandRunner::with_outcomes([ok(""), ok(STATE)]);
+        open_center(&mut model, &runner).expect("the script succeeds");
+        assert_eq!(shown_center_open(&model), Some(false));
+    }
+
+    #[test]
+    fn exit_status_1_means_eww_is_not_running() {
+        // The script exits 1 when eww's daemon does not answer. The state is still
+        // re-read, and the message names eww.
+        let mut model = running_model_with_center();
+        let runner = MockCommandRunner::with_outcomes([
+            Ok(CommandOutput::fake_with_streams(1, "", "")),
+            ok(STATE),
+        ]);
+        let error = open_center(&mut model, &runner).expect_err("eww is down");
+        assert!(matches!(error, OpenCenterError::EwwNotRunning));
+        assert_eq!(error.to_string(), "eww is not running");
         assert_eq!(
             runner.recorded(),
-            vec![control_command(NotifdMethod::OpenCenter)]
+            vec![
+                center_open_command(CENTER_SCRIPT),
+                control_command(NotifdMethod::GetState),
+            ]
         );
+        assert_eq!(shown_center_open(&model), Some(false));
+    }
+
+    #[test]
+    fn another_failure_names_the_exit_status_but_not_the_stderr() {
+        // Exit 2 (a bad argument, which `open` never is) or any other status: the
+        // generic message with the code; stderr stays in the debug log.
+        let mut model = running_model_with_center();
+        let runner = MockCommandRunner::with_outcomes([
+            Ok(CommandOutput::fake_with_streams(
+                2,
+                "",
+                "usage: notif-center toggle|open|close",
+            )),
+            ok(STATE),
+        ]);
+        let error = open_center(&mut model, &runner).expect_err("the script failed");
+        assert!(matches!(error, OpenCenterError::Failed { code: Some(2) }));
+        assert_eq!(
+            error.to_string(),
+            "the notif-center script exited with status 2"
+        );
+        assert_eq!(
+            OpenCenterError::Failed { code: None }.to_string(),
+            "the notif-center script was terminated by a signal"
+        );
+    }
+
+    #[test]
+    fn a_script_that_overruns_its_bound_is_reported_and_the_state_still_read() {
+        // After a timeout the window may or may not have opened; the read decides.
+        let mut model = running_model_with_center();
+        let runner = MockCommandRunner::with_outcomes([
+            Err(CommandError::Timeout {
+                limit: CENTER_SCRIPT_TIMEOUT,
+            }),
+            ok(STATE_CENTER_OPEN),
+        ]);
+        let error = open_center(&mut model, &runner).expect_err("the script timed out");
         assert!(matches!(
-            model.view(),
-            DaemonView::Running {
-                state: Some(NotifdState {
-                    center_open: true,
-                    ..
-                }),
-                ..
-            }
+            error,
+            OpenCenterError::Command(CommandError::Timeout { .. })
         ));
+        assert!(
+            error
+                .to_string()
+                .starts_with("the notif-center script could not be run")
+        );
+        assert_eq!(runner.recorded().len(), 2);
+        assert_eq!(shown_center_open(&model), Some(true));
+    }
+
+    #[test]
+    fn a_failed_re_read_keeps_the_shown_state() {
+        let mut model = running_model_with_center();
+        let runner = MockCommandRunner::with_outcomes([ok(""), Ok(CommandOutput::fake(1))]);
+        open_center(&mut model, &runner).expect("the script succeeded");
+        assert_eq!(shown_center_open(&model), Some(false));
+    }
+
+    #[test]
+    fn a_pre_1_1_daemon_is_re_read_from_bar_json_after_the_script() {
+        // A daemon without GetState: the script, then bar.json — and no D-Bus call.
+        let dir = bar_json_dir();
+        std::fs::write(
+            dir.path().join("bar.json"),
+            br#"{"count": 4, "dnd": true, "inhibited": true, "center_open": true}"#,
+        )
+        .expect("rewrite bar.json");
+        let mut model = NotificationsModel::new(
+            Some(dir.path().join("bar.json")),
+            Some(CENTER_SCRIPT.to_string()),
+        );
+        model.refresh(&MockCommandRunner::with_outcomes([ok(OWNED), ok(INFO_1_0)]));
+
+        let runner = MockCommandRunner::new();
+        open_center(&mut model, &runner).expect("the script succeeds");
+        assert_eq!(runner.recorded(), vec![center_open_command(CENTER_SCRIPT)]);
+        assert_eq!(shown_center_open(&model), Some(true));
+    }
+
+    #[test]
+    fn the_open_is_refused_without_a_script_or_a_running_daemon() {
+        // Without the script (or eww) the action is not offered at all.
+        let model = running_model();
+        assert!(!model.can_open_center());
+        assert!(matches!(
+            model.open_center_request(),
+            Err(OpenCenterError::Unavailable)
+        ));
+
+        // With the script, but the daemon not running (or not yet read): refused, so
+        // the window is never opened behind a daemon that cannot be told.
+        let mut model = NotificationsModel::new(None, Some(CENTER_SCRIPT.to_string()));
+        assert!(matches!(
+            model.open_center_request(),
+            Err(OpenCenterError::NotRunning)
+        ));
+        model.refresh(&MockCommandRunner::with_outcomes([ok("b false\n")]));
+        assert!(matches!(
+            model.open_center_request(),
+            Err(OpenCenterError::NotRunning)
+        ));
+    }
+
+    #[test]
+    fn a_read_that_arrives_after_the_daemon_stopped_is_not_stored() {
+        let mut model = running_model_with_center();
+        let request = model.open_center_request().expect("offered");
+        let outcome = request.run(&MockCommandRunner::with_outcomes([
+            ok(""),
+            ok(STATE_CENTER_OPEN),
+        ]));
+        model.refresh(&MockCommandRunner::with_outcomes([ok("b false\n")]));
+        model
+            .finish_open_center(outcome)
+            .expect("the script succeeded");
+        assert_eq!(model.view(), DaemonView::NotRunning);
+    }
+
+    #[test]
+    fn the_button_needs_both_the_script_and_eww() {
+        // Task 13.1, R4.2: the gate is the detected script *and* eww on $PATH.
+        let script = std::path::PathBuf::from(CENTER_SCRIPT);
+        let both = Capabilities::for_tests(&[Binary::Eww], &[], false)
+            .with_notif_center_script_for_tests(script.clone());
+        assert_eq!(center_script(&both).as_deref(), Some(CENTER_SCRIPT));
+
+        let no_eww =
+            Capabilities::for_tests(&[], &[], false).with_notif_center_script_for_tests(script);
+        assert_eq!(center_script(&no_eww), None);
+
+        let no_script = Capabilities::for_tests(&[Binary::Eww], &[], false);
+        assert_eq!(center_script(&no_script), None);
+        assert!(!NotificationsModel::new(None, center_script(&no_script)).can_open_center());
     }
 
     #[test]
@@ -741,18 +1293,14 @@ mod tests {
 
     #[test]
     fn no_action_is_sent_to_a_daemon_that_is_not_running() {
-        for mut model in [NotificationsModel::new(None), {
-            let mut model = NotificationsModel::new(None);
+        for mut model in [NotificationsModel::new(None, None), {
+            let mut model = NotificationsModel::new(None, None);
             model.refresh(&MockCommandRunner::with_outcomes([ok("b false\n")]));
             model
         }] {
             let runner = MockCommandRunner::new();
             assert!(matches!(
                 model.set_dnd(&runner, true),
-                Err(NotifdActionError::NotRunning)
-            ));
-            assert!(matches!(
-                model.open_center(&runner),
                 Err(NotifdActionError::NotRunning)
             ));
             model.request_clear();

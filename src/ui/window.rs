@@ -108,6 +108,7 @@ use crate::core::input::InputModel;
 use crate::core::load::{LoadedFile, StartupLoad, adopt_refreshed_model, merge_refreshed_files};
 use crate::core::model::Category;
 use crate::core::notifd_config::NotifdConfigModel;
+use crate::core::notifications::center_script;
 use crate::core::power::PowerModel;
 use crate::core::store::SettingsStore;
 use crate::core::theme::{PaletteModel, ThemesModel, WallpaperModel};
@@ -119,7 +120,7 @@ use crate::ui::chrome::{self, ApplyResponse, Toast};
 use crate::ui::display::{self, DisplayPage, LaptopToggleState};
 use crate::ui::input;
 use crate::ui::network::{self, NetworkPage};
-use crate::ui::notifications::{self, NotificationsPage};
+use crate::ui::notifications::{self, CenterOpenState, NotificationsPage};
 use crate::ui::page::{self, PageMsg, PagePlan, SettingsPage};
 use crate::ui::sound::{self, SoundPage};
 use crate::ui::startup::spawn_load;
@@ -292,6 +293,12 @@ struct MountedPages {
     /// page entry (the first read included, task 9.26). Its staged notifd rows are a
     /// framework page whose controller sits in `controllers` like any other.
     notifications: Rc<RefCell<Option<NotificationsPage>>>,
+    /// Opening the notification centre: whether the eww script is running on its
+    /// worker and why the last open failed (task 13.1). Kept for the window's
+    /// lifetime and never released, for the same reason as [`Self::laptop_toggle`]: a
+    /// Refresh rebuilds the Notifications page while the script may still run, and the
+    /// rebuilt page must keep the button disabled until that open reports back.
+    notif_center: Rc<CenterOpenState>,
     /// The read-only Network page (task 6.9), whose connection status is re-read on
     /// every page entry.
     network: Rc<RefCell<Option<NetworkPage>>>,
@@ -945,10 +952,15 @@ impl Shell {
         let rows = notifications::page_rows(self.models.notifd_config.borrow().as_ref());
         let staged = (!rows.is_empty())
             .then(|| page::build_page(self.store.clone(), rows, self.update_chrome.clone()));
+        // Task 13.1: the "open the notification center" button needs the eww
+        // notif-center script and eww itself (R4.2).
+        let script = center_script(&self.capabilities.borrow());
         let page = notifications::build(
             staged
                 .as_ref()
                 .map(|controller| controller.widget().upcast_ref::<Widget>()),
+            script,
+            self.pages.notif_center.clone(),
         );
         let root = page.root().clone();
         *self.pages.notifications.borrow_mut() = Some(page);

@@ -411,6 +411,7 @@ fn detect(fx: &FixtureDotfiles) -> Capabilities {
         notifd_replies: NotifdReplies::default(),
         notifd_unit_file: fx.config_path("systemd/user/notifd.service"),
         bar_text_tone_script: fx.config_path("eww/scripts/bar-text-tone"),
+        notif_center_script: fx.config_path("eww/scripts/notif-center"),
     })
 }
 

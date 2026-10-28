@@ -16,9 +16,17 @@
 //!
 //! The control interface is what this app drives: `GetState()` (signature `bubb`:
 //! do-not-disturb, history count, inhibited, center open — a pure query),
-//! `SetDnd(s on|off)`, `SetCenter(s open|close)`, `Clear()` and `Reload()`.
-//! `GetState` and `Reload` exist from daemon version **1.1** on (analysis §8.2);
+//! `SetDnd(s on|off)`, `Clear()` and `Reload()`. `GetState` and `Reload` exist from
+//! daemon version **1.1** on (analysis §8.2);
 //! [`NotifdVersion::supports_state_and_reload`] is the feature test.
+//!
+//! The interface also has `SetCenter(s open|close)`, which the app deliberately
+//! never calls (task 13.1; analysis §7.5). Despite its name it opens nothing: it
+//! only records the daemon's "center open" flag, which mutes popups. The centre is
+//! an eww window that the eww script `notif-center` opens and *then* reports to the
+//! daemon; calling `SetCenter open` directly would leave popups muted with no window
+//! on screen. The app opens the centre through that script instead
+//! ([`crate::core::notifications`]), so [`NotifdMethod`] has no variant for it.
 //!
 //! # Why `busctl`, and why `--auto-start=no`
 //!
@@ -344,8 +352,6 @@ pub enum NotifdMethod {
     GetState,
     /// `SetDnd(s "on"|"off")` → `b` (the new state).
     SetDnd(bool),
-    /// `SetCenter(s "open")` → `b` (whether the center is now open).
-    OpenCenter,
     /// `Clear()` — removes every notification from the history and the screen.
     Clear,
     /// `Reload()` (≥ 1.1) — re-reads `~/.config/notifd/config` and the icon theme
@@ -360,8 +366,8 @@ pub enum NotifdMethod {
 /// se.dotfiles.Notifd <Method> [<signature> <args>…]` — one control call, the exact
 /// form `scripts/notifctl` uses.
 ///
-/// Arguments are fixed tokens (`on`/`off`/`open`); no user text ever reaches the
-/// argument vector.
+/// Arguments are fixed tokens (`on`/`off`); no user text ever reaches the argument
+/// vector. There is deliberately no `SetCenter` call (see the module docs).
 pub fn control_command(method: NotifdMethod) -> Command {
     let command = Command::new(BUSCTL).args([
         "--user",
@@ -376,7 +382,6 @@ pub fn control_command(method: NotifdMethod) -> Command {
         NotifdMethod::SetDnd(enabled) => {
             command.args(["SetDnd", "s", if enabled { "on" } else { "off" }])
         }
-        NotifdMethod::OpenCenter => command.args(["SetCenter", "s", "open"]),
         NotifdMethod::Clear => command.arg("Clear"),
         NotifdMethod::Reload => command.arg("Reload"),
     }
@@ -518,7 +523,7 @@ pub fn parse_name_has_owner(text: &str) -> Option<bool> {
     }
 }
 
-/// Parses a `SetDnd`/`SetCenter` reply (`b <new state>`); the same shape as
+/// Parses a `SetDnd` reply (`b <new state>`); the same shape as
 /// [`parse_name_has_owner`].
 pub fn parse_bool_reply(text: &str) -> Option<bool> {
     parse_name_has_owner(text)
@@ -626,13 +631,57 @@ mod tests {
             (NotifdMethod::GetState, "GetState"),
             (NotifdMethod::SetDnd(true), "SetDnd s on"),
             (NotifdMethod::SetDnd(false), "SetDnd s off"),
-            (NotifdMethod::OpenCenter, "SetCenter s open"),
             (NotifdMethod::Clear, "Clear"),
             (NotifdMethod::Reload, "Reload"),
         ] {
             assert_eq!(
                 argv(&control_command(method)).join(" "),
                 format!("{prefix} {tail}")
+            );
+        }
+    }
+
+    /// Every [`NotifdMethod`] value, `SetDnd` with both arguments, built as a chain in
+    /// which each value's `match` arm names the next one.
+    ///
+    /// The match has one arm per variant and no wildcard, so a variant added to the
+    /// enum does not compile here until it gets an arm — and an arm only makes sense
+    /// with a link to its successor, which puts the new value on the list the tests
+    /// below check (the `SetCenter` guard among them).
+    fn every_method() -> Vec<NotifdMethod> {
+        let mut methods = Vec::new();
+        let mut next = Some(NotifdMethod::GetState);
+        while let Some(method) = next {
+            methods.push(method);
+            next = match method {
+                NotifdMethod::GetState => Some(NotifdMethod::SetDnd(true)),
+                NotifdMethod::SetDnd(true) => Some(NotifdMethod::SetDnd(false)),
+                NotifdMethod::SetDnd(false) => Some(NotifdMethod::Clear),
+                NotifdMethod::Clear => Some(NotifdMethod::Reload),
+                NotifdMethod::Reload => None,
+            };
+        }
+        methods
+    }
+
+    /// Every control call the app can make — one per value of [`every_method`].
+    fn every_control_command() -> Vec<Command> {
+        every_method().into_iter().map(control_command).collect()
+    }
+
+    #[test]
+    fn no_control_command_ever_sets_the_center_flag() {
+        // Task 13.1: `SetCenter` only records notifd's "center open" flag (which mutes
+        // popups) and never opens the eww window, so the flag must only ever be set by
+        // the eww `notif-center` script, after its window exists. No call the app can
+        // build may name it.
+        for command in every_control_command() {
+            assert!(
+                command
+                    .args_slice()
+                    .iter()
+                    .all(|arg| !arg.contains("SetCenter")),
+                "{command}"
             );
         }
     }
@@ -645,7 +694,6 @@ mod tests {
             server_information_command(),
             control_command(NotifdMethod::GetState),
             control_command(NotifdMethod::SetDnd(true)),
-            control_command(NotifdMethod::OpenCenter),
             control_command(NotifdMethod::Clear),
             control_command(NotifdMethod::Reload),
         ];
@@ -936,7 +984,6 @@ mod tests {
             unit_is_active_command(),
             control_command(NotifdMethod::GetState),
             control_command(NotifdMethod::SetDnd(false)),
-            control_command(NotifdMethod::OpenCenter),
             control_command(NotifdMethod::Clear),
             control_command(NotifdMethod::Reload),
         ];

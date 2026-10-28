@@ -176,6 +176,7 @@ fn detection_finds_the_palette_source_behind_the_symlink() {
         notifd_replies: NotifdReplies::default(),
         notifd_unit_file: fx.config_path("systemd/user/notifd.service"),
         bar_text_tone_script: fx.config_path("eww/scripts/bar-text-tone"),
+        notif_center_script: fx.config_path("eww/scripts/notif-center"),
     };
     let caps = Capabilities::detect(&inputs);
 
@@ -197,6 +198,12 @@ fn detection_finds_the_palette_source_behind_the_symlink() {
     assert_eq!(
         caps.bar_text_tone_script(),
         Some(fx.config_path("eww/scripts/bar-text-tone").as_path())
+    );
+    // Task 13.1: likewise the eww notif-center stub, which gates the Notifications
+    // page's "open the notification center" button together with eww on `$PATH`.
+    assert_eq!(
+        caps.notif_center_script(),
+        Some(fx.config_path("eww/scripts/notif-center").as_path())
     );
 }
 

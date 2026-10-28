@@ -1,5 +1,5 @@
-//! The Notifications page's bespoke GTK glue (tasks 11.7, 11.15; architecture §7; R4.2,
-//! R5.1, R5.2).
+//! The Notifications page's bespoke GTK glue (tasks 11.7, 11.15, 13.1; architecture §7;
+//! R4.2, R5.1, R5.2).
 //!
 //! # Two halves on one page
 //!
@@ -28,7 +28,11 @@
 //! - **Do Not Disturb** — a switch applied immediately with `SetDnd`;
 //! - **Notifications** — how many notifications the history holds;
 //! - **Popups held back** — whether an application currently inhibits popups;
-//! - **Open notification center** — `SetCenter open`;
+//! - **Notification center** — whether the centre is open, as the daemon last reported;
+//! - **Open notification center** — runs the eww script `notif-center open`, exactly
+//!   what the bar click and `SUPER+N` do (task 13.1; see below). Shown only when that
+//!   script and `eww` were detected (R4.2); never notifd's `SetCenter`, which opens no
+//!   window and only mutes popups;
 //! - **Clear all…** — opens a confirmation dialog; only "Clear all" in that dialog
 //!   issues `Clear` ([`NotificationsModel::request_clear`] /
 //!   [`NotificationsModel::confirm_clear`]).
@@ -59,14 +63,30 @@
 //! its runtime-backed siblings: nothing reachable from [`build`] may spawn a command,
 //! and the page-entry `refresh` must reach the live read.
 //!
-//! # Synchronous on the GTK main thread (deliberate)
+//! # Synchronous on the GTK main thread (deliberate), except opening the centre
 //!
 //! Each `busctl` call is short-lived, so — matching the Sound and Network pages — they
 //! run synchronously on the GTK main thread through the real
-//! [`CommandRunner`](crate::system::command::CommandRunner), bounded by its 5 s timeout.
+//! [`CommandRunner`], bounded by its 5 s timeout.
+//!
+//! Opening the notification centre is the exception (task 13.1). The eww script waits
+//! for the eww daemon for a few seconds and bounds each of its own calls at 5 s, so a
+//! successful open can take longer than the runner's usual timeout; it runs under its
+//! own [`CENTER_SCRIPT_TIMEOUT`](crate::core::notifications::CENTER_SCRIPT_TIMEOUT) on a
+//! worker thread ([`run_off_main_thread`]), exactly like the Display page's
+//! laptop-display toggle (tasks 10.3, 10.7). [`CenterOpenState`] carries the pieces of
+//! that pattern: while the script runs the button is insensitive and says it is
+//! opening, so a second click cannot start a second run; each open carries a
+//! generation number so a late result can never finish a newer open; and a watchdog
+//! re-enables the button if no result comes back within [`CENTER_OPEN_WATCHDOG`].
+//! After the script the daemon's state is re-read and the page shows whether the
+//! centre is open from that read. The state lives as long as the window, not the page,
+//! because a Refresh rebuilds the page — and its model — while the script may still be
+//! running.
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::rc::{Rc, Weak};
+use std::time::Duration;
 
 use gtk4::prelude::*;
 use gtk4::{
@@ -77,13 +97,270 @@ use gtk4::{
 use crate::core::model::SettingId;
 use crate::core::notifd::NotifdState;
 use crate::core::notifd_config::{NotifdConfigModel, NotifdRule, NotifdSetting};
-use crate::core::notifications::{DaemonView, NotifdActionError, NotificationsModel};
-use crate::system::command::SystemCommandRunner;
+use crate::core::notifications::{
+    DaemonView, NotifdActionError, NotificationsModel, OpenCenterError, OpenCenterOutcome,
+};
+use crate::system::command::{CommandRunner, SystemCommandRunner};
 use crate::ui::row::{RowCapability, RowDescriptor, WidgetKind};
 use crate::ui::widgets::{PAGE_MARGIN, ROW_SPACING, SECTION_SPACING, labelled_row, note};
+use crate::ui::worker::run_off_main_thread;
 
 /// The confirmation dialog's button index for "Clear all"; index 0 is "Cancel".
 const CLEAR_BUTTON: i32 = 1;
+
+/// The "open the notification center" button's label while no open is running.
+const OPEN_CENTER_LABEL: &str = "Open notification center";
+
+/// The button's label while the eww script runs (task 13.1); the button is
+/// insensitive meanwhile.
+const OPENING_CENTER_LABEL: &str = "Opening the notification center…";
+
+/// What a failed open says before its reason (see [`action_error_text`]).
+const OPEN_CENTER_FAILED: &str = "The notification center could not be opened";
+
+/// How long the page waits for an open of the notification centre to report back
+/// before it gives up and re-enables the button (task 13.1, the task 10.7 pattern).
+///
+/// One open runs the script, bounded by
+/// [`CENTER_SCRIPT_TIMEOUT`](crate::core::notifications::CENTER_SCRIPT_TIMEOUT) (20 s),
+/// and one state read bounded by the runner's 5 s, so an open that has not reported
+/// back after 30 s is stuck — typically the runner still draining output pipes that a
+/// killed script's children hold open — not slow. Nothing is killed when it fires.
+const CENTER_OPEN_WATCHDOG: Duration = Duration::from_secs(30);
+
+/// The note the watchdog leaves when an open did not report back in time: the button
+/// is usable again, and the shown state may be stale.
+const CENTER_WATCHDOG_NOTE: &str = "Opening the notification center did not report back, \
+                                    so the button is available again. Open this page again \
+                                    to read the current state.";
+
+/// The state of opening the notification centre that must outlive any one
+/// Notifications page and its model (task 13.1): whether the eww script is running on
+/// the worker, why the last open failed, which page and model to update when the
+/// result arrives, and the watchdog that stops waiting for a result that never comes.
+///
+/// The window creates one for its whole lifetime (through [`Default`]) and hands it to
+/// every page it builds ([`build`]); see the module docs for why it cannot live on the
+/// page. It is the Display page's `LaptopToggleState` pattern (tasks 10.3, 10.7)
+/// applied to this button.
+pub(crate) struct CenterOpenState {
+    /// Whether an open is running. While `true` the button is insensitive and labelled
+    /// as opening, and a new open is refused. Cleared when the result arrives or, at
+    /// the latest, when the watchdog fires.
+    running: Cell<bool>,
+    /// Why the last open failed, shown under the page's status line until the next
+    /// open or page entry (R5.5), or `None`.
+    error: RefCell<Option<String>>,
+    /// The model of the page that currently shows the button: the open's request is
+    /// taken from it and its result stored on it. Weak, so a model the window dropped
+    /// with its page is simply skipped.
+    model: RefCell<Weak<RefCell<NotificationsModel>>>,
+    /// The page that currently shows the button, re-rendered when an open starts or
+    /// ends. Weak for the same reason.
+    page: RefCell<Weak<Inner>>,
+    /// The number of the most recently started open. Each open's result and watchdog
+    /// carry the number it started with and act only while it is still the current one
+    /// *and* [`Self::running`] is set, so neither a late result nor a stale watchdog
+    /// can finish a newer open.
+    generation: Cell<u64>,
+    /// How long an open may run before the watchdog gives up on it:
+    /// [`CENTER_OPEN_WATCHDOG`] in the app, chosen per open in tests. Read when an
+    /// open starts, so a change affects only opens started afterwards.
+    watchdog_interval: Cell<Duration>,
+    /// The running open's armed watchdog, aborted when the result arrives first;
+    /// `None` when no open is running.
+    watchdog: RefCell<Option<glib::JoinHandle<()>>>,
+}
+
+impl Default for CenterOpenState {
+    /// No open running, no note, no page yet, and the production watchdog interval.
+    fn default() -> Self {
+        Self::with_watchdog_interval(CENTER_OPEN_WATCHDOG)
+    }
+}
+
+impl CenterOpenState {
+    /// A state with no open running whose watchdog gives up after
+    /// `watchdog_interval`.
+    fn with_watchdog_interval(watchdog_interval: Duration) -> Self {
+        Self {
+            running: Cell::new(false),
+            error: RefCell::new(None),
+            model: RefCell::new(Weak::new()),
+            page: RefCell::new(Weak::new()),
+            generation: Cell::new(0),
+            watchdog_interval: Cell::new(watchdog_interval),
+            watchdog: RefCell::new(None),
+        }
+    }
+
+    /// Makes `model` the one later opens take their request from and store their
+    /// result on. [`build`] calls it for every new page, so a result that arrives
+    /// after a Refresh rebuilt the page lands on the rebuilt page's model.
+    fn attach_model(&self, model: &Rc<RefCell<NotificationsModel>>) {
+        self.model.replace(Rc::downgrade(model));
+    }
+
+    /// Starts opening the notification centre (R5.2, task 13.1): takes the request from
+    /// the attached model, marks the open as running, arms its watchdog and
+    /// re-renders the page, then runs the eww script and the state read through
+    /// `runner` on a worker thread and returns at once. The result is handled by
+    /// [`Self::finish`] on the main thread or, if it does not arrive within the
+    /// watchdog interval, the wait is abandoned by [`Self::watchdog_fired`].
+    ///
+    /// A call while an open is running is ignored — the button is insensitive then,
+    /// so only a click already queued could reach it — rather than running the
+    /// script twice at once. An open the model refuses (no script, daemon not
+    /// running) runs nothing and only shows why.
+    fn start(self: &Rc<Self>, runner: impl CommandRunner + Send + 'static) {
+        if self.running.get() {
+            tracing::debug!(
+                "the notification center is already being opened; the new click is ignored"
+            );
+            return;
+        }
+        let Some(model) = self.model.borrow().upgrade() else {
+            tracing::debug!("no Notifications page is mounted; nothing to open from");
+            return;
+        };
+        let request = model.borrow().open_center_request();
+        let request = match request {
+            Ok(request) => request,
+            Err(error) => {
+                self.error.replace(Some(open_error_text(&error)));
+                self.rerender_page();
+                return;
+            }
+        };
+
+        let generation = self.generation.get().wrapping_add(1);
+        self.generation.set(generation);
+        self.running.set(true);
+        self.error.replace(None);
+        self.arm_watchdog(generation);
+        self.rerender_page();
+
+        let state = Rc::clone(self);
+        run_off_main_thread(
+            move || request.run(&runner),
+            move |outcome| state.finish(generation, outcome),
+        );
+    }
+
+    /// Schedules [`Self::watchdog_fired`] for open `generation` after the watchdog
+    /// interval, on the calling thread's main context. The timer holds only a
+    /// [`Weak`] reference, so it never keeps the state alive on its own.
+    fn arm_watchdog(self: &Rc<Self>, generation: u64) {
+        let state = Rc::downgrade(self);
+        let interval = self.watchdog_interval.get();
+        let handle = relm4::spawn_local(async move {
+            glib::timeout_future(interval).await;
+            if let Some(state) = state.upgrade() {
+                state.watchdog_fired(generation);
+            }
+        });
+        // No previous open's handle can be left here: an open only starts when none
+        // is running, and every running open ends in `finish` (which takes its handle)
+        // or in `watchdog_fired` (which clears it).
+        debug_assert!(self.watchdog.borrow().is_none());
+        self.watchdog.replace(Some(handle));
+    }
+
+    /// Gives up waiting for open `generation`: re-enables the button, leaves
+    /// [`CENTER_WATCHDOG_NOTE`], logs at `warn` and re-renders the page. Nothing is
+    /// killed or signalled; the result, should it still arrive, is ignored by
+    /// [`Self::finish`]. Does nothing when that open is no longer the running one.
+    fn watchdog_fired(&self, generation: u64) {
+        if !self.is_running(generation) {
+            tracing::debug!(
+                generation,
+                "a notification center watchdog fired after its open had ended; ignored"
+            );
+            return;
+        }
+        tracing::warn!(
+            interval = ?self.watchdog_interval.get(),
+            "opening the notification center did not report back in time; the button is \
+             re-enabled, and the result will be ignored if it still arrives (R5.5)"
+        );
+        self.watchdog.replace(None);
+        self.running.set(false);
+        self.error.replace(Some(CENTER_WATCHDOG_NOTE.to_owned()));
+        self.rerender_page();
+    }
+
+    /// Whether open `generation` is the one the page is still waiting for.
+    fn is_running(&self, generation: u64) -> bool {
+        self.running.get() && self.generation.get() == generation
+    }
+
+    /// Handles the result of open `generation` on the main thread: cancels its
+    /// watchdog, stores the state read after the script on the attached model
+    /// ([`NotificationsModel::finish_open_center`]), keeps a failure for the page to
+    /// show, clears the running flag and re-renders the page.
+    ///
+    /// `outcome` is `None` when the worker ended without one (it panicked); the button
+    /// is then re-enabled and the loss logged. A result for an open the page is no
+    /// longer waiting for — its watchdog fired — is logged at `info` and otherwise
+    /// ignored, its state read included: a newer open or page entry may have read the
+    /// daemon since, and the late read cannot be told apart from an older one.
+    fn finish(&self, generation: u64, outcome: Option<OpenCenterOutcome>) {
+        if !self.is_running(generation) {
+            tracing::info!(
+                generation,
+                current = self.generation.get(),
+                ?outcome,
+                "opening the notification center reported back after its watchdog gave up \
+                 on it; the result is ignored"
+            );
+            return;
+        }
+        if let Some(watchdog) = self.watchdog.take() {
+            watchdog.abort();
+        }
+        self.running.set(false);
+        let model = self.model.borrow().upgrade();
+        let result = match (outcome, model) {
+            (Some(outcome), Some(model)) => Some(model.borrow_mut().finish_open_center(outcome)),
+            (Some(outcome), None) => {
+                tracing::debug!(
+                    ?outcome,
+                    "the notification center was opened with no Notifications page mounted; \
+                     the result has nowhere to be shown"
+                );
+                None
+            }
+            (None, _) => {
+                tracing::error!(
+                    "the notification center worker ended without a result; the button is \
+                     available again (R5.5)"
+                );
+                None
+            }
+        };
+        // The model has already logged any failure; here it is only kept for the page.
+        self.error.replace(match result {
+            Some(Err(error)) => Some(open_error_text(&error)),
+            Some(Ok(())) | None => None,
+        });
+        self.rerender_page();
+    }
+
+    /// Re-renders the page currently showing the button, if the window still has one.
+    fn rerender_page(&self) {
+        // Upgrade first, so the `page` borrow is released before the render runs.
+        let page = self.page.borrow().upgrade();
+        if let Some(page) = page {
+            page.rerender();
+        }
+    }
+}
+
+/// The line shown for a failed open (R5.5): "The notification center could not be
+/// opened: eww is not running." for the script's exit status 1 (task 13.1).
+fn open_error_text(error: &OpenCenterError) -> String {
+    format!("{OPEN_CENTER_FAILED}: {error}.")
+}
 
 /// The mounted Notifications page: the scrollable root plus the handle the window uses
 /// to re-read the daemon when the page is shown.
@@ -115,8 +392,11 @@ impl NotificationsPage {
 /// forms a reference cycle with the closures mounted inside it (the Sound/Network
 /// pattern).
 struct Inner {
-    /// The headless model every decision and command goes through.
-    model: RefCell<NotificationsModel>,
+    /// The headless model every decision and command goes through. Shared (weakly)
+    /// with [`CenterOpenState`], which stores an open's result on it.
+    model: Rc<RefCell<NotificationsModel>>,
+    /// The window-lifetime state of opening the notification centre (task 13.1).
+    center: Rc<CenterOpenState>,
     /// The one-line daemon status above the controls.
     status: Label,
     /// "Check again", shown beside the status only while the daemon is not running,
@@ -138,6 +418,11 @@ struct Inner {
     count_value: Label,
     /// The "popups held back" value.
     inhibited_value: Label,
+    /// Whether the notification centre is open, as last read from the daemon.
+    center_value: Label,
+    /// "Open notification center": hidden without the eww script or eww, insensitive
+    /// and relabelled while an open runs (task 13.1).
+    open_button: Button,
 }
 
 impl Inner {
@@ -145,6 +430,7 @@ impl Inner {
     fn refresh(&self) {
         self.model.borrow_mut().refresh(&SystemCommandRunner::new());
         self.last_error.replace(None);
+        self.center.error.replace(None);
         self.rerender();
     }
 
@@ -155,13 +441,15 @@ impl Inner {
         self.status.set_text(&status_text(view));
         self.check_again
             .set_visible(matches!(view, DaemonView::NotRunning));
-        match self.last_error.borrow().as_deref() {
-            Some(text) => {
-                self.error.set_text(text);
-                self.error.set_visible(true);
-            }
-            None => self.error.set_visible(false),
-        }
+        let errors: Vec<String> = [
+            self.last_error.borrow().clone(),
+            self.center.error.borrow().clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        self.error.set_text(&errors.join("\n"));
+        self.error.set_visible(!errors.is_empty());
         let (running, state) = match view {
             DaemonView::Running { state, .. } => (true, state),
             DaemonView::NotQueried | DaemonView::NotRunning => (false, None),
@@ -170,6 +458,16 @@ impl Inner {
         self.set_switch(state.is_some_and(|state| state.dnd));
         self.count_value.set_text(&count_text(state));
         self.inhibited_value.set_text(&inhibited_text(state));
+        self.center_value.set_text(&center_text(state));
+        let opening = self.center.running.get();
+        self.open_button
+            .set_visible(self.model.borrow().can_open_center());
+        self.open_button.set_sensitive(!opening);
+        self.open_button.set_label(if opening {
+            OPENING_CENTER_LABEL
+        } else {
+            OPEN_CENTER_LABEL
+        });
     }
 
     /// Sets the switch without firing its handler.
@@ -202,14 +500,12 @@ impl Inner {
         self.rerender();
     }
 
-    /// The user asked to open the notification center.
+    /// The user asked to open the notification center: run the eww script on a worker
+    /// thread (task 13.1). The page re-renders when the open starts and again when its
+    /// result arrives.
     fn open_center(&self) {
-        let result = self
-            .model
-            .borrow_mut()
-            .open_center(&SystemCommandRunner::new());
-        self.record("The notification center was not opened", result);
-        self.rerender();
+        self.last_error.replace(None);
+        self.center.start(SystemCommandRunner::new());
     }
 
     /// The user answered the confirmation dialog: clear on "Clear all", forget the
@@ -327,16 +623,26 @@ const STAGED_NOTE: &str = "Times are in milliseconds; 0 keeps a popup until it i
                            to ~/.config/notifd/config with Apply and take effect for new \
                            notifications without dropping the ones on screen.";
 
-/// Builds the Notifications page (tasks 11.7, 11.15). Runs no command (see the module
-/// docs); the returned page must be kept alive by the window, which mounts
+/// Builds the Notifications page (tasks 11.7, 11.15, 13.1). Runs no command (see the
+/// module docs); the returned page must be kept alive by the window, which mounts
 /// [`NotificationsPage::root`] and calls [`NotificationsPage::refresh`] on page entry.
+///
+/// `center_script` is the eww `notif-center` script when it and eww were detected
+/// ([`center_script`](crate::core::notifications::center_script)), else `None`, which
+/// hides the "open the notification center" button. `center` is the window's
+/// long-lived [`CenterOpenState`]; the new page registers itself and its model there,
+/// so an open still running from a previous page reports back here.
 ///
 /// `staged` is the root widget of the framework page the window launched for
 /// [`page_rows`], or `None` when there are no staged rows; it is placed under the
 /// runtime controls with a heading and [`STAGED_NOTE`]. It stays sensitive when the
 /// daemon is found not running on page entry: the edits are saved to the file and
 /// notifd reads it when it starts.
-pub(crate) fn build(staged: Option<&Widget>) -> NotificationsPage {
+pub(crate) fn build(
+    staged: Option<&Widget>,
+    center_script: Option<String>,
+    center: Rc<CenterOpenState>,
+) -> NotificationsPage {
     let bar_json =
         NotificationsModel::bar_json_path(std::env::var_os("XDG_RUNTIME_DIR").as_deref());
 
@@ -360,7 +666,8 @@ pub(crate) fn build(staged: Option<&Widget>) -> NotificationsPage {
     dnd_switch.set_tooltip_text(Some("Applied immediately"));
     let count_value = Label::new(None);
     let inhibited_value = Label::new(None);
-    let open_button = Button::with_label("Open notification center");
+    let center_value = Label::new(None);
+    let open_button = Button::with_label(OPEN_CENTER_LABEL);
     open_button.set_halign(Align::Start);
     let clear_button = Button::with_label("Clear all…");
     clear_button.set_halign(Align::Start);
@@ -372,6 +679,7 @@ pub(crate) fn build(staged: Option<&Widget>) -> NotificationsPage {
         "Popups held back by an app",
         &inhibited_value,
     ));
+    controls.append(&labelled_row("Notification center", &center_value));
     let buttons = GtkBox::new(Orientation::Horizontal, ROW_SPACING);
     buttons.append(&open_button);
     buttons.append(&clear_button);
@@ -394,8 +702,14 @@ pub(crate) fn build(staged: Option<&Widget>) -> NotificationsPage {
         content.append(staged);
     }
 
+    let model = Rc::new(RefCell::new(NotificationsModel::new(
+        bar_json,
+        center_script,
+    )));
+    center.attach_model(&model);
     let inner = Rc::new(Inner {
-        model: RefCell::new(NotificationsModel::new(bar_json)),
+        model,
+        center: Rc::clone(&center),
         status,
         check_again: check_again.clone(),
         error,
@@ -405,7 +719,10 @@ pub(crate) fn build(staged: Option<&Widget>) -> NotificationsPage {
         dnd_handler: OnceCell::new(),
         count_value,
         inhibited_value,
+        center_value,
+        open_button: open_button.clone(),
     });
+    center.page.replace(Rc::downgrade(&inner));
     inner.rerender();
 
     let weak = Rc::downgrade(&inner);
@@ -503,6 +820,17 @@ fn version_suffix(version: Option<crate::core::notifd::NotifdVersion>) -> String
 /// The notification count, or a dash when unknown.
 fn count_text(state: Option<NotifdState>) -> String {
     state.map_or_else(|| "—".to_string(), |state| state.count.to_string())
+}
+
+/// Whether the notification centre is open, or a dash when unknown.
+fn center_text(state: Option<NotifdState>) -> String {
+    match state {
+        Some(NotifdState {
+            center_open: true, ..
+        }) => "Open".to_string(),
+        Some(_) => "Closed".to_string(),
+        None => "—".to_string(),
+    }
 }
 
 /// Whether popups are held back, or a dash when unknown.
@@ -625,6 +953,7 @@ mod tests {
     fn unknown_values_render_as_a_dash() {
         assert_eq!(count_text(None), "—");
         assert_eq!(inhibited_text(None), "—");
+        assert_eq!(center_text(None), "—");
         let state = NotifdState {
             dnd: true,
             count: 22,
@@ -633,6 +962,14 @@ mod tests {
         };
         assert_eq!(count_text(Some(state)), "22");
         assert_eq!(inhibited_text(Some(state)), "Yes");
+        assert_eq!(center_text(Some(state)), "Closed");
+        assert_eq!(
+            center_text(Some(NotifdState {
+                center_open: true,
+                ..state
+            })),
+            "Open"
+        );
         assert_eq!(
             inhibited_text(Some(NotifdState {
                 inhibited: false,
@@ -640,5 +977,291 @@ mod tests {
             })),
             "No"
         );
+    }
+}
+
+#[cfg(test)]
+mod center_tests {
+    //! Opening the notification centre off the main thread (task 13.1), exercised
+    //! without widgets: [`CenterOpenState`] touches widgets only through a registered
+    //! page, so these tests attach just a model and drive their own GLib main context
+    //! in place of the GTK main loop — the same approach as the Display page's laptop
+    //! toggle tests.
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::time::Duration;
+
+    use gtk4::glib::MainContext;
+
+    use super::{CENTER_WATCHDOG_NOTE, CenterOpenState};
+    use crate::core::notifd::{NotifdMethod, NotifdState, control_command};
+    use crate::core::notifications::{DaemonView, NotificationsModel, center_open_command};
+    use crate::system::command::{
+        Command, CommandError, CommandOutput, CommandRunner, MockCommandRunner,
+    };
+    use crate::ui::worker::drive_until;
+
+    /// A placeholder path for the detected `notif-center` script; nothing is executed.
+    const CENTER_SCRIPT: &str = "/test/config/eww/scripts/notif-center";
+
+    /// A successful command printing `stdout`.
+    fn ok(stdout: &str) -> Result<CommandOutput, CommandError> {
+        Ok(CommandOutput::fake_with_streams(0, stdout, ""))
+    }
+
+    /// The `GetState` reply with the centre open or closed.
+    fn state_reply(center_open: bool) -> Result<CommandOutput, CommandError> {
+        ok(&format!("bubb false 3 false {center_open}\n"))
+    }
+
+    /// A model that read a running notifd 1.1 with the centre closed and has the
+    /// script, shared the way the page shares it.
+    fn shared_model() -> Rc<RefCell<NotificationsModel>> {
+        let mut model = NotificationsModel::new(None, Some(CENTER_SCRIPT.to_string()));
+        model.refresh(&MockCommandRunner::with_outcomes([
+            ok("b true\n"),
+            ok("ssss \"notifd\" \"dotfiles\" \"1.1\" \"1.3\"\n"),
+            state_reply(false),
+        ]));
+        Rc::new(RefCell::new(model))
+    }
+
+    /// The centre-open flag `model` shows.
+    fn center_open(model: &RefCell<NotificationsModel>) -> bool {
+        match model.borrow().view() {
+            DaemonView::Running {
+                state: Some(NotifdState { center_open, .. }),
+                ..
+            } => center_open,
+            other => panic!("unexpected view {other:?}"),
+        }
+    }
+
+    /// The script-then-read sequence of one open (task 13.1).
+    fn open_sequence() -> Vec<Command> {
+        vec![
+            center_open_command(CENTER_SCRIPT),
+            control_command(NotifdMethod::GetState),
+        ]
+    }
+
+    /// A runner that records through a shared [`MockCommandRunner`] and then, for the
+    /// script only, blocks until the test releases it — a script still running on the
+    /// worker while the test inspects the main thread.
+    struct GatedRunner {
+        /// Records every command and answers from its canned outcomes.
+        recorder: Arc<MockCommandRunner>,
+        /// Receives one message per release of the script.
+        gate: Receiver<()>,
+    }
+
+    impl CommandRunner for GatedRunner {
+        fn run(&self, command: &Command) -> Result<CommandOutput, CommandError> {
+            let output = self.recorder.run(command);
+            if command.program() == CENTER_SCRIPT {
+                self.gate
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("the test releases the script");
+            }
+            output
+        }
+    }
+
+    /// A gated runner answering `outcomes` in order, its recorder, and the sender that
+    /// releases the script.
+    fn gated_runner(
+        outcomes: [Result<CommandOutput, CommandError>; 2],
+    ) -> (GatedRunner, Arc<MockCommandRunner>, Sender<()>) {
+        let recorder = Arc::new(MockCommandRunner::with_outcomes(outcomes));
+        let (release, gate) = mpsc::channel();
+        let runner = GatedRunner {
+            recorder: Arc::clone(&recorder),
+            gate,
+        };
+        (runner, recorder, release)
+    }
+
+    /// A [`CommandRunner`] forwarding to a shared mock, so a test can move the runner
+    /// into [`CenterOpenState::start`] and still inspect what it recorded.
+    struct ArcRunner(Arc<MockCommandRunner>);
+
+    impl CommandRunner for ArcRunner {
+        fn run(&self, command: &Command) -> Result<CommandOutput, CommandError> {
+            self.0.run(command)
+        }
+    }
+
+    /// A state with `model` attached and the given watchdog interval.
+    fn attached_state(
+        model: &Rc<RefCell<NotificationsModel>>,
+        interval: Duration,
+    ) -> Rc<CenterOpenState> {
+        let state = Rc::new(CenterOpenState::with_watchdog_interval(interval));
+        state.attach_model(model);
+        state
+    }
+
+    #[test]
+    fn a_second_click_while_the_script_runs_is_refused() {
+        // Task 13.1 acceptance: `start` returns while the script is still running on
+        // the worker; meanwhile the open is marked running (the button insensitive)
+        // and a second click issues nothing. When the result arrives the model shows
+        // the centre as the read after the script reported it.
+        let model = shared_model();
+        let state = attached_state(&model, Duration::from_secs(600));
+        let (runner, recorder, release) = gated_runner([ok(""), state_reply(true)]);
+
+        let context = MainContext::new();
+        context
+            .with_thread_default(|| {
+                state.start(runner);
+                drive_until(&context, || recorder.recorded().len() == 1);
+                assert!(state.running.get(), "the button is disabled");
+                assert!(
+                    model.try_borrow_mut().is_ok(),
+                    "no model borrow is held while the script runs"
+                );
+                assert!(!center_open(&model), "nothing stored before the read");
+
+                let second = Arc::new(MockCommandRunner::new());
+                state.start(ArcRunner(Arc::clone(&second)));
+                assert!(second.recorded().is_empty(), "the second click ran nothing");
+                assert!(state.running.get());
+
+                release.send(()).expect("the script is waiting");
+                drive_until(&context, || !state.running.get());
+            })
+            .expect("the test thread owns its main context");
+
+        assert!(center_open(&model), "shown from the read after the script");
+        assert_eq!(*state.error.borrow(), None);
+        assert_eq!(recorder.recorded(), open_sequence());
+        assert!(
+            recorder
+                .recorded()
+                .iter()
+                .all(|command| !command.to_string().contains("SetCenter")),
+            "the daemon flag is only ever set by the script"
+        );
+    }
+
+    #[test]
+    fn exit_status_1_leaves_a_note_naming_eww() {
+        let model = shared_model();
+        let state = attached_state(&model, Duration::from_secs(600));
+        let (runner, recorder, release) =
+            gated_runner([Ok(CommandOutput::fake(1)), state_reply(false)]);
+        release.send(()).expect("pre-release the script");
+
+        let context = MainContext::new();
+        context
+            .with_thread_default(|| {
+                state.start(runner);
+                drive_until(&context, || !state.running.get());
+            })
+            .expect("the test thread owns its main context");
+
+        assert_eq!(
+            state.error.borrow().as_deref(),
+            Some("The notification center could not be opened: eww is not running.")
+        );
+        assert!(!center_open(&model));
+        assert_eq!(recorder.recorded(), open_sequence());
+    }
+
+    #[test]
+    fn an_open_the_model_refuses_runs_nothing_and_says_why() {
+        // A daemon seen not running: refused synchronously, no worker, no command.
+        let model = Rc::new(RefCell::new(NotificationsModel::new(
+            None,
+            Some(CENTER_SCRIPT.to_string()),
+        )));
+        let state = attached_state(&model, Duration::from_secs(600));
+        let runner = Arc::new(MockCommandRunner::new());
+        state.start(ArcRunner(Arc::clone(&runner)));
+        assert!(!state.running.get());
+        assert_eq!(
+            state.error.borrow().as_deref(),
+            Some(
+                "The notification center could not be opened: the notification daemon is \
+                 not running."
+            )
+        );
+        assert!(runner.recorded().is_empty());
+    }
+
+    #[test]
+    fn an_open_that_never_reports_back_re_enables_the_button_and_a_late_result_is_ignored() {
+        // The watchdog ends the wait: the button is usable again with the note, a newer
+        // open can start, and the first open's late result — the centre read as open —
+        // neither finishes the newer open nor reaches the model.
+        let model = shared_model();
+        let state = attached_state(&model, Duration::from_millis(50));
+        let (runner_a, recorder_a, release_a) = gated_runner([ok(""), state_reply(true)]);
+        let (runner_b, recorder_b, release_b) = gated_runner([ok(""), state_reply(false)]);
+
+        let context = MainContext::new();
+        context
+            .with_thread_default(|| {
+                state.start(runner_a);
+                let generation_a = state.generation.get();
+                drive_until(&context, || !state.running.get());
+                assert_eq!(state.error.borrow().as_deref(), Some(CENTER_WATCHDOG_NOTE));
+                drive_until(&context, || recorder_a.recorded().len() == 1);
+
+                // B must outlive everything below however slowly the machine runs. (The
+                // field is set directly: a `#[cfg(test)]` helper above `build` would cut
+                // the page-entry guard's view of the module short.)
+                state.watchdog_interval.set(Duration::from_secs(600));
+                state.start(runner_b);
+                drive_until(&context, || recorder_b.recorded().len() == 1);
+                assert!(state.running.get(), "B is running");
+
+                // A's result, replayed directly and then for real.
+                state.finish(generation_a, None);
+                assert!(state.running.get(), "B is still running");
+                release_a.send(()).expect("A's script is still waiting");
+                drive_until(&context, || Rc::strong_count(&state) == 2);
+                assert!(state.running.get(), "B is still running");
+                assert!(!center_open(&model), "A's late read was not stored");
+
+                release_b.send(()).expect("B's script is still waiting");
+                drive_until(&context, || Rc::strong_count(&state) == 1);
+            })
+            .expect("the test thread owns its main context");
+
+        assert!(!state.running.get(), "B finished with its own result");
+        assert_eq!(*state.error.borrow(), None);
+        assert!(!center_open(&model), "B's read (closed) is shown");
+        assert_eq!(recorder_a.recorded(), open_sequence());
+        assert_eq!(recorder_b.recorded(), open_sequence());
+    }
+
+    #[test]
+    fn a_result_lands_on_the_model_of_the_page_that_replaced_the_first() {
+        // A Refresh rebuilds the page and its model while the script runs; the result
+        // is stored on the newly attached model.
+        let first = shared_model();
+        let state = attached_state(&first, Duration::from_secs(600));
+        let (runner, _recorder, release) = gated_runner([ok(""), state_reply(true)]);
+
+        let context = MainContext::new();
+        context
+            .with_thread_default(|| {
+                state.start(runner);
+                let second = shared_model();
+                state.attach_model(&second);
+                release.send(()).expect("the script is waiting");
+                drive_until(&context, || !state.running.get());
+                assert!(
+                    center_open(&second),
+                    "the rebuilt page's model got the read"
+                );
+                assert!(!center_open(&first));
+            })
+            .expect("the test thread owns its main context");
     }
 }

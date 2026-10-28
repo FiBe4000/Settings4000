@@ -1,4 +1,4 @@
-//! Installed-app detection and dynamic visibility (tasks 4.3, 11.2, 11.7, 11.8, 11.12; architecture
+//! Installed-app detection and dynamic visibility (tasks 4.3, 11.2, 11.7, 11.8, 11.12, 13.1; architecture
 //! §4; R4.1–R4.4, R2.2, R3.2, R8.5, R6.1, R7.3).
 //!
 //! # What this module is
@@ -72,7 +72,8 @@
 //!   **paths** ([`DetectionInputs::hyprland_socket`],
 //!   [`DetectionInputs::palette_config_anchor`], [`DetectionInputs::config_paths`],
 //!   [`DetectionInputs::hyprland_lua_config`],
-//!   [`DetectionInputs::bar_text_tone_script`]), which [`Capabilities::detect`]
+//!   [`DetectionInputs::bar_text_tone_script`],
+//!   [`DetectionInputs::notif_center_script`]), which [`Capabilities::detect`]
 //!   checks against the real filesystem — so a test builds a temp-dir fixture (a
 //!   fake socket file, a config symlinked into a fake repo, an unreadable config)
 //!   and gets faithful behavior;
@@ -100,8 +101,10 @@
 //! Absent page-gating binaries, an absent palette source, an absent settings
 //! portal, a non-Lua Hyprland config provider and an absent or stopped notifd are
 //! logged at `info` (the "hidden item" signal, R4.2), as are a running `xsettingsd`
-//! (a user-visible Theme-page note, task 11.12) and a missing eww `bar-text-tone`
-//! script (a skipped wallpaper follow-up, task 11.14); a missing or unreadable config
+//! (a user-visible Theme-page note, task 11.12), a missing eww `bar-text-tone`
+//! script (a skipped wallpaper follow-up, task 11.14) and a missing eww
+//! `notif-center` script (a hidden "open the notification center" button, task
+//! 13.1); a missing or unreadable config
 //! is logged at `warn` (R4.4); a one-line detection summary, naming the config
 //! provider and the notifd status, is logged at `info` (R7.3). File *contents* are
 //! never logged.
@@ -353,6 +356,11 @@ const LAPTOP_TOGGLE_SCRIPT_RELATIVE: &[&str] = &["scripts", "hypr-toggle-laptop-
 /// repo, so the live path reaches the repo copy without the app resolving the repo.
 const BAR_TEXT_TONE_SCRIPT_RELATIVE: &[&str] = &["eww", "scripts", "bar-text-tone"];
 
+/// The eww notification-centre script, relative to the XDG config directory (task
+/// 13.1; analysis §7.5). Like [`BAR_TEXT_TONE_SCRIPT_RELATIVE`] it ships inside the
+/// deployed `eww/scripts` directory link, so its live path needs no repo resolution.
+const NOTIF_CENTER_SCRIPT_RELATIVE: &[&str] = &["eww", "scripts", "notif-center"];
+
 /// The dotfiles palette source located behind a deployed config symlink (R3.2,
 /// R8.5).
 ///
@@ -448,6 +456,13 @@ pub struct DetectionInputs {
     /// not through the dotfiles repo, because it ships inside the deployed eww
     /// config directory.
     pub bar_text_tone_script: PathBuf,
+    /// The live path of the eww notification-centre script, conventionally
+    /// `~/.config/eww/scripts/notif-center` (task 13.1). When it is an executable
+    /// file the Notifications page opens the centre by running it with `open` — the
+    /// same thing the bar click and `SUPER+N` do — rather than through notifd's
+    /// `SetCenter`, which opens no window (analysis §7.5). Addressed by its XDG path
+    /// for the same reason as [`Self::bar_text_tone_script`].
+    pub notif_center_script: PathBuf,
 }
 
 impl DetectionInputs {
@@ -493,6 +508,7 @@ impl DetectionInputs {
             notifd_replies,
             notifd_unit_file: default_config_path(&["systemd", "user", "notifd.service"]),
             bar_text_tone_script: default_config_path(BAR_TEXT_TONE_SCRIPT_RELATIVE),
+            notif_center_script: default_config_path(NOTIF_CENTER_SCRIPT_RELATIVE),
         }
     }
 }
@@ -531,6 +547,11 @@ pub struct Capabilities {
     /// missing, not executable or not addressable as UTF-8 — the gate of the
     /// wallpaper follow-up reload (task 11.14).
     bar_text_tone_script: Option<PathBuf>,
+    /// The eww `notif-center` script at its XDG path, or `None` when it is missing,
+    /// not executable or not addressable as UTF-8 — one half of the gate of the
+    /// Notifications page's "open the notification center" button (task 13.1; the
+    /// other half is `eww` on `$PATH`).
+    notif_center_script: Option<PathBuf>,
     /// Backing config paths that could not be read (missing or unreadable, R4.4).
     unreadable_configs: BTreeSet<PathBuf>,
     /// The Hyprland config provider in use, the guard for the Lua-only input and
@@ -599,6 +620,7 @@ impl Capabilities {
         let laptop_toggle_script = detect_laptop_toggle_script(repo_root.as_deref());
 
         let bar_text_tone_script = detect_bar_text_tone_script(&inputs.bar_text_tone_script);
+        let notif_center_script = detect_notif_center_script(&inputs.notif_center_script);
 
         let unreadable_configs = detect_unreadable_configs(&inputs.config_paths);
 
@@ -615,6 +637,7 @@ impl Capabilities {
             palette_source,
             laptop_toggle_script,
             bar_text_tone_script,
+            notif_center_script,
             unreadable_configs,
             hypr_config_provider,
             notifd,
@@ -646,6 +669,7 @@ impl Capabilities {
             palette_source: None,
             laptop_toggle_script: None,
             bar_text_tone_script: None,
+            notif_center_script: None,
             unreadable_configs: BTreeSet::new(),
             hypr_config_provider: HyprConfigProvider::Hyprlang,
             notifd: NotifdStatus::Absent,
@@ -761,6 +785,18 @@ impl Capabilities {
         self.bar_text_tone_script.as_deref()
     }
 
+    /// The eww notification-centre script, or `None` when it was not found usable
+    /// (task 13.1; analysis §7.5).
+    ///
+    /// Present only when `$XDG_CONFIG_HOME/eww/scripts/notif-center` (falling back
+    /// to `~/.config/…`) is an executable file with a UTF-8 path. This is the raw
+    /// finding; the Notifications page's "open the notification center" button
+    /// additionally needs `eww` on `$PATH`, a decision made by
+    /// [`crate::core::notifications::center_script`].
+    pub fn notif_center_script(&self) -> Option<&Path> {
+        self.notif_center_script.as_deref()
+    }
+
     /// Whether the backing config at `path` was found readable (R4.4).
     ///
     /// Returns `true` for any path that was not among the [`DetectionInputs::config_paths`]
@@ -796,6 +832,7 @@ impl Capabilities {
             palette_source = self.palette_source.is_some(),
             laptop_toggle_script = self.laptop_toggle_script.is_some(),
             bar_text_tone_script = self.bar_text_tone_script.is_some(),
+            notif_center_script = self.notif_center_script.is_some(),
             unreadable_configs = self.unreadable_configs.len(),
             hypr_config_provider = %self.hypr_config_provider,
             notifd = %self.notifd,
@@ -836,6 +873,7 @@ impl Capabilities {
             palette_source: None,
             laptop_toggle_script: None,
             bar_text_tone_script: None,
+            notif_center_script: None,
             unreadable_configs: BTreeSet::new(),
             hypr_config_provider: HyprConfigProvider::Lua,
             notifd: NotifdStatus::Absent,
@@ -856,6 +894,16 @@ impl Capabilities {
     /// presence check itself runs [`Capabilities::detect`] instead.
     pub fn with_bar_text_tone_script_for_tests(mut self, script: PathBuf) -> Capabilities {
         self.bar_text_tone_script = Some(script);
+        self
+    }
+
+    /// Returns `self` with the given eww notification-centre script marked present,
+    /// for tests of the "open the notification center" gate (task 13.1) —
+    /// builder-style, like [`Self::with_bar_text_tone_script_for_tests`]. The path is
+    /// taken as given; a test of the presence check itself runs
+    /// [`Capabilities::detect`] instead.
+    pub fn with_notif_center_script_for_tests(mut self, script: PathBuf) -> Capabilities {
+        self.notif_center_script = Some(script);
         self
     }
 
@@ -1244,35 +1292,94 @@ fn detect_laptop_toggle_script(repo_root: Option<&Path>) -> Option<PathBuf> {
     }
 }
 
-/// Decides whether the eww bar's text-tone script at its live XDG path can be run
-/// (task 11.14; architecture §6, analysis §7.8).
+/// Why a script found by its live XDG path cannot be run (see [`usable_script`]).
+enum UnusableScript {
+    /// No executable regular file at the path (missing, a directory, a broken
+    /// link, no executable bit).
+    Missing,
+    /// An executable file whose path is not valid UTF-8.
+    NonUtf8,
+}
+
+/// The shared check behind the eww scripts the app runs by their live XDG path
+/// ([`detect_bar_text_tone_script`], [`detect_notif_center_script`]).
 ///
-/// Present only as an executable regular file (a symlink is followed, since the
-/// dotfiles link the whole `eww/scripts` directory into the repo) whose path is
-/// valid UTF-8 — a command's program is a `String`, so a lossy conversion would name
-/// a different file. Anything else skips the wallpaper follow-up, logged at `info`:
-/// it is a best-effort refinement of the bar, not a control, so nothing on a page
-/// is hidden by its absence.
-fn detect_bar_text_tone_script(script: &Path) -> Option<PathBuf> {
-    // Presence first, so a missing script under a non-UTF-8 config directory is
-    // reported as missing — the common reason — rather than as a path problem.
+/// A script is usable only as an executable regular file (a symlink is followed,
+/// since the dotfiles link the whole `eww/scripts` directory into the repo) whose
+/// path is valid UTF-8 — a command's program is a `String`, so a lossy conversion
+/// would name a different file. Presence is checked first, so a missing script
+/// under a non-UTF-8 config directory is reported as missing, the common reason,
+/// rather than as a path problem. Each caller logs the reason in its own words.
+fn usable_script(script: &Path) -> Result<PathBuf, UnusableScript> {
     if !is_executable_file(script) {
-        tracing::info!(
-            script = %script.display(),
-            "the eww bar-text-tone script is missing or not executable; the bar text \
-             colour is not refreshed after a wallpaper change"
-        );
-        None
+        Err(UnusableScript::Missing)
     } else if script.to_str().is_none() {
-        tracing::info!(
-            script = %script.display(),
-            "the eww bar-text-tone script path is not valid UTF-8, so it cannot be run; \
-             the bar text colour is not refreshed after a wallpaper change"
-        );
-        None
+        Err(UnusableScript::NonUtf8)
     } else {
-        tracing::debug!(script = %script.display(), "eww bar-text-tone script detected");
-        Some(script.to_path_buf())
+        Ok(script.to_path_buf())
+    }
+}
+
+/// Decides whether the eww bar's text-tone script at its live XDG path can be run
+/// (task 11.14; architecture §6, analysis §7.8), by [`usable_script`]'s rule.
+///
+/// Anything else skips the wallpaper follow-up, logged at `info`: it is a
+/// best-effort refinement of the bar, not a control, so nothing on a page is hidden
+/// by its absence.
+fn detect_bar_text_tone_script(script: &Path) -> Option<PathBuf> {
+    match usable_script(script) {
+        Ok(script) => {
+            tracing::debug!(script = %script.display(), "eww bar-text-tone script detected");
+            Some(script)
+        }
+        Err(UnusableScript::Missing) => {
+            tracing::info!(
+                script = %script.display(),
+                "the eww bar-text-tone script is missing or not executable; the bar text \
+                 colour is not refreshed after a wallpaper change"
+            );
+            None
+        }
+        Err(UnusableScript::NonUtf8) => {
+            tracing::info!(
+                script = %script.display(),
+                "the eww bar-text-tone script path is not valid UTF-8, so it cannot be run; \
+                 the bar text colour is not refreshed after a wallpaper change"
+            );
+            None
+        }
+    }
+}
+
+/// Decides whether the eww notification-centre script at its live XDG path can be
+/// run (task 13.1; analysis §7.5), by [`usable_script`]'s rule.
+///
+/// Without it the Notifications page hides its "open the notification center"
+/// button (R4.2) — the app has no other correct way to open the centre — which is
+/// logged at `info` like any hidden control. The rest of the page is unaffected.
+fn detect_notif_center_script(script: &Path) -> Option<PathBuf> {
+    match usable_script(script) {
+        Ok(script) => {
+            tracing::debug!(script = %script.display(), "eww notif-center script detected");
+            Some(script)
+        }
+        Err(UnusableScript::Missing) => {
+            tracing::info!(
+                script = %script.display(),
+                "the eww notif-center script is missing or not executable; the \
+                 Notifications page offers no \"open the notification center\" button (R4.2)"
+            );
+            None
+        }
+        Err(UnusableScript::NonUtf8) => {
+            tracing::info!(
+                script = %script.display(),
+                "the eww notif-center script path is not valid UTF-8, so it cannot be run; \
+                 the Notifications page offers no \"open the notification center\" button \
+                 (R4.2)"
+            );
+            None
+        }
     }
 }
 
@@ -1452,6 +1559,9 @@ mod tests {
             ),
             bar_text_tone_script: PathBuf::from(
                 "/nonexistent/settings4000/eww/scripts/bar-text-tone",
+            ),
+            notif_center_script: PathBuf::from(
+                "/nonexistent/settings4000/eww/scripts/notif-center",
             ),
         }
     }
@@ -2049,6 +2159,66 @@ mod tests {
         assert!(
             Capabilities::detect(&inputs)
                 .bar_text_tone_script()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_executable_notif_center_script_is_detected() {
+        // Task 13.1: the script is looked up at its live XDG path, independently of
+        // any dotfiles repo (none is behind `base_inputs`), and reported as given —
+        // with or without eww on `$PATH`, which the Notifications page checks itself.
+        let root = tempfile::tempdir().expect("temp dir");
+        let scripts = root.path().join("eww").join("scripts");
+        fs::create_dir_all(&scripts).expect("create the eww scripts dir");
+        let script = write_executable(&scripts, "notif-center");
+
+        let mut inputs = base_inputs();
+        inputs.notif_center_script = script.clone();
+        let caps = Capabilities::detect(&inputs);
+        assert_eq!(caps.notif_center_script(), Some(script.as_path()));
+        assert!(caps.dotfiles_repo_root().is_none(), "no repo was needed");
+        assert!(!caps.has_binary(Binary::Eww));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unusable_notif_center_script_is_absent() {
+        // Missing, not executable, or a directory: absent; the missing case is logged
+        // at `info` as a hidden control.
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let script = root.path().join("notif-center");
+        let mut inputs = base_inputs();
+        inputs.notif_center_script = script.clone();
+        let mut caps = None;
+        let events = crate::testing::capture_logs(|| caps = Some(Capabilities::detect(&inputs)));
+        assert!(caps.expect("detection ran").notif_center_script().is_none());
+        assert!(
+            events
+                .iter()
+                .any(|event| event.level == tracing::Level::INFO
+                    && event.message.contains("notif-center script is missing")),
+            "a missing script must be logged at info, got {events:?}"
+        );
+
+        fs::write(&script, b"#!/bin/sh\n").expect("write the script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o644))
+            .expect("clear the executable bits");
+        assert!(
+            Capabilities::detect(&inputs)
+                .notif_center_script()
+                .is_none()
+        );
+
+        let dir = root.path().join("dir-named-notif-center");
+        fs::create_dir(&dir).expect("create a directory");
+        inputs.notif_center_script = dir;
+        assert!(
+            Capabilities::detect(&inputs)
+                .notif_center_script()
                 .is_none()
         );
     }

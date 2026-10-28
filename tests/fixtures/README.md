@@ -25,9 +25,21 @@ shape for the sake of a test. The files that still differ from `8a5b20b` are:
   `config/hypr/monitors.conf`, `config/uwsm/env`;
 - stand-ins and stubs (see "What it contains"): `colors/README.md`,
   `scripts/generate-colors`, `scripts/hypr-toggle-laptop-display`,
-  `scripts/notifctl`, `config/eww/scripts/bar-text-tone`.
+  `scripts/notifctl`, `config/eww/scripts/bar-text-tone`,
+  `config/eww/scripts/notif-center`.
 
 Every other file is the `8a5b20b` content byte for byte.
+
+**The single exception to the `8a5b20b` pin** is
+`config/eww/scripts/notif-center` (task 13.1), which was taken from the later
+commit **`e8f7558`** (the `wayland-dev` head on 2026-10-27, the version that
+runs on the target desktop) and then turned into a stub. `8a5b20b..e8f7558` changes only
+eww scripts, `launch-eww-bars` and a hotplug script — nothing the app parses —
+and this script's two versions differ only in how they probe the eww daemon
+(`e8f7558` retries `eww active-windows` for 2–3 s and opens with
+`--no-daemonize`), which is what makes an `open` able to outlast the 5 s
+command timeout. The file is a stub either way, so the pin of every other
+file is unaffected.
 
 ### What it contains
 
@@ -87,6 +99,15 @@ Every other file is the `8a5b20b` content byte for byte.
     `~/.config/eww/scripts/bar-text-tone`; detection finds it there and the
     wallpaper reload runs `<that path> --apply` through `CommandRunner`, so
     tests never execute it unless they mean to.
+
+  New in task 13.1:
+  - `eww/scripts/notif-center` — an executable no-op stub of the same shape
+    (records its argv, exits 0), from `e8f7558` (see above). The real script
+    opens the eww notification-centre window on the focused monitor and then
+    tells notifd (`notifctl center open`). Deployed as
+    `~/.config/eww/scripts/notif-center`; detection finds it there and the
+    Notifications page runs `<that path> open` through `CommandRunner` — never
+    notifd's `SetCenter`, which opens no window.
 - `zsh/colors.zsh` — a generated color partial (deployed as `~/.zsh_colors`).
 
 The installer creates two links outside `$XDG_CONFIG_HOME`: `~/.zsh_colors`
@@ -228,9 +249,9 @@ The real deployment (analysis §1) symlinks a few items the fixture does not
 carry, because the app never reads or writes them and they are effectively
 code rather than config: `eww/eww.scss`, `eww/eww.yuck`, the rest of
 `eww/scripts` (deployed as a whole-**directory** symlink — a link shape the
-installer never creates; it links files only, so the one script the fixture
-carries, `bar-text-tone`, is deployed as a file link inside a plain
-`~/.config/eww/scripts/`), `rofi/config.rasi`, and the home-level `~/.zshrc`. Since
+installer never creates; it links files only, so the two scripts the fixture
+carries, `bar-text-tone` and `notif-center`, are deployed as file links inside a
+plain `~/.config/eww/scripts/`), `rofi/config.rasi`, and the home-level `~/.zshrc`. Since
 task 11.1 the same holds for the `wayland-dev` additions the app does not read
 yet: `scripts/notifd` itself and the D-Bus activation file
 `local/share/dbus-1/services/org.freedesktop.Notifications.service` (the app

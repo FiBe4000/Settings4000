@@ -44,7 +44,7 @@ build dependencies:
 |---|---|
 | `hyprctl` | Hyprland reloads, monitor info, `setcursor`, hyprpaper control |
 | `wpctl` / `pactl` | Sound page (volume, mute, devices) |
-| `notifd` (+ `busctl`) | Notifications page: do-not-disturb, notification count, clear all, open the center — detected by its D-Bus name `se.dotfiles.Notifd` (running) or its `~/.config/systemd/user/notifd.service` unit (installed); with notifd ≥ 1.1 the page also edits the seven settings of `~/.config/notifd/config` (popup timeouts, history size, critical popups per app, hold time, 2FA copy), and its `Reload()` method follows a write of that file as well as an icon-theme change; every call goes through `busctl` with auto-start disabled |
+| `notifd` (+ `busctl`) | Notifications page: do-not-disturb, notification count, clear all, open the center (this one also needs `eww` on `$PATH` and the dotfiles' eww script `~/.config/eww/scripts/notif-center`, which it runs exactly as the bar click does) — detected by its D-Bus name `se.dotfiles.Notifd` (running) or its `~/.config/systemd/user/notifd.service` unit (installed); with notifd ≥ 1.1 the page also edits the seven settings of `~/.config/notifd/config` (popup timeouts, history size, critical popups per app, hold time, 2FA copy), and its `Reload()` method follows a write of that file as well as an icon-theme change; every call goes through `busctl` with auto-start disabled |
 | `hypridle`, `hyprlock`, `hyprpaper` | Power & Idle, lock background, wallpaper |
 | `nmcli`, `nm-connection-editor` | Network status page + settings launcher |
 | `gsettings`, `dconf` | GTK theme/cursor propagation, live-restyle detection |

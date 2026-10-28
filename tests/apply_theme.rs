@@ -92,6 +92,7 @@ fn load_palette(fx: &FixtureDotfiles) -> PaletteModel {
         notifd_replies: NotifdReplies::default(),
         notifd_unit_file: fx.config_path("systemd/user/notifd.service"),
         bar_text_tone_script: fx.config_path("eww/scripts/bar-text-tone"),
+        notif_center_script: fx.config_path("eww/scripts/notif-center"),
     };
     let source_caps = Capabilities::detect(&inputs);
     let source = source_caps
@@ -784,6 +785,7 @@ fn an_older_notifd_is_not_reloaded_on_an_icon_change() {
         },
         notifd_unit_file: fx.config_path("systemd/user/notifd.service"),
         bar_text_tone_script: fx.config_path("eww/scripts/bar-text-tone"),
+        notif_center_script: fx.config_path("eww/scripts/notif-center"),
     });
     assert_eq!(detected.notifd(), notifd_running("1.0"));
 
@@ -1284,6 +1286,7 @@ fn detect_fixture(fx: &FixtureDotfiles, running: &[&str]) -> Capabilities {
         notifd_replies: NotifdReplies::default(),
         notifd_unit_file: fx.config_path("systemd/user/notifd.service"),
         bar_text_tone_script: fx.config_path("eww/scripts/bar-text-tone"),
+        notif_center_script: fx.config_path("eww/scripts/notif-center"),
     })
 }
 
@@ -1448,6 +1451,7 @@ fn plain_settings_ini_without_a_repo_are_not_reported() {
         notifd_replies: NotifdReplies::default(),
         notifd_unit_file: config.join("systemd/user/notifd.service"),
         bar_text_tone_script: config.join("eww/scripts/bar-text-tone"),
+        notif_center_script: config.join("eww/scripts/notif-center"),
     });
     assert_eq!(caps.dotfiles_repo_root(), None);
 

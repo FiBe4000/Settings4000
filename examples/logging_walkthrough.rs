@@ -91,6 +91,9 @@ fn main() {
         // The fixture ships the eww bar-text-tone stub, so the wallpaper follow-up
         // reads as available (task 11.14).
         bar_text_tone_script: fx.config_path("eww/scripts/bar-text-tone"),
+        // Likewise the eww notif-center stub (task 13.1); the "open the notification
+        // center" button additionally needs eww on `$PATH`.
+        notif_center_script: fx.config_path("eww/scripts/notif-center"),
     };
     let detected = Capabilities::detect(&inputs);
     let generate_colors = detected
