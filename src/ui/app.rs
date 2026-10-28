@@ -309,6 +309,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_icon_svg_root_tag_starts_within_the_first_256_bytes() {
+        // Task 13.2: gdk-pixbuf identifies an image file by its content type,
+        // guessed by GIO (`g_content_type_guess`) from the leading bytes, and
+        // shared-mime-info's magic rule for `image/svg+xml` only looks for
+        // `<svg` within the first 256 bytes. Anything longer in front of the
+        // root tag (such as an explanatory comment) makes the file plain
+        // `application/xml`, which no gdk-pixbuf loader accepts, so loading
+        // fails with "Couldn't recognize the image file format". rofi loads
+        // every launcher icon through gdk-pixbuf, so the symptom is a drun
+        // entry without an icon and a bare "Failed to load image" in its log,
+        // while GTK 4 itself may still show the icon.
+        let icon_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("data")
+            .join(format!("{APP_ID}.svg"));
+        let icon = std::fs::read(&icon_path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", icon_path.display()));
+        let offset = icon
+            .windows(b"<svg".len())
+            .position(|window| window == b"<svg");
+        assert!(
+            offset.is_some_and(|offset| offset < 256),
+            "{} must contain `<svg` within its first 256 bytes, found at {offset:?}; \
+             move any leading comment inside the root element",
+            icon_path.display()
+        );
+    }
+
     /// The Arch VCS package (task 12.2), which builds the latest commit; also
     /// the name of its directory under `packaging/arch/`.
     const VCS_PACKAGE: &str = "settings4000-git";

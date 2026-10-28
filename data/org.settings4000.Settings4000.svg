@@ -1,17 +1,23 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!--
-  Application icon for Settings4000 (task 8.2). An original drawing made for
-  this project: three horizontal slider tracks with offset knobs - the
-  universal "settings" motif - on a rounded dark square. The palette is a
-  hand-picked dark-blue/cyan/off-white triple chosen to sit comfortably next
-  to the Nord-themed desktop the app manages, without copying any third-party
-  artwork or palette file.
-
-  Installed to ~/.local/share/icons/hicolor/scalable/apps/ under the fixed
-  GApplication ID (org.settings4000.Settings4000.svg) so GTK's icon lookup
-  finds it by the same name the .desktop file and the Wayland app_id use.
--->
 <svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!--
+    Application icon for Settings4000 (task 8.2). An original drawing made for
+    this project: three horizontal slider tracks with offset knobs - the
+    universal "settings" motif - on a rounded dark square. The palette is a
+    hand-picked dark-blue/cyan/off-white triple chosen to sit comfortably next
+    to the Nord-themed desktop the app manages, without copying any third-party
+    artwork or palette file.
+
+    Installed to <data dir>/icons/hicolor/scalable/apps/ (~/.local/share by
+    install.sh, /usr/share by the Arch package) under the fixed GApplication ID
+    (org.settings4000.Settings4000.svg) so GTK's icon lookup finds it by the
+    same name the .desktop file and the Wayland app_id use.
+
+    This comment deliberately sits inside the root element, not above it
+    (task 13.2): image loaders such as gdk-pixbuf recognise an SVG only when
+    "<svg" appears within the file's first 256 bytes, and a long comment
+    before the root tag makes them reject the file as plain XML.
+  -->
   <!-- Rounded-square plate, sized to the common 128 px grid with an 8 px margin. -->
   <rect x="8" y="8" width="112" height="112" rx="26" fill="#232a33"/>
   <!-- Three slider tracks. -->
