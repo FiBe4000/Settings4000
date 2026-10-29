@@ -10,6 +10,9 @@
 //! with its About entry (task 10.2, R2.5) — over a content area
 //! that is a [`StackSidebar`] beside a [`Stack`] of category pages, all wrapped in an
 //! [`Overlay`] so a non-fatal [`Toast`](super::chrome::Toast) can float over it (R5.5).
+//! The window also unsets the focus GTK hands the menu button when its popover is
+//! dismissed with the pointer, so themes that style any focused button do not leave it
+//! highlighted (task 13.3, `wire_menu_button_focus`).
 //! One stack page is added per *visible* category (see [`super::category`]); a
 //! [`super::page::PagePlan`] decides whether each is a rendered
 //! [`SettingsPage`](super::page::SettingsPage), a task-5.1 placeholder, or dropped
@@ -92,8 +95,9 @@ use std::rc::Rc;
 
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Application, ApplicationWindow, Box as GtkBox, Button, HeaderBar, Label, MenuButton,
-    Orientation, Overlay, ScrolledWindow, Spinner, Stack, StackSidebar, Widget, glib,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, EventControllerKey, GestureClick,
+    HeaderBar, Label, MenuButton, Orientation, Overlay, PropagationPhase, ScrolledWindow, Spinner,
+    Stack, StackSidebar, Widget, glib,
 };
 use relm4::{ComponentController, Controller};
 
@@ -536,6 +540,10 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     header.pack_end(&apply_button);
     header.pack_end(&reset_button);
 
+    // Undo the focus GTK hands the menu button when its popover is dismissed by a
+    // pointer click elsewhere (task 13.3; see the function docs).
+    wire_menu_button_focus(&window, &menu_button);
+
     // Install the shell once, before the window is presented — the titlebar can only be
     // set on an unrealized window (see the module docs).
     window.set_titlebar(Some(&header));
@@ -565,6 +573,131 @@ pub(crate) fn build(app: &Application) -> ApplicationWindow {
     shell.start_load();
 
     window
+}
+
+/// Drops pointer-given keyboard focus on the header bar's menu button, chiefly the focus
+/// GTK hands it after the button's popover is dismissed with the pointer, so the button
+/// is not left drawn as focused (task 13.3, R2.1).
+///
+/// # Why focus lands there
+///
+/// When the user opens the application menu and then clicks somewhere else, the
+/// compositor dismisses the popover and GTK hides it. The focused widget (a menu item)
+/// was inside the popover, so GTK moves focus out of it — not at once, but after the next
+/// paint, by focusing the first visible ancestor that accepts focus: the menu button's
+/// internal toggle button. Nothing about that was a keyboard action, so the window's
+/// `focus-visible` property stays false.
+///
+/// # Why that is visible at all
+///
+/// Themes are expected to draw a focus indicator only under `:focus-visible`, and
+/// Adwaita does. Some themes (Everforest among them) style `button:focus` without that
+/// condition, so they draw a pointer-focused button highlighted until something else
+/// takes focus. The app may not ship CSS to correct a theme (R2.1), so it removes the
+/// cause instead: when focus *arrives* on the menu button from pointer use, the window's
+/// focus is unset.
+///
+/// # Why this hook
+///
+/// The popover's `closed` signal fires before GTK's deferred focus move, and an idle
+/// callback is not guaranteed to run after it either (the move waits for the next frame),
+/// so the handler watches the window's `focus-widget` property, which changes exactly
+/// when the move happens. The same notification also fires for the pointer press that
+/// opens the menu (the toggle takes focus on click) and for a click on the button that
+/// closes it; dropping the focus there is harmless, because showing the popover moves
+/// focus into it regardless.
+///
+/// # Keeping keyboard users' focus
+///
+/// Tab or arrow navigation turns the window's `focus-visible` on, but GTK also arms a
+/// timeout (the `gtk-keyboard-focus-visible-timeout` setting, 3 s by default) that turns
+/// it off again after keyboard inactivity. A keyboard user who pauses in the open menu
+/// and then presses Escape would therefore reach the deferred focus move with
+/// `focus-visible` false and lose their place. To tell the cases apart the window also
+/// records which kind of input came last: a capture-phase key controller sets the flag, a
+/// capture-phase click gesture (any button) clears it. Both run before any widget sees
+/// the event and neither claims it nor stops its propagation, so they only observe.
+/// Focus is kept when either `focus-visible` or the flag is set.
+///
+/// Focus inside the popover itself is never touched, although the popover is a child of
+/// the menu button — dropping it there would break keyboard navigation of a menu opened
+/// with the pointer. The decision is [`drop_pointer_focus`].
+///
+/// # References and re-entrancy
+///
+/// The handler holds the menu button weakly (the window owns the button, so a strong
+/// reference would form a cycle), and the window arrives as the handler's argument.
+/// Unsetting the focus notifies `focus-widget` again with no focus widget, which the
+/// condition rejects, so the handler does not recurse; GTK emits the notification at the
+/// end of its focus change, so re-entering it from the handler is safe.
+fn wire_menu_button_focus(window: &ApplicationWindow, menu_button: &MenuButton) {
+    let last_input_was_keyboard = Rc::new(Cell::new(false));
+
+    let keys = EventControllerKey::new();
+    keys.set_propagation_phase(PropagationPhase::Capture);
+    keys.connect_key_pressed({
+        let last_input_was_keyboard = last_input_was_keyboard.clone();
+        move |_, _, _, _| {
+            last_input_was_keyboard.set(true);
+            glib::Propagation::Proceed
+        }
+    });
+    window.add_controller(keys);
+
+    let clicks = GestureClick::new();
+    // Button 0 means every mouse button, so a right or middle click counts as pointer use.
+    clicks.set_button(0);
+    clicks.set_propagation_phase(PropagationPhase::Capture);
+    clicks.connect_pressed({
+        let last_input_was_keyboard = last_input_was_keyboard.clone();
+        move |_, _, _, _| last_input_was_keyboard.set(false)
+    });
+    window.add_controller(clicks);
+
+    let menu_button = menu_button.downgrade();
+    window.connect_focus_widget_notify(move |window| {
+        let Some(menu_button) = menu_button.upgrade() else {
+            return;
+        };
+        // `GtkRoot` has `focus`/`set_focus` methods too; the window's own are meant.
+        let focus_in_menu_button = GtkWindowExt::focus(window)
+            .is_some_and(|focus| is_on_menu_button(&focus, &menu_button));
+        if drop_pointer_focus(
+            focus_in_menu_button,
+            window.gets_focus_visible(),
+            last_input_was_keyboard.get(),
+        ) {
+            GtkWindowExt::set_focus(window, None::<&Widget>);
+        }
+    });
+}
+
+/// Whether `focus` is the menu button or a widget inside it (its internal toggle button),
+/// excluding anything inside the button's popover, which is also its child in the widget
+/// tree (see [`wire_menu_button_focus`]).
+fn is_on_menu_button(focus: &Widget, menu_button: &MenuButton) -> bool {
+    let within = |ancestor: &Widget| focus == ancestor || focus.is_ancestor(ancestor);
+    within(menu_button.upcast_ref())
+        && !menu_button
+            .popover()
+            .is_some_and(|popover| within(popover.upcast_ref()))
+}
+
+/// Decides whether the window's focus should be unset after it changed (task 13.3).
+///
+/// True only when focus has just landed on the menu button (`focus_in_menu_button`), the
+/// window is not showing focus indicators (`focus_visible` false) and the last input was
+/// not a key press (`last_input_was_keyboard` false) — the state pointer use leaves
+/// behind. The keyboard flag covers the case where GTK's focus-visible timeout has
+/// already switched `focus_visible` off for a keyboard user. Any other focus change and
+/// the follow-up notification for the cleared focus return false. See
+/// [`wire_menu_button_focus`] for the GTK and theme behaviour behind it.
+fn drop_pointer_focus(
+    focus_in_menu_button: bool,
+    focus_visible: bool,
+    last_input_was_keyboard: bool,
+) -> bool {
+    focus_in_menu_button && !focus_visible && !last_input_was_keyboard
 }
 
 /// Connects a page-entry hook that runs `probe` on the page currently held in `page`
@@ -1474,4 +1607,40 @@ fn build_placeholder_page(category: SidebarCategory) -> ScrolledWindow {
     scroller.set_vexpand(true);
     scroller.set_child(Some(&content));
     scroller
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drop_pointer_focus;
+
+    /// Only pointer-given focus on the menu button is dropped (task 13.3): keyboard focus
+    /// must keep its ring whether GTK still shows it (`focus-visible` on) or its
+    /// focus-visible timeout has already switched that off (the last input was a key),
+    /// focus elsewhere is none of the handler's business, and the notification that
+    /// follows the drop itself (no focus, so not on the button) must not trigger another
+    /// drop. Only the decision is tested here: `is_on_menu_button`'s popover exclusion and
+    /// the safety of re-entering `set_focus` from the handler need a display and are not
+    /// verified headlessly.
+    #[test]
+    fn only_pointer_focus_on_the_menu_button_is_dropped() {
+        for focus_in_menu_button in [false, true] {
+            for focus_visible in [false, true] {
+                for last_input_was_keyboard in [false, true] {
+                    // Exactly one of the eight combinations drops the focus.
+                    let expected = (focus_in_menu_button, focus_visible, last_input_was_keyboard)
+                        == (true, false, false);
+                    assert_eq!(
+                        drop_pointer_focus(
+                            focus_in_menu_button,
+                            focus_visible,
+                            last_input_was_keyboard
+                        ),
+                        expected,
+                        "in button {focus_in_menu_button}, visible {focus_visible}, \
+                         keyboard {last_input_was_keyboard}"
+                    );
+                }
+            }
+        }
+    }
 }
