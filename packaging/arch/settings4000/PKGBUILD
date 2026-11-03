@@ -52,7 +52,7 @@ pkgname=settings4000
 # after the GApplication ID so launchers can match the app's windows to them.
 # A unit test there pins this exact line.
 _app_id=org.settings4000.Settings4000
-pkgver=1.1.0
+pkgver=1.1.1
 pkgrel=1
 pkgdesc='Native GTK 4 settings GUI for a dotfiles-managed Hyprland desktop'
 arch=(x86_64)
